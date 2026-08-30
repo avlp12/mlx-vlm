@@ -62,6 +62,23 @@ falls back to the eager path otherwise (prefill, the `S>1` verify block,
 batched/left-padded decode, or a checkpoint whose `A_log`/`dt_bias` were not kept
 in fp32). Default is off.
 
+#### Folding the small projections in (`MLX_VLM_GLM5_FUSED_KDA_QPROJ=1`)
+
+A second opt-in also pulls `f_b_proj` and `g_b_proj` -- two `Linear(head_dim,
+num_heads*head_dim)` affine-quantized GEMVs whose only consumer is this kernel --
+inside the launch, leaving the chain as literally one dispatch per layer.
+
+The in-kernel GEMV is written as a transcription of MLX's affine `qmv_quad`
+(`load_vector` + `qdot` + `quad_sum`, `bits == 8`): one quad per output row, quad
+lane `l` owning `x[VPT*l : VPT*l+VPT]` with `VPT = head_dim/4`. Same partition and
+same accumulation order, so it stays bit-identical. Writing it as an ordinary
+per-element `x * (scale*q + bias)` dot instead disagreed with `mx.quantized_matmul`
+on ~0.01% of elements -- small, but enough to flip greedy tokens on 2 of 5 synthetic
+seeds, which is why the exact form is the one that ships. MLX only dispatches
+`qmv_quad` for `head_dim` in {64, 128} at 8 bits, so the fold declines outside that
+and the layer keeps the two GEMVs outside the kernel. It also stays off on the
+speculative capture path, which hands `f_b_proj`'s output back in `gdn_sink`.
+
 Speculative decoding keeps the fusion on its single-token steps: a capture variant
 of the kernel also emits the `gdn_sink` tensors (post-conv `q`/`k`/`v` straight out
 of threadgroup memory, plus the pre-conv window `concatenate([conv_state, mixed])`)
