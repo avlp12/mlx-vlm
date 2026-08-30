@@ -9,7 +9,9 @@ The kernel is a rounding-faithful transcription, not an approximation: it is
 expected to be *bit-identical* to the eager path, including the fp32 recurrent
 state carried across steps.  These tests pin that, and pin that the fast path
 correctly declines anything it is not written for (prefill, S>1, batched or
-left-padded decode, speculative capture).
+left-padded decode).  A speculative capture is *not* declined: the kernel has a
+capture variant that emits the ``gdn_sink`` tensors, checked here against the
+eager sink and against the rollback replay those tensors feed.
 
 Run the 34-layer micro-bench with ``python -m mlx_vlm.tests.test_glm5_next_fused_kda``.
 """
@@ -170,6 +172,83 @@ def test_fused_kda_matches_eager_over_32_decode_steps():
     assert worst == (0.0, 0.0), f"expected bit-identical, got {worst}"
 
 
+def test_fused_kda_capture_matches_eager_gdn_sink():
+    """With a drafter attached the capture variant must reproduce gdn_sink exactly.
+
+    Those tensors are not observable in the forward output -- they are replayed by
+    ``rollback_speculative_cache`` on a partial accept -- so they need their own
+    check, including running the rollback consumer on both sinks.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    from mlx_vlm.models.gated_delta import gated_delta_update
+
+    config = _config()
+    layer = _layer(config)
+    eager_cache = _cache(config)
+    fused_cache = _clone(eager_cache)
+
+    mx.random.seed(2468)
+    steps = [
+        mx.random.normal((1, 1, config.hidden_size)).astype(mx.bfloat16)
+        for _ in range(32)
+    ]
+    mx.eval(steps)
+
+    names = ["q", "k", "v", "a", "b", "A_log", "dt_bias", "state", "conv_input"]
+    worst = (0.0, 0.0)
+    for x in steps:
+        eager_sink, fused_sink = [], []
+        _set_toggle(layer, False)
+        eager_out = layer(x, None, eager_cache, gdn_sink=eager_sink)
+        _set_toggle(layer, True)
+        fused_out = layer(x, None, fused_cache, gdn_sink=fused_sink)
+        assert len(eager_sink) == len(fused_sink) == 1
+
+        # Replay the rollback consumer (accept the single token) on both sinks.
+        def replay(entry):
+            return gated_delta_update(
+                entry[0][:, :1],
+                entry[1][:, :1],
+                entry[2][:, :1],
+                entry[3][:, :1],
+                entry[4][:, :1],
+                entry[5],
+                entry[6],
+                state=entry[7],
+                lower_bound=entry[10],
+            )[1]
+
+        eager_roll, fused_roll = replay(eager_sink[0]), replay(fused_sink[0])
+        mx.eval(
+            eager_out,
+            fused_out,
+            eager_cache.cache,
+            fused_cache.cache,
+            eager_sink[0][:9],
+            fused_sink[0][:9],
+            eager_roll,
+            fused_roll,
+        )
+        assert eager_sink[0][9] == fused_sink[0][9] == config.linear_conv_kernel_dim
+        assert eager_sink[0][10] == fused_sink[0][10] == config.linear_lower_bound
+        pairs = [
+            (eager_out, fused_out),
+            (eager_cache[0], fused_cache[0]),
+            (eager_cache[1], fused_cache[1]),
+            (eager_roll, fused_roll),
+        ]
+        for i, name in enumerate(names):
+            ref, got = eager_sink[0][i], fused_sink[0][i]
+            assert ref.shape == got.shape, f"{name}: {ref.shape} vs {got.shape}"
+            assert ref.dtype == got.dtype, f"{name}: {ref.dtype} vs {got.dtype}"
+            pairs.append((ref, got))
+        for ref, got in pairs:
+            worst = max(worst, _max_abs_rel(ref, got))
+
+    assert worst == (0.0, 0.0), f"expected bit-identical sink, got {worst}"
+
+
 def test_fused_kda_declines_ineligible_shapes():
     if not mx.metal.is_available():
         pytest.skip("Metal kernels are unavailable on this host")
@@ -185,7 +264,7 @@ def test_fused_kda_declines_ineligible_shapes():
     assert not layer._fused_kda_eligible(**{**ok, "B": 2})
     assert not layer._fused_kda_eligible(**{**ok, "S": 8})
     assert not layer._fused_kda_eligible(**{**ok, "mask": mx.array([[True]])})
-    assert not layer._fused_kda_eligible(**{**ok, "gdn_sink": []})
+    assert layer._fused_kda_eligible(**{**ok, "gdn_sink": []})  # capture variant
     assert not layer._fused_kda_eligible(**{**ok, "cache": None})
     assert not layer._fused_kda_eligible(**{**ok, "cache": ArraysCache(size=2)})
     assert not layer._fused_kda_eligible(**{**ok, "cache": _cache(config, batch=2)})
