@@ -226,9 +226,11 @@ class Glm5NextLinearAttention(nn.Module):
 
     def _fused_kda_eligible(self, B, S, mask, cache, gdn_sink, ref) -> bool:
         # Per-step preconditions.  Anything unusual (prefill, S>1 verify block,
-        # batched / left-padded decode, speculative capture, a checkpoint whose
-        # gate params were not kept in fp32) falls back to the eager path.
-        if B != 1 or S != 1 or mask is not None or gdn_sink is not None:
+        # batched / left-padded decode, a checkpoint whose gate params were not
+        # kept in fp32) falls back to the eager path.  A speculative capture is
+        # fine: the kernel's capture variant emits the gdn_sink tensors itself.
+        del gdn_sink
+        if B != 1 or S != 1 or mask is not None:
             return False
         if cache is None or cache[0] is None or cache[1] is None:
             return False
@@ -251,14 +253,21 @@ class Glm5NextLinearAttention(nn.Module):
             and self.o_norm.weight.size == D
         )
 
-    def _fused_kda_step(self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache) -> mx.array:
+    def _fused_kda_step(
+        self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink=None
+    ) -> mx.array:
         # One custom Metal kernel for the whole post-projection chain: conv1d
         # window update + silu, both L2 norms, the safe forget gate, beta, the
-        # gated delta-rule state update and the gated RMSNorm.
+        # gated delta-rule state update and the gated RMSNorm.  With a drafter
+        # attached the capture variant also emits the gdn_sink tensors, so the
+        # single-token draft/plain steps of a speculative round keep the fusion
+        # (the S>1 verify block still runs eager).
         fg = self.forget_gate
+        H, D = self.num_heads, self.head_dim
         a = fg.f_b_proj(fa_o)
         gate = self.g_b_proj(ga_o)
-        y, state, conv_state = fused_kda_decode_step(
+        entry_state = cache[1]
+        outs = fused_kda_decode_step(
             q_o,
             k_o,
             v_o,
@@ -268,15 +277,34 @@ class Glm5NextLinearAttention(nn.Module):
             b_o,
             fg.A_log,
             fg.dt_bias,
-            cache[1],
+            entry_state,
             gate,
             self.o_norm.weight,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
+            num_heads=H,
+            head_dim=D,
             conv_kernel_size=self.conv_kernel_size,
             lower_bound=fg.safe_gate_lower_bound,
             norm_eps=self.o_norm.eps,
+            capture=gdn_sink is not None,
         )
+        y, state, conv_state = outs[:3]
+        if gdn_sink is not None:
+            q_n, k_n, v_n, conv_input = outs[3:]
+            gdn_sink.append(
+                (
+                    q_n,
+                    k_n,
+                    v_n,
+                    a.reshape(1, 1, H, D),
+                    b_o,
+                    fg.A_log.reshape(H, 1),
+                    fg.dt_bias.reshape(H, D),
+                    entry_state,
+                    conv_input,
+                    self.conv_kernel_size,
+                    fg.safe_gate_lower_bound,
+                )
+            )
         cache[0] = conv_state
         cache[1] = state
         cache.advance(1)
@@ -296,7 +324,9 @@ class Glm5NextLinearAttention(nn.Module):
             if self._fused_kda_ready() and self._fused_kda_eligible(
                 B, S, mask, cache, gdn_sink, q_o
             ):
-                return self._fused_kda_step(q_o, k_o, v_o, fa_o, ga_o, b_o, cache)
+                return self._fused_kda_step(
+                    q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink
+                )
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
         else:
             q_o, k_o, v_o = (
@@ -311,7 +341,9 @@ class Glm5NextLinearAttention(nn.Module):
             if self._fused_kda_ready() and self._fused_kda_eligible(
                 B, S, mask, cache, gdn_sink, q_o
             ):
-                return self._fused_kda_step(q_o, k_o, v_o, fa_o, ga_o, b_o, cache)
+                return self._fused_kda_step(
+                    q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink
+                )
         if mask is not None and mask.dtype == mx.bool_:
             mixed = mx.where(mask[..., None], mixed, 0)
 

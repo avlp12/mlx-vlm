@@ -19,9 +19,13 @@ twice (sigmoid then product), ``gated_delta_kernel`` writes its output ``y`` in 
 input dtype before the gated RMSNorm reads it back as float32, and ``beta`` is a
 bfloat16 sigmoid.  State accumulation stays float32, matching the eager kernel.
 
-Not a drop-in for prefill: this is decode-only (B=1, S=1, no SSM mask, no
-speculative capture).  ``Glm5NextLinearAttention`` falls back to the eager path
-whenever any of those preconditions does not hold.
+A ``capture=True`` variant additionally emits the tensors ``gdn_sink`` carries for
+speculative rollback (post-conv q/k/v and the pre-conv window), straight out of
+threadgroup memory, so a drafter-attached single-token step keeps the fusion.
+
+Not a drop-in for prefill: this is decode-only (B=1, S=1, no SSM mask).
+``Glm5NextLinearAttention`` falls back to the eager path whenever any of those
+preconditions does not hold.
 """
 
 from typing import Optional, Tuple
@@ -262,6 +266,34 @@ _SOURCE = """
   }
 """
 
+# Appended to _SOURCE for the capture variant.  `sq` / `sk` / `sv` still hold the
+# post-conv, post-L2-norm q / k / v at this point (phases 1-2 only touch `sy`), so
+# the sink tensors come straight out of threadgroup memory -- the same values the
+# recurrence consumed, hence bit-identical to what the eager path stashes.
+_SINK_SOURCE = """
+  // --------------------------------------------------------------- sink emit
+  // Speculative capture: hand back exactly the tensors gdn_sink carries, so
+  // rollback_speculative_cache replays the accepted prefix on identical inputs.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint d = tid; d < (uint)D; d += NT) {
+    q_out[h * (uint)D + d] = static_cast<T>(sq[d]);
+    k_out[h * (uint)D + d] = static_cast<T>(sk[d]);
+    v_out[h * (uint)D + d] = static_cast<T>(sv[d]);
+  }
+  // conv_input = concatenate([conv_state, mixed], axis=1), i.e. [1, K, 3*H*D].
+  for (uint idx = tid; idx < 3u * (uint)D; idx += NT) {
+    uint part = idx / (uint)D;
+    uint d    = idx - part * (uint)D;
+    uint c    = part * QKVD + h * (uint)D + d;
+    for (uint j = 0; j + 1 < (uint)K; ++j) {
+      conv_input_out[(size_t)j * CDIM + c] = conv_state[(size_t)j * CDIM + c];
+    }
+    conv_input_out[(size_t)(K - 1) * CDIM + c] =
+        (part == 0u) ? mq[h * (uint)D + d]
+      : ((part == 1u) ? mk[h * (uint)D + d] : mv[h * (uint)D + d]);
+  }
+"""
+
 _INPUT_NAMES = [
     "mq",
     "mk",
@@ -280,8 +312,10 @@ _INPUT_NAMES = [
     "norm_eps",
 ]
 _OUTPUT_NAMES = ["y", "state_out", "conv_state_out"]
+_SINK_OUTPUT_NAMES = _OUTPUT_NAMES + ["q_out", "k_out", "v_out", "conv_input_out"]
 
 _KERNEL = None
+_KERNEL_SINK = None
 _KERNEL_TRIED = False
 
 # Threadgroup y-extent.  32 * TY threads per threadgroup, one threadgroup per head;
@@ -289,13 +323,15 @@ _KERNEL_TRIED = False
 _TY = 32
 
 
-def _kernel():
-    global _KERNEL, _KERNEL_TRIED
+def _kernels():
+    # Two objects rather than one: mx.fast.metal_kernel derives the function
+    # signature from output_names, so the capture variant needs its own kernel.
+    global _KERNEL, _KERNEL_SINK, _KERNEL_TRIED
     if _KERNEL_TRIED:
-        return _KERNEL
+        return _KERNEL, _KERNEL_SINK
     _KERNEL_TRIED = True
     if not mx.metal.is_available():
-        return None
+        return None, None
     _KERNEL = mx.fast.metal_kernel(
         name="glm5_kda_decode_step",
         input_names=_INPUT_NAMES,
@@ -303,7 +339,18 @@ def _kernel():
         header=_HEADER,
         source=_SOURCE,
     )
-    return _KERNEL
+    _KERNEL_SINK = mx.fast.metal_kernel(
+        name="glm5_kda_decode_step_capture",
+        input_names=_INPUT_NAMES,
+        output_names=_SINK_OUTPUT_NAMES,
+        header=_HEADER,
+        source=_SOURCE + _SINK_SOURCE,
+    )
+    return _KERNEL, _KERNEL_SINK
+
+
+def _kernel():
+    return _kernels()[0]
 
 
 def fused_kda_supported(
@@ -354,7 +401,8 @@ def fused_kda_decode_step(
     conv_kernel_size: int,
     lower_bound: float,
     norm_eps: float,
-) -> Tuple[mx.array, mx.array, mx.array]:
+    capture: bool = False,
+) -> Tuple[mx.array, ...]:
     """One fused KDA decode step.
 
     Args (all B=1, S=1):
@@ -370,9 +418,21 @@ def fused_kda_decode_step(
 
     Returns ``(y, state_out, conv_state_out)`` where ``y`` is ``[1, 1, H*D]`` and is
     exactly what the eager path feeds to ``o_proj``.
+
+    With ``capture=True`` it additionally returns
+    ``(q_out, k_out, v_out, conv_input_out)``: the post-conv / post-L2-norm q, k, v
+    as ``[1, 1, H, D]`` and ``concatenate([conv_state, mixed], axis=1)`` as
+    ``[1, K, 3*H*D]`` -- the tensors ``gdn_sink`` carries for speculative rollback.
     """
-    kernel = _kernel()
+    base, sink = _kernels()
+    kernel = sink if capture else base
+    H, D, K = num_heads, head_dim, conv_kernel_size
     dt = q_in.dtype
+    out_shapes = [(1, 1, H * D), state.shape, conv_state.shape]
+    out_dtypes = [dt, state.dtype, dt]
+    if capture:
+        out_shapes += [(1, 1, H, D)] * 3 + [(1, K, 3 * H * D)]
+        out_dtypes += [dt] * 4
     return kernel(
         inputs=[
             q_in,
@@ -401,10 +461,6 @@ def fused_kda_decode_step(
         ],
         grid=(32, _TY, num_heads),
         threadgroup=(32, _TY, 1),
-        output_shapes=[
-            (1, 1, num_heads * head_dim),
-            state.shape,
-            conv_state.shape,
-        ],
-        output_dtypes=[dt, state.dtype, dt],
+        output_shapes=out_shapes,
+        output_dtypes=out_dtypes,
     )

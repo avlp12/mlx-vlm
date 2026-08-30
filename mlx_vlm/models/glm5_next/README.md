@@ -57,10 +57,17 @@ precise inside MLX's prebuilt library but the fast approximation inside anything
 JIT'd (`mx.compile`, custom kernels) -- and disabling fma contraction in the norm
 reductions, since `(x*x).sum(-1)` rounds the square before the add.
 
-Decode-only and conservative: it engages only for `B=1, S=1` with no SSM mask and
-no speculative capture, and falls back to the eager path otherwise (prefill, the
-`S>1` verify block, batched/left-padded decode, a drafter's capture forward, or a
-checkpoint whose `A_log`/`dt_bias` were not kept in fp32). Default is off.
+Decode-only and conservative: it engages only for `B=1, S=1` with no SSM mask, and
+falls back to the eager path otherwise (prefill, the `S>1` verify block,
+batched/left-padded decode, or a checkpoint whose `A_log`/`dt_bias` were not kept
+in fp32). Default is off.
+
+Speculative decoding keeps the fusion on its single-token steps: a capture variant
+of the kernel also emits the `gdn_sink` tensors (post-conv `q`/`k`/`v` straight out
+of threadgroup memory, plus the pre-conv window `concatenate([conv_state, mixed])`)
+that `rollback_speculative_cache` replays on a partial accept. Those are bit-identical
+to the eager sink too, as is the rollback state they reconstruct. The `S>1` verify
+block itself stays eager.
 
 ## Self-speculative decoding (MTP)
 
