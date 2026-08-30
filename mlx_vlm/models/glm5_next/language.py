@@ -19,12 +19,32 @@ from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
 from .config import ModelConfig, TextConfig
-from .fused_kda import fused_kda_decode_step, fused_kda_supported
+from .fused_kda import (
+    fused_kda_decode_step,
+    fused_kda_qproj_supported,
+    fused_kda_supported,
+)
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
 _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
 
 _FUSED_KDA_ENV = None
+_FUSED_KDA_QPROJ_ENV = None
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _fused_kda_qproj_enabled() -> bool:
+    # Second, stricter opt-in.  Folding f_b_proj / g_b_proj into the kernel drops
+    # two dispatches per layer but reorders the quantized dot product relative to
+    # mx.quantized_matmul, so the default fused path stays provably bit-identical
+    # and this one is measured at rounding scale instead.
+    global _FUSED_KDA_QPROJ_ENV
+    if _FUSED_KDA_QPROJ_ENV is None:
+        _FUSED_KDA_QPROJ_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA_QPROJ")
+    return _FUSED_KDA_QPROJ_ENV
 
 
 def _fused_kda_enabled() -> bool:
@@ -33,12 +53,7 @@ def _fused_kda_enabled() -> bool:
     # so it stays behind a flag until it has live mileage.
     global _FUSED_KDA_ENV
     if _FUSED_KDA_ENV is None:
-        _FUSED_KDA_ENV = os.environ.get("MLX_VLM_GLM5_FUSED_KDA", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        _FUSED_KDA_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA")
     return _FUSED_KDA_ENV
 
 
@@ -160,6 +175,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.fuse_in = True
         self._fused_ready = False
         self._fused_kda = None
+        self._fused_kda_qproj = None
 
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
@@ -224,6 +240,19 @@ class Glm5NextLinearAttention(nn.Module):
             )
         return self._fused_kda
 
+    def _fused_kda_qproj_ready(self) -> bool:
+        if self._fused_kda_qproj is None:
+            self._fused_kda_qproj = (
+                _fused_kda_qproj_enabled()
+                and self._fused_kda_ready()
+                and fused_kda_qproj_supported(
+                    self.forget_gate.f_b_proj,
+                    self.g_b_proj,
+                    head_dim=self.head_dim,
+                )
+            )
+        return self._fused_kda_qproj
+
     def _fused_kda_eligible(self, B, S, mask, cache, gdn_sink, ref) -> bool:
         # Per-step preconditions.  Anything unusual (prefill, S>1 verify block,
         # batched / left-padded decode, a checkpoint whose gate params were not
@@ -264,8 +293,16 @@ class Glm5NextLinearAttention(nn.Module):
         # (the S>1 verify block still runs eager).
         fg = self.forget_gate
         H, D = self.num_heads, self.head_dim
-        a = fg.f_b_proj(fa_o)
-        gate = self.g_b_proj(ga_o)
+        capture = gdn_sink is not None
+        # The capture variant hands back `a` in gdn_sink, so it keeps the
+        # projections outside; folding them in is for the plain decode step.
+        qproj = (
+            (fa_o, fg.f_b_proj, ga_o, self.g_b_proj)
+            if not capture and self._fused_kda_qproj_ready()
+            else None
+        )
+        a = None if qproj is not None else fg.f_b_proj(fa_o)
+        gate = None if qproj is not None else self.g_b_proj(ga_o)
         entry_state = cache[1]
         outs = fused_kda_decode_step(
             q_o,
@@ -285,7 +322,8 @@ class Glm5NextLinearAttention(nn.Module):
             conv_kernel_size=self.conv_kernel_size,
             lower_bound=fg.safe_gate_lower_bound,
             norm_eps=self.o_norm.eps,
-            capture=gdn_sink is not None,
+            capture=capture,
+            qproj=qproj,
         )
         y, state, conv_state = outs[:3]
         if gdn_sink is not None:

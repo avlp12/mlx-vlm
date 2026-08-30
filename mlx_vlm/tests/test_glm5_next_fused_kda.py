@@ -13,6 +13,9 @@ left-padded decode).  A speculative capture is *not* declined: the kernel has a
 capture variant that emits the ``gdn_sink`` tensors, checked here against the
 eager sink and against the rollback replay those tensors feed.
 
+``MLX_VLM_GLM5_FUSED_KDA_QPROJ=1`` additionally folds the two small quantized
+projections (``f_b_proj`` / ``g_b_proj``) into the same launch.
+
 Run the 34-layer micro-bench with ``python -m mlx_vlm.tests.test_glm5_next_fused_kda``.
 """
 
@@ -125,14 +128,16 @@ def _max_abs_rel(a, b):
 
 @pytest.fixture(autouse=True)
 def _reset_toggle():
-    saved = glm5._FUSED_KDA_ENV
+    saved = (glm5._FUSED_KDA_ENV, glm5._FUSED_KDA_QPROJ_ENV)
     yield
-    glm5._FUSED_KDA_ENV = saved
+    glm5._FUSED_KDA_ENV, glm5._FUSED_KDA_QPROJ_ENV = saved
 
 
-def _set_toggle(layer, on):
+def _set_toggle(layer, on, qproj=False):
     glm5._FUSED_KDA_ENV = on
+    glm5._FUSED_KDA_QPROJ_ENV = qproj
     layer._fused_kda = None
+    layer._fused_kda_qproj = None
 
 
 def test_fused_kda_matches_eager_over_32_decode_steps():
@@ -249,6 +254,63 @@ def test_fused_kda_capture_matches_eager_gdn_sink():
     assert worst == (0.0, 0.0), f"expected bit-identical sink, got {worst}"
 
 
+def test_fused_kda_qproj_matches_eager_over_32_decode_steps():
+    """MLX_VLM_GLM5_FUSED_KDA_QPROJ folds f_b_proj / g_b_proj into the kernel.
+
+    The in-kernel GEMV transcribes MLX's affine ``qmv_quad`` partition, so it is
+    bit-identical too -- a plain per-element dequant dot instead disagrees on
+    ~0.01% of elements, which was enough to flip greedy tokens on 2 of 5 seeds.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    layer = _layer(config)
+    _set_toggle(layer, True, qproj=True)
+    if not layer._fused_kda_qproj_ready():
+        pytest.skip("projection fold unsupported for this quantization")
+
+    eager_cache = _cache(config)
+    qproj_cache = _clone(eager_cache)
+    mx.random.seed(1357)
+    steps = [
+        mx.random.normal((1, 1, config.hidden_size)).astype(mx.bfloat16)
+        for _ in range(32)
+    ]
+    mx.eval(steps)
+
+    worst = (0.0, 0.0)
+    for x in steps:
+        _set_toggle(layer, False)
+        eager_out = layer(x, None, eager_cache)
+        _set_toggle(layer, True, qproj=True)
+        qproj_out = layer(x, None, qproj_cache)
+        mx.eval(eager_out, qproj_out, eager_cache.cache, qproj_cache.cache)
+        for ref, got in (
+            (eager_out, qproj_out),
+            (eager_cache[0], qproj_cache[0]),
+            (eager_cache[1], qproj_cache[1]),
+        ):
+            worst = max(worst, _max_abs_rel(ref, got))
+    assert worst == (0.0, 0.0), f"expected bit-identical, got {worst}"
+
+
+def test_fused_kda_qproj_declines_unsupported_quantization():
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    from mlx_vlm.models.glm5_next.fused_kda import fused_kda_qproj_supported
+
+    config = _config()
+    layer = _layer(config)
+    fb, gb = layer.forget_gate.f_b_proj, layer.g_b_proj
+    D = config.linear_head_dim
+    assert fused_kda_qproj_supported(fb, gb, head_dim=D)
+    # qmv_quad is only dispatched for head_dim in {64, 128} and bits == 8.
+    assert not fused_kda_qproj_supported(fb, gb, head_dim=256)
+    assert not fused_kda_qproj_supported(nn.Linear(D, D, bias=False), gb, head_dim=D)
+    # An unfolded (dequantized) projection has no scales.
+    assert not fused_kda_qproj_supported(fb, nn.Linear(D, D, bias=False), head_dim=D)
+
+
 def test_fused_kda_declines_ineligible_shapes():
     if not mx.metal.is_available():
         pytest.skip("Metal kernels are unavailable on this host")
@@ -340,9 +402,10 @@ def _bench(n_layers=34, iters=20, warmup=5):  # pragma: no cover - manual bench
 
         return run
 
-    for tag, on in (("eager", False), ("fused", True)):
+    for tag, on, qp in (("eager", False, False), ("fused", True, False),
+                        ("qproj", True, True)):
         for layer in layers:
-            _set_toggle(layer, on)
+            _set_toggle(layer, on, qproj=qp)
         caches = [_cache(config, seed=100 + i) for i in range(n_layers)]
         full = timeit(sweep(lambda i: layers[i](h, None, caches[i])))
         gemv = (

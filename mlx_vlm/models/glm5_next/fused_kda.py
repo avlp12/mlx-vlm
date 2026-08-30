@@ -294,6 +294,89 @@ _SINK_SOURCE = """
   }
 """
 
+# ---------------------------------------------------------------------------
+# Optional extra fold: f_b_proj / g_b_proj done in-kernel.
+#
+# Both are Linear(head_dim, num_heads*head_dim) affine-quantized GEMVs whose only
+# consumer is this kernel, so folding them in removes two dispatches per layer at
+# the cost of streaming ~2 MB more weight.
+#
+# It is written as a transcription of MLX's affine ``qmv_quad`` path
+# (mlx/backend/metal/kernels/quantized.h: load_vector + qdot + quad_sum, bits==8)
+# rather than as a generic dot product: one quad per output row, quad lane `l`
+# owning x[VPT*l : VPT*l+VPT] with VPT = head_dim/4, one scale/bias pair per
+# thread, and the row total closed by quad_sum.  Same partition and same
+# accumulation order as MLX, so the folded projection is bit-identical to
+# mx.quantized_matmul -- verified for head_dim in {64, 128}.  (A plain
+# per-element ``x * (scale*q + bias)`` dot instead disagrees on ~0.01% of
+# elements, which is enough to flip greedy tokens.)
+#
+# Element e of row r is byte e of the row for bits==8:
+#   ((w[r, e/4] >> (8 * (e % 4))) & 0xff) * scales[r, e/GS] + biases[r, e/GS]
+_QPROJ_COMPUTE = """
+  // ------------------------------------------------------------- phase 0a-pre
+  {
+    constexpr int VPT   = D / 4;        // values_per_thread
+    constexpr int SSPT  = GS / VPT;     // scale_step_per_thread
+    constexpr int NQUAD = NT / 4;
+    constexpr int NG    = D / GS;
+    const uint qg   = tid / 4u;         // quad index within the threadgroup
+    const uint qlid = tid % 4u;         // lane within the quad
+
+    // Rows [0, D) are f_b_proj, [D, 2D) are g_b_proj; a quad owns one row.
+    for (uint t = qg; t < 2u * (uint)D; t += (uint)NQUAD) {
+      uint proj = t / (uint)D;
+      uint d    = t - proj * (uint)D;
+      uint row  = h * (uint)D + d;
+      device const T* xp = (proj == 0u ? fa : ga) + qlid * (uint)VPT;
+      float xs = 0.0f;                                  // load_vector's `sum`
+      for (int i = 0; i < VPT; ++i) xs += float(xp[i]);
+      size_t wb = (size_t)row * D + (size_t)qlid * VPT; // byte offset (bits == 8)
+      uint gi = row * (uint)NG + qlid / (uint)SSPT;
+      float sc = float(proj == 0u ? fbs[gi] : gbs[gi]);
+      float bi = float(proj == 0u ? fbb[gi] : gbb[gi]);
+      float accum = 0.0f;                               // qdot
+      for (int i = 0; i < VPT; ++i) {
+        size_t bo = wb + (size_t)i;
+        uint word = (proj == 0u) ? fbw[bo / 4u] : gbw[bo / 4u];
+        accum += float(xp[i]) * float((word >> (8u * (uint)(bo % 4u))) & 0xffu);
+      }
+      float r = quad_sum(sc * accum + xs * bi);
+      if (qlid == 0u) {
+        if (proj == 0u) sa[d] = float(static_cast<T>(r));      // f_b_proj -> T
+        else            sgate[d] = float(static_cast<T>(r));   // g_b_proj -> T
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+"""
+
+
+def _qproj_source(source: str) -> str:
+    """Derive the fold-the-GEMVs source from the validated base source."""
+    out = source.replace(
+        "  threadgroup float shr[3];",
+        "  threadgroup float sa[D];          // in-kernel f_b_proj output\n"
+        "  threadgroup float shr[3];",
+        1,
+    )
+    out = out.replace(
+        "  // ---------------------------------------------------------------- phase 0a\n",
+        _QPROJ_COMPUTE
+        + "\n  // ---------------------------------------------------------------- phase 0a\n",
+        1,
+    )
+    out = out.replace(
+        "      float av = float(a[h * (uint)D + d]) + dt_bias[h * (uint)D + d];",
+        "      float av = sa[d] + dt_bias[h * (uint)D + d];",
+        1,
+    )
+    out = out.replace(
+        "      sgate[d] = float(gate[h * (uint)D + d]);\n", "", 1
+    )
+    return out
+
+
 _INPUT_NAMES = [
     "mq",
     "mk",
@@ -314,8 +397,13 @@ _INPUT_NAMES = [
 _OUTPUT_NAMES = ["y", "state_out", "conv_state_out"]
 _SINK_OUTPUT_NAMES = _OUTPUT_NAMES + ["q_out", "k_out", "v_out", "conv_input_out"]
 
-_KERNEL = None
-_KERNEL_SINK = None
+# "a" / "gate" (the f_b_proj / g_b_proj outputs) are replaced by their inputs and
+# quantized weights when the projections are folded in.
+_QPROJ_INPUT_NAMES = [
+    n for n in _INPUT_NAMES if n not in ("a", "gate")
+] + ["fa", "fbw", "fbs", "fbb", "ga", "gbw", "gbs", "gbb"]
+
+_KERNELS = {}
 _KERNEL_TRIED = False
 
 # Threadgroup y-extent.  32 * TY threads per threadgroup, one threadgroup per head;
@@ -323,34 +411,38 @@ _KERNEL_TRIED = False
 _TY = 32
 
 
-def _kernels():
-    # Two objects rather than one: mx.fast.metal_kernel derives the function
-    # signature from output_names, so the capture variant needs its own kernel.
-    global _KERNEL, _KERNEL_SINK, _KERNEL_TRIED
-    if _KERNEL_TRIED:
-        return _KERNEL, _KERNEL_SINK
-    _KERNEL_TRIED = True
-    if not mx.metal.is_available():
-        return None, None
-    _KERNEL = mx.fast.metal_kernel(
-        name="glm5_kda_decode_step",
-        input_names=_INPUT_NAMES,
-        output_names=_OUTPUT_NAMES,
-        header=_HEADER,
-        source=_SOURCE,
-    )
-    _KERNEL_SINK = mx.fast.metal_kernel(
-        name="glm5_kda_decode_step_capture",
-        input_names=_INPUT_NAMES,
-        output_names=_SINK_OUTPUT_NAMES,
-        header=_HEADER,
-        source=_SOURCE + _SINK_SOURCE,
-    )
-    return _KERNEL, _KERNEL_SINK
+def _kernel(kind: str = "base"):
+    """``kind`` in {"base", "capture", "qproj"}; ``None`` if Metal is unavailable.
 
-
-def _kernel():
-    return _kernels()[0]
+    Three objects rather than one: mx.fast.metal_kernel derives the function
+    signature from input_names/output_names, so each variant needs its own.
+    """
+    global _KERNEL_TRIED
+    if not _KERNEL_TRIED:
+        _KERNEL_TRIED = True
+        if mx.metal.is_available():
+            _KERNELS["base"] = mx.fast.metal_kernel(
+                name="glm5_kda_decode_step",
+                input_names=_INPUT_NAMES,
+                output_names=_OUTPUT_NAMES,
+                header=_HEADER,
+                source=_SOURCE,
+            )
+            _KERNELS["capture"] = mx.fast.metal_kernel(
+                name="glm5_kda_decode_step_capture",
+                input_names=_INPUT_NAMES,
+                output_names=_SINK_OUTPUT_NAMES,
+                header=_HEADER,
+                source=_SOURCE + _SINK_SOURCE,
+            )
+            _KERNELS["qproj"] = mx.fast.metal_kernel(
+                name="glm5_kda_decode_step_qproj",
+                input_names=_QPROJ_INPUT_NAMES,
+                output_names=_OUTPUT_NAMES,
+                header=_HEADER,
+                source=_qproj_source(_SOURCE),
+            )
+    return _KERNELS.get(kind)
 
 
 def fused_kda_supported(
@@ -379,7 +471,46 @@ def fused_kda_supported(
         return False
     if num_heads <= 0:
         return False
-    return _kernel() is not None
+    return _kernel("base") is not None
+
+
+def fused_kda_qproj_supported(f_b_proj, g_b_proj, *, head_dim: int) -> bool:
+    """Can f_b_proj / g_b_proj be folded into the kernel?
+
+    Requires both to be affine-quantized with the same bits/group_size, a packed
+    layout the kernel can address, and a lane-aligned input dim.
+    """
+    mods = (f_b_proj, g_b_proj)
+    if not all(hasattr(m, "scales") and hasattr(m, "biases") for m in mods):
+        return False
+    if len({getattr(m, "mode", "affine") for m in mods}) != 1:
+        return False
+    if getattr(mods[0], "mode", "affine") != "affine":
+        return False
+    if len({m.bits for m in mods}) != 1 or len({m.group_size for m in mods}) != 1:
+        return False
+    bits, group_size = mods[0].bits, mods[0].group_size
+    # The in-kernel GEMV transcribes MLX's affine qmv_quad, which MLX only
+    # dispatches for these shapes -- outside them the fold would still be
+    # correct but no longer bit-identical, so decline instead.
+    if bits != 8:
+        return False
+    if head_dim not in (64, 128):
+        return False
+    values_per_thread = head_dim // 4
+    if group_size % values_per_thread or head_dim % group_size:
+        return False
+    pack = 32 // bits
+    for m in mods:
+        if m.weight.dtype != mx.uint32:
+            return False
+        if m.weight.shape[-1] != head_dim // pack:
+            return False
+        if m.scales.shape[-1] != head_dim // group_size:
+            return False
+        if m.scales.shape != m.biases.shape:
+            return False
+    return _kernel("qproj") is not None
 
 
 def fused_kda_decode_step(
@@ -388,12 +519,12 @@ def fused_kda_decode_step(
     v_in: mx.array,
     conv_state: mx.array,
     conv_w: mx.array,
-    a: mx.array,
+    a: Optional[mx.array],
     b: mx.array,
     A_log: mx.array,
     dt_bias: mx.array,
     state: mx.array,
-    gate: mx.array,
+    gate: Optional[mx.array],
     o_weight: mx.array,
     *,
     num_heads: int,
@@ -402,6 +533,7 @@ def fused_kda_decode_step(
     lower_bound: float,
     norm_eps: float,
     capture: bool = False,
+    qproj: Optional[Tuple] = None,
 ) -> Tuple[mx.array, ...]:
     """One fused KDA decode step.
 
@@ -424,41 +556,49 @@ def fused_kda_decode_step(
     as ``[1, 1, H, D]`` and ``concatenate([conv_state, mixed], axis=1)`` as
     ``[1, K, 3*H*D]`` -- the tensors ``gdn_sink`` carries for speculative rollback.
     """
-    base, sink = _kernels()
-    kernel = sink if capture else base
     H, D, K = num_heads, head_dim, conv_kernel_size
     dt = q_in.dtype
+    kind = "capture" if capture else ("qproj" if qproj is not None else "base")
+    kernel = _kernel(kind)
     out_shapes = [(1, 1, H * D), state.shape, conv_state.shape]
     out_dtypes = [dt, state.dtype, dt]
     if capture:
         out_shapes += [(1, 1, H, D)] * 3 + [(1, K, 3 * H * D)]
         out_dtypes += [dt] * 4
+    head = [q_in, k_in, v_in, conv_state, conv_w]
+    tail = [b, A_log, dt_bias, state, o_weight]
+    scalars = [float(lower_bound), float(head_dim**-0.5), float(norm_eps)]
+    template = [
+        ("T", dt),
+        ("ST", state.dtype),
+        ("H", num_heads),
+        ("D", head_dim),
+        ("K", conv_kernel_size),
+        ("TY", _TY),
+    ]
+    if qproj is not None:
+        fa, f_b_proj, ga, g_b_proj = qproj
+        inputs = (
+            head
+            + tail
+            + scalars
+            + [
+                fa,
+                f_b_proj.weight,
+                f_b_proj.scales,
+                f_b_proj.biases,
+                ga,
+                g_b_proj.weight,
+                g_b_proj.scales,
+                g_b_proj.biases,
+            ]
+        )
+        template += [("BITS", f_b_proj.bits), ("GS", f_b_proj.group_size)]
+    else:
+        inputs = head + [a] + tail[:4] + [gate, o_weight] + scalars
     return kernel(
-        inputs=[
-            q_in,
-            k_in,
-            v_in,
-            conv_state,
-            conv_w,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            state,
-            gate,
-            o_weight,
-            float(lower_bound),
-            float(head_dim**-0.5),
-            float(norm_eps),
-        ],
-        template=[
-            ("T", dt),
-            ("ST", state.dtype),
-            ("H", num_heads),
-            ("D", head_dim),
-            ("K", conv_kernel_size),
-            ("TY", _TY),
-        ],
+        inputs=inputs,
+        template=template,
         grid=(32, _TY, num_heads),
         threadgroup=(32, _TY, 1),
         output_shapes=out_shapes,
