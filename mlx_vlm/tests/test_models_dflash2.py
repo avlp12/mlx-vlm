@@ -9,6 +9,13 @@ from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.qwen3_5 import language as qwen_language
 from mlx_vlm.models.qwen3_5.config import TextConfig as Qwen3_5TextConfig
 from mlx_vlm.server.generation import _PositionedTargetSampler
+from mlx_vlm.speculative.common import _speculative_walk, _speculative_walk_batch
+from mlx_vlm.speculative.dflash import (
+    _dflash_deferred_walk_enabled,
+    _dflash_pack_greedy_walk,
+    _speculative_walk_batch_deferred_greedy,
+    _speculative_walk_deferred_greedy,
+)
 from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
@@ -475,3 +482,244 @@ def test_dflash2_glm5_next_batch_generation_matches_target():
 
     assert actual == expected
     assert [len(row) for row in actual] == max_tokens
+
+
+@pytest.mark.parametrize("budget", [1, 2, 3, 10])
+@pytest.mark.parametrize(
+    ("draft_row", "target_row"),
+    [
+        ([5, 6], [5, 6, 7]),
+        ([5, 6], [9, 6, 7]),
+        ([5, 6], [5, 9, 7]),
+        ([5, 6, 7], [5, 6, 7, 8]),
+        ([5, 6, 7], [5, 6, 1, 8]),
+        ([0, 0, 0], [0, 0, 0, 0]),
+    ],
+)
+def test_dflash_deferred_greedy_walk_matches_eager_walk(draft_row, target_row, budget):
+    draft_tokens = mx.array([draft_row], dtype=mx.int32)
+    target_tokens = mx.array([target_row], dtype=mx.uint32)
+
+    packed = _dflash_pack_greedy_walk(draft_tokens, target_tokens, 1)
+
+    assert _speculative_walk_deferred_greedy(packed, budget) == _speculative_walk(
+        draft_tokens, target_tokens, budget
+    )
+
+
+def test_dflash_deferred_greedy_batch_walk_matches_eager_walk():
+    draft_tokens = mx.array([[5, 6], [1, 2], [3, 4]], dtype=mx.int32)
+    target_tokens = mx.array([[5, 6, 7], [9, 2, 3], [3, 8, 4]], dtype=mx.uint32)
+    budgets = [3, 1, 2]
+
+    packed = _dflash_pack_greedy_walk(draft_tokens, target_tokens, 3)
+
+    assert _speculative_walk_batch_deferred_greedy(
+        packed, 3, budgets
+    ) == _speculative_walk_batch(draft_tokens, target_tokens, budgets)
+
+
+def test_dflash_deferred_walk_toggle_prefers_env_then_drafter(monkeypatch):
+    drafter = DFlash2DraftModel(_tiny_config())
+
+    monkeypatch.delenv("MLX_VLM_DFLASH_DEFERRED", raising=False)
+    assert _dflash_deferred_walk_enabled(drafter, greedy_sampling=True)
+    assert not _dflash_deferred_walk_enabled(drafter, greedy_sampling=False)
+
+    monkeypatch.setenv("MLX_VLM_DFLASH_DEFERRED", "0")
+    assert not _dflash_deferred_walk_enabled(drafter, greedy_sampling=True)
+    monkeypatch.setenv("MLX_VLM_DFLASH_DEFERRED", "1")
+    assert _dflash_deferred_walk_enabled(drafter, greedy_sampling=True)
+    monkeypatch.setenv("MLX_VLM_DFLASH_DEFERRED", "on")
+    assert _dflash_deferred_walk_enabled(drafter, greedy_sampling=True)
+
+    monkeypatch.delenv("MLX_VLM_DFLASH_DEFERRED")
+    drafter.dflash_deferred_walk = False
+    assert not _dflash_deferred_walk_enabled(drafter, greedy_sampling=True)
+
+
+def _dflash2_greedy_round_trace(monkeypatch, deferred):
+    monkeypatch.setenv("MLX_VLM_DFLASH_DEFERRED", deferred)
+    mx.random.seed(7)
+    target = _tiny_target()
+    drafter = DFlash2DraftModel(_tiny_config())
+    mx.eval(target.parameters(), drafter.parameters())
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    tokens = _generated_tokens(target, prompt, drafter)
+    return tokens, list(drafter.accept_lens), list(drafter.draft_lens)
+
+
+def test_dflash2_deferred_greedy_walk_is_bit_identical(monkeypatch):
+    eager = _dflash2_greedy_round_trace(monkeypatch, "0")
+    deferred = _dflash2_greedy_round_trace(monkeypatch, "1")
+
+    assert deferred == eager
+    assert eager[1]
+
+
+def _glm5_next_greedy_round_trace(monkeypatch, deferred):
+    monkeypatch.setenv("MLX_VLM_DFLASH_DEFERRED", deferred)
+    mx.random.seed(7)
+    target = _tiny_glm5_next_target()
+    drafter = DFlash2DraftModel(_tiny_glm5_next_drafter_config())
+    mx.eval(target.parameters(), drafter.parameters())
+    prompt = mx.array([[2, 4, 6, 8]], dtype=mx.int32)
+
+    tokens = _glm5_next_generated_tokens(target, prompt, drafter)
+    return tokens, list(drafter.accept_lens), list(drafter.draft_lens)
+
+
+def test_dflash2_glm5_next_deferred_greedy_walk_is_bit_identical(monkeypatch):
+    eager = _glm5_next_greedy_round_trace(monkeypatch, "0")
+    deferred = _glm5_next_greedy_round_trace(monkeypatch, "1")
+
+    assert deferred == eager
+    assert eager[1]
+
+
+def _glm5_next_batch_greedy_tokens(monkeypatch, deferred):
+    from mlx_vlm.generate import BatchGenerator
+
+    class NeverStop:
+        def __call__(self, _token):
+            return False
+
+        def add_eos_token_ids(self, _tokens):
+            return None
+
+    monkeypatch.setenv("MLX_VLM_DFLASH_DEFERRED", deferred)
+    mx.random.seed(0)
+    target = _tiny_glm5_next_target()
+    drafter = DFlash2DraftModel(_tiny_glm5_next_drafter_config())
+    mx.eval(target.parameters(), drafter.parameters())
+
+    prompts = [[2, 4, 6], [3, 5, 7, 9, 11]]
+    max_tokens = [3, 5]
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=NeverStop())
+    )
+    generator = BatchGenerator(
+        target,
+        processor,
+        prefill_batch_size=2,
+        completion_batch_size=2,
+        prefill_step_size=None,
+        draft_model=drafter,
+        draft_kind="dflash",
+        draft_block_size=3,
+        greedy_sampling=True,
+    )
+    prompt_kwargs = [
+        {"inputs_embeds": target.model.embed_tokens(mx.array([prompt], dtype=mx.int32))}
+        for prompt in prompts
+    ]
+    uids = generator.insert(prompts, max_tokens=max_tokens, prompt_kwargs=prompt_kwargs)
+    tokens = {uid: [] for uid in uids}
+    try:
+        for _ in range(32):
+            if not generator.has_work:
+                break
+            _, responses = generator.next()
+            for response in responses:
+                if response.token is not None:
+                    tokens[response.uid].append(int(response.token))
+    finally:
+        generator.close()
+    return [tokens[uid] for uid in uids], list(drafter.accept_lens)
+
+
+def test_dflash2_glm5_next_batch_deferred_greedy_walk_is_bit_identical(monkeypatch):
+    eager = _glm5_next_batch_greedy_tokens(monkeypatch, "0")
+    deferred = _glm5_next_batch_greedy_tokens(monkeypatch, "1")
+
+    assert deferred == eager
+    assert eager[1]
+
+
+# The synthetic drafter never agrees with the synthetic target, so acceptance
+# is scripted from the target's own greedy continuation to reach the
+# full-accept, partial-accept and full-reject branches of the walk.
+_REAL_DFLASH2_DRAFT_BLOCK = DFlash2DraftModel.draft_block
+
+
+def _script_dflash2_draft_block(monkeypatch, baseline, pattern):
+    def scripted(self, last_bonus, hidden, cache, block_size, sampler, token_dtype):
+        drafted = _REAL_DFLASH2_DRAFT_BLOCK(
+            self, last_bonus, hidden, cache, block_size, sampler, token_dtype
+        )
+        length = int(drafted.shape[1])
+        cursor = 1 + sum(int(accepted) + 1 for accepted in self.accept_lens)
+        correct = pattern[len(self.accept_lens) % len(pattern)]
+        row = []
+        for offset in range(length):
+            position = cursor + offset
+            if position >= len(baseline):
+                row.append(0)
+            elif offset < correct:
+                row.append(int(baseline[position]))
+            else:
+                row.append((int(baseline[position]) + 1) % 32)
+        return mx.array([row], dtype=token_dtype)
+
+    monkeypatch.setattr(DFlash2DraftModel, "draft_block", scripted)
+
+
+def _scripted_trace(monkeypatch, deferred, pattern, target_fn, config_fn, prompt, run):
+    mx.random.seed(7)
+    target = target_fn()
+    mx.eval(target.parameters())
+    prompt = mx.array([prompt], dtype=mx.int32)
+    baseline = run(target, prompt)
+
+    monkeypatch.setenv("MLX_VLM_DFLASH_DEFERRED", deferred)
+    _script_dflash2_draft_block(monkeypatch, baseline, pattern)
+    mx.random.seed(7)
+    drafter = DFlash2DraftModel(config_fn())
+    mx.eval(drafter.parameters())
+    tokens = run(target, prompt, drafter)
+    return baseline, tokens, list(drafter.accept_lens), list(drafter.draft_lens)
+
+
+def test_dflash2_deferred_greedy_walk_matches_eager_when_drafts_are_accepted(
+    monkeypatch,
+):
+    def trace(deferred):
+        return _scripted_trace(
+            monkeypatch,
+            deferred,
+            (2, 1, 0),
+            _tiny_target,
+            _tiny_config,
+            [1, 2, 3, 4],
+            _generated_tokens,
+        )
+
+    eager = trace("0")
+    deferred = trace("1")
+
+    assert deferred == eager
+    assert eager[1] == eager[0]
+    assert set(eager[2]) == {0, 1, 2}
+
+
+def test_dflash2_glm5_next_deferred_greedy_walk_matches_eager_when_accepted(
+    monkeypatch,
+):
+    def trace(deferred):
+        return _scripted_trace(
+            monkeypatch,
+            deferred,
+            (2, 1, 0),
+            _tiny_glm5_next_target,
+            _tiny_glm5_next_drafter_config,
+            [2, 4, 6, 8],
+            _glm5_next_generated_tokens,
+        )
+
+    eager = trace("0")
+    deferred = trace("1")
+
+    assert deferred == eager
+    assert eager[1] == eager[0]
+    assert set(eager[2]) == {0, 1, 2}

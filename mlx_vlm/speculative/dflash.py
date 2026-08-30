@@ -1,3 +1,4 @@
+import os
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -54,7 +55,10 @@ def _dflash_next_block_size(
     accept_rate = accepted / drafted
     mean_accept = accepted / len(recent)
 
-    if accept_rate < 0.30 or mean_accept < 2.0:
+    # mean_accept is bounded by the drafted length (current-1), so a constant
+    # 2.0 floor pins small blocks at min forever (at current=3 the bound IS
+    # 2.0). Scale the floor below 2.0 for small blocks (2026-08-30).
+    if accept_rate < 0.30 or mean_accept < min(2.0, 0.5 * (current - 1)):
         if current >= 8:
             return max(min_total, min(block_total, current // 2))
         return max(min_total, min(block_total, current - 2))
@@ -225,6 +229,73 @@ def _sample_dflash_target_walk(
     ]
 
 
+def _dflash_deferred_walk_enabled(
+    draft_model: nn.Module, *, greedy_sampling: bool
+) -> bool:
+    """Whether a round should use the deferred greedy walk.
+
+    ``MLX_VLM_DFLASH_DEFERRED`` forces the choice; otherwise the drafter
+    attribute ``dflash_deferred_walk`` decides and defaults to on. Sampled
+    decoding always stays eager: its walk draws target samples in position
+    order and cannot be reduced to a token comparison.
+    """
+    if not greedy_sampling:
+        return False
+    raw = os.environ.get("MLX_VLM_DFLASH_DEFERRED")
+    if raw is not None:
+        return raw.lower() in ("1", "true", "yes", "on")
+    return bool(getattr(draft_model, "dflash_deferred_walk", True))
+
+
+def _dflash_pack_greedy_walk(
+    draft_tokens: mx.array, target_tokens: mx.array, batch: int
+) -> mx.array:
+    """Resolve the greedy walk on device into one flat host transfer.
+
+    Layout is ``[accepted per row..., target row per row...]``. Acceptance is
+    the length of the leading run where the drafter matched the target's
+    greedy choice, so every committed token is already a prefix of the target
+    row and the drafted tokens never have to come back to the host.
+    """
+    target_rows = target_tokens.reshape(batch, -1)
+    n_draft = int(draft_tokens.size) // batch
+    if n_draft == 0:
+        accepted = mx.zeros((batch,), dtype=mx.int32)
+    else:
+        matched = draft_tokens.reshape(batch, -1) == target_rows[:, :n_draft]
+        accepted = mx.sum(mx.cumprod(matched.astype(mx.int32), axis=1), axis=1)
+    return mx.concatenate(
+        [accepted.astype(mx.int32), target_rows.reshape(-1).astype(mx.int32)],
+        axis=0,
+    )
+
+
+def _speculative_walk_deferred_greedy(
+    packed: mx.array,
+    budget: int,
+) -> Tuple[int, List[int]]:
+    """Materialize a packed greedy walk. Mirrors ``_speculative_walk``."""
+    values = packed.tolist()
+    accepted = int(values[0])
+    return accepted, values[1 : accepted + 2][:budget]
+
+
+def _speculative_walk_batch_deferred_greedy(
+    packed: mx.array,
+    batch: int,
+    budgets: List[int],
+) -> Tuple[List[int], List[List[int]]]:
+    """Materialize a packed greedy walk for B > 1."""
+    values = packed.tolist()
+    accepted_list = [int(value) for value in values[:batch]]
+    n_target = (len(values) - batch) // batch
+    new_tokens_list: List[List[int]] = []
+    for row, accepted in enumerate(accepted_list):
+        start = batch + row * n_target
+        new_tokens_list.append(values[start : start + accepted + 1][: budgets[row]])
+    return accepted_list, new_tokens_list
+
+
 def _dflash_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -259,6 +330,11 @@ def _dflash_rounds(
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling and not positioned_sampling,
+    )
+    # Greedy rounds resolve acceptance on device and pull the round back in a
+    # single transfer instead of two eager token rows (2026-08-30).
+    deferred_walk = _dflash_deferred_walk_enabled(
+        draft_model, greedy_sampling=greedy_sampling
     )
     prepare_target_hidden = getattr(draft_model, "prepare_target_hidden", None)
     hidden_is_prepared = callable(prepare_target_hidden)
@@ -319,12 +395,20 @@ def _dflash_rounds(
             hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
             if greedy_sampling:
                 target_tokens = sampler(verify_out.logits)
+                if deferred_walk:
+                    walk_packed = _dflash_pack_greedy_walk(
+                        draft_tokens, target_tokens, 1
+                    )
         if greedy_sampling:
-            mx.async_eval(target_tokens, hidden)
+            mx.async_eval(walk_packed if deferred_walk else target_tokens, hidden)
         else:
             mx.async_eval(hidden)
 
-        if greedy_sampling:
+        if greedy_sampling and deferred_walk:
+            accepted, new_tokens = _speculative_walk_deferred_greedy(
+                walk_packed, max_tokens - emitted
+            )
+        elif greedy_sampling:
             accepted, new_tokens = _speculative_walk(
                 draft_tokens, target_tokens, max_tokens - emitted
             )
@@ -411,6 +495,11 @@ def _dflash_rounds_batch(
         draft_model,
         enabled=not greedy_sampling and not positioned_sampling,
     )
+    # Greedy rounds resolve acceptance on device and pull the round back in a
+    # single transfer instead of two eager token rows (2026-08-30).
+    deferred_walk = _dflash_deferred_walk_enabled(
+        draft_model, greedy_sampling=greedy_sampling
+    )
     draft_caches = [draft_model.make_cache() for _ in range(B)]
 
     # Per-sequence state tracked by ORIGINAL index so the caller sees
@@ -478,13 +567,21 @@ def _dflash_rounds_batch(
             hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             if greedy_sampling:
                 target_tokens = sampler(verify_out.logits)
+                if deferred_walk:
+                    walk_packed = _dflash_pack_greedy_walk(
+                        draft_tokens, target_tokens, n_active
+                    )
         if greedy_sampling:
-            mx.async_eval(target_tokens, hidden_full)
+            mx.async_eval(walk_packed if deferred_walk else target_tokens, hidden_full)
         else:
             mx.async_eval(hidden_full)
 
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        if greedy_sampling:
+        if greedy_sampling and deferred_walk:
+            accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
+                walk_packed, n_active, budgets
+            )
+        elif greedy_sampling:
             accepted_list, new_tokens_list = _speculative_walk_batch(
                 draft_tokens, target_tokens, budgets
             )
