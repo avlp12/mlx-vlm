@@ -31,6 +31,37 @@ All are on the compute path (no weight changes) and lossless:
 | Last-token `lm_head` | skip the vocab-wide projection on discarded prefill positions |
 | FFN-block compile | `mx.compile` the stateless FFN half, scoped to single-stream decode |
 
+### Fused KDA decode step (opt-in: `MLX_VLM_GLM5_FUSED_KDA=1`)
+
+After the input projections, a KDA layer's decode step is a long tail of tiny
+kernels -- causal conv1d window update, silu, two L2 norms, the safe forget gate,
+`sigmoid` beta, the gated delta-rule state update, gated RMSNorm -- roughly 30 GPU
+dispatches per layer, 34 layers per token. The arithmetic is trivial; the launch
+count is the cost.
+
+`fused_kda.py` folds that whole chain into **one** `mx.fast.metal_kernel` launch
+per layer. One threadgroup owns one head, so both cross-`head_dim` reductions (the
+L2 norms over the key axis, the RMSNorm over the value axis) stay in threadgroup
+memory, while the `[head_dim, head_dim]` recurrent state streams through registers
+exactly once. State accumulation stays fp32, as in the eager kernel.
+
+The kernel is a rounding-faithful transcription, so its output *and* the fp32
+recurrent state it carries are **bit-identical** to the eager path -- verified over
+32 consecutive decode steps in
+[`test_glm5_next_fused_kda.py`](../../tests/test_glm5_next_fused_kda.py).
+Getting that exact means matching where MLX rounds: `mx.conv1d` writes bf16,
+`nn.silu` rounds twice, `gated_delta_kernel` writes `y` in the input dtype, and
+`mx.sigmoid` evaluates in bf16 (not fp32) for a bf16 input. It also means matching
+*which* `exp` MLX used -- its `Sigmoid` is written with `metal::exp`, which is
+precise inside MLX's prebuilt library but the fast approximation inside anything
+JIT'd (`mx.compile`, custom kernels) -- and disabling fma contraction in the norm
+reductions, since `(x*x).sum(-1)` rounds the square before the add.
+
+Decode-only and conservative: it engages only for `B=1, S=1` with no SSM mask and
+no speculative capture, and falls back to the eager path otherwise (prefill, the
+`S>1` verify block, batched/left-padded decode, a drafter's capture forward, or a
+checkpoint whose `A_log`/`dt_bias` were not kept in fp32). Default is off.
+
 ## Self-speculative decoding (MTP)
 
 GLM-5.3-Flash ships one trained nextn (MTP) layer inside the target checkpoint.
