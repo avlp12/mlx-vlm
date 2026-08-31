@@ -14,6 +14,100 @@ from .common import (
 )
 
 
+_ADAPTIVE_K_ENV = None
+_ROUND_FIXED = None
+_ROUND_COST = None
+_ADAPTIVE_K_WINDOW = None
+_ADAPTIVE_K_MINROUNDS = None
+
+
+def _adaptive_k_enabled() -> bool:
+    """MLX_VLM_DFLASH_ADAPTIVE_K=1 -- pick the block width that maximises
+    measured throughput instead of ratcheting on thresholds.
+
+    Opt-in, and it deliberately takes precedence over
+    ``prefer_requested_block_size`` (the harness's --fixed-block): pinning the
+    width is exactly what this is trying to replace, so honouring the pin would
+    make the A/B a no-op.
+    """
+    global _ADAPTIVE_K_ENV
+    if _ADAPTIVE_K_ENV is None:
+        _ADAPTIVE_K_ENV = os.environ.get(
+            "MLX_VLM_DFLASH_ADAPTIVE_K", "0"
+        ).lower() in ("1", "true", "yes", "on")
+    return _ADAPTIVE_K_ENV
+
+
+def _round_cost_params():
+    """Round cost in units of one plain decode step: ``fixed + cost * K``.
+
+    Fitted on 45 receipts across three independent block widths (DFlash2 block
+    8 -> 99.6 ms, DFlash2 block 5 -> 81.3 ms, MTP block 2 -> 61.5 ms, against a
+    34.1 ms decode step): fixed = 1.63 decode-steps, cost = 0.186 per drafted
+    token.  These are properties of the target and the box, not of the drafter,
+    so they are env-tunable and should be refitted when the serving stack
+    changes (probe_verify_width_v2.py + the round-model fit).
+    """
+    global _ROUND_FIXED, _ROUND_COST
+    if _ROUND_FIXED is None:
+        _ROUND_FIXED = float(os.environ.get("MLX_VLM_DFLASH_ROUND_FIXED", 1.63))
+        _ROUND_COST = float(os.environ.get("MLX_VLM_DFLASH_ROUND_COST", 0.186))
+    return _ROUND_FIXED, _ROUND_COST
+
+
+def _dflash_hazard(draft_model: nn.Module) -> Optional[float]:
+    """Truncated-geometric MLE of the per-token acceptance hazard.
+
+    Measured on our receipts the hazard is essentially flat across positions in
+    the block (code: 0.78 0.85 0.82 0.84 0.78 0.81 0.82), so acceptance is a
+    constant-hazard process and one scalar describes it.  A round that accepted
+    ``a`` of ``d`` drafted tokens contributes ``a`` successes and -- only when it
+    was cut short -- exactly one observed failure; a round that accepted all of
+    them is right-censored and contributes no failure.  Laplace-smoothed so an
+    all-accept window explores wider instead of dividing by zero.
+    """
+    global _ADAPTIVE_K_WINDOW, _ADAPTIVE_K_MINROUNDS
+    if _ADAPTIVE_K_WINDOW is None:
+        _ADAPTIVE_K_WINDOW = int(os.environ.get("MLX_VLM_DFLASH_ADAPTIVE_K_WINDOW", 16))
+        _ADAPTIVE_K_MINROUNDS = int(
+            os.environ.get("MLX_VLM_DFLASH_ADAPTIVE_K_MINROUNDS", 4)
+        )
+    accept_lens = getattr(draft_model, "accept_lens", None) or []
+    draft_lens = getattr(draft_model, "draft_lens", None) or []
+    recent = [
+        (float(a), int(d))
+        for a, d in zip(accept_lens[-_ADAPTIVE_K_WINDOW:], draft_lens[-_ADAPTIVE_K_WINDOW:])
+        if int(d) > 0
+    ]
+    if len(recent) < _ADAPTIVE_K_MINROUNDS:
+        return None
+    successes = sum(a for a, _ in recent)
+    failures = sum(1 for a, d in recent if a < d)
+    p = (successes + 0.5) / (successes + failures + 1.0)
+    return min(0.98, max(0.05, p))
+
+
+def _dflash_block_size_for_hazard(p: float, cap: int, floor: int = 2) -> int:
+    """argmax over block widths of (1 + E[accepted]) / round cost.
+
+    E[accepted] for a geometric hazard truncated at K = cap-1 drafted tokens is
+    sum_j p^j, and the round costs fixed + cost*K, so the optimum is a genuine
+    interior maximum: too narrow wastes the fixed cost, too wide pays 0.186 of a
+    decode step for a token that probably will not survive.
+    """
+    fixed, cost = _round_cost_params()
+    best, best_gain = floor, -1.0
+    e = 0.0
+    pk = 1.0
+    for width in range(2, cap + 1):
+        pk *= p
+        e += pk                       # E[accepted] at width-1 drafted tokens
+        gain = (1.0 + e) / (fixed + cost * (width - 1))
+        if gain > best_gain:
+            best_gain, best = gain, width
+    return max(floor, min(cap, best))
+
+
 def _dflash_next_block_size(
     draft_model: nn.Module,
     requested_block_total: int,
@@ -29,6 +123,21 @@ def _dflash_next_block_size(
     """
     block_total = min(requested_block_total, remaining_budget)
     if block_total <= 1:
+        return block_total
+    if _adaptive_k_enabled():
+        # Cost-model policy: supersedes both the threshold ladder below and the
+        # fixed-width pin.  The two cannot compose -- they drive the same
+        # actuator from different objectives, and the ladder has no notion of
+        # what a drafted token costs, so it can only ratchet between thresholds
+        # calibrated to nothing measurable.  Every block-8 receipt in our corpus
+        # ran with --fixed-block, so the ladder has no measured behaviour here
+        # to preserve either.
+        p = _dflash_hazard(draft_model)
+        if p is not None:
+            floor = max(2, int(getattr(draft_model, "dflash_min_block_size", 2)))
+            return _dflash_block_size_for_hazard(p, block_total, floor=floor)
+        if initial_block_size is not None:
+            return min(block_total, max(2, int(initial_block_size)))
         return block_total
     if getattr(draft_model, "prefer_requested_block_size", False):
         return block_total
