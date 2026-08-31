@@ -676,6 +676,21 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
     Loads model, processor, and config based on paths.
     Handles potential loading errors.
     """
+    # TP=2 mode is opt-in by the presence of MLX_VLM_GLM5_TP_HOSTS.  With the
+    # variable absent this branch is a single dict lookup and nothing from the
+    # tp package is imported, so the single-box path stays exactly as it was.
+    try:
+        from .tp_mode import maybe_load_tp, tp_enabled
+
+        if tp_enabled() and not adapter_path:
+            tp = maybe_load_tp(model_path)
+            if tp is not None:
+                logger.info("Serving in TP=2 mode.")
+                return tp
+            logger.warning("TP=2 requested but unavailable; serving single-box.")
+    except Exception:
+        logger.warning("TP=2 probe failed; serving single-box.", exc_info=True)
+
     try:
         logger.info("Loading model: %s", model_path)
         if adapter_path:
