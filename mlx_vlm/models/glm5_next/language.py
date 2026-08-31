@@ -871,6 +871,11 @@ class Glm5NextIndexer(nn.Module):
         """
         kp, hd = self.index_kpool, self.head_dim
         B = tail.shape[0]
+        # Load-bearing: the caller's `t_prev == T - 1` guard is what bounds the
+        # tail to a single pool (n = (t_prev % kp) + 1).  Fail loudly rather than
+        # silently pool only the first kp tokens if that ever stops holding.
+        if not 1 <= n <= kp:
+            raise ValueError(f"indexer fast tail expects 1..{kp} tokens, got {n}")
         key = (kp, n, s0)
         cached = getattr(self, "_ptc", None)
         if cached is None or cached[0] != key:
