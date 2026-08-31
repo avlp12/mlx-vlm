@@ -679,6 +679,13 @@ class Glm5NextIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
+        # Tensor-parallel hooks, no-ops unless mlx_vlm.tp shards this module.
+        # The head axis of the scorer is contracted below, so with heads split
+        # across ranks each rank holds a partial sum and the reduction has to
+        # happen before the top-k. The weight scale stays at the GLOBAL head
+        # count -- it is part of the math, not a per-rank normalization.
+        self._tp_reduce = None
+        self._tp_weight_scale = self.n_heads**-0.5
         self.index_kpool_compress_ape = mx.zeros((self.index_kpool, self.head_dim))
         self.index_kpool_compress_gate = mx.zeros((self.head_dim, self.dim))
 
@@ -822,8 +829,10 @@ class Glm5NextIndexer(nn.Module):
         select_k = min(self.index_topk // kp, P)
         scores = q @ pool_keys[:, None].swapaxes(-1, -2)
         scores = mx.maximum(scores * self.softmax_scale, 0.0)
-        weights = self.weights_proj(x) * (self.n_heads**-0.5)
+        weights = self.weights_proj(x) * self._tp_weight_scale
         index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
+        if self._tp_reduce is not None:
+            index_scores = self._tp_reduce(index_scores)
         # (a) valid_candidates == pool_valid: `visible` is all-True here.
         valid_candidates = mx.broadcast_to(pool_valid[:, None], (B, 1, P))
         index_scores = mx.where(valid_candidates, index_scores, -1e30)
@@ -1044,7 +1053,7 @@ class Glm5NextIndexer(nn.Module):
                 ]
             scores = q[:, c0:c1] @ pool_keys_t
             scores = mx.maximum(scores * self.softmax_scale, 0.0)
-            weights = self.weights_proj(x[:, c0:c1]) * (self.n_heads**-0.5)
+            weights = self.weights_proj(x[:, c0:c1]) * self._tp_weight_scale
             # Contract the head axis as a batched matmul rather than an
             # elementwise product + sum: it never materializes the
             # [B, cs, n_heads, P] product (halving the scorer transient),
@@ -1053,6 +1062,8 @@ class Glm5NextIndexer(nn.Module):
             # to the large-strided-shape reduction issue of mx.sum over a
             # non-last axis (ml-explore/mlx#3784) should the chunk ever grow.
             index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
+            if self._tp_reduce is not None:
+                index_scores = self._tp_reduce(index_scores)
             if bundle is None:
                 pool_visible = mx.take_along_axis(
                     visible, mx.broadcast_to(pool_end[:, None, :], (B, cs, P)), axis=-1
