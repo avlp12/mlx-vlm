@@ -222,6 +222,52 @@ def from_wire(buf: bytearray, shape) -> mx.array:
     return mx.array(a).view(mx.bfloat16)
 
 
+# ----------------------------------------------------------- ring transport
+
+_RING_GROUP = None
+
+
+def ring_group():
+    """Lazily join the MLX ring backend.
+
+    Requires ``MLX_HOSTFILE`` (a file holding e.g. ``[["10.0.0.1:39400"],
+    ["10.0.0.2:39401"]]``) and ``MLX_RANK``; ``--ring-hosts`` writes that file
+    for you. Deliberately *not* jaccl: that backend wants RDMA device
+    enumeration and a Thunderbolt Bridge, which is out of bounds on this fleet.
+    The ring backend is plain TCP over whatever IPs you hand it, so it rides
+    the existing tbnet with no interface changes at all.
+    """
+    global _RING_GROUP
+    if _RING_GROUP is None:
+        _RING_GROUP = mx.distributed.init(backend="ring")
+    return _RING_GROUP
+
+
+def setup_ring_env(ring_hosts: Optional[str], rank: int):
+    if not ring_hosts:
+        return
+    hosts = [h.strip() for h in ring_hosts.split(",") if h.strip()]
+    path = Path(os.environ.get("TMPDIR", "/tmp")) / "mlx_pipeline_ring_hosts.json"
+    path.write_text(json.dumps([[h] for h in hosts]))
+    os.environ["MLX_HOSTFILE"] = str(path)
+    os.environ["MLX_RANK"] = str(rank)
+
+
+def ring_send(h: mx.array, dst: int, stream):
+    # Send/Recv have no GPU implementation -- they must run on a CPU stream, and
+    # MLX streams are thread-local, so the stream is created inside the worker
+    # thread that uses it. Measured: 12.7 ms for the 64 MiB boundary tensor with
+    # the GPU fully loaded, and no measurable slowdown of the compute stream.
+    mx.eval(mx.distributed.send(h, dst, group=ring_group(), stream=stream))
+
+
+def ring_recv(shape, src: int, stream) -> mx.array:
+    tmpl = mx.zeros(shape, dtype=mx.bfloat16)
+    h = mx.distributed.recv_like(tmpl, src, group=ring_group(), stream=stream)
+    mx.eval(h)
+    return h
+
+
 # --------------------------------------------------- stage-B cache handoff
 
 
@@ -322,6 +368,12 @@ def run_head(args):
                 raise
             time.sleep(2.0)
     print(f"[head] connected to {args.peer}:{args.port}", flush=True)
+    _send_json(sock, {"cmd": "hello", "transport": args.transport, "split": args.split})
+    hi = _recv_json(sock)
+    assert hi.get("ok"), hi
+    if args.transport == "ring":
+        g = ring_group()
+        print(f"[head] ring rank {g.rank()}/{g.size()}", flush=True)
 
     results = []
     for tokens in args.tokens:
@@ -362,6 +414,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
             "split": args.split,
             "n_chunks": n_chunks,
             "handoff": bool(args.handoff),
+            "transport": args.transport,
         },
     )
     ack = _recv_json(sock)
@@ -373,6 +426,8 @@ def _head_one(args, stage: Stage, sock, tokens: int):
 
     def sender():
         try:
+            # MLX streams are thread-local: the comm stream must be made here.
+            stream = mx.new_stream(mx.cpu) if args.transport == "ring" else None
             while True:
                 item = sendq.get()
                 if item is None:
@@ -381,8 +436,14 @@ def _head_one(args, stage: Stage, sock, tokens: int):
                 idx, keep, nb = item
                 B, S, HC, D = keep.shape
                 t0 = time.perf_counter()
-                sock.sendall(HDR.pack(MAGIC, idx, B, S, HC, D, nb.nbytes))
-                sock.sendall(memoryview(nb).cast("B"))
+                # The shape header always rides the control socket (16 bytes,
+                # sub-ms) so chunk shapes need not be predicted by the peer.
+                nbytes = 0 if nb is None else nb.nbytes
+                sock.sendall(HDR.pack(MAGIC, idx, B, S, HC, D, nbytes))
+                if args.transport == "ring":
+                    ring_send(keep, 1, stream)
+                else:
+                    sock.sendall(memoryview(nb).cast("B"))
                 send_times.append(time.perf_counter() - t0)
         except Exception as e:  # noqa: BLE001
             err.append(repr(e))
@@ -401,7 +462,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
         mx.eval(h)
         stage.eval_state()
         t_gpu = time.perf_counter() - t0
-        nb = to_wire(h)
+        nb = None if args.transport == "ring" else to_wire(h)
         t1 = time.perf_counter()
         sendq.put((idx, h, nb))  # blocks when the tail is behind -> backpressure
         t_block = time.perf_counter() - t1
@@ -434,6 +495,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
         "head_done_s": t_head_done,
         "total_s": t_total,
         "tok_per_s": tokens / t_total,
+        "transport": args.transport,
         "wire_bytes_per_chunk": boundary_bytes(chunk, hc, D),
         "wire_send_s": sum(send_times),
         "wire_send_each": send_times,
@@ -457,6 +519,14 @@ def run_tail(args):
     sock, addr = srv.accept()
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     print(f"[tail] peer {addr}", flush=True)
+    hello = _recv_json(sock)
+    assert hello.get("cmd") == "hello", hello
+    assert hello["split"] == args.split, (hello, args.split)
+    args.transport = hello["transport"]
+    _send_json(sock, {"ok": True, "load_s": load_s})
+    if args.transport == "ring":
+        g = ring_group()
+        print(f"[tail] ring rank {g.rank()}/{g.size()}", flush=True)
 
     while True:
         req = _recv_json(sock)
@@ -478,6 +548,7 @@ def _tail_one(args, stage: Stage, sock, req):
 
     def receiver():
         try:
+            stream = mx.new_stream(mx.cpu) if args.transport == "ring" else None
             hdrbuf = bytearray(HDR.size)
             while True:
                 _recv_exact(sock, memoryview(hdrbuf), HDR.size)
@@ -487,11 +558,15 @@ def _tail_one(args, stage: Stage, sock, req):
                     recvq.put(None)
                     return
                 # header already arrived -> this times the payload transfer only
-                buf = bytearray(nbytes)
                 t0 = time.perf_counter()
-                _recv_exact(sock, memoryview(buf), nbytes)
+                if args.transport == "ring":
+                    payload = ring_recv((B, S, HC, D), 0, stream)
+                else:
+                    buf = bytearray(nbytes)
+                    _recv_exact(sock, memoryview(buf), nbytes)
+                    payload = buf
                 recv_times.append(time.perf_counter() - t0)
-                recvq.put((idx, buf, (B, S, HC, D)))
+                recvq.put((idx, payload, (B, S, HC, D)))
         except Exception as e:  # noqa: BLE001
             err.append(repr(e))
             recvq.put(None)
@@ -510,7 +585,7 @@ def _tail_one(args, stage: Stage, sock, req):
             break
         idx, buf, shape = item
         t1 = time.perf_counter()
-        h = from_wire(buf, shape)
+        h = buf if isinstance(buf, mx.array) else from_wire(buf, shape)
         mx.eval(h)
         t_deser = time.perf_counter() - t1
         t2 = time.perf_counter()
@@ -626,6 +701,17 @@ def main(argv=None):
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=39200)
     p.add_argument("--depth", type=int, default=2, help="in-flight chunk queue depth")
+    p.add_argument(
+        "--transport",
+        choices=["socket", "ring"],
+        default="ring",
+        help="boundary-tensor transport; 'socket' is the fallback",
+    )
+    p.add_argument(
+        "--ring-hosts",
+        default=None,
+        help="comma separated ip:port per rank, e.g. 10.0.0.1:39400,10.0.0.2:39401",
+    )
     p.add_argument("--connect-timeout", type=float, default=1800.0)
     p.add_argument("--out", default=None)
     p.add_argument("--no-prune", dest="prune", action="store_false")
@@ -637,6 +723,8 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     mx.random.seed(args.seed)
+    if args.role != "single" and args.transport == "ring":
+        setup_ring_env(args.ring_hosts, 0 if args.role == "head" else 1)
     if args.role == "head":
         run_head(args)
     elif args.role == "tail":
