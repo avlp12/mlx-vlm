@@ -147,6 +147,17 @@ def shard_moe(moe, rank: int, size: int):
 
 
 def shard_layer(layer, rank: int, size: int, reduce_fn):
+    # The FFN block is mx.compile'd for B=1, S<=8 (models/glm5_next/language.py:
+    # 1417).  Under TP that block contains the MoE's all-reduce, i.e. a
+    # *distributed* op inside a traced-and-cached graph.  The full-stack
+    # lockstep validator already refused to compile it (tp/validate_full.py);
+    # the serving path never did, and it bit on 2026-09-01: the first
+    # generation in a process completes, the second stalls a couple of decode
+    # steps in, with rank 1 waiting for a collective rank 0 did not issue.
+    # Compiling a collective is not something to get subtly right -- do not
+    # compile it.
+    layer.compile_ffn = False
+    layer._ffn_c = None
     if layer.is_linear:
         shard_kda(layer.self_attn, rank, size, reduce_fn)
     else:

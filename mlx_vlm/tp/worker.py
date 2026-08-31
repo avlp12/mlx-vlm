@@ -286,6 +286,22 @@ def _ack_recv() -> int:
 
 
 # ------------------------------------------------------------------- worker
+_OP_NAMES = {OP_EXIT: "EXIT", OP_MAKE_CACHE: "MAKE_CACHE", OP_FORWARD: "FORWARD",
+             OP_ROLLBACK: "ROLLBACK", OP_VAULT_STORE: "VAULT_STORE",
+             OP_VAULT_RESTORE: "VAULT_RESTORE"}
+ENV_TRACE = "MLX_VLM_GLM5_TP_TRACE"
+
+
+def _trace() -> bool:
+    """Log every control message rank 1 acts on.
+
+    Off by default (one line per decode step is a lot at 160 tok/s), on when
+    diagnosing a stall -- which is the only time the question "what did rank 1
+    last hear?" can be answered any other way than by guessing.
+    """
+    return os.environ.get(ENV_TRACE, "") not in ("", "0", "false", "False")
+
+
 class _WorkerState:
     """Rank 1's mirror of everything rank 0 announces.
 
@@ -321,6 +337,10 @@ class _WorkerState:
     # -- verbs ------------------------------------------------------------
     def handle(self, msg: Ctrl) -> bool:
         """Apply one control message. Returns False when told to exit."""
+        if _trace():
+            logger.info("ctrl op=%s epoch=%s b=%s s=%s cap=%s arg0=%s name=%s",
+                        _OP_NAMES.get(msg.op, msg.op), msg.epoch, msg.batch,
+                        msg.seqlen, msg.capture, msg.arg0, msg.name[:12])
         if msg.op == OP_EXIT:
             logger.info("tp worker: EXIT")
             return False

@@ -46,7 +46,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "HeavyRunActive",
     "HEAVY_FOOTPRINT_GB",
+    "MAX_SWAP_GB",
+    "MIN_FREE_PCT",
     "heavy_processes",
+    "memory_snapshot",
     "phys_footprint_gb",
     "require_quiet_fleet",
     "self_rss_gb",
@@ -59,6 +62,16 @@ __all__ = [
 HEAVY_FOOTPRINT_GB = float(os.environ.get("MLX_VLM_TP_HEAVY_RSS_GB", "20"))
 HEAVY_RSS_GB = HEAVY_FOOTPRINT_GB          # back-compat alias
 
+# A second resident is not the only way to wedge the box, and on 2026-09-01 it
+# was not the way that happened: one 86 GiB shard on a 512 GB machine drove
+# swap to 39.9 of 42 GB with 6% free, and the run died with a Metal
+# "Insufficient Memory" while the box went unresponsive.  Nothing was
+# co-resident -- the pressure had accumulated across the night's repeated
+# load/unload cycles.  A guard that only counts big processes cannot see that,
+# so it also has to look at the state those processes leave behind.
+MAX_SWAP_GB = float(os.environ.get("MLX_VLM_TP_MAX_SWAP_GB", "8"))
+MIN_FREE_PCT = float(os.environ.get("MLX_VLM_TP_MIN_FREE_PCT", "10"))
+
 _GB = 1024.0 ** 3
 _PS_SEP = "===PS==="
 # One call per box: ``top`` for the numbers (its COMMAND column is truncated to
@@ -68,8 +81,12 @@ _PS_SEP = "===PS==="
 # ``===PS===`` triggers equals-expansion and the probe fails with
 # "==PS=== not found" -- which the guard then correctly reports as "cannot
 # inspect", but for the wrong reason.
+_MEM_SEP = "===MEM==="
 _PROBE = ("/usr/bin/top -l 1 -o mem -n 40 -stats pid,mem; "
-          f"echo '{_PS_SEP}'; /bin/ps -A -o pid=,command=")
+          f"echo '{_PS_SEP}'; /bin/ps -A -o pid=,command=; "
+          f"echo '{_MEM_SEP}'; /usr/sbin/sysctl -n vm.swapusage; "
+          "/usr/bin/memory_pressure -Q 2>/dev/null | "
+          "/usr/bin/grep -i 'free percentage'")
 
 
 class HeavyRunActive(RuntimeError):
@@ -137,6 +154,43 @@ def _parse_ps(text: str, threshold_gb: float, ignore_pids: Sequence[int] = ()) \
                       "rss_gb": round(gb, 1),   # back-compat key
                       "cmd": names.get(pid, "?")[:160]})
     return heavy
+
+
+def _parse_memory(text: str) -> Dict[str, Optional[float]]:
+    """swap used (GB) and system-wide free percentage from the probe tail."""
+    out: Dict[str, Optional[float]] = {"swap_used_gb": None, "free_pct": None}
+    _, _, mem = text.partition(_MEM_SEP)
+    for line in mem.splitlines():
+        low = line.lower()
+        if "used =" in low and "total =" in low:
+            try:
+                after = line.split("used")[1]
+                val = after.split("=")[1].split()[0]
+                unit = val[-1].upper()
+                num = float(val[:-1]) if unit in _UNITS else float(val)
+                mult = _UNITS.get(unit, 1.0)
+                out["swap_used_gb"] = round(num * mult / _GB, 2)
+            except (IndexError, ValueError):
+                pass
+        elif "free percentage" in low:
+            try:
+                out["free_pct"] = float(low.split(":")[1].strip().rstrip("%"))
+            except (IndexError, ValueError):
+                pass
+    return out
+
+
+def memory_snapshot(host: Optional[str] = None,
+                    ps_runner: Optional[Callable[[Optional[str]], str]] = None
+                    ) -> Dict[str, Optional[float]]:
+    """Swap + free-percentage for one box, for a harness receipt.
+
+    Heavy harnesses should record this before and after: "the run died" and
+    "the run died with the box at 95% swap" are different findings, and only
+    the second one tells you what to change.
+    """
+    runner = ps_runner or _run_ps
+    return _parse_memory(runner(host))
 
 
 class _RUsageInfoV2(ctypes.Structure):
@@ -237,16 +291,53 @@ def require_quiet_fleet(
     Returns a receipt.  The receipt is the point: "the guard ran and the fleet
     was quiet" and "nobody called the guard" must not look the same afterwards.
     """
-    found = heavy_processes(hosts, threshold_gb, ignore_pids, ps_runner)
+    runner = ps_runner or _run_ps
+    local_names = {"", "localhost", "127.0.0.1", socket.gethostname()}
+    try:
+        local_names |= set(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    targets: List[Optional[str]] = [None]
+    for h in hosts:
+        if h.split("@")[-1] not in local_names:
+            targets.append(h)
+    found: Dict[str, List[Dict[str, object]]] = {}
+    pressure: Dict[str, Dict[str, Optional[float]]] = {}
+    for t in targets:
+        text = runner(t)
+        name = t or "localhost"
+        found[name] = _parse_ps(text, threshold_gb, ignore_pids)
+        pressure[name] = _parse_memory(text)
     busy = {h: procs for h, procs in found.items() if procs}
+    strained = {}
+    for h, m in pressure.items():
+        why = []
+        if m.get("swap_used_gb") is not None and m["swap_used_gb"] > MAX_SWAP_GB:
+            why.append(f"swap {m['swap_used_gb']}GB > {MAX_SWAP_GB}GB")
+        if m.get("free_pct") is not None and m["free_pct"] < MIN_FREE_PCT:
+            why.append(f"free {m['free_pct']}% < {MIN_FREE_PCT}%")
+        if why:
+            strained[h] = "; ".join(why)
     receipt = {
         "checked": sorted(found),
         "threshold_gb": threshold_gb,
+        "max_swap_gb": MAX_SWAP_GB,
+        "min_free_pct": MIN_FREE_PCT,
         "label": label,
         "when": time.strftime("%FT%T%z"),
-        "quiet": not busy,
+        "quiet": not busy and not strained,
         "busy": busy,
+        "pressure": pressure,
+        "strained": strained,
     }
+    if strained and not busy:
+        raise HeavyRunActive(
+            f"refusing to start {label or 'this run'}: the box is under memory "
+            f"pressure with nothing co-resident ("
+            + "; ".join(f"{h}: {w}" for h, w in strained.items())
+            + "). This is the 2026-09-01 shape -- pressure accumulated across "
+            "load/unload cycles, not a second model. Let it drain (or recycle "
+            "the process) before loading again.")
     if busy:
         detail = "; ".join(
             f"{h}: " + ", ".join(f"pid {p['pid']} {p['footprint_gb']}GB {p['cmd']}"

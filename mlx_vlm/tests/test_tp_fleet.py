@@ -14,7 +14,19 @@ import pytest
 from mlx_vlm.tp import fleet
 
 
-_QUIET = """\
+_MEM_OK = """
+===MEM===
+total = 4096.00M  used = 2448.50M  free = 1647.50M  (encrypted)
+System-wide memory free percentage: 41%
+"""
+
+_MEM_STRAINED = """
+===MEM===
+total = 42912.00M  used = 39901.00M  free = 3011.00M  (encrypted)
+System-wide memory free percentage: 6%
+"""
+
+_QUIET_HEAD = """\
 Processes: 500 total
 PID   MEM  COMMAND
 1113  838M UGREEN NAS Helpe
@@ -23,6 +35,8 @@ PID   MEM  COMMAND
  1113 /Applications/UGREEN NAS Helper.app/Contents/MacOS/helper
  1777 python -m pytest
 """
+_QUIET = _QUIET_HEAD + _MEM_OK
+_QUIET_STRAINED = _QUIET_HEAD + _MEM_STRAINED
 
 _BUSY = """\
 Processes: 500 total
@@ -32,7 +46,7 @@ PID   MEM  COMMAND
 ===PS===
   999 python -m mlx_vlm.server --model quasar
  1113 /Applications/UGREEN NAS Helper.app/Contents/MacOS/helper
-"""
+""" + _MEM_OK
 
 
 def test_rss_is_the_wrong_metric_and_footprint_is_the_right_one():
@@ -185,3 +199,49 @@ def test_cli_exits_0_when_quiet(monkeypatch, capsys):
     monkeypatch.setattr(fleet, "_run_ps", lambda host=None, timeout=20.0: _QUIET)
     assert fleet.main(["--label", "x"]) == 0
     assert '"quiet": true' in capsys.readouterr().out
+
+
+# ------------------------------------------------------- memory pressure gate
+def test_parses_swap_and_free_percentage():
+    m = fleet._parse_memory(_QUIET_STRAINED)
+    # 39901 MiB reported by sysctl is 38.97 GiB -- the units are MiB, and
+    # reading them as GB would put the threshold 1000x off.
+    assert 38.5 < m["swap_used_gb"] < 39.5
+    assert m["free_pct"] == 6.0
+
+
+def test_pressure_gate_refuses_with_nothing_co_resident():
+    """The 2026-09-01 incident shape.
+
+    One 86 GiB shard on a 512 GB box drove swap to 39.9 of 42 GB with 6% free
+    and the run died with a Metal "Insufficient Memory" while the machine went
+    unresponsive.  Nothing was co-resident: the pressure had accumulated across
+    the night's repeated load/unload cycles.  A guard that only counts big
+    processes is blind to that by construction.
+    """
+    with pytest.raises(fleet.HeavyRunActive, match="memory pressure"):
+        fleet.require_quiet_fleet(threshold_gb=20, label="x",
+                                  ps_runner=lambda host: _QUIET_STRAINED)
+
+
+def test_pressure_receipt_records_the_numbers_even_when_quiet():
+    r = fleet.require_quiet_fleet(threshold_gb=20, label="x",
+                                  ps_runner=lambda host: _QUIET)
+    assert r["quiet"] is True
+    assert r["pressure"]["localhost"]["free_pct"] == 41.0
+    assert r["pressure"]["localhost"]["swap_used_gb"] == 2.39
+    assert r["strained"] == {}
+
+
+def test_memory_snapshot_is_available_to_harnesses():
+    m = fleet.memory_snapshot(ps_runner=lambda host: _QUIET_STRAINED)
+    assert m["swap_used_gb"] is not None and m["free_pct"] == 6.0
+
+
+def test_a_missing_memory_section_does_not_block(monkeypatch):
+    """An older peer, or a box where memory_pressure is unavailable, must not
+    be refused for a check it cannot answer -- the process check still applies."""
+    text = _QUIET_HEAD
+    r = fleet.require_quiet_fleet(threshold_gb=20, ps_runner=lambda host: text)
+    assert r["quiet"] is True
+    assert r["pressure"]["localhost"] == {"swap_used_gb": None, "free_pct": None}

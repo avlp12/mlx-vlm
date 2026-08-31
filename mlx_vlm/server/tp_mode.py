@@ -163,6 +163,12 @@ class _Watchdog:
                f"the server instead of leaving a wedged 94 GiB process.")
         print(msg, flush=True)
         logger.error(msg)
+        # Reap the peer FIRST.  os._exit skips atexit and every finally, so
+        # nothing else will: observed live on 2026-09-01, an aborted rank 0
+        # left rank 1 holding 98 GB, and the next run's fleet preflight
+        # (correctly) refused to start at all.  "Supervisor restarts the
+        # server" is only a recovery if the box it restarts onto is empty.
+        _reap_peer_workers(tp_hosts())
         os._exit(75)  # EX_TEMPFAIL
 
 
@@ -502,7 +508,14 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
         f"cd {src} && MLX_VLM_GLM5_FUSED_KDA=1 PYTHONPATH={src} "
         f"{ENV_HOSTS}='{','.join(hosts)}' {ENV_RANK}=1 "
         f"MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD={_max_tok()} "
+        f"MLX_VLM_GLM5_TP_TRACE={os.environ.get('MLX_VLM_GLM5_TP_TRACE', '')} "
         f"MLX_VLM_GLM5_VAULT={os.environ.get('MLX_VLM_GLM5_VAULT', '')} "
+        # Passed through so the peer's store can be sized independently -- which
+        # is also the only way to exercise the peer-miss path on purpose: give
+        # rank 1 a budget too small to hold a rung and rank 0 keeps one it
+        # cannot use, which is exactly the divergence the ack exists to catch.
+        f"MLX_VLM_GLM5_VAULT_BUDGET_GB="
+        f"{os.environ.get('MLX_VLM_GLM5_TP_PEER_VAULT_BUDGET_GB', '')} "
         # -u: the worker's log is a redirected file, so Python block-buffers
         # it and a SIGTERM discards everything not yet flushed.  Observed
         # 2026-08-31: rank 0 hung on its first control send, rank 1 was alive
@@ -600,6 +613,13 @@ def _reap_worker(worker, hosts) -> None:
             worker.terminate()
         except Exception:
             pass
+    _reap_peer_workers(hosts)
+
+
+def _reap_peer_workers(hosts) -> None:
+    """SIGTERM any rank-1 worker on the peer. Never SIGKILL: the worker's own
+    ``finally`` drops the shard and releases the wired limit, and we want it
+    to run."""
     if len(hosts or []) < 2:
         return
     try:
