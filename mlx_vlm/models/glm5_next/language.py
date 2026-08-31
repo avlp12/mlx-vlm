@@ -69,7 +69,9 @@ _GATHER_Q_CHUNK = 1024
 # context (e2e prefill: 16k -6%, 32k -15% with a 16384 gate; 421.9/351.1
 # tok/s = parity with dense at a 65536 gate; 131k +52.7% either way).
 # Receipts: sparse_gate65536_16k32k.json / sparse_{ref,new}131k.json.
-_GATHER_MIN_CONTEXT = 65536
+# Env-tunable per workload (band decomposition suggests the true optimum may
+# sit nearer 32768; see AIF I813/I819).
+_GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "65536"))
 
 
 class Glm5NextRMSNormGated(nn.Module):
