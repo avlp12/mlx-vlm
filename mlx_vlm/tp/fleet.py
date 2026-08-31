@@ -47,6 +47,7 @@ __all__ = [
     "HeavyRunActive",
     "HEAVY_FOOTPRINT_GB",
     "MAX_SWAP_GB",
+    "MIN_FREE_GB",
     "MIN_FREE_PCT",
     "heavy_processes",
     "memory_snapshot",
@@ -71,6 +72,14 @@ HEAVY_RSS_GB = HEAVY_FOOTPRINT_GB          # back-compat alias
 # so it also has to look at the state those processes leave behind.
 MAX_SWAP_GB = float(os.environ.get("MLX_VLM_TP_MAX_SWAP_GB", "8"))
 MIN_FREE_PCT = float(os.environ.get("MLX_VLM_TP_MIN_FREE_PCT", "10"))
+# The check that would actually have stopped the incident.  A percentage is a
+# weak predictor of "will this load fit": what matters is whether the free
+# pages exceed what the shard is about to ask for.  Measured 2026-09-01 on
+# gesicht: 449 GB of a 512 GB box was wired and held by no visible process,
+# leaving 55 GB free -- and an 86 GiB shard was loaded into it anyway, which is
+# how the box reached 95% swap.  Default 100 GB covers an 85.5 GiB TP shard
+# plus working space; raise it for a single-box 183 GiB load.
+MIN_FREE_GB = float(os.environ.get("MLX_VLM_TP_MIN_FREE_GB", "100"))
 
 _GB = 1024.0 ** 3
 _PS_SEP = "===PS==="
@@ -86,7 +95,12 @@ _PROBE = ("/usr/bin/top -l 1 -o mem -n 40 -stats pid,mem; "
           f"echo '{_PS_SEP}'; /bin/ps -A -o pid=,command=; "
           f"echo '{_MEM_SEP}'; /usr/sbin/sysctl -n vm.swapusage; "
           "/usr/bin/memory_pressure -Q 2>/dev/null | "
-          "/usr/bin/grep -i 'free percentage'")
+          "/usr/bin/grep -i 'free percentage'; "
+          # Free and wired in GB.  vm_stat is the only place the *absolute*
+          # headroom is visible, and absolute headroom is what a load needs.
+          "/usr/bin/vm_stat | /usr/bin/awk '/Pages free/{f=$3} "
+          "/Pages wired down/{w=$4} END{gsub(/[.]/,\"\",f);gsub(/[.]/,\"\",w);"
+          "printf \"VMFREEGB %.1f %.1f\\n\", f*16384/2^30, w*16384/2^30}'")
 
 
 class HeavyRunActive(RuntimeError):
@@ -158,7 +172,9 @@ def _parse_ps(text: str, threshold_gb: float, ignore_pids: Sequence[int] = ()) \
 
 def _parse_memory(text: str) -> Dict[str, Optional[float]]:
     """swap used (GB) and system-wide free percentage from the probe tail."""
-    out: Dict[str, Optional[float]] = {"swap_used_gb": None, "free_pct": None}
+    out: Dict[str, Optional[float]] = {"swap_used_gb": None, "free_pct": None,
+                                       "free_gb": None, "wired_gb": None}
+    out["free_gb"] = None
     _, _, mem = text.partition(_MEM_SEP)
     for line in mem.splitlines():
         low = line.lower()
@@ -170,6 +186,12 @@ def _parse_memory(text: str) -> Dict[str, Optional[float]]:
                 num = float(val[:-1]) if unit in _UNITS else float(val)
                 mult = _UNITS.get(unit, 1.0)
                 out["swap_used_gb"] = round(num * mult / _GB, 2)
+            except (IndexError, ValueError):
+                pass
+        elif line.strip().startswith("VMFREEGB"):
+            try:
+                out["free_gb"] = round(float(line.split()[1]), 1)
+                out["wired_gb"] = round(float(line.split()[2]), 1)
             except (IndexError, ValueError):
                 pass
         elif "free percentage" in low:
@@ -316,6 +338,10 @@ def require_quiet_fleet(
             why.append(f"swap {m['swap_used_gb']}GB > {MAX_SWAP_GB}GB")
         if m.get("free_pct") is not None and m["free_pct"] < MIN_FREE_PCT:
             why.append(f"free {m['free_pct']}% < {MIN_FREE_PCT}%")
+        if m.get("free_gb") is not None and m["free_gb"] < MIN_FREE_GB:
+            why.append(f"only {m['free_gb']}GB free < {MIN_FREE_GB}GB needed"
+                       + (f" (wired {m['wired_gb']}GB)"
+                          if m.get("wired_gb") else ""))
         if why:
             strained[h] = "; ".join(why)
     receipt = {
@@ -323,6 +349,7 @@ def require_quiet_fleet(
         "threshold_gb": threshold_gb,
         "max_swap_gb": MAX_SWAP_GB,
         "min_free_pct": MIN_FREE_PCT,
+        "min_free_gb": MIN_FREE_GB,
         "label": label,
         "when": time.strftime("%FT%T%z"),
         "quiet": not busy and not strained,

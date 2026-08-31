@@ -18,12 +18,23 @@ _MEM_OK = """
 ===MEM===
 total = 4096.00M  used = 2448.50M  free = 1647.50M  (encrypted)
 System-wide memory free percentage: 41%
+VMFREEGB 180.0 120.0
 """
 
 _MEM_STRAINED = """
 ===MEM===
 total = 42912.00M  used = 39901.00M  free = 3011.00M  (encrypted)
 System-wide memory free percentage: 6%
+VMFREEGB 30.0 449.4
+"""
+
+# The measured 2026-09-01 post-incident state: swap drained and the percentage
+# is only just under threshold, but 54.7 GB cannot hold an 85.5 GiB shard.
+_MEM_NO_HEADROOM = """
+===MEM===
+total = 4096.00M  used = 2080.00M  free = 2016.00M  (encrypted)
+System-wide memory free percentage: 11%
+VMFREEGB 54.7 449.4
 """
 
 _QUIET_HEAD = """\
@@ -244,4 +255,38 @@ def test_a_missing_memory_section_does_not_block(monkeypatch):
     text = _QUIET_HEAD
     r = fleet.require_quiet_fleet(threshold_gb=20, ps_runner=lambda host: text)
     assert r["quiet"] is True
-    assert r["pressure"]["localhost"] == {"swap_used_gb": None, "free_pct": None}
+    assert r["pressure"]["localhost"] == {
+        "swap_used_gb": None, "free_pct": None, "free_gb": None,
+        "wired_gb": None}
+
+
+def test_absolute_headroom_is_what_a_load_actually_needs():
+    """A percentage is a weak predictor of "will this load fit".
+
+    Measured after the incident: swap had drained to 2 GB and free was 11%,
+    which passes both of those checks -- while 449 GB of a 512 GB box was wired
+    and held by no visible process, leaving 54.7 GB for an 85.5 GiB shard.
+    """
+    text = _QUIET_HEAD + _MEM_NO_HEADROOM
+    m = fleet._parse_memory(text)
+    assert m["free_gb"] == 54.7 and m["wired_gb"] == 449.4
+    assert m["swap_used_gb"] < fleet.MAX_SWAP_GB      # swap check passes
+    assert m["free_pct"] >= fleet.MIN_FREE_PCT        # percentage passes
+    with pytest.raises(fleet.HeavyRunActive, match="free < "):
+        fleet.require_quiet_fleet(threshold_gb=20, label="x",
+                                  ps_runner=lambda host: text)
+
+
+def test_headroom_gate_names_the_wired_holder():
+    text = _QUIET_HEAD + _MEM_NO_HEADROOM
+    try:
+        fleet.require_quiet_fleet(threshold_gb=20, ps_runner=lambda host: text)
+        raise AssertionError("should have refused")
+    except fleet.HeavyRunActive as e:
+        assert "wired 449.4GB" in str(e)
+
+
+def test_enough_headroom_passes():
+    r = fleet.require_quiet_fleet(threshold_gb=20, ps_runner=lambda host: _QUIET)
+    assert r["quiet"] is True
+    assert r["pressure"]["localhost"]["free_gb"] == 180.0
