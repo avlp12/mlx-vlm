@@ -76,6 +76,118 @@ _GATHER_Q_CHUNK = int(os.environ.get("MLX_VLM_GLM5_GATHER_Q_CHUNK", "1024"))
 _GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "32768"))
 
 
+# --------------------------------------------------------------- indexer memo
+# The DSA lightning indexer splits cleanly in two halves:
+#
+#   (a) the *scoring* half -- pool_keys, scores, index_scores -- which depends on
+#       the cached keys / gate scores, i.e. on hidden states, and is genuinely
+#       per-layer work; and
+#   (b) the *visibility* half -- pool_indices, pool_valid, pool_end, visible,
+#       pool_visible, valid_candidates and the always-select tail -- which is a
+#       pure function of the padding mask history (`valid`) and the sequence
+#       lengths.  It never reads a key, a gate score or a hidden state.
+#
+# Every DSA layer inside one Glm5NextModel forward is handed the same fa_mask
+# object and advances its indexer cache in lockstep, so all of them rebuild
+# byte-identical (b) tensors.  At 32k context that redundancy measures 0.32 ms
+# per 512-query chunk on the GPU; over 11 DSA layers x 4 chunks it is 14.2 ms of
+# a 2048-token prefill step (29.6 ms at 131k).  Computing it once and handing
+# back the *same* mx.array objects removes 10/11 of that.
+#
+# Correctness is by construction, not by numerical agreement: the memo returns
+# the identical array object the first layer built.  It is scoped to a single
+# Glm5NextModel.__call__ and only serves indexers that model registered, so the
+# MTP head (mtp.py, its own indexer and its own cache) and direct sub-module
+# callers (the attribution probes, which invoke layer.self_attn by hand) always
+# take the original path.
+_VIS_MEMO_CTX = None
+_VIS_MEMO_ENV = None
+_VIS_MEMO_MB = None
+_VIS_MEMO_VERIFY = None
+
+
+def _vis_memo_enabled() -> bool:
+    # Opt-OUT (default on): bit-exact by object identity, self-scoped, and it
+    # only ever removes work.  MLX_VLM_GLM5_VIS_MEMO=0 restores per-layer
+    # recomputation for A/B measurement.
+    global _VIS_MEMO_ENV
+    if _VIS_MEMO_ENV is None:
+        _VIS_MEMO_ENV = os.environ.get("MLX_VLM_GLM5_VIS_MEMO", "1").lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    return _VIS_MEMO_ENV
+
+
+def _vis_memo_budget_bytes() -> int:
+    # The chunk loop is inside the layer loop, so the memo has to hold every
+    # chunk of the current forward at once: n_chunks * chunk * P bools.  A
+    # 2048-token step at 131k context is ~67 MB; an 8192-token step is ~268 MB.
+    # Past the budget we stop memoizing (and fall back to recomputation) rather
+    # than trade prefill latency for peak memory.
+    global _VIS_MEMO_MB
+    if _VIS_MEMO_MB is None:
+        _VIS_MEMO_MB = int(os.environ.get("MLX_VLM_GLM5_VIS_MEMO_MB", "1024"))
+    return _VIS_MEMO_MB * 1024 * 1024
+
+
+def _vis_memo_verify() -> bool:
+    # Debug gate used by the parity test: recompute every memoized tensor and
+    # assert equality with the cached one, on every layer.
+    global _VIS_MEMO_VERIFY
+    if _VIS_MEMO_VERIFY is None:
+        _VIS_MEMO_VERIFY = _env_flag("MLX_VLM_GLM5_VIS_MEMO_VERIFY")
+    return _VIS_MEMO_VERIFY
+
+
+class _VisibilityMemo:
+    """Per-forward store for the layer-invariant half of the DSA indexer."""
+
+    __slots__ = ("owners", "layout", "chunks", "nbytes", "budget")
+
+    def __init__(self, owners):
+        self.owners = owners          # ids of the indexers this model owns
+        self.layout = {}              # (B, T) -> pool layout tuple
+        self.chunks = {}              # (B, T, S, c0, c1) -> chunk bundle
+        self.nbytes = 0
+        self.budget = _vis_memo_budget_bytes()
+
+    def serves(self, indexer) -> bool:
+        return id(indexer) in self.owners
+
+    def charge(self, nbytes: int) -> bool:
+        if self.nbytes + nbytes > self.budget:
+            return False
+        self.nbytes += nbytes
+        return True
+
+
+def _active_vis_memo(indexer):
+    ctx = _VIS_MEMO_CTX
+    if ctx is None or not _vis_memo_enabled() or not ctx.serves(indexer):
+        return None
+    return ctx
+
+
+def _assert_same(what, cached, fresh):
+    """MLX_VLM_GLM5_VIS_MEMO_VERIFY=1: prove the memo hands back exactly the
+    tensor the layer would have built itself.  Used by the parity test; never
+    runs on the hot path."""
+    for i, (a, b) in enumerate(zip(cached, fresh)):
+        if a is None or b is None:
+            if a is not b:
+                raise AssertionError(f"{what}[{i}]: None mismatch")
+            continue
+        if a.shape != b.shape or a.dtype != b.dtype:
+            raise AssertionError(
+                f"{what}[{i}]: {a.shape}/{a.dtype} vs {b.shape}/{b.dtype}"
+            )
+        if not bool(mx.all(a == b)):
+            raise AssertionError(f"{what}[{i}]: value mismatch")
+
+
 class Glm5NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -490,8 +602,15 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool_compress_ape = mx.zeros((self.index_kpool, self.head_dim))
         self.index_kpool_compress_gate = mx.zeros((self.head_dim, self.dim))
 
-    def _pooled_states(self, keys, gate_scores, valid):
-        B, S, hd = keys.shape
+    def _pool_layout(self, valid, S):
+        """The half of the pooling that depends only on `valid` and the length.
+
+        Split out of _pooled_states verbatim (same ops, same order) so a whole
+        Glm5NextModel forward can build it once and share it across the DSA
+        layers -- see _VisibilityMemo.  Returns everything the keys/gate half
+        needs plus the two outputs the selector needs.
+        """
+        B = valid.shape[0]
         kp = self.index_kpool
         P = (S + kp - 1) // kp
         any_valid = mx.any(valid, axis=-1)
@@ -502,11 +621,6 @@ class Glm5NextIndexer(nn.Module):
         pool_indices = first_key[:, None, None] + pool_offsets
         safe = mx.clip(pool_indices, 0, S - 1)
         flat = safe.reshape(B, P * kp)
-        idxC = mx.broadcast_to(flat[..., None], (B, P * kp, hd))
-        grouped_keys = mx.take_along_axis(keys, idxC, axis=1).reshape(B, P, kp, hd)
-        grouped_gate = mx.take_along_axis(gate_scores, idxC, axis=1).reshape(
-            B, P, kp, hd
-        )
         grouped_valid = (
             mx.take_along_axis(valid.astype(mx.int32), flat, axis=1).reshape(B, P, kp)
             > 0
@@ -514,6 +628,20 @@ class Glm5NextIndexer(nn.Module):
         grouped_valid = grouped_valid & (pool_indices < S)
         pool_valid = mx.all(grouped_valid, axis=-1)
         pool_indices = mx.where(grouped_valid, pool_indices, -1)
+        return flat, grouped_valid, pool_indices, pool_valid
+
+    def _pooled_states(self, keys, gate_scores, valid, layout=None):
+        B, S, hd = keys.shape
+        kp = self.index_kpool
+        P = (S + kp - 1) // kp
+        if layout is None:
+            layout = self._pool_layout(valid, S)
+        flat, grouped_valid, pool_indices, pool_valid = layout
+        idxC = mx.broadcast_to(flat[..., None], (B, P * kp, hd))
+        grouped_keys = mx.take_along_axis(keys, idxC, axis=1).reshape(B, P, kp, hd)
+        grouped_gate = mx.take_along_axis(gate_scores, idxC, axis=1).reshape(
+            B, P, kp, hd
+        )
         logits = grouped_gate + self.index_kpool_compress_ape[None, None]
         logits = mx.where(grouped_valid[..., None], logits, -1e30)
         probs = mx.softmax(logits, axis=2)
@@ -605,8 +733,18 @@ class Glm5NextIndexer(nn.Module):
             pool_indices = mx.concatenate([ci[:, :n_stable], pi_s], axis=1)
             pool_valid = mx.concatenate([cv[:, :n_stable], pv_s], axis=1)
         else:
+            memo = _active_vis_memo(self)
+            layout = None
+            if memo is not None:
+                key = (B, T)
+                layout = memo.layout.get(key)
+                if layout is None:
+                    layout = self._pool_layout(valid, T)
+                    memo.layout[key] = layout
+                elif _vis_memo_verify():
+                    _assert_same("pool_layout", layout, self._pool_layout(valid, T))
             pool_keys, pool_indices, pool_valid = self._pooled_states(
-                k_full, gate_full, valid
+                k_full, gate_full, valid, layout=layout
             )
             if cache is not None:
                 cache._no_pad = bool(mx.all(valid))
@@ -623,14 +761,22 @@ class Glm5NextIndexer(nn.Module):
         # [B, S, n_heads, P] scores (O(S*P)) and OOMs at long context; chunking bounds
         # peak to O(chunk*P). Decode (S=1) is a single chunk -> identical to before.
         chunk = 512 if S > 512 else S
+        # The visibility half of the chunk body (visible -> pool_visible ->
+        # valid_candidates, and the always-select tail) reads only `valid`,
+        # `pool_end` and the positions, so one forward computes it once and every
+        # DSA layer reuses the same arrays.  memo is None for the MTP head, for
+        # direct sub-module callers, and when MLX_VLM_GLM5_VIS_MEMO=0.
+        memo = _active_vis_memo(self)
         out = []
         for c0 in range(0, S, chunk):
             c1 = min(c0 + chunk, S)
             cs = c1 - c0
-            q_pos = offset + mx.arange(c0, c1)
-            visible = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[
-                :, None, :
-            ]
+            bundle = memo.chunks.get((B, T, S, c0, c1)) if memo is not None else None
+            if bundle is None:
+                q_pos = offset + mx.arange(c0, c1)
+                visible = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[
+                    :, None, :
+                ]
             scores = q[:, c0:c1] @ pool_keys_t
             scores = mx.maximum(scores * self.softmax_scale, 0.0)
             weights = self.weights_proj(x[:, c0:c1]) * (self.n_heads**-0.5)
@@ -642,10 +788,33 @@ class Glm5NextIndexer(nn.Module):
             # to the large-strided-shape reduction issue of mx.sum over a
             # non-last axis (ml-explore/mlx#3784) should the chunk ever grow.
             index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
-            pool_visible = mx.take_along_axis(
-                visible, mx.broadcast_to(pool_end[:, None, :], (B, cs, P)), axis=-1
-            )
-            valid_candidates = pool_visible & pool_valid[:, None]
+            if bundle is None:
+                pool_visible = mx.take_along_axis(
+                    visible, mx.broadcast_to(pool_end[:, None, :], (B, cs, P)), axis=-1
+                )
+                valid_candidates = pool_visible & pool_valid[:, None]
+                tail = self._visible_tail(visible, valid) if tail_on else None
+                bundle = (valid_candidates, tail)
+                if memo is not None:
+                    nbytes = valid_candidates.size * valid_candidates.itemsize
+                    if memo.charge(nbytes):
+                        memo.chunks[(B, T, S, c0, c1)] = bundle
+                del visible
+            elif _vis_memo_verify():
+                q_pos = offset + mx.arange(c0, c1)
+                vis = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[:, None, :]
+                pv = mx.take_along_axis(
+                    vis, mx.broadcast_to(pool_end[:, None, :], (B, cs, P)), axis=-1
+                )
+                _assert_same(
+                    "chunk_visibility",
+                    bundle,
+                    (
+                        pv & pool_valid[:, None],
+                        self._visible_tail(vis, valid) if tail_on else None,
+                    ),
+                )
+            valid_candidates, tail = bundle
             index_scores = mx.where(valid_candidates, index_scores, -1e30)
             order = mx.argsort(-index_scores, axis=-1)
             selected = order[..., :select_k]
@@ -661,9 +830,7 @@ class Glm5NextIndexer(nn.Module):
             ).reshape(B, cs, select_k * self.index_kpool)
             topk = mx.where(sv, topk, -1)
             if tail_on:
-                topk = mx.concatenate(
-                    [topk, self._visible_tail(visible, valid)], axis=-1
-                )
+                topk = mx.concatenate([topk, tail], axis=-1)
             if topk.shape[-1] < output_width:
                 pad = mx.full(
                     (B, cs, output_width - topk.shape[-1]), -1, dtype=topk.dtype
@@ -1009,6 +1176,13 @@ class Glm5NextModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ssm_idx = next((i for i, l in enumerate(self.layers) if l.is_linear), 0)
         self.fa_idx = next((i for i, l in enumerate(self.layers) if not l.is_linear), 0)
+        # Indexers this model owns, so the per-forward visibility memo can never
+        # serve a foreign one (the MTP head keeps its own indexer + cache).
+        self._dsa_indexer_ids = frozenset(
+            id(l.self_attn.indexer)
+            for l in self.layers
+            if not l.is_linear and hasattr(l.self_attn, "indexer")
+        )
 
     def __call__(
         self,
@@ -1036,11 +1210,24 @@ class Glm5NextModel(nn.Module):
         h = mx.contiguous(h)
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
-            mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
-            if i in capture_set and hidden_sink is not None:
-                hidden_sink.append(h.mean(axis=2))
+        # Open a visibility memo for the span of this forward only.  Every DSA
+        # layer below is handed the same fa_mask and advances its indexer cache
+        # in lockstep, so the mask-only half of the indexer is identical across
+        # them; outside this block (MTP head, attribution probes calling
+        # layer.self_attn by hand) the memo is closed and nothing changes.
+        global _VIS_MEMO_CTX
+        outer_memo = _VIS_MEMO_CTX
+        _VIS_MEMO_CTX = (
+            _VisibilityMemo(self._dsa_indexer_ids) if _vis_memo_enabled() else None
+        )
+        try:
+            for i, (layer, c) in enumerate(zip(self.layers, cache)):
+                mask = ssm_mask if layer.is_linear else fa_mask
+                h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
+                if i in capture_set and hidden_sink is not None:
+                    hidden_sink.append(h.mean(axis=2))
+        finally:
+            _VIS_MEMO_CTX = outer_memo
 
         h = h.mean(axis=2)
         if hidden_sink is not None and not capture_set:
