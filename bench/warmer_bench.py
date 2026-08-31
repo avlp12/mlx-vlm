@@ -68,7 +68,9 @@ def main() -> None:
 
     ids = processor.tokenizer.encode("The system under test. ", add_special_tokens=False)
     doc = processor.tokenizer.decode((ids * (args.prompt_tokens // max(len(ids), 1) + 4))[: args.prompt_tokens])
-    prompt = apply_chat_template(processor, None, doc, num_images=0)
+    prompt = apply_chat_template(
+        processor, model.config, doc, num_images=0, enable_thinking=False
+    )
 
     mx.reset_peak_memory()
     t1 = time.perf_counter()
