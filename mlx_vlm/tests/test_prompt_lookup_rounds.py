@@ -137,8 +137,12 @@ def test_output_is_exactly_greedy_without_any_match():
 
 
 def test_all_three_paths_are_exercised():
+    # adaptive=False: this pins the *round loop's* three paths, so the proposal
+    # width must not be throttled by the gate (which has its own tests, and
+    # which is conservative enough on this toy target to hide the partial-accept
+    # path entirely).
     prompt = [10, 11, 12, 99, 98, 97, 96, 7, 7, 7]
-    out, drafter, lm = _drive(prompt, 10, 48)
+    out, drafter, lm = _drive(prompt, 10, 48, adaptive=False)
     accepts = drafter.accept_lens
     assert any(a == 0 for a in accepts), "no full-rejection round"
     assert any(a > 0 for a in accepts), "no accepting round"
@@ -147,12 +151,16 @@ def test_all_three_paths_are_exercised():
     assert out == _greedy_reference(10, 47)
 
 
-def test_rollback_trims_the_cache_consistently():
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_rollback_trims_the_cache_consistently(adaptive):
+    """Each round feeds K+1 positions and must keep exactly accepted+1 of them:
+    the verify widens the cache, the rollback trims it back.  Stated against
+    accept_lens so it holds whether or not the last round was truncated by the
+    token budget."""
     prompt = [10, 11, 12, 99, 98, 97, 96, 7, 7, 7]
-    out, _, lm = _drive(prompt, 10, 40)
-    # every emitted token, plus the bonus that seeded the round loop, must be
-    # exactly what the cache holds beyond the prompt
-    assert lm.cache[0].offset == len(prompt) + 1 + len(out)
+    _, drafter, lm = _drive(prompt, 10, 40, adaptive=adaptive)
+    expected = len(prompt) + sum(int(a) + 1 for a in drafter.accept_lens)
+    assert lm.cache[0].offset == expected
 
 
 def test_verify_always_passes_an_empty_capture_list():

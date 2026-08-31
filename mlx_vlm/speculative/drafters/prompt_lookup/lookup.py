@@ -23,6 +23,7 @@ verify width on a workload that does not quote", and the defence is to make the
 proposal length track the measured accept rate -- see ``_budget``.
 """
 
+import math
 from typing import Any, Callable, List, Optional, Sequence
 
 import mlx.core as mx
@@ -56,6 +57,7 @@ class PromptLookupDraftModel(nn.Module):
         self.match_lens: List[int] = []
         self.abstentions = 0
         self._ema: Optional[float] = None
+        self._last_proposed = 0
 
     # ------------------------------------------------------------- lifecycle
     def reset(self, target_model: Any = None) -> None:
@@ -68,6 +70,7 @@ class PromptLookupDraftModel(nn.Module):
         self.match_lens = []
         self.abstentions = 0
         self._ema = None
+        self._last_proposed = 0
         return None
 
     def validate_target_compatibility(self, target_model: Any) -> None:
@@ -91,20 +94,41 @@ class PromptLookupDraftModel(nn.Module):
 
     # ---------------------------------------------------------------- policy
     def _budget(self, block_size: int) -> int:
-        """How many tokens this round is allowed to propose.
+        """How many tokens this round may propose *if the matcher finds a match*.
 
-        Fixed at block_size-1 when the adaptive gate is off.  With it on, the
-        ceiling follows an EMA of recent accepted lengths, so a workload that
-        stops quoting collapses the verify width back toward a plain decode step
-        within a few rounds instead of paying a wide verify forever.  A floor of
-        ``explore_tokens`` keeps proposing after a collapse, which is what lets
-        the EMA recover when quoting resumes.
+        Abstention is not this function's job.  Whether a match exists is known
+        for free, before any GPU work, and a round with no match verifies a
+        single token and is therefore exactly a plain decode step and exactly
+        free.  So the drafter is already self-limiting on workloads that do not
+        quote, and this only has to answer the second question: when I do match,
+        how far into the match is it still worth proposing?
+
+        That question has a marginal answer.  One extra proposed token widens the
+        verify by ``verify_cost_per_token`` decode-steps and buys one token if it
+        survives, so it is worth proposing while P(survive) exceeds that cost.
+        Modelling the accepted run as geometric with mean ``e`` (the EMA over
+        proposing rounds) gives per-token survival p = e/(1+e), so the last
+        worthwhile position is ``log(cost)/log(p)``.
+
+        Two earlier revisions were wrong in opposite directions and both were
+        caught by the quote sweep rather than by reasoning:
+          * gating *abstention* on the same EMA locked the gate at zero -- a
+            collapsed gate proposes nothing, so nothing is accepted, so it never
+            recovers -- and dropped pure quoting from 2.30x to 1.08x;
+          * a flat ``int(e+1)`` ceiling was far too timid, forfeiting about half
+            the available win on verbatim quoting (2.30x -> 1.81x).
         """
         hard = max(1, int(block_size) - 1)
         if not self.config.adaptive or self._ema is None:
             return hard
-        ceiling = int(self._ema + 1.0)          # round up: accept n => try n+1
-        return max(self.config.explore_tokens, min(hard, ceiling))
+        e = max(0.0, float(self._ema))
+        p = e / (1.0 + e)                       # per-token survival
+        if p <= 0.0:
+            return 1                            # a found match is evidence
+        cost = self.config.verify_cost_per_token
+        if p >= 1.0:
+            return hard
+        return max(1, min(hard, int(math.log(cost) / math.log(p))))
 
     def _record(self, accepted: float) -> None:
         w = max(1, int(self.config.adaptive_window))
@@ -116,8 +140,12 @@ class PromptLookupDraftModel(nn.Module):
         )
 
     def note_round(self, accepted: float) -> None:
-        """Called by the round loop after the walk, to drive the gate."""
-        self._record(accepted)
+        """Called by the round loop after the walk.  Only rounds that actually
+        proposed inform the width gate; an abstention says nothing about how
+        good this drafter's matches are, and folding it in is what made the
+        earlier revision lock at zero."""
+        if self._last_proposed > 0:
+            self._record(accepted)
 
     # ----------------------------------------------------------------- draft
     def draft_block(
@@ -142,6 +170,7 @@ class PromptLookupDraftModel(nn.Module):
             last_bonus = int(mx.array(last_bonus).reshape(-1)[0].item())
         k = self._budget(block_size)
         tokens, n_matched, _pos = self.index.propose(k)
+        self._last_proposed = len(tokens)
         self.match_lens.append(len(tokens))
         if not tokens:
             self.abstentions += 1

@@ -153,17 +153,76 @@ def test_reset_clears_context_and_stats():
     assert d.abstentions == 0 and d.match_lens == [] and len(d.index) == 0
 
 
-def test_adaptive_gate_shrinks_then_recovers():
-    """A workload that stops quoting must collapse the verify width, and must
-    still be able to widen again -- that is what explore_tokens buys."""
-    d = _drafter(adaptive=True, adaptive_window=2, explore_tokens=1)
+def _note(d, accepted, proposed=7):
+    d._last_proposed = proposed
+    d.note_round(accepted)
+
+
+def test_width_gate_shrinks_then_recovers():
+    """The gate answers 'when I match, how much survives?' -- it narrows the
+    proposal after rejections and widens again after acceptances."""
+    d = _drafter(adaptive=True, adaptive_window=2)
     assert d._budget(8) == 7                     # no history yet: full width
     for _ in range(12):
-        d.note_round(0)
-    assert d._budget(8) == 1                     # collapsed to the explore floor
+        _note(d, 0)
+    assert d._budget(8) == 1                     # narrowed to the floor
     for _ in range(12):
-        d.note_round(7)
+        _note(d, 7)
     assert d._budget(8) == 7                     # recovered
+
+
+def test_width_gate_never_suppresses_a_match_entirely():
+    """Regression: an earlier revision let the gate collapse to zero, which
+    suppressed even known-good matches.  Because nothing was then proposed,
+    nothing was accepted and the EMA could never recover -- measured on the
+    quote sweep it dropped a pure-quoting workload from 2.30x to 1.08x."""
+    d = _drafter(adaptive=True, adaptive_window=2)
+    for _ in range(200):
+        _note(d, 0)
+    assert d._budget(8) >= 1
+    d.set_context([1, 2, 3, 4, 5, 6, 1, 2, 3])
+    assert d.draft_block(3, None, None, 8, None, mx.int32).shape[1] >= 1
+
+
+def test_abstentions_do_not_inform_the_width_gate():
+    """A round with no match says nothing about match quality; folding it in is
+    what made the earlier revision lock at zero."""
+    d = _drafter(adaptive=True, adaptive_window=2)
+    for _ in range(12):
+        _note(d, 6)
+    wide = d._budget(8)
+    for _ in range(50):
+        d._last_proposed = 0                     # abstained
+        d.note_round(0)
+    assert d._budget(8) == wide, "abstentions moved the width gate"
+
+
+def test_width_follows_the_marginal_rule():
+    """One more proposed token costs verify_cost_per_token decode-steps and buys
+    one token if it survives, so the ceiling is log(cost)/log(p) with
+    p = e/(1+e).  Pin a few points so a change to the formula is visible."""
+    import math
+
+    d = _drafter(adaptive=True, adaptive_window=1, verify_cost_per_token=0.175)
+    for e in (0.5, 1.0, 3.0, 7.0):
+        d._ema = e
+        p = e / (1 + e)
+        want = max(1, min(15, int(math.log(0.175) / math.log(p))))
+        assert d._budget(16) == want, f"e={e}"
+    # a costlier verify must make the gate more conservative
+    cheap = _drafter(adaptive=True, verify_cost_per_token=0.05)
+    dear = _drafter(adaptive=True, verify_cost_per_token=0.4)
+    cheap._ema = dear._ema = 2.0
+    assert cheap._budget(16) > dear._budget(16)
+
+
+def test_abstention_is_driven_by_the_matcher_not_the_gate():
+    """No match -> propose nothing, whatever the gate says.  That round is a
+    plain decode step and therefore free."""
+    d = _drafter(adaptive=True)
+    d.set_context([1, 2, 3, 4, 5, 6, 7, 8])      # suffix occurs only once
+    assert d.draft_block(8, None, None, 8, None, mx.int32).shape == (1, 0)
+    assert d.abstentions == 1
 
 
 def test_adaptive_off_always_uses_full_width():
