@@ -40,6 +40,7 @@ invariant is rank0 == rank1, asserted by the identity test.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import os
 import subprocess
@@ -326,12 +327,31 @@ class MirroredLanguageModel:
                 f"single-box.")
         with self._lock:
             self._ensure_epoch(cache)
+            shape = getattr(inputs, "shape", ("?", "?"))
             self._announce(OP_FORWARD, inputs,
                            flags=FLAG_CAPTURE if capture else 0,
-                           label=f"forward b={getattr(inputs, 'shape', ('?',))[0]}")
-            out = self._lm(inputs, cache=cache, **kw)
-            _force_same_graph(out)
+                           label=f"announce forward b={shape[0]} s={shape[1]}")
+            # The watchdog has to cover the FORWARD ITSELF, not just the
+            # announcement.  The announcement is one collective; the forward is
+            # 101, and a count mismatch stalls inside them, not before them.
+            # Observed 2026-09-01: the first forward after a vault restore hung
+            # for 19 minutes with the watchdog disarmed, because it had already
+            # been disarmed when the control send returned.
+            with self._guard(f"forward b={shape[0]} s={shape[1]}"):
+                out = self._lm(inputs, cache=cache, **kw)
+                _force_same_graph(out)
             return out
+
+    @contextlib.contextmanager
+    def _guard(self, label: str):
+        if self._watchdog is None:
+            yield
+            return
+        self._watchdog.arm(label)
+        try:
+            yield
+        finally:
+            self._watchdog.disarm()
 
     def _ensure_epoch(self, cache) -> None:
         """Announce a fresh cache if this is one rank 1 has not been told about."""
@@ -372,9 +392,10 @@ class MirroredLanguageModel:
                     "TP rollback on a cache that is not the announced one; "
                     "rank 1 would roll back a different conversation.")
             self._announce(OP_ROLLBACK, acc, arg0=int(block_size),
-                           label=f"rollback a={acc} bs={block_size}")
-            return self._lm.rollback_speculative_cache(
-                caches, gdn_states, accepted, block_size)
+                           label=f"announce rollback a={acc} bs={block_size}")
+            with self._guard(f"rollback a={acc} bs={block_size}"):
+                return self._lm.rollback_speculative_cache(
+                    caches, gdn_states, accepted, block_size)
 
     # ------------------------------------------------------------ vault verbs
     def tp_mirror_vault(self, vault):

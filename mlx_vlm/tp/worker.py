@@ -462,23 +462,67 @@ def worker_loop(model_path: str, hosts: List[str], rank: int) -> None:
             if not state.handle(_ctrl_recv()):
                 return
     finally:
+        # Order matters: leave wired_limit FIRST (it synchronises the stream and
+        # puts the wired budget back), then drop the shard, then clear.  Skipping
+        # this is what leaks 85.5 GiB of wired pages that survive the process.
         try:
             wire.__exit__(None, None, None)
         except Exception:
-            pass
-        # Drop the shard before the process exits so the box is quiet the
-        # moment rank 0 sees the worker gone, not merely soon afterwards.
+            logger.warning("tp worker: releasing wired limit failed",
+                           exc_info=True)
         state.caches.clear()
         state.last_gdn = None
-        del lm, model
+        state.vault = None
+        lm = None
+        model = None
         try:
+            import gc
+
+            gc.collect()
             mx.clear_cache()
+            mx.set_wired_limit(0)
         except Exception:
+            pass
+        logger.info("tp worker: shard released")
+
+
+def _install_clean_exit_handlers() -> None:
+    """Turn SIGTERM/SIGINT into SystemExit so ``worker_loop``'s finally runs.
+
+    THIS IS NOT COSMETIC.  Python's default SIGTERM disposition terminates the
+    process without unwinding, so ``wired_limit.__exit__`` never runs and the
+    shard is never dropped -- and the pages stay WIRED after the process is
+    gone.  Measured 2026-09-01 on the peer: wired 206.3 GB / free 112.0 GB
+    before, wired 305.6 GB / free 9.5 GB after a single SIGTERM of a worker
+    holding an 85.5 GiB shard.  The whole shard leaked, permanently, and the
+    box could no longer take a load.
+
+    The clean path (rank 0 announces OP_EXIT, the loop returns, the finally
+    runs) releases fully -- the same box sat at 7.1 GB wired after a clean
+    cycle.  So the fix is simply to make the signal path take the clean path.
+
+    Caveat, and it is the same one as everywhere else here: a process blocked
+    inside a collective cannot run a Python signal handler until the collective
+    returns.  This makes the ordinary case correct; it cannot rescue a wedged
+    one.
+    """
+    import signal
+
+    def _bail(signum, _frame):
+        logger.info("tp worker: signal %s -- unwinding so the shard is released",
+                    signum)
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _bail)
+        except (ValueError, OSError):
             pass
 
 
 def main():
     import argparse
+    _install_clean_exit_handlers()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s rank%(rank)s %(message)s"
                         .replace("%(rank)s", str(tp_rank())),

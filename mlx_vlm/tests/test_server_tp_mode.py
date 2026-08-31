@@ -620,3 +620,50 @@ def test_launch_worker_command_shape(monkeypatch):
     assert "mlx_vlm.tp.worker" in inner
     assert f"{T.ENV_RANK}=1" in inner
     assert "/models/quasar" in inner
+
+
+def test_watchdog_covers_the_forward_not_just_the_announce():
+    """The 19-minute hang.
+
+    A collective-count mismatch stalls INSIDE the forward's 101 reduces, not in
+    the one-collective announcement before them.  A watchdog that disarms when
+    the control send returns is disarmed for exactly the window that can hang.
+    """
+    import time
+
+    fired = []
+    w = T._Watchdog(timeout_s=0.02, poll_s=0.005,
+                    on_timeout=lambda label, waited: fired.append(label))
+    w.start()
+    try:
+        class _SlowLM(_FakeLM):
+            def __call__(self, inputs=None, cache=None, **kw):
+                time.sleep(0.12)          # a forward that never comes back
+                return "out"
+
+        sent = []
+        import mlx_vlm.server.tp_mode as M
+        real = M._ctrl_send
+        M._ctrl_send = lambda op, ep, ids, **k: sent.append(op)
+        try:
+            m = T.MirroredLanguageModel(_SlowLM(), watchdog=w)
+            m(_Ids(1, 4), cache=[])
+        finally:
+            M._ctrl_send = real
+        assert any("forward" in f for f in fired), (
+            f"watchdog must fire during the forward, got {fired}")
+    finally:
+        w.stop()
+
+
+def test_guard_disarms_even_when_the_forward_raises():
+    fired = []
+    w = T._Watchdog(timeout_s=5, poll_s=0.01,
+                    on_timeout=lambda label, waited: fired.append(label))
+    m = T.MirroredLanguageModel(_FakeLM(), watchdog=w)
+    try:
+        with m._guard("x"):
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert m._watchdog._inflight is None
