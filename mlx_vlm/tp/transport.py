@@ -25,6 +25,9 @@ import ctypes
 import json
 import os
 import socket
+import threading
+import time
+import traceback
 from pathlib import Path
 from typing import List, Optional
 
@@ -213,3 +216,64 @@ def all_sum(x: mx.array) -> mx.array:
     if _GROUP is None or _GROUP.size() == 1:
         return x
     return mx.distributed.all_sum(x, group=_GROUP)
+
+
+# ---------------------------------------------------------------- deadman
+
+
+class Deadman:
+    """Bound the wall time of a region that blocks inside a collective.
+
+    A stalled peer leaves the fast fence's one-thread GPU kernel spinning on a
+    shared counter.  Measured tolerance on M3 Ultra is at least 40 s with
+    correct results and no Metal watchdog kill (the watchdog kill seen earlier
+    in this campaign was the *default* fence, a different mechanism), but a peer
+    that dies outright spins forever.
+
+    This cannot preempt the GPU spin -- nothing on the host can -- so it does
+    the next best thing: it turns an indefinite hang into a fast, diagnosed
+    abort, which also frees the surviving peer instead of deadlocking the pair.
+    A genuinely bounded wait would need a max-iteration counter in mlx's
+    fence_wait kernel; that is an upstream change, not something a user of the
+    library can do.
+    """
+
+    def __init__(self, seconds: float = 120.0, label: str = "", on_timeout="abort"):
+        self.seconds = seconds
+        self.label = label
+        self.on_timeout = on_timeout
+        self._timer = None
+        self._armed = False
+
+    def _fire(self):
+        if not self._armed:
+            return
+        rank = tp_rank() if _GROUP is not None else "?"
+        msg = (
+            f"[tp deadman] rank {rank}: '{self.label}' exceeded {self.seconds}s. "
+            f"A peer is stalled or dead and the GPU-side fence is spinning; "
+            f"aborting so the surviving peer fails fast instead of deadlocking."
+        )
+        print(msg, flush=True)
+        traceback.print_stack()
+        if self.on_timeout == "abort":
+            os._exit(75)  # EX_TEMPFAIL
+
+    def __enter__(self):
+        self._armed = True
+        self._timer = threading.Timer(self.seconds, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._armed = False
+        if self._timer is not None:
+            self._timer.cancel()
+        return False
+
+
+def guarded_eval(arrays, seconds: float = 120.0, label: str = "eval"):
+    """mx.eval under a deadman."""
+    with Deadman(seconds, label):
+        mx.eval(arrays)
