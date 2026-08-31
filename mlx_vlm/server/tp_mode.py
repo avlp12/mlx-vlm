@@ -35,116 +35,13 @@ from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-ENV_HOSTS = "MLX_VLM_GLM5_TP_HOSTS"
-ENV_RANK = "MLX_VLM_GLM5_TP_RANK"
-ENV_WORKER_PY = "MLX_VLM_GLM5_TP_WORKER_PYTHON"
-ENV_WORKER_SRC = "MLX_VLM_GLM5_TP_WORKER_SRC"
-ENV_MAX_TOK = "MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD"
-
-OP_EXIT, OP_MAKE_CACHE, OP_FORWARD = 0, 1, 2
-HEADER = 4  # [op, cache_epoch, batch, seqlen]
-
-
-def tp_hosts() -> List[str]:
-    raw = os.environ.get(ENV_HOSTS, "")
-    return [h.strip() for h in raw.split(",") if h.strip()]
-
-
-def tp_enabled() -> bool:
-    return len(tp_hosts()) > 1
-
-
-def tp_rank() -> int:
-    return int(os.environ.get(ENV_RANK, "0"))
-
-
-def _max_tok() -> int:
-    try:
-        return max(64, int(os.environ.get(ENV_MAX_TOK, "8192")))
-    except ValueError:
-        return 8192
-
-
-class TPUnavailable(RuntimeError):
-    """Raised when TP cannot be brought up; the caller serves single-box."""
-
-
-def preflight(hosts: List[str], rank: int, timeout_s: float = 60.0) -> dict:
-    """Seconds-long transport check before anything expensive.
-
-    A four-minute sharded load per box is a bad place to discover the group will
-    not form, so the same check the stage-3/4 campaign used runs at startup.
-    """
-    import mlx.core as mx
-
-    from ..tp.transport import Deadman, all_sum, backend, init_tp, tp_size
-
-    init_tp(hosts=hosts, rank=rank, backend="jaccl")
-    x = mx.full((1, 1, 64), float(rank + 1))
-    with Deadman(timeout_s, "tp preflight all_sum"):
-        y = all_sum(x)
-        mx.eval(y)
-    got = float(y[0, 0, 0])
-    want = float(sum(range(1, tp_size() + 1)))
-    if abs(got - want) > 1e-6:
-        raise TPUnavailable(f"preflight all_sum {got} != {want}")
-    return {"size": tp_size(), "backend": backend(), "all_sum": got,
-            "fast_synch": os.environ.get("MLX_METAL_FAST_SYNCH")}
-
-
-# ------------------------------------------------------------------ control
-def encode(op: int, epoch: int, shape=None, flat=None, n: Optional[int] = None):
-    """Control message as a flat int32 vector. Separated from transport so the
-    codec is testable without a group."""
-    n = _max_tok() if n is None else n
-    buf = [0] * (HEADER + n)
-    b = s = 0
-    if flat is not None:
-        b, s = int(shape[0]), int(shape[1])
-        if len(flat) > n:
-            raise TPUnavailable(
-                f"forward of {len(flat)} tokens exceeds {ENV_MAX_TOK}={n}")
-        buf[HEADER:HEADER + len(flat)] = [int(v) for v in flat]
-    buf[0], buf[1], buf[2], buf[3] = int(op), int(epoch), b, s
-    return buf
-
-
-def decode(row):
-    """Inverse of encode: (op, epoch, batch, seqlen, flat_ids)."""
-    op, epoch, b, s = (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
-    ids = [int(v) for v in row[HEADER:HEADER + b * s]] if (b and s) else None
-    return op, epoch, b, s, ids
-
-
-def _ctrl_send(op: int, epoch: int, ids) -> None:
-    """Rank 0: publish a control message through the data collective."""
-    import mlx.core as mx
-
-    from ..tp.transport import all_sum
-
-    flat = shape = None
-    if ids is not None:
-        flat = ids.reshape(-1).tolist()
-        shape = (ids.shape[0], ids.shape[1])
-    msg = mx.array([encode(op, epoch, shape, flat)], dtype=mx.int32)
-    out = all_sum(msg)
-    mx.eval(out)
-
-
-def _ctrl_recv():
-    """Rank 1: contribute zeros and read the sum."""
-    import mlx.core as mx
-
-    from ..tp.transport import all_sum
-
-    n = _max_tok()
-    out = all_sum(mx.zeros((1, HEADER + n), dtype=mx.int32))
-    mx.eval(out)
-    row = out[0].tolist()
-    op, epoch, b, s, flat = decode(row)
-    ids = mx.array(flat, dtype=mx.int32).reshape(b, s) if flat else None
-    return op, epoch, b, s, ids
-
+from ..tp.worker import (  # noqa: F401  re-exported for the rank-0 side
+    ENV_HOSTS, ENV_MAX_TOK, ENV_RANK, ENV_WORKER_PY, ENV_WORKER_SRC,
+    HEADER, OP_EXIT, OP_FORWARD, OP_MAKE_CACHE, TPUnavailable,
+    ENV_WORKER_MODEL,
+    _ctrl_recv, _ctrl_send, _max_tok, decode, encode, preflight,
+    tp_enabled, tp_hosts, tp_rank, worker_loop,
+)
 
 class MirroredLanguageModel:
     """Rank-0 wrapper: announce each forward, then run it locally.
@@ -199,56 +96,17 @@ class MirroredLanguageModel:
                 logger.warning("tp: EXIT broadcast failed", exc_info=True)
 
 
-def worker_loop(model_path: str, hosts: List[str], rank: int) -> None:
-    """Rank 1: hold a shard and execute whatever rank 0 announces."""
-    import mlx.core as mx
-
-    from ..generate import wired_limit
-    from ..tp.load import load_sharded, materialize
-    from ..tp.transport import tp_rank as _r, tp_size
-
-    info = preflight(hosts, rank)
-    logger.info("tp worker: joined %s", info)
-    model, report = load_sharded(model_path, _r(), tp_size())
-    peak = materialize(model)
-    logger.info("tp worker: sharded %s peak %.1f GiB", report, peak)
-    lm = model.language_model if hasattr(model, "language_model") else model
-    wire = wired_limit(model, [mx.default_stream(mx.default_device())])
-    wire.__enter__()
-    caches, epoch = {}, -1
-    try:
-        while True:
-            op, ep, b, s, ids = _ctrl_recv()
-            if op == OP_EXIT:
-                logger.info("tp worker: EXIT")
-                return
-            if op == OP_MAKE_CACHE:
-                caches = {ep: lm.make_cache()}   # one live cache in mode-level TP
-                epoch = ep
-                continue
-            if op == OP_FORWARD:
-                c = caches.get(ep)
-                if c is None:
-                    c = caches[ep] = lm.make_cache()
-                out = lm(ids, cache=c)
-                mx.eval(out.logits)
-    finally:
-        try:
-            wire.__exit__(None, None, None)
-        except Exception:
-            pass
-
-
 def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
     """Start rank 1 over ssh, the way the pipeline tail is started."""
     py = os.environ.get(ENV_WORKER_PY, "/Users/m3ms/venv_mlx321/bin/python")
     src = os.environ.get(ENV_WORKER_SRC, "/Users/m3ms/src/mlx-vlm-tp2serve")
     host = hosts[1]
+    remote_model = os.environ.get(ENV_WORKER_MODEL) or model_path
     inner = (
         f"cd {src} && MLX_VLM_GLM5_FUSED_KDA=1 PYTHONPATH={src} "
         f"{ENV_HOSTS}='{','.join(hosts)}' {ENV_RANK}=1 "
         f"MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD={_max_tok()} "
-        f"nohup {py} -m mlx_vlm.server.tp_worker --model {model_path} "
+        f"nohup {py} -m mlx_vlm.tp.worker --model {remote_model} "
         f"> ~/tp_worker.log 2>&1 &"
     )
     cmd = ["ssh", "-o", "BatchMode=yes", f"m3ms@{host}", inner]

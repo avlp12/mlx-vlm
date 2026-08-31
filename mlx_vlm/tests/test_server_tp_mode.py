@@ -219,6 +219,6 @@ def test_launch_worker_command_shape(monkeypatch):
     assert cmd[0] == "ssh"
     assert cmd[3] == "m3ms@10.0.0.2"
     inner = cmd[4]
-    assert "mlx_vlm.server.tp_worker" in inner
+    assert "mlx_vlm.tp.worker" in inner
     assert f"{T.ENV_RANK}=1" in inner
     assert "/models/quasar" in inner
