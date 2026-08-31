@@ -174,6 +174,41 @@ def test_idx_fast_survives_pool_buffer_growth():
     assert _carry(ix, config, 4096, 40) == 0
 
 
+def test_idx_fast_survives_interleaved_verify_blocks():
+    """Speculative decoding interleaves S>1 verify blocks with S=1 decode.
+
+    The fast path owns the pool state in `_fpool` and clears `_pool`; a verify
+    block is ineligible, so it must fall back to a full rebuild, restore
+    `_pool`, and let the next single-token step re-seed `_fpool` from it.  Run
+    the identical mixed sequence eager and fast and require the selections to
+    stay bit-identical the whole way through.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    ix = _indexer(config)
+    eager_cache = _prefill(ix, config, 4096)
+    fast_cache = _clone(eager_cache)
+
+    mx.random.seed(1234)
+    plan = []
+    for i in range(4):
+        for _ in range(3):
+            plan.append(1)
+        plan.append(4)  # a draft-block verify
+    for n in plan:
+        x = (mx.random.normal((1, n, config.hidden_size)) * 0.4).astype(mx.bfloat16)
+        qr = (mx.random.normal((1, n, config.q_lora_rank)) * 0.4).astype(mx.bfloat16)
+        mx.eval(x, qr)
+        glm5._IDX_FAST_ENV = False
+        ref = ix(x, qr, None, cache=eager_cache)
+        glm5._IDX_FAST_ENV = True
+        got = ix(x, qr, None, cache=fast_cache)
+        mx.eval(ref, got)
+        assert ref.shape == got.shape
+        assert int(mx.sum((ref != got).astype(mx.int32))) == 0, f"diverged at S={n}"
+
+
 def test_idx_fast_declines_ineligible_shapes():
     if not mx.metal.is_available():
         pytest.skip("Metal kernels are unavailable on this host")
