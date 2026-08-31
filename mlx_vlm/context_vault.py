@@ -637,3 +637,37 @@ def vault_identity(model_path: Any, extra: str = "") -> str:
 
 
 __all__ += ["vault_identity"]
+
+
+def vault_identity_for_model(model: Any) -> str:
+    """Identity derived from a loaded model when no path is at hand.
+
+    Uses the shape-and-quantization fingerprint of the config rather than the
+    weights themselves: two trees that agree on all of these produce identical
+    cache tensors for identical tokens, and any that differ do not.
+    """
+    cfg = getattr(model, "config", None)
+    text_cfg = getattr(cfg, "text_config", None) or cfg
+    parts = [str(getattr(cfg, "model_type", "?"))]
+    for attr in (
+        "num_hidden_layers",
+        "hidden_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "index_head_dim",
+        "index_topk",
+        "first_k_dense_replace",
+    ):
+        parts.append(f"{attr}={getattr(text_cfg, attr, None)}")
+    quant = getattr(cfg, "quantization", None)
+    if isinstance(quant, dict):
+        parts.append(f"q={quant.get('bits')}/{quant.get('group_size')}/{quant.get('mode')}")
+    path = getattr(cfg, "_name_or_path", None) or getattr(model, "model_path", None) or ""
+    return vault_identity(path, extra="|".join(parts))
+
+
+__all__ += ["vault_identity_for_model"]

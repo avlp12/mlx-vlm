@@ -12,6 +12,7 @@ from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
 from ..kv_quant import from_legacy as kv_quant_from_legacy
+from .. import context_vault as _vault_mod
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
@@ -927,6 +928,54 @@ def stream_generate(
             elif warm_cache is None and matched_blocks:
                 apc_manager.release(matched_blocks)
 
+    # ------------------------------------------------------------------
+    # Warm Context Vault: boundary-ladder prefix reuse.
+    #
+    # apc_mode() can only offer "exact" for this stack (ArraysCache KDA state is
+    # CHECKPOINT-only, so the mixed cache is never fully block-pageable), which
+    # makes "same document, new suffix" a total miss. The vault restores the
+    # deepest stored boundary that prefixes this request and re-prefills only
+    # the tail. Off unless MLX_VLM_GLM5_VAULT=1.
+    # ------------------------------------------------------------------
+    _vault = None
+    _vault_boundaries: List[int] = []
+    if _vault_mod.vault_enabled() and pixel_values is None:
+        try:
+            _vault = _vault_mod.get_vault(_vault_mod.vault_identity_for_model(model))
+        except Exception:  # noqa: BLE001 - a vault fault must never fail a request
+            _vault = None
+    if _vault is not None and reused_prefix_len == 0:
+        try:
+            _hit = _vault.lookup(full_input_ids_list)
+        except Exception:  # noqa: BLE001
+            _hit = None
+        if _hit is not None and 0 < _hit.prefix_len < len(full_input_ids_list):
+            _fresh = cache.make_prompt_cache(
+                model.language_model, max_kv_size=kwargs.get("max_kv_size", None)
+            )
+            _restored = False
+            try:
+                _restored = _vault.restore_into(_fresh, _hit)
+            except Exception:  # noqa: BLE001
+                _restored = False
+            if _restored and _prime_cached_prefix_rope_state(
+                model, input_ids, mask, kwargs
+            ):
+                reused_prefix_len = _hit.prefix_len
+                input_ids = input_ids[:, _hit.prefix_len :]
+                kwargs["prompt_cache"] = _fresh
+                kwargs.pop("cached_image_features", None)
+    if _vault is not None:
+        # Boundaries are absolute positions in the full prompt; generate_step
+        # counts from the start of the (possibly trimmed) tail, so shift them.
+        _vault_boundaries = [
+            b - reused_prefix_len
+            for b in _vault_mod.boundary_ladder(
+                len(full_input_ids_list), step=kwargs.get("prefill_step_size")
+            )
+            if b > reused_prefix_len
+        ]
+
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
@@ -977,6 +1026,33 @@ def stream_generate(
                     prompt_cache,
                     extra_hash=apc_extra_hash,
                 )
+
+        if _vault is not None and _vault_boundaries:
+            # One hook, many boundaries: the APC exact store (if any) keeps its
+            # single rung, and every vault rung is stored on the way past it.
+            _apc_cb, _apc_len = exact_checkpoint, exact_checkpoint_len
+            _vault_rungs = set(_vault_boundaries)
+            _base = reused_prefix_len
+
+            def _vault_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
+                if _apc_cb is not None and prefix_len == _apc_len:
+                    _apc_cb(prefix_len, prompt_cache)
+                if prefix_len not in _vault_rungs:
+                    return
+                abs_len = _base + prefix_len
+                try:
+                    _vault.insert(
+                        full_input_ids_list,
+                        abs_len,
+                        _vault_mod.capture_fragments(prompt_cache, abs_len),
+                    )
+                except Exception:  # noqa: BLE001 - storing is best-effort
+                    pass
+
+            exact_checkpoint = _vault_checkpoint
+            exact_checkpoint_len = sorted(
+                _vault_rungs | ({_apc_len} if _apc_len else set())
+            )
 
         gen = generate_step(
             input_ids,
