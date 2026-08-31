@@ -197,6 +197,7 @@ def generate_step(
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[Union[int, Sequence[int]]] = None,
+    warm_prefix: bool = False,
     seed: Optional[int] = None,
     verbose: bool = False,
     **kwargs,
@@ -443,7 +444,18 @@ def generate_step(
         ladder = CheckpointLadder(checkpoint_boundaries, inputs_embeds.shape[1])
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
-        ) or bool(ladder)
+        ) or bool(ladder) or (warm_prefix and inputs_embeds.shape[1] > 1)
+        # ``warm_prefix`` marks a request resuming from an already-populated
+        # prompt cache (vault restore / APC prefix hit). Without it, a tail
+        # shorter than prefill_step_size skips the chunk loop entirely and the
+        # WHOLE tail -- final token included -- is processed by a single _step
+        # forward, while a cold prefill always splits the last token off into
+        # its own _step. The two decompositions are mathematically equal but not
+        # bit-identical: measured on GLM-5.3-Flash the KDA conv/recurrent state
+        # then diverges by up to 3e-2 in 101 of 112 cache components, and greedy
+        # decode splits from the cold reference at token 35 of 64. Forcing the
+        # loop reproduces the cold path's exact tail split (n-1 chunked, 1
+        # stepped) and restores token identity.
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]

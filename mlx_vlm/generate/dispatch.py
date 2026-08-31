@@ -1061,6 +1061,7 @@ def stream_generate(
             mask,
             prompt_cache_checkpoint=exact_checkpoint,
             prompt_cache_checkpoint_len=exact_checkpoint_len,
+            warm_prefix=reused_prefix_len > 0,
             verbose=verbose,
             **kwargs,
         )
