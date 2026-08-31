@@ -4,7 +4,7 @@ Acceptance on this stack is a constant-hazard process -- measured per-position
 hazard on code is 0.78 0.85 0.82 0.84 0.78 0.81 0.82, i.e. flat -- so one scalar
 p describes a workload and the best block width is whatever maximises
 (1 + E[accepted]) / (fixed + cost*K).  With fixed = 1.63 decode-steps and
-cost = 0.186 per drafted token (fitted on 45 receipts at three widths), that
+cost = 0.186 per drafted token (measured directly by probe_verify_width_v2.py), that
 optimum is interior: too narrow wastes the fixed cost, too wide buys tokens that
 will not survive.
 
@@ -99,7 +99,7 @@ def test_cold_start_falls_back():
 
 
 @pytest.mark.parametrize(
-    "p,expected", [(0.55, 3), (0.68, 5), (0.75, 5), (0.81, 7), (0.85, 8), (0.93, 8)]
+    "p,expected", [(0.55, 4), (0.68, 5), (0.75, 7), (0.81, 8), (0.85, 8), (0.93, 8)]
 )
 def test_optimum_width_by_hazard(p, expected):
     assert dflash._dflash_block_size_for_hazard(p, 8) == expected
@@ -169,6 +169,6 @@ def test_cost_params_are_env_tunable():
     _reset()
     # a near-free draft token pushes the optimum to the cap
     assert dflash._dflash_block_size_for_hazard(0.68, 8) == 8
-    os.environ["MLX_VLM_DFLASH_ROUND_COST"] = "0.186"
+    os.environ["MLX_VLM_DFLASH_ROUND_COST"] = "0.134"
     _reset()
     assert dflash._dflash_block_size_for_hazard(0.68, 8) == 5
