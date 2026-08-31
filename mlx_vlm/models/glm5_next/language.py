@@ -24,6 +24,7 @@ from .fused_kda import (
     fused_kda_qproj_supported,
     fused_kda_supported,
 )
+from .moe_gemm import Glm5NextTiledSwitchGLU, moe_gemm_enabled
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
 _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
@@ -931,6 +932,14 @@ class Glm5NextMoE(DeepseekV32MoE):
     # and an fp32 router.
     def __init__(self, config):
         super().__init__(config)
+        if moe_gemm_enabled(config):
+            # Same parameter names/shapes as SwitchGLU -- only the row layout handed
+            # to gather_qmm changes, and only on the sorted prefill path.
+            self.switch_mlp = Glm5NextTiledSwitchGLU(
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.n_routed_experts,
+            )
         self.switch_mlp.activation = Glm5NextClampedSwiGLU(config.swiglu_limit)
         self.gate = Glm5NextMoEGate(config)
         if config.n_shared_experts is not None:

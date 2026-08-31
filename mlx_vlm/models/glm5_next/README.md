@@ -86,6 +86,93 @@ that `rollback_speculative_cache` replays on a partial accept. Those are bit-ide
 to the eager sink too, as is the rollback state they reconstruct. The `S>1` verify
 block itself stays eager.
 
+## Prefill optimizations
+
+### Segment-aligned routed-expert GEMM (opt-in: `MLX_VLM_GLM5_MOE_GEMM=1`)
+
+`SwitchGLU` sorts the routed rows by expert and calls
+`mx.gather_qmm(x[N, 1, K], w[E, O, K], sorted_indices=True)`. On a non-`nax` GPU
+(M3/M2 Ultra) that takes `GatherQMM::eval_gpu`'s `M == 1` branch, which dispatches
+`gather_qmm_rhs` with `bm=16, bn=32, bk=32, wm=1, wn=2`. That kernel walks the
+*distinct experts inside each 16-row block* and runs a **full** `16 x 32 x K`
+block-gemm per distinct expert, storing only that expert's row slice. Every expert
+boundary that lands strictly inside a 16-row block therefore costs one extra full
+block-gemm.
+
+GLM-5.3-Flash prefill hits this hard: 288 routed experts, top-8, prefill chunk 2048
+gives 16384 sorted rows in 1024 blocks with 287 interior boundaries, i.e. ~1311
+block-gemms for 1024 blocks of useful work.
+
+Measured on M3 Ultra / mlx 0.32.0 at the real shapes
+(`x[16384, 4096] @ w[288, 2048, 4096]`, 4-bit g64 affine):
+
+| variant                                                | ms    | TFLOPS |
+| ------------------------------------------------------ | ----- | ------ |
+| sorted `gather_qmm`, random top-8 route (counts 36..78) | 16.65 | 16.5   |
+| same, every count forced to a multiple of 16            | 13.15 | 20.9   |
+| dense `quantized_matmul`, same M/N/K (`bm=32`)          | 12.18 | 22.6   |
+| bf16 `matmul`, same M/N/K                               | 11.92 | 23.1   |
+
+So the ~69%-of-dense gap reported in ml-explore/mlx#4246 is not the `bm=16` tile
+(that reaches 93% of dense on its own) -- it is the redundant boundary block-gemms.
+
+`MLX_VLM_GLM5_MOE_GEMM=1` swaps `SwitchGLU` for `Glm5NextTiledSwitchGLU`, which pads
+every expert's run of sorted rows out to a multiple of `R` (`MLX_VLM_GLM5_MOE_GEMM_ROWS`,
+default 16) with zero rows, so no block ever spans two experts. Wasted rows drop from
+~16 per boundary to `(R - c_e mod R) mod R`: 1.265x -> 1.132x. The padding is folded
+into the sort gather `SwitchGLU` already performs and the unpad into the unsort gather,
+so no extra bulk traffic is added.
+
+Whole-layer A/B at the production shape (`x[1, chunk, 4096]`, top-8, E=288, 4-bit g64,
+M3 Ultra, ms per MoE layer; chunk 2048 is three independent runs, 58.23 / 58.14 / 58.05
+stock):
+
+| chunk | rows/expert | stock  | `R=16`          | `R=32`          |
+| ----- | ----------- | ------ | --------------- | --------------- |
+| 512   | 14.2        | 23.95  | 17.92 (1.337x)  | 24.64 (0.972x)  |
+| 1024  | 28.4        | 36.37  | 29.80 (1.220x)  | 30.24 (1.203x)  |
+| 1536  | 42.7        | 46.87  | 40.78 (1.150x)  | 46.61 (1.006x)  |
+| 2048  | 56.9        | 58.28  | 52.67 (1.107x)  | 52.50 (1.110x)  |
+| 3072  | 85.3        | 80.67  | 75.13 (1.074x)  | 74.96 (1.076x)  |
+| 4096  | 113.8       | 102.90 | 97.89 (1.051x)  | 96.97 (1.061x)  |
+| 8192  | 227.6       | 192.10 | 188.41 (1.020x) | 180.92 (1.062x) |
+
+Those track `1 + 16*(E-1)/N` (stock) vs `1 + E*R/2/N` (padded) to within ~2%: the win is
+biggest where the route is thinnest. At the default chunk 2048 the routed-expert path is
+~53.7% of a 4551 ms chunk (450 tok/s), so `R=16` is ~+5% end-to-end prefill.
+
+`R=16` keeps `M == 1` and therefore the `gather_qmm_rhs` (`bm=16`) kernel; `R >= 32`
+hands mlx `x[T, R, K]`, which falls through to the general `gather_qmm` dispatch
+(`bm=32 bn=32 wm=2 wn=2`, the dense `qmm_t` tile) -- a 1.064x better tile but coarser
+padding. `MLX_VLM_GLM5_MOE_GEMM_ROWS` defaults to `auto`, which compares the two padded
+row totals (both already available from the per-expert counts, so no extra sync) and
+takes `R=32` only when its padding costs less than the 1.064x it buys back. On the seven
+measured points that rule picks the winner or a tie every time: `R=16` up to ~85
+rows/expert, `R=32` from ~114 up.
+
+**Numerics.** Only the row layout changes -- the same `BlockMMA` runs over the same
+`BK=32` K steps into the same fp32 accumulator -- so the output is **bit-identical** to
+the stock path. `mlx_vlm/tests/test_glm5_next_moe_gemm.py` pins bit-identity across 5
+seeds at both `R` values, on a hot/cold route that leaves experts empty, and pins a
+64-token greedy walk through 8 stacked MoE blocks over 5 seeds.
+
+**Scope.** Sorted/prefill only. The path declines routes with fewer than `R * E * 3/4`
+routed rows (3456 rows = 432 tokens at top-8; override with
+`MLX_VLM_GLM5_MOE_GEMM_MIN`). Below that the route is thin enough that a whole `R`-row
+tile per *active* expert costs more than the boundary passes it removes, and below
+`4 * E` rows mlx does not take the `gather_qmm_rhs` branch for the stock path at all
+(`B / E >= 4` in `GatherQMM::eval_gpu`). Measured: 0.696x at 3.6 rows/expert, 0.679x at
+7.1, 1.286x at 10.7, 1.337x at 14.2 -- the crossover is between 7.1 and 10.7 and the gate
+sits at 12 with margin. Decode and the speculative verify block are therefore untouched,
+and so is the MTP drafter's own decode step.
+
+**Related free lever.** The waste is `1 + 16*(E-1)/N`, so it shrinks as the prefill
+chunk grows. Same synthetic layer, stock kernel: 28.46 us/token/layer at chunk 2048,
+25.12 at 4096, 23.45 at 8192 (1.21x). With `R=32` at chunk 8192 it is 22.08 (1.29x
+against chunk-2048 stock). Raising `--prefill-step-size` is orthogonal to this toggle
+and composes with it; whether the rest of the stack pays for the larger chunk has to
+be measured live.
+
 ## Self-speculative decoding (MTP)
 
 GLM-5.3-Flash ships one trained nextn (MTP) layer inside the target checkpoint.

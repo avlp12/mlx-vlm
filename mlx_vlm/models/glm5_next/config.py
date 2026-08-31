@@ -68,6 +68,9 @@ class TextConfig(BaseModelConfig):
     rope_scaling: Optional[Dict] = None
     pad_token_id: int = 154820
     eos_token_id: Optional[List[int]] = None
+    # Opt-in segment-aligned routed-expert GEMM for the sorted prefill path
+    # (see moe_gemm.py).  None -> follow MLX_VLM_GLM5_MOE_GEMM; default OFF.
+    moe_prefill_gemm: Optional[bool] = None
 
     def __post_init__(self):
         if self.rope_parameters is not None:
@@ -121,6 +124,9 @@ class ModelConfig(BaseModelConfig):
     tie_word_embeddings: bool = False
     pad_token_id: int = 154820
     eos_token_id: Optional[List[int]] = None
+    # Opt-in segment-aligned routed-expert GEMM for the sorted prefill path
+    # (see moe_gemm.py).  None -> follow MLX_VLM_GLM5_MOE_GEMM; default OFF.
+    moe_prefill_gemm: Optional[bool] = None
 
     def __post_init__(self):
         if self.eos_token_id is None:

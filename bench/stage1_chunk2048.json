@@ -1,0 +1,165 @@
+{
+  "chunk": 2048,
+  "n_rows": 16384,
+  "experts": 288,
+  "hidden": 4096,
+  "inter": 2048,
+  "bits": 4,
+  "group": 64,
+  "device": "Apple M3 Ultra",
+  "rows": [
+    {
+      "name": "A  sorted gather_qmm [STOCK bm16]  balanced57",
+      "ms": 16.504650004208088,
+      "useful_tflops": 16.654573521638817,
+      "counts": "balanced57"
+    },
+    {
+      "name": "A  sorted gather_qmm [STOCK bm16]  aligned16",
+      "ms": 13.154016598127782,
+      "useful_tflops": 20.89688004370646,
+      "counts": "aligned16"
+    },
+    {
+      "name": "A  sorted gather_qmm [STOCK bm16]  realistic",
+      "ms": 16.691004199674353,
+      "useful_tflops": 16.468626072801715,
+      "counts": "realistic"
+    },
+    {
+      "name": "B  UNsorted gather_qmm (realistic)",
+      "ms": 44.65211132386079,
+      "useful_tflops": 6.1559890180850925
+    },
+    {
+      "name": "C  dense quantized_matmul [bm32] same M/N/K",
+      "ms": 12.174608401255682,
+      "useful_tflops": 22.577967018277914
+    },
+    {
+      "name": "D  tiled gather_qmm x[616,32,4096] [bm32] pad 1.203x",
+      "ms": 14.872133207973093,
+      "useful_tflops": 18.48274911877708,
+      "R": 32,
+      "tiles": 616,
+      "pad_factor": 1.203125
+    },
+    {
+      "name": "D  tiled gather_qmm x[328,64,4096] [bm32] pad 1.281x",
+      "ms": 15.824400004930794,
+      "useful_tflops": 17.370510531732616,
+      "R": 64,
+      "tiles": 328,
+      "pad_factor": 1.28125
+    },
+    {
+      "name": "E  bf16 dense matmul (compute roofline proxy)",
+      "ms": 11.923341697547585,
+      "useful_tflops": 23.053764113842128
+    }
+  ],
+  "mlx_version": "0.32.0",
+  "counts_balanced": {
+    "min": 56,
+    "max": 57,
+    "mean": 56.888888888888886,
+    "predicted_block_passes_bm16": 1280,
+    "predicted_waste_bm16": 1.25,
+    "pad_factor_R32": 1.125,
+    "pad_factor_R64": 1.125
+  },
+  "counts_aligned16": {
+    "min": 48,
+    "max": 64,
+    "mean": 56.888888888888886,
+    "predicted_block_passes_bm16": 1024,
+    "predicted_waste_bm16": 1.0,
+    "pad_factor_R32": 1.125,
+    "pad_factor_R64": 1.125
+  },
+  "counts_realistic": {
+    "min": 34,
+    "max": 77,
+    "mean": 56.888888888888886,
+    "predicted_block_passes_bm16": 1295,
+    "predicted_waste_bm16": 1.2646484375,
+    "pad_factor_R32": 1.203125,
+    "pad_factor_R64": 1.28125
+  },
+  "weight_read_gbs": 680.4227629875402,
+  "weight_bytes_per_proj": 1358954496,
+  "sweep": [
+    {
+      "rows_per_expert": 8,
+      "ms": 4.066625004634261,
+      "tflops": 9.505352871226071,
+      "predicted_waste": 2.0
+    },
+    {
+      "rows_per_expert": 16,
+      "ms": 3.997008199803531,
+      "tflops": 19.341819546880107,
+      "predicted_waste": 1.0
+    },
+    {
+      "rows_per_expert": 24,
+      "ms": 7.84617499448359,
+      "tflops": 14.779700564100455,
+      "predicted_waste": 1.3333333333333333
+    },
+    {
+      "rows_per_expert": 32,
+      "ms": 7.597024994902313,
+      "tflops": 20.35254889377762,
+      "predicted_waste": 1.0
+    },
+    {
+      "rows_per_expert": 48,
+      "ms": 11.234391597099602,
+      "tflops": 20.644485460510136,
+      "predicted_waste": 1.0
+    },
+    {
+      "rows_per_expert": 57,
+      "ms": 16.724258405156434,
+      "tflops": 16.467981490353193,
+      "predicted_waste": 1.263157894736842
+    },
+    {
+      "rows_per_expert": 64,
+      "ms": 14.775866596028209,
+      "tflops": 20.92856234876429,
+      "predicted_waste": 1.0
+    },
+    {
+      "rows_per_expert": 96,
+      "ms": 22.005716804414988,
+      "tflops": 21.078907453491215,
+      "predicted_waste": 1.0
+    },
+    {
+      "rows_per_expert": 128,
+      "ms": 30.276041594333947,
+      "tflops": 20.427878218391186,
+      "predicted_waste": 1.0
+    },
+    {
+      "rows_per_expert": 256,
+      "ms": 63.10605820035561,
+      "tflops": 19.601138409260198,
+      "predicted_waste": 1.0
+    }
+  ],
+  "switchglu_layer_ms": 68.58984159771353,
+  "switchglu_layer_tflops": 12.022680059075826,
+  "projection": {
+    "chunk_wall_ms_at_baseline": 4551.111111111111,
+    "stock_moe_ms_per_chunk_42L": 2880.7733471039683,
+    "stock_moe_share_of_prefill": 0.6329824249007743,
+    "dense_ceiling_ms_per_chunk_42L": 1534.0006585582157,
+    "dense_ceiling_recoverable_pct_e2e": 29.592173332304135,
+    "tiled_best": "tiled32",
+    "tiled_ms_per_chunk_42L": 1873.8887842046097,
+    "tiled_recoverable_pct_e2e": 22.12392838401911
+  }
+}
