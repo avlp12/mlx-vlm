@@ -460,7 +460,17 @@ def worker_loop(model_path: str, hosts: List[str], rank: int) -> None:
 def main():
     import argparse
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+                        format="%(asctime)s %(levelname)s rank%(rank)s %(message)s"
+                        .replace("%(rank)s", str(tp_rank())),
+                        force=True)
+    # Belt and braces with the launcher's -u: a peer whose last words are lost
+    # is a peer that cannot be diagnosed at all.
+    for h in logging.getLogger().handlers:
+        try:
+            h.setStream(getattr(h, "stream", None)) if False else None
+            h.flush()
+        except Exception:
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     a = ap.parse_args()

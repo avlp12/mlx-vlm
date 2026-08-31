@@ -166,6 +166,36 @@ class _Watchdog:
         os._exit(75)  # EX_TEMPFAIL
 
 
+# Keyword arguments rank 0 may consume alone, with the reason each one is safe.
+# Everything else is refused BY NAME, because the mirror hands rank 1 nothing but
+# token ids: an argument that changes the computation and is not on this list
+# makes the two ranks run different forwards, and two different forwards issue
+# different numbers of collectives.  That does not surface as a wrong answer --
+# it surfaces as the *next* collective pairing a send with the wrong recv, i.e.
+# a jaccl error or a hang, a long way from the cause.
+_RANK0_ONLY_KWARGS = {
+    # Verified per call to equal embed_tokens(inputs); rank 1 rebuilds it.
+    "inputs_embeds": "verified equal to embed_tokens(inputs)",
+    # Mirrored as FLAG_CAPTURE; the ids belong to the rank-0-only drafter.
+    "capture_layer_ids": "mirrored as a flag",
+    # glm5_next's LanguageModel.__call__ pops and ignores it.
+    "speculative_verify": "popped and ignored by the model",
+    # Accepted by LanguageModel.__call__ and never forwarded to the stack
+    # (models/glm5_next/language.py builds self.model(...) without it).
+    "mask": "accepted and ignored by glm5_next",
+    # Read by the prefill driver, never by the model.
+    "n_to_process": "not read by the model",
+    # Slice the lm_head output only; lm_head is replicated, no collective.
+    "num_logits_to_keep": "slices replicated lm_head output",
+    "logits_to_keep": "slices replicated lm_head output",
+    # Append to a sink; never read back into the residual.
+    "return_hidden": "appends to a sink, numerically inert",
+    "return_shared_kv": "appends to a sink, numerically inert",
+    # Skips the replicated lm_head; no collective either way.
+    "skip_logits": "skips the replicated lm_head",
+}
+
+
 class MirroredLanguageModel:
     """Rank-0 wrapper: announce each forward, then run it locally.
 
@@ -276,12 +306,26 @@ class MirroredLanguageModel:
         # capture too (flag, not the id list: the drafter lives on rank 0) so
         # that its KDA layers stash the block inputs its own rollback needs.
         capture = kw.get("capture_layer_ids") is not None
+        unknown = [k for k, v in kw.items()
+                   if v is not None and k not in _RANK0_ONLY_KWARGS]
+        if unknown:
+            raise TPDesync(
+                f"TP mode was handed forward kwargs it does not mirror: "
+                f"{sorted(unknown)}. Rank 1 receives token ids and nothing "
+                f"else, so an argument that changes the computation makes the "
+                f"two ranks run different forwards -- which shows up as a "
+                f"mispaired collective (a jaccl error or a hang) rather than a "
+                f"wrong answer. Add it to _RANK0_ONLY_KWARGS with the reason it "
+                f"is inert, give it a control verb, or keep this path "
+                f"single-box.")
         with self._lock:
             self._ensure_epoch(cache)
             self._announce(OP_FORWARD, inputs,
                            flags=FLAG_CAPTURE if capture else 0,
                            label=f"forward b={getattr(inputs, 'shape', ('?',))[0]}")
-            return self._lm(inputs, cache=cache, **kw)
+            out = self._lm(inputs, cache=cache, **kw)
+            _force_same_graph(out)
+            return out
 
     def _ensure_epoch(self, cache) -> None:
         """Announce a fresh cache if this is one rank 1 has not been told about."""
@@ -407,6 +451,39 @@ class MirroredLanguageModel:
                 self._atexit_hook = None
 
 
+def _force_same_graph(out) -> None:
+    """Evaluate the forward here, because laziness is rank-local and
+    collectives are not.
+
+    MLX only executes the ops an evaluated output depends on.  During a chunked
+    prefill the caller *discards* the model's return value and evaluates only
+    the caches (generate/ar.py: ``model.language_model(...)`` with no
+    assignment, then ``mx.eval([c.state for c in prompt_cache])``).  The last
+    decoder layer's MLP output feeds nothing else, so its ``all_sum`` has no
+    evaluated consumer and rank 0 simply never runs it -- while rank 1, which
+    evaluates its logits, runs all 101.
+
+    One collective out of phase does not produce a wrong answer.  It produces a
+    *later* recv paired with a send of the wrong size: observed live as
+    ``[jaccl] Recv failed with error code -12`` raised from inside the DSA
+    indexer, several layers away from the reduce that went missing.  A short
+    prompt hides it completely, which is why every TP validation up to this
+    point passed: they were all one chunk long, and a one-chunk prefill ends in
+    a sampled token, so the logits were evaluated after all.
+
+    Forcing evaluation here makes rank 0's executed graph equal to rank 1's by
+    construction, for every caller, rather than for the callers we happened to
+    test.
+    """
+    import mlx.core as mx
+
+    logits = getattr(out, "logits", None)
+    if logits is not None:
+        mx.eval(logits)
+    elif isinstance(out, mx.array):
+        mx.eval(out)
+
+
 def _accepted_list(accepted) -> List[int]:
     if isinstance(accepted, int):
         return [int(accepted)]
@@ -426,8 +503,14 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
         f"{ENV_HOSTS}='{','.join(hosts)}' {ENV_RANK}=1 "
         f"MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD={_max_tok()} "
         f"MLX_VLM_GLM5_VAULT={os.environ.get('MLX_VLM_GLM5_VAULT', '')} "
-        f"nohup {py} -m mlx_vlm.tp.worker --model {remote_model} "
-        f"> ~/tp_worker.log 2>&1 &"
+        # -u: the worker's log is a redirected file, so Python block-buffers
+        # it and a SIGTERM discards everything not yet flushed.  Observed
+        # 2026-08-31: rank 0 hung on its first control send, rank 1 was alive
+        # and had written a completely empty log, leaving no way to tell what
+        # rank 1 was doing.  A mirror whose peer cannot be observed is a mirror
+        # that can only be debugged by guessing.
+        f"nohup {py} -u -m mlx_vlm.tp.worker --model {remote_model} "
+        f">> ~/tp_worker.log 2>&1 &"
     )
     cmd = ["ssh", "-o", "BatchMode=yes", f"m3ms@{host}", inner]
     logger.info("tp: launching rank1 on %s", host)
