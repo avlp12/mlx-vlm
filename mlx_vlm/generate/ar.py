@@ -398,6 +398,11 @@ def generate_step(
 
             return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
 
+    # Chunked prefill trims ``input_ids`` down to its last token below; the
+    # prompt-lookup drafter needs the whole prompt to build its n-gram index, so
+    # snapshot it before that happens.
+    full_prompt_ids = input_ids
+
     with mx.stream(generation_stream):
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
@@ -500,6 +505,7 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
+            prompt_tokens=full_prompt_ids,
         )
         return
 

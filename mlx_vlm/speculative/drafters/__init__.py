@@ -6,9 +6,14 @@ from .dflash2 import DFlash2DraftModel
 from .dspark import DSparkDraftModel
 from .laguna_dflash import LagunaDFlashDraftModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
+from .prompt_lookup import PromptLookupConfig, PromptLookupDraftModel
 from .qwen3_dflash import DFlashDraftModel
 
-KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
+KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3", "lookup"}
+
+# The lookup drafter has no checkpoint.  ``load_drafter`` accepts this in
+# place of a path so callers that already take --draft-model keep working.
+LOOKUP_SENTINELS = {"lookup", "prompt-lookup", "prompt_lookup", "none", ""}
 
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
@@ -24,6 +29,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "qwen3_5_mtp": "mtp",
     "laguna": "dflash",
     "muse_glimmer_assistant": "dflash",
+    "prompt_lookup": "lookup",
 }
 
 DEFAULT_DRAFTER_KIND = "dflash"
@@ -168,11 +174,20 @@ def load_drafter(
         raise ValueError(
             f"Unknown drafter kind {kind!r}. Known: {sorted(KNOWN_DRAFTER_KINDS)}"
         )
+    if kind == "lookup" or str(path_or_repo).strip().lower() in LOOKUP_SENTINELS:
+        # Weight-free: nothing to fetch, nothing to load onto the GPU.
+        return make_lookup_drafter(), "lookup"
     from ...utils import get_model_path, load_model
 
     path = get_model_path(path_or_repo)
     resolved = resolve_drafter_kind(path, kind)
     return load_model(path, **kwargs), resolved
+
+
+def make_lookup_drafter(config: Optional[PromptLookupConfig] = None):
+    """Build the weight-free prompt-lookup drafter, configured from the
+    environment unless a config is supplied."""
+    return PromptLookupDraftModel(config or PromptLookupConfig.from_env())
 
 
 __all__ = [
@@ -184,7 +199,11 @@ __all__ = [
     "DSparkDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",
+    "LOOKUP_SENTINELS",
+    "PromptLookupConfig",
+    "PromptLookupDraftModel",
     "load_drafter",
+    "make_lookup_drafter",
     "resolve_drafter_kind",
     "validate_drafter_compatibility",
 ]

@@ -20,6 +20,7 @@ from .dflash import (
     _dflash_rounds_batch,
 )
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
+from .lookup import _lookup_rounds, _lookup_rounds_batch
 from .mtp import (
     _buffer_mtp_target_cache,
     _effective_mtp_block_size,
@@ -44,6 +45,8 @@ __all__ = [
     "_dflash_rounds_batch",
     "_effective_mtp_block_size",
     "_format_speculative_stats",
+    "_lookup_rounds",
+    "_lookup_rounds_batch",
     "_mtp_draft_block_active",
     "_mtp_draft_hidden",
     "_mtp_next_block_size",
@@ -81,6 +84,8 @@ def _validate_speculative_sampling(draft_model: nn.Module, greedy: bool) -> None
 
 
 def get_speculative_rounds_batch(draft_kind: str):
+    if draft_kind == "lookup":
+        return _lookup_rounds_batch
     if draft_kind == "eagle3":
         return _eagle3_rounds_batch
     if draft_kind == "mtp":
@@ -88,11 +93,15 @@ def get_speculative_rounds_batch(draft_kind: str):
     if draft_kind == "dflash":
         return _dflash_rounds_batch
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'lookup', 'mtp']"
     )
 
 
 def speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
+    if draft_kind == "lookup":
+        # Nothing to capture: the drafter reads token ids.  Prefill therefore
+        # runs exactly as it does with no drafter attached.
+        return {}
     if draft_kind == "mtp":
         return {"return_hidden": True, "return_shared_kv": True}
     if draft_kind == "eagle3":
@@ -100,17 +109,19 @@ def speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
     if draft_kind == "dflash":
         return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'lookup', 'mtp']"
     )
 
 
 def speculative_hidden_state(draft_kind: str, outputs):
+    if draft_kind == "lookup":
+        return None
     if draft_kind == "mtp":
         return outputs.hidden_states[-1]
     if draft_kind in ("dflash", "eagle3"):
         return mx.concatenate(outputs.hidden_states, axis=-1)
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'lookup', 'mtp']"
     )
 
 
@@ -148,6 +159,26 @@ def run_speculative_server_rounds(
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
+
+    if draft_kind == "lookup":
+        if batch_size != 1:
+            _lookup_rounds_batch()
+        for tok, state in _lookup_rounds(
+            model,
+            draft_model,
+            prompt_cache,
+            prompt_tokens=prompt_tokens,
+            first_bonus=int(first_bonus.reshape(-1).item()),
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=token_dtype,
+            greedy_sampling=greedy_sampling,
+        ):
+            yield [tok], state
+            if stop_check is not None and stop_check(0, tok):
+                return
+        return
 
     if draft_kind == "eagle3":
         if batch_size == 1:
@@ -241,7 +272,7 @@ def run_speculative_server_rounds(
         return
 
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'lookup', 'mtp']"
     )
 
 
@@ -259,9 +290,33 @@ def run_speculative_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
+    prompt_tokens: Optional[mx.array] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
+
+    if draft_kind == "lookup":
+        if B != 1:
+            _lookup_rounds_batch()
+        mx.eval(first_token)
+        bonus = first_token.item()
+        yield bonus, logprobs
+        # ``input_ids`` has been trimmed to its tail when prefill chunked, so the
+        # caller passes the untrimmed prompt separately; fall back to input_ids
+        # for callers that do not.
+        yield from _lookup_rounds(
+            model,
+            draft_model,
+            prompt_cache,
+            prompt_tokens=prompt_tokens if prompt_tokens is not None else input_ids,
+            first_bonus=bonus,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=input_ids.dtype,
+            greedy_sampling=sampler_is_greedy,
+        )
+        return
 
     if draft_kind == "mtp":
         shared_kv_states = last_outputs.shared_kv_states
@@ -362,7 +417,7 @@ def run_speculative_rounds(
 
     if draft_kind != "dflash":
         raise ValueError(
-            f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+            f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'lookup', 'mtp']"
         )
 
     hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
