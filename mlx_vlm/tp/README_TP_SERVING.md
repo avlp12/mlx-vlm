@@ -113,6 +113,16 @@ from the other rank — and the shapes match either way, so the check is on
 provenance: `VaultCheckpoint.origin` is stamped at insert and compared at
 restore. A mismatch logs both identities and falls back to a cold prefill.
 
+**What a restore does not carry.** `KVCacheCloneAdapter.clone` copies exactly
+`keys`, `values` and `offset`. The DSA layer's cache is
+`CacheList(KVCache, KVCache)` whose second entry is the indexer cache, carrying
+`_pool`, `_fpool` and `_no_pad` — derived state the model sets during a forward.
+None of it survives. Tested (`tests/test_vault_indexer_state.py`): the pool is
+rebuilt from the restored keys and **a restored cache selects the same KV blocks
+as a live one**, so this costs time on the first post-restore forward, not
+agreement. `_no_pad` is read with `getattr(..., False)`, so a restored cache
+takes the slow visibility path until it is recomputed.
+
 **The ack exists because the two stores evict independently.** "Rank 0 holds the
 rung" does not imply "rank 1 holds it". Rank 1 restores first and answers over a
 roles-swapped `all_sum`; on a miss rank 0 discards its own restore and both ranks
@@ -159,6 +169,28 @@ Every heavy-run driver should call it:
 
 `maybe_load_tp` calls `require_quiet_fleet` itself before launching the worker.
 
+## Operating cost: wired memory, and why abrupt kills used to age the box
+
+A worker that is killed rather than asked to exit **leaks its entire shard as
+wired memory that survives the process**. Measured 2026-09-01 on the peer:
+wired 206.3 GB / free 112.0 GB before a bare SIGTERM of a worker holding an
+85.5 GiB shard, wired 305.6 GB / free 9.5 GB after. The box could not take
+another load, and only a reboot reclaimed it.
+
+The cause is ordinary: Python's default SIGTERM disposition terminates without
+unwinding, so `wired_limit.__exit__` never runs and the shard is never dropped.
+The clean path — rank 0 announces `OP_EXIT`, the loop returns, the `finally`
+runs — releases fully (the same box sat at 7.1 GB wired after a clean cycle).
+The worker now installs SIGTERM/SIGINT/SIGHUP handlers that raise `SystemExit`
+so the signal path *is* the clean path; verified live, a bare SIGTERM of a real
+materialized shard returned 86.1 GB.
+
+This is the whole explanation for the campaign's memory history: the freeze, the
+95% swap incident, and 449 GB of wired held by no visible process were all
+workers that got a signal instead of a verb. **Prefer `OP_EXIT` / `/unload`
+anyway** — the handler cannot run while the process is blocked inside a
+collective, so a genuinely wedged rank still costs a reboot.
+
 ## Fault behaviour
 
 A dead peer leaves the fast fence's GPU kernel spinning on a shared counter, and
@@ -198,6 +230,14 @@ Spread within each arm is ≤0.5%.
   Serve a fixed batch, or `MLX_VLM_MAX_NUM_SEQS=1`. Making this work means
   announcing batch composition — a real design, and a much larger protocol.
 * **Multimodal prefill.**
+* **Vault restore, live.** The protocol works end to end — rank 1 stores under
+  the announced name, restores it, and re-prefills only the tail (observed:
+  `VAULT_STORE name=874732f45a45`, then `VAULT_RESTORE`, then a forward of
+  `s=1678` for a 5774-token prompt restored at 4096). But the first forward
+  *after* a restore stalled indefinitely on 2026-09-01 and the cause is not
+  known. Ruled out: dropped indexer pool state (a restored cache selects the
+  same blocks), and unmirrored forward kwargs (the whitelist would name them).
+  Do not enable `MLX_VLM_GLM5_VAULT` under TP until this is understood.
 
 ## Long-context checklist
 
