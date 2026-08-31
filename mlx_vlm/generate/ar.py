@@ -447,6 +447,19 @@ def generate_step(
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
             processed_tokens = 0
+            # Optional two-box layer-pipelined prefill: stage A runs layers
+            # [0, split) here while stage B runs the rest on a peer box, one
+            # chunk behind. Only the boundary activation crosses; stage B's
+            # caches come back once at the end so decode stays single-box.
+            # Disabled when an APC checkpoint is requested (the checkpoint
+            # would capture a half-populated cache).
+            pipeline = None
+            if checkpoint_len is None:
+                from ..pipeline_runtime import maybe_open_pipeline
+
+                pipeline = maybe_open_pipeline(model, total_tokens, verbose=verbose)
+                if pipeline is not None:
+                    pipeline.begin(total_tokens, prefill_step_size)
             with tqdm(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
             ) as pbar:
@@ -462,15 +475,25 @@ def generate_step(
                     chunk_kwargs = kwargs
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**kwargs, "logits_to_keep": 1}
-                    model.language_model(
-                        inputs=input_ids[:, :n_to_process],
-                        inputs_embeds=inputs_embeds[:, :n_to_process],
-                        cache=prompt_cache,
-                        n_to_process=n_to_process,
-                        **chunk_kwargs,
-                    )
-                    quantize_cache_fn(prompt_cache)
-                    mx.eval([c.state for c in prompt_cache])
+                    if pipeline is not None:
+                        pipeline.prefill_chunk(
+                            model,
+                            input_ids[:, :n_to_process],
+                            inputs_embeds[:, :n_to_process],
+                            prompt_cache,
+                        )
+                        # only stage A's caches exist on this box until finalize
+                        mx.eval([c.state for c in pipeline.local_caches(prompt_cache)])
+                    else:
+                        model.language_model(
+                            inputs=input_ids[:, :n_to_process],
+                            inputs_embeds=inputs_embeds[:, :n_to_process],
+                            cache=prompt_cache,
+                            n_to_process=n_to_process,
+                            **chunk_kwargs,
+                        )
+                        quantize_cache_fn(prompt_cache)
+                        mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
                     if (
                         checkpoint_len is not None
@@ -483,6 +506,13 @@ def generate_step(
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
                     pbar.update(n_to_process)
+
+            if pipeline is not None:
+                # pull stage B's KDA/DSA caches back and install them, so the
+                # last token and all of decode run locally over the full stack
+                pipeline.finalize(prompt_cache)
+                quantize_cache_fn(prompt_cache)
+                pipeline.close()
 
             input_ids = input_ids[:, -1:]
 

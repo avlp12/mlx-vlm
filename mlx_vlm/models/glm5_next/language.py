@@ -1499,6 +1499,67 @@ class Glm5NextModel(nn.Module):
             hidden_sink.append(h)  # pre-final-norm hidden for the nextn drafter
         return self.norm(h)
 
+    # ---------------------------------------------------------------- pipeline
+    # Two-box layer-pipelined prefill splits this stack at a layer boundary and
+    # runs the halves on different machines. The tensor that crosses is the
+    # mHC-expanded hidden -- (B, S, hc_mult, D), i.e. hc_mult times a plain
+    # residual stream -- because the streams are only collapsed after the last
+    # layer, above. KDA recurrent state and DSA latent/indexer KV are per-layer,
+    # so each half keeps its own caches and nothing else crosses.
+
+    def pipeline_forward(
+        self,
+        h: Optional[mx.array],
+        cache,
+        lo: int,
+        hi: int,
+        inputs: Optional[mx.array] = None,
+        inputs_embeds: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Run decoder layers [lo, hi) over one prefill chunk.
+
+        ``lo == 0``: embed ``inputs``/``inputs_embeds`` and broadcast the mHC
+        streams.  Otherwise ``h`` is the boundary tensor from the previous
+        stage and is consumed as-is.  Returns the boundary tensor after layer
+        ``hi - 1``; call :meth:`pipeline_finish` on the last stage.
+
+        Masks depend only on (chunk length, cache offset) and offsets are equal
+        for every layer of a kind, so any local layer of that kind supplies the
+        mask -- a stage does not need the other half's caches to build one.
+        """
+        if lo == 0:
+            h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+
+        local = range(lo, hi)
+        ssm_i = next((i for i in local if self.layers[i].is_linear), None)
+        fa_i = next((i for i in local if not self.layers[i].is_linear), None)
+        fa_cache = cache[fa_i] if fa_i is not None else None
+        fa_mask = (
+            create_attention_mask(
+                h, fa_cache[0] if fa_cache else None, return_array=True
+            )
+            if fa_i is not None
+            else None
+        )
+        ssm_mask = create_ssm_mask(h, cache[ssm_i]) if ssm_i is not None else None
+
+        if lo == 0:
+            h = mx.broadcast_to(
+                h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[2])
+            )
+            h = mx.contiguous(h)
+
+        for i in local:
+            layer = self.layers[i]
+            h = layer(
+                h, mask=ssm_mask if layer.is_linear else fa_mask, cache=cache[i]
+            )
+        return h
+
+    def pipeline_finish(self, h: mx.array) -> mx.array:
+        """Collapse the mHC streams and apply the final norm (last stage only)."""
+        return self.norm(h.mean(axis=2))
+
 
 class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig, config: ModelConfig = None):
@@ -1558,6 +1619,18 @@ class LanguageModel(nn.Module):
             gdn_states=gdn_sink,
             shared_kv_states={} if return_shared_kv else None,
         )
+
+    def pipeline_prefill_head(
+        self, inputs=None, inputs_embeds=None, cache=None, split: int = 0
+    ) -> mx.array:
+        """Stage-A half of a pipelined prefill chunk -> the boundary tensor."""
+        return self.model.pipeline_forward(
+            None, cache, 0, split, inputs=inputs, inputs_embeds=inputs_embeds
+        )
+
+    @property
+    def pipeline_num_layers(self) -> int:
+        return len(self.model.layers)
 
     def _logits(self, normed_hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
