@@ -41,17 +41,24 @@ def _adaptive_k_enabled() -> bool:
 def _round_cost_params():
     """Round cost in units of one plain decode step: ``fixed + cost * K``.
 
-    Fitted on 45 receipts across three independent block widths (DFlash2 block
-    8 -> 99.6 ms, DFlash2 block 5 -> 81.3 ms, MTP block 2 -> 61.5 ms, against a
-    34.1 ms decode step): fixed = 1.63 decode-steps, cost = 0.186 per drafted
-    token.  These are properties of the target and the box, not of the drafter,
-    so they are env-tunable and should be refitted when the serving stack
-    changes (probe_verify_width_v2.py + the round-model fit).
+    Measured directly (probe_verify_width_v2.py, wired_limit + mx.eval +
+    mx.synchronize, cache restored between reps): a verify forward costs
+    44.7 + 4.75*L ms for L >= 2, against a 35.5 ms serving decode step.  With
+    the block-8 round at 99.6 ms that is fixed = 1.87 decode-steps and
+    cost = 0.134 per drafted token.
+
+    The marginal cost is high because GLM-5.3-Flash is a 288-expert MoE: eight
+    tokens route to ~58 distinct experts instead of 8, so widening the verify
+    multiplies FFN weight traffic.  On a dense model verify width would be
+    nearly free and the optimum would be much wider; here it is not.
+
+    Both constants belong to the target and the box, not to the drafter, so
+    they are env-tunable and must be refitted when the serving stack changes.
     """
     global _ROUND_FIXED, _ROUND_COST
     if _ROUND_FIXED is None:
-        _ROUND_FIXED = float(os.environ.get("MLX_VLM_DFLASH_ROUND_FIXED", 1.63))
-        _ROUND_COST = float(os.environ.get("MLX_VLM_DFLASH_ROUND_COST", 0.186))
+        _ROUND_FIXED = float(os.environ.get("MLX_VLM_DFLASH_ROUND_FIXED", 1.87))
+        _ROUND_COST = float(os.environ.get("MLX_VLM_DFLASH_ROUND_COST", 0.134))
     return _ROUND_FIXED, _ROUND_COST
 
 

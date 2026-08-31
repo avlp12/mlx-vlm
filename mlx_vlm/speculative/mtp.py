@@ -1,3 +1,4 @@
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
@@ -445,6 +446,24 @@ def _slice_shared_kv_after_reject(shared_kv_states: dict, rejected: int) -> dict
     return next_shared_kv
 
 
+_MTP_NO_PAUSE = None
+
+
+def _mtp_pause_disabled() -> bool:
+    """MLX_VLM_MTP_NO_PAUSE=1 -- keep the adaptive pause controller out of the
+    way.  It exists so an MTP round is never slower than plain decoding, which
+    is right for serving but makes the drafter unmeasurable: on a workload it
+    dislikes it asks for empty blocks, so a requested rollout depth never
+    actually runs and every depth reports the same numbers.  Measurement only.
+    """
+    global _MTP_NO_PAUSE
+    if _MTP_NO_PAUSE is None:
+        _MTP_NO_PAUSE = os.environ.get("MLX_VLM_MTP_NO_PAUSE", "0").lower() in (
+            "1", "true", "yes", "on"
+        )
+    return _MTP_NO_PAUSE
+
+
 def _effective_mtp_block_size(
     requested_block_total: int,
     configured_block_total: int,
@@ -712,7 +731,7 @@ def _mtp_rounds(
 
     pause_ctl = (
         _AdaptivePauseController(configured_block_total)
-        if getattr(draft_model, "adaptive_pause", False)
+        if getattr(draft_model, "adaptive_pause", False) and not _mtp_pause_disabled()
         else None
     )
 
@@ -1018,7 +1037,7 @@ def _mtp_rounds_batch(
 
     pause_ctl = (
         _AdaptivePauseController(configured_block_total)
-        if getattr(draft_model, "adaptive_pause", False)
+        if getattr(draft_model, "adaptive_pause", False) and not _mtp_pause_disabled()
         else None
     )
 
