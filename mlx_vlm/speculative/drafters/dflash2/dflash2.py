@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable, Mapping
 
 import mlx.core as mx
@@ -6,6 +7,36 @@ import mlx.nn as nn
 from ..compatibility import validate_dflash_target
 from ..qwen3_dflash.dflash import DFlashDecoderLayer, DFlashDraftModel
 from .config import DFlash2Config
+
+_COMPILE_ENV = None
+
+
+def _compile_enabled() -> bool:
+    """MLX_VLM_DFLASH_COMPILE=1 -- fuse the drafter's small-op chains.
+
+    A DFlash2 draft block is launch-bound, not bandwidth-bound: five layers of
+    ~1.2 GB of q8 weights is ~2 ms of traffic, but the round spends several ms
+    more in dispatch, most of it in two Python loops -- the two-offset
+    _grouped_dynamic_convolve (four calls per layer, twenty per block) and the
+    selector's per-position edge scoring.
+
+    Off by default.  mx.compile is known on this model family to silently bake
+    cache offsets into a trace, so only regions that are provably pure with
+    respect to cache state are compiled here: the conv/norm halves around
+    self_attn, and the selector step.  self_attn (which reads and writes the KV
+    cache) and the MLP (whose silu carries a sigmoid, and JIT'd Metal swaps the
+    precise exp for the fast approximation) are both deliberately left outside
+    the boundary so the fused path stays bit-identical.
+    """
+    global _COMPILE_ENV
+    if _COMPILE_ENV is None:
+        _COMPILE_ENV = os.environ.get("MLX_VLM_DFLASH_COMPILE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    return _COMPILE_ENV
 
 
 def _grouped_dynamic_convolve(
@@ -71,16 +102,52 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         self.mlp_conv = GroupedDynamicCausalConv(
             config.hidden_size, config.conv_kernel_size, config.conv_group_size
         )
+        self._fused = None
+
+    # The four cache-free halves of the layer.  Each is a norm plus a projection
+    # plus a two-offset dynamic convolution -- a dozen tiny dispatches that fuse
+    # into one.  None of them reads or writes the KV cache, and none of them
+    # contains an exp, a sigmoid or an RNG.
+    def _pre_attn(self, x):
+        return self.attention_conv.prepare(self.input_layernorm(x))
+
+    def _post_attn(self, residual, attn_out, kernel):
+        return residual + self.attention_conv.finish(attn_out, kernel)
+
+    def _pre_mlp(self, x):
+        return self.mlp_conv.prepare(self.post_attention_layernorm(x))
+
+    def _post_mlp(self, residual, mlp_out, kernel):
+        return residual + self.mlp_conv.finish(mlp_out, kernel)
+
+    def _halves(self):
+        if not _compile_enabled():
+            return self._pre_attn, self._post_attn, self._pre_mlp, self._post_mlp
+        if self._fused is None:
+            # mx.compile keeps a per-shape cache, so the handful of live block
+            # sizes (block_size, the adaptive floor, and 1 on the bonus step)
+            # each trace once.
+            self._fused = (
+                mx.compile(self._pre_attn),
+                mx.compile(self._post_attn),
+                mx.compile(self._pre_mlp),
+                mx.compile(self._post_mlp),
+            )
+        return self._fused
 
     def __call__(self, x, x_ctx, rope, cache):
+        pre_attn, post_attn, pre_mlp, post_mlp = self._halves()
         residual = x
-        x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
-        x = residual + self.attention_conv.finish(
-            self.self_attn(x, x_ctx, rope, cache), kernel
-        )
+        x, kernel = pre_attn(x)
+        # self_attn stays eager: it carries the rotating KV cache, and a trace
+        # would freeze cache.offset.
+        x = post_attn(residual, self.self_attn(x, x_ctx, rope, cache), kernel)
         residual = x
-        x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
-        return residual + self.mlp_conv.finish(self.mlp(x), kernel)
+        x, kernel = pre_mlp(x)
+        # self.mlp stays eager: swiglu -> nn.silu -> sigmoid -> exp, and JIT'd
+        # Metal uses the fast exp approximation where the prebuilt path uses the
+        # precise one.  Keeping it out is what makes the fused path bit-identical.
+        return post_mlp(residual, self.mlp(x), kernel)
 
 
 class CandidateSelector(nn.Module):
@@ -94,6 +161,24 @@ class CandidateSelector(nn.Module):
         self.hidden_projection = nn.Linear(
             config.hidden_size, config.selector_rank, bias=False
         )
+        self._fused_step = None
+
+    def _scores(self, predecessor, hidden_pos, candidates_pos, unary_pos):
+        edges = mx.sum(
+            self.predecessor_codebook(predecessor)[:, None]
+            * hidden_pos[:, None]
+            * self.successor_codebook(candidates_pos),
+            axis=-1,
+        )
+        return unary_pos + edges
+
+    def _greedy_step(self, predecessor, hidden_pos, candidates_pos, unary_pos):
+        """One position of the Viterbi walk, greedy.  Two codebook gathers, a
+        three-way product, a reduction, an argmax and a gather -- six dispatches
+        that fuse into one.  Pure: no cache, no exp, no RNG."""
+        scores = self._scores(predecessor, hidden_pos, candidates_pos, unary_pos)
+        selected = mx.argmax(scores, axis=-1).reshape(-1)
+        return mx.take_along_axis(candidates_pos, selected[:, None], axis=-1)[:, 0]
 
     def select(
         self,
@@ -108,14 +193,28 @@ class CandidateSelector(nn.Module):
         predecessor = anchor_ids.reshape(-1)
         path = []
         sample_proposal = getattr(sampler, "sample_proposal", None)
+        # Only the greedy walk is fused.  A caller-supplied sample_proposal is an
+        # opaque callable that may draw randomness, and mx.compile freezes an RNG
+        # key into the trace, so that path stays eager.
+        step = None
+        if _compile_enabled() and not callable(sample_proposal):
+            if self._fused_step is None:
+                self._fused_step = mx.compile(self._greedy_step)
+            step = self._fused_step
         for position in range(hidden.shape[1]):
-            edges = mx.sum(
-                self.predecessor_codebook(predecessor)[:, None]
-                * hidden[:, position, None]
-                * self.successor_codebook(candidates[:, position]),
-                axis=-1,
+            if step is not None:
+                predecessor = step(
+                    predecessor,
+                    hidden[:, position],
+                    candidates[:, position],
+                    unary[:, position],
+                )
+                path.append(predecessor)
+                continue
+            scores = self._scores(
+                predecessor, hidden[:, position], candidates[:, position],
+                unary[:, position],
             )
-            scores = unary[:, position] + edges
             selected = (
                 sample_proposal(scores)
                 if callable(sample_proposal)
