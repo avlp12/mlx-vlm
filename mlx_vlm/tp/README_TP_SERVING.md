@@ -135,11 +135,22 @@ power cycle. Both halves of that are now closed:
   the mirror, and through it every weight tensor, for the life of the
   interpreter — defeating every unload the server performs.
 * **The next load refuses to start until the box is quiet.**
-  `mlx_vlm.tp.fleet` is the shared preflight, the same rule the EAGLE-3 bulk
-  wrapper already used (`refuse while any python RSS > 20 GB`), made reusable,
-  extended to the peer box, and made to return a receipt so "the guard ran and
-  found the fleet quiet" is distinguishable from "nobody called the guard". It
-  refuses rather than assumes when a box cannot be inspected.
+  `mlx_vlm.tp.fleet` is the shared preflight: refuse (or queue) while any
+  process on either box holds more than 20 GB, returning a receipt so "the
+  guard ran and found the fleet quiet" is distinguishable from "nobody called
+  the guard", and refusing rather than assuming when a box cannot be inspected.
+
+  **It does not use RSS, and the reason matters.** The EAGLE-3 bulk wrapper's
+  guard is `ps -A -o rss,command | awk '$1>20000000 && /[Pp]ython/`, and that
+  cannot fire: measured, 8 GiB of live `mx.array` moves a process's RSS by
+  0.01 GB, and a loaded 85.5 GiB shard reports about 3 GB. MLX allocates Metal
+  buffers and macOS does not count them in `resident_size`. The guard that was
+  supposed to prevent the freeze was structurally incapable of it. What does
+  track the allocation — `footprint(1)`, `vmmap --summary`, `top`'s MEM column
+  and `proc_pid_rusage`'s `ri_phys_footprint` — all agreed to within 0.5% on
+  the same 8 GiB. This module reads `top` for the fleet scan and
+  `proc_pid_rusage` for "how big am I", and it was checked live against a
+  deliberate 32 GiB holder (detected at 32.0 GB; RSS read 0.03 GB).
 
 Every heavy-run driver should call it:
 

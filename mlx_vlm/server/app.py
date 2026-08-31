@@ -569,15 +569,18 @@ def _teardown_report() -> dict:
     with its model resident, the next load started anyway, and the box froze).
     So the shutdown path emits a number a receipt can carry.
     """
-    report = {"active_memory_gb": None, "rss_gb": None}
+    report = {"active_memory_gb": None, "phys_footprint_gb": None}
     try:
         report["active_memory_gb"] = round(mx.get_active_memory() / 1024**3, 2)
     except Exception:  # noqa: BLE001
         pass
     try:
-        from ..tp.fleet import self_rss_gb
+        from ..tp.fleet import phys_footprint_gb
 
-        report["rss_gb"] = round(self_rss_gb(), 2)
+        # NOT resident_size: MLX's Metal buffers are not in it, so an 85 GiB
+        # shard reports ~3 GB of RSS and a teardown that freed nothing would
+        # look identical to one that worked.
+        report["phys_footprint_gb"] = round(phys_footprint_gb(), 2)
     except Exception:  # noqa: BLE001
         pass
     return report

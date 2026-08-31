@@ -464,8 +464,6 @@ def maybe_load_tp(model_path: str):
         from ..tp.load import load_sharded, materialize
         from ..tp.transport import tp_rank as _r, tp_size
         from ..tp.vault import topology_descriptor
-        from ..utils import (get_model_path, load_image_processor,
-                             load_processor)
 
         _refuse_unmirrorable_env()
         # Two 94 GiB shards fit; a 94 GiB shard beside a leftover 183 GiB
@@ -493,25 +491,81 @@ def maybe_load_tp(model_path: str):
             model.language_model = mirrored
         else:
             model = mirrored
-        # Build the processor exactly as utils.load() does.  Returning a bare
-        # TokenizerWrapper here is not enough: the server calls the processor,
-        # and a wrapper is not callable -- which is how the first HTTP request
-        # 500'd even though TP itself had come up correctly.
-        mp = get_model_path(model_path)
-        eos = getattr(model.config, "eos_token_id", None)
-        processor = load_processor(mp, True, eos_token_ids=eos)
-        image_processor = load_image_processor(mp)
-        if image_processor is not None:
-            processor.image_processor = image_processor
+        processor = _load_processor_like_utils_load(model_path, model)
         return model, processor, model.config if hasattr(model, "config") else None
     except Exception as e:
         logger.error("tp: unavailable (%s); serving single-box", e, exc_info=True)
-        if worker is not None:
-            try:
-                worker.terminate()
-            except Exception:
-                pass
+        _reap_worker(worker, hosts)
         return None
+
+
+def _reap_worker(worker, hosts) -> None:
+    """Make sure a failed bring-up does not leave a shard on the peer.
+
+    ``launch_worker`` starts rank 1 with ``nohup ... &``, so the local ssh
+    client exits immediately and terminating it terminates nothing: the remote
+    worker is already detached, and by the time an error surfaces here it may be
+    most of the way through materialising 85 GiB.  It would then sit blocked in
+    a collective forever, holding that memory, and the next load's fleet
+    preflight would (correctly) refuse to start.
+
+    SIGTERM only, never SIGKILL: the worker's own ``finally`` drops the shard
+    and releases the wired limit, and we want it to run.
+    """
+    if worker is not None:
+        try:
+            worker.terminate()
+        except Exception:
+            pass
+    if len(hosts or []) < 2:
+        return
+    try:
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+             f"m3ms@{hosts[1]}", 'pkill -TERM -f "mlx_vlm.tp.worker"'],
+            capture_output=True, timeout=30)
+        logger.info("tp: sent SIGTERM to any rank-1 worker on %s", hosts[1])
+    except Exception:
+        logger.warning(
+            "tp: could not reap the rank-1 worker on %s -- check it by hand "
+            "before the next load (python -m mlx_vlm.tp.fleet)", hosts[1],
+            exc_info=True)
+
+
+def _load_processor_like_utils_load(model_path: str, model):
+    """Build the processor the way ``utils.load()`` does, or the best available.
+
+    Returning a bare ``TokenizerWrapper`` is not equivalent: the server calls
+    the processor, and a wrapper is not callable.  So the full ``AutoProcessor``
+    is the target.
+
+    It is not always reachable.  ``Glm5NextProcessor`` pulls in a *video*
+    sub-processor that transformers gates behind torch + torchvision, and a
+    text-serving venv reasonably has neither -- in which case
+    ``AutoProcessor.from_pretrained`` raises ImportError for a component this
+    model path never touches.  Falling back to the tokenizer keeps text serving
+    working (which is what the single-box path did before the upgrade) and says
+    exactly what was lost, rather than refusing TP over an optional backend.
+    """
+    from ..utils import get_model_path, load_image_processor, load_processor, \
+        load_tokenizer
+
+    mp = get_model_path(model_path)
+    eos = getattr(model, "config", None)
+    eos = getattr(eos, "eos_token_id", None)
+    try:
+        processor = load_processor(mp, True, eos_token_ids=eos)
+    except (ImportError, OSError, ValueError) as e:
+        logger.warning(
+            "tp: full processor unavailable (%s); falling back to the "
+            "tokenizer. Text serving is unaffected; image/video inputs are "
+            "not supported in this environment (and are refused by the mirror "
+            "in TP mode anyway).", str(e).strip().splitlines()[0][:160])
+        return load_tokenizer(mp)
+    image_processor = load_image_processor(mp)
+    if image_processor is not None:
+        processor.image_processor = image_processor
+    return processor
 
 
 def shutdown_tp(model) -> bool:

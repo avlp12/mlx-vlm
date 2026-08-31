@@ -15,23 +15,78 @@ from mlx_vlm.tp import fleet
 
 
 _QUIET = """\
-  4096   101 /usr/sbin/cfprefsd
- 512000   202 python -m pytest
+Processes: 500 total
+PID   MEM  COMMAND
+1113  838M UGREEN NAS Helpe
+1777  362M python3.13
+===PS===
+ 1113 /Applications/UGREEN NAS Helper.app/Contents/MacOS/helper
+ 1777 python -m pytest
 """
 
 _BUSY = """\
-  4096   101 /usr/sbin/cfprefsd
-191938560   999 python -m mlx_vlm.server --model quasar
+Processes: 500 total
+PID   MEM  COMMAND
+999   183G Python
+1113  838M UGREEN NAS Helpe
+===PS===
+  999 python -m mlx_vlm.server --model quasar
+ 1113 /Applications/UGREEN NAS Helper.app/Contents/MacOS/helper
 """
 
 
-def test_parses_rss_in_kib():
-    """``ps`` reports kibibytes on macOS; reading them as bytes would put the
-    threshold a thousand times too high and never fire."""
+def test_rss_is_the_wrong_metric_and_footprint_is_the_right_one():
+    """The measurement this module exists because of.
+
+    8 GiB of live ``mx.array`` moves this process's RSS by ~0.01 GB: MLX
+    allocates Metal buffers and macOS does not count them in ``resident_size``.
+    An RSS threshold of any value is therefore a guard that never fires -- which
+    is consistent with the 2026-08-31 freeze having happened at all, since the
+    EAGLE-3 wrapper's guard was exactly that.  ``ri_phys_footprint`` tracked the
+    same allocation to within 0.5%.
+    """
+    import mlx.core as mx
+    import subprocess
+
+    before_fp = fleet.phys_footprint_gb()
+    before_rss = float(subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(__import__("os").getpid())],
+        capture_output=True, text=True).stdout.strip() or 0) * 1024 / 1024**3
+    hold = mx.zeros((1024, 1024, 512), dtype=mx.float32)   # 2 GiB
+    mx.eval(hold)
+    after_fp = fleet.phys_footprint_gb()
+    after_rss = float(subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(__import__("os").getpid())],
+        capture_output=True, text=True).stdout.strip() or 0) * 1024 / 1024**3
+    del hold
+    assert after_fp - before_fp > 1.5, "footprint must see a 2 GiB allocation"
+    assert after_rss - before_rss < 0.5, "RSS must not (this is the whole point)"
+
+
+def test_parses_top_mem_units():
+    for cell, gb in (("838M", 0.818), ("12G", 12.0), ("1234K", 0.0011),
+                     ("8211M+", 8.018), ("183G", 183.0)):
+        got = fleet._parse_mem(cell)
+        assert abs(got - gb) < 0.01, (cell, got, gb)
+    assert fleet._parse_mem("") is None
+    assert fleet._parse_mem("junk") is None
+
+
+def test_command_lines_come_from_ps_not_from_top():
+    """``top``'s COMMAND column is truncated to 16 characters, which is not
+    enough to tell one python from another -- and "which python" is the whole
+    diagnostic."""
     heavy = fleet._parse_ps(_BUSY, threshold_gb=20)
     assert len(heavy) == 1
     assert heavy[0]["pid"] == 999
-    assert 180 < heavy[0]["rss_gb"] < 190
+    assert heavy[0]["footprint_gb"] == 183.0
+    assert "mlx_vlm.server" in heavy[0]["cmd"]
+
+
+def test_back_compat_rss_key_still_carries_the_footprint():
+    """Existing receipts read ``rss_gb``; the key stays, the number is right."""
+    heavy = fleet._parse_ps(_BUSY, threshold_gb=20)
+    assert len(heavy) == 1 and 180 < heavy[0]["rss_gb"] < 190
 
 
 def test_a_pytest_process_is_not_heavy():
@@ -108,14 +163,15 @@ def test_wait_for_quiet_gives_up_loudly():
                              sleep=lambda s: None, now=lambda: next(clock))
 
 
-def test_self_rss_is_a_number_for_this_process():
+def test_self_footprint_is_a_number_for_this_process():
     """Used by the server teardown to prove the model was released rather than
     assert it."""
     assert fleet.self_rss_gb() > 0
+    assert fleet.phys_footprint_gb() > 0
 
 
-def test_self_rss_of_a_dead_pid_is_zero():
-    assert fleet.self_rss_gb(2 ** 30) == 0.0
+def test_self_footprint_of_a_dead_pid_is_zero():
+    assert fleet.phys_footprint_gb(2 ** 30) == 0.0
 
 
 def test_cli_exits_75_when_busy(monkeypatch, capsys):
