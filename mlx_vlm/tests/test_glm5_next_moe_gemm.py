@@ -289,6 +289,95 @@ def test_model_wiring_selects_the_tiled_switch_glu(monkeypatch):
     assert keys(moe.parameters()) == keys(stock.parameters())
 
 
+def test_language_model_prefill_is_bit_identical(monkeypatch):
+    """Real 4-layer Glm5Next stack (3 sparse MoE layers), toggle off vs on.
+
+    Exercises the actual wiring -- Glm5NextDecoderLayer._ffn_block -> Glm5NextMoE ->
+    switch_mlp -- rather than the SwitchGLU module in isolation, at 4-bit g64 and at
+    prefill lengths on both sides of the fallback gate.
+    """
+    from mlx_vlm.models.glm5_next.config import TextConfig
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    monkeypatch.setenv("MLX_VLM_GLM5_MOE_GEMM_MIN", "64")
+    monkeypatch.delenv("MLX_VLM_GLM5_MOE_GEMM_ROWS", raising=False)
+    cfg = dict(
+        model_type="glm5_next_text",
+        vocab_size=512,
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        n_shared_experts=1,
+        n_routed_experts=E,
+        routed_scaling_factor=2.5,
+        kv_lora_rank=128,
+        q_lora_rank=128,
+        qk_rope_head_dim=0,
+        v_head_dim=64,
+        qk_nope_head_dim=64,
+        num_experts_per_tok=TOP_K,
+        first_k_dense_replace=1,
+        max_position_embeddings=8192,
+        rms_norm_eps=1e-5,
+        index_topk=128,
+        index_head_dim=64,
+        index_n_heads=4,
+        layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "deepseek_sparse_attention",
+            "linear_attention",
+        ],
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+        linear_attn_config={
+            "num_heads": 4,
+            "gate_lower_bound": -5.0,
+            "head_dim": 64,
+            "short_conv_kernel_size": 4,
+        },
+    )
+
+    def build(flag):
+        mx.random.seed(0)
+        model = LanguageModel(TextConfig.from_dict(dict(cfg, moe_prefill_gemm=flag)))
+
+        def rand(tree):
+            if isinstance(tree, dict):
+                return {k: rand(v) for k, v in tree.items()}
+            if isinstance(tree, list):
+                return [rand(v) for v in tree]
+            return (mx.random.normal(tree.shape) * 0.05).astype(mx.bfloat16)
+
+        model.update(rand(model.parameters()))
+        nn.quantize(model, group_size=GROUP, bits=BITS)
+        mx.eval(model.parameters())
+        return model
+
+    off, on = build(False), build(True)
+    sparse = [
+        l.mlp.switch_mlp for l in off.model.layers if hasattr(l.mlp, "switch_mlp")
+    ]
+    assert len(sparse) == 3 and all(type(m) is SwitchGLU for m in sparse)
+    assert all(
+        isinstance(l.mlp.switch_mlp, Glm5NextTiledSwitchGLU)
+        for l in on.model.layers
+        if hasattr(l.mlp, "switch_mlp")
+    )
+    on.update(off.parameters())  # identical weights on both sides
+    mx.eval(on.parameters())
+
+    for tokens in (256, 1024, 2048):
+        mx.random.seed(3)
+        ids = mx.random.randint(0, cfg["vocab_size"], (1, tokens))
+        mx.eval(ids)
+        want, got = off(ids).logits, on(ids).logits
+        mx.eval(want, got)
+        assert mx.array_equal(want, got), f"{tokens}-token prefill diverged"
+
+
 # --------------------------------------------------------------------------- #
 # Micro-bench: python -m mlx_vlm.tests.test_glm5_next_moe_gemm [chunk ...]
 # --------------------------------------------------------------------------- #

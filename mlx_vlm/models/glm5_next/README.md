@@ -153,8 +153,10 @@ rows/expert, `R=32` from ~114 up.
 **Numerics.** Only the row layout changes -- the same `BlockMMA` runs over the same
 `BK=32` K steps into the same fp32 accumulator -- so the output is **bit-identical** to
 the stock path. `mlx_vlm/tests/test_glm5_next_moe_gemm.py` pins bit-identity across 5
-seeds at both `R` values, on a hot/cold route that leaves experts empty, and pins a
-64-token greedy walk through 8 stacked MoE blocks over 5 seeds.
+seeds at `R=auto/16/32`, on a hot/cold route that leaves experts empty, pins a 64-token
+greedy walk through 8 stacked MoE blocks over 5 seeds, and pins bit-identical logits
+from a real 4-layer `LanguageModel` (3 sparse MoE layers, 4-bit g64) at 256/1024/2048
+token prefill.
 
 **Scope.** Sorted/prefill only. The path declines routes with fewer than `R * E * 3/4`
 routed rows (3456 rows = 432 tokens at top-8; override with
