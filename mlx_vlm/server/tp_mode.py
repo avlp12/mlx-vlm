@@ -170,6 +170,26 @@ class _Watchdog:
         # (correctly) refused to start at all.  "Supervisor restarts the
         # server" is only a recovery if the box it restarts onto is empty.
         _reap_peer_workers(tp_hosts())
+        # And drop OUR OWN wired budget, for the same reason: measured
+        # 2026-09-01, a watchdog abort left this box 88 GB deeper in wired
+        # memory that no process owned and only a reboot reclaimed.  Best
+        # effort by construction -- the main thread is wedged inside a
+        # collective, so ``wired_limit.__exit__`` cannot run (it synchronises
+        # the stream) and all this thread can do is lower the budget and hope
+        # the allocator unwires.  Logged either way so the next abort tells us
+        # whether it worked.
+        try:
+            import mlx.core as mx
+
+            from ..tp.fleet import phys_footprint_gb
+
+            before = phys_footprint_gb()
+            mx.set_wired_limit(0)
+            logger.error("[tp watchdog] wired budget dropped; footprint "
+                         "%.1f -> %.1f GiB", before, phys_footprint_gb())
+        except Exception:
+            logger.warning("[tp watchdog] could not drop the wired budget",
+                           exc_info=True)
         os._exit(75)  # EX_TEMPFAIL
 
 
