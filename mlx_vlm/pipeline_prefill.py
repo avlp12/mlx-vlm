@@ -27,6 +27,35 @@ Roles::
         --peer 10.0.0.2 --port 39200 --tokens 8192 --chunk 2048
     # single-process reference using the identical stage/chunk code
     python -m mlx_vlm.pipeline_prefill --role single --model PATH --tokens 8192 --chunk 2048
+
+Measured on the twin M3 Ultra 512GB fleet (gesicht 10.0.0.1 = stage A layers
+0:23, epsilon 10.0.0.2 = stage B layers 23:45), GLM-5.3-Flash q4, chunk 2048,
+Thunderbolt IP link.  Prefill tok/s, warm, median of replicates::
+
+    ctx     1 box (best of both)   2 box pipelined   speedup   ideal 2N/(N+1)
+    8192          419.0                 613.5         1.46x        1.60x  (N=4)
+    32768         316.0                 579.6         1.83x        1.88x  (N=16)
+    131072        230.6                 427.6         1.85x        1.97x  (N=64)
+
+Against the *sum of its own two stage times* the schedule runs at 95-100% of
+the ideal two-stage pipeline: 1.55x / 1.85x / 1.89x at 8k / 32k / 131k.  The
+only structural loss is the fill/drain bubble, which is 1/(N+1) of the
+schedule -- so short prompts gain least.
+
+Wire: 64.0 MiB per 2048-token boundary (32 KiB/token), one direction, 4.0 GiB
+total for a 131k prefill.  10.9 ms idle over Thunderbolt IP with the MLX ring
+backend, 12.0 ms with a raw Python socket, 28-41 ms in-flight here because the
+sender/receiver threads contend with the compute thread for the GIL.  Even the
+degraded number is 0.7-1.3% of a stage's per-chunk compute.
+
+Split 23 balances the two halves within 5% (head 5 DSA + 3 dense MLP + 15 KDA,
+tail 6 DSA + 16 KDA).  The optimum drifts with context because DSA cost grows
+with context while KDA is flat and the halves hold 5 vs 6 DSA layers.
+
+--handoff: shipping stage B's caches back for single-box decode costs 186 MiB /
+59 ms at 8k, 547 MiB / 192 ms at 32k, 1988 MiB / 429 ms at 131k -- 0.14% of a
+131k prefill.  DSA cache is 2562 B/token/layer, KDA state is a flat
+4.14 MiB/layer.
 """
 
 from __future__ import annotations
