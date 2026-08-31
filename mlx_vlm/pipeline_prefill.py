@@ -56,6 +56,21 @@ with context while KDA is flat and the halves hold 5 vs 6 DSA layers.
 59 ms at 8k, 547 MiB / 192 ms at 32k, 1988 MiB / 429 ms at 131k -- 0.14% of a
 131k prefill.  DSA cache is 2562 B/token/layer, KDA state is a flat
 4.14 MiB/layer.
+
+Transport, 32k, interleaved jaccl/ring/jaccl/ring in one quiet window (head
+stage 50.51-50.65 s across all four, so conditions are matched)::
+
+    transport   tok/s   wire_send/chunk   tail_wait   internal speedup
+    jaccl       578.6        9.4 ms         2.63 s        1.844x
+    ring        580.5       28.4 ms         2.83 s        1.843x
+
+RDMA cuts the in-flight boundary transfer 3.0x and moves end-to-end throughput
+by nothing, because the pipeline already hides the wire behind compute. That is
+the expected result and the reason to adopt jaccl here is headroom, not speed:
+the wire stops being the thing that would break first if the split moved or the
+chunk shrank. Idle the three transports are much closer (jaccl 7.19, ring 10.9,
+socket 12.0 ms) -- the gap only opens under prefill's memory-bandwidth pressure,
+which the copy-based transports pay and DMA does not.
 """
 
 from __future__ import annotations
