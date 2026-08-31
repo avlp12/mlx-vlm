@@ -135,6 +135,23 @@ def init_tp(
     if _GROUP is not None:
         return _GROUP
 
+    # MLX's Metal fence has two modes. The default one signals an MTLSharedEvent
+    # at command-buffer granularity; the "fast" one spins a tiny GPU kernel on a
+    # shared-memory counter, so a CPU-stream op inside a GPU chain no longer
+    # costs a command-buffer round trip. Distributed collectives are CPU-stream
+    # ops (AllReduce/Send/Recv have no GPU implementation on Metal), so every
+    # reduce in a sharded forward pays that crossing: measured 161 us with the
+    # default fence and 4.9 us with the fast one, which is the difference
+    # between 45 ms and 3 ms of comm per 101-reduce decode step.
+    #
+    # mlx reads the flag once, lazily, in a function-local static
+    # (mlx/utils.h: metal_fast_synch), on the first fence construction -- which
+    # happens well after import and after this call -- so setting it here works.
+    # Requires Metal 3.2+ / macOS 15+; mlx falls back on its own if unsupported.
+    if os.environ.get("MLX_VLM_TP_FAST_SYNCH", "1") == "1":
+        if "MLX_METAL_FAST_SYNCH" not in os.environ:
+            os.environ["MLX_METAL_FAST_SYNCH"] = "1"
+
     hosts = hosts or os.environ.get("MLX_VLM_TP_HOSTS", "").split(",")
     hosts = [h.strip() for h in hosts if h.strip()]
     if rank is None:
