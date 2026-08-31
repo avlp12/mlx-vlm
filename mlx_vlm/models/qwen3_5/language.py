@@ -1435,6 +1435,9 @@ class LanguageModel(nn.Module):
         prefill_kwargs = prefill_kwargs or {}
         if draft_model is None:
             return True
+        if draft_kind == "lookup":
+            # Token-id drafter: nothing to carry across a chunk boundary.
+            return True
         if draft_kind == "mtp":
             return bool(prefill_kwargs.get("return_hidden", False)) and bool(
                 prefill_kwargs.get("return_shared_kv", False)

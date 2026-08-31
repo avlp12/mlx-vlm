@@ -1601,6 +1601,11 @@ class LanguageModel(nn.Module):
         prefill_kwargs = prefill_kwargs or {}
         if draft_model is None:
             return True
+        if draft_kind == "lookup":
+            # The lookup drafter reads token ids, not captured hidden states, so
+            # nothing has to survive a chunk boundary and prefill can chunk
+            # exactly as it does with no drafter attached.
+            return True
         if draft_kind == "mtp":
             return bool(prefill_kwargs.get("return_hidden", False)) and bool(
                 prefill_kwargs.get("return_shared_kv", False)
