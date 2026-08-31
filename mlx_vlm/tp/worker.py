@@ -362,8 +362,14 @@ class _WorkerState:
             # half back.  Rank 1 passes the empty list: it allocates the sink
             # without capturing hidden states, which only rank 0's drafter reads.
             kw = {"capture_layer_ids": []} if msg.capture else {}
+            from ..tp.transport import collective_count
+
+            n0 = collective_count()
             out = self.lm(ids, cache=c, **kw)
             mx.eval(out.logits)
+            if _trace():
+                logger.info("rank1 forward b=%s s=%s collectives=%d",
+                            msg.batch, msg.seqlen, collective_count() - n0)
             self.last_gdn = getattr(out, "gdn_states", None) if msg.capture else None
             self.tokens_seen += msg.batch * msg.seqlen
             return True
@@ -402,10 +408,17 @@ class _WorkerState:
         c = self.caches.get(msg.epoch)
         if c is None:
             return
+        from ..tp.transport import collective_count
+
+        n0 = collective_count()
         try:
             self.vault.store(msg.name, int(msg.arg0), c)
         except Exception:  # noqa: BLE001 - storing is best-effort on both ranks
             logger.warning("tp worker: vault store failed", exc_info=True)
+        if _trace():
+            logger.info("rank1 vault_store %s@%s collectives=%d (must be 0: "
+                        "each rank captures its own half)",
+                        msg.name[:12], msg.arg0, collective_count() - n0)
 
     def _vault_restore(self, msg: Ctrl) -> None:
         """Rebuild this rank's cache from its own shard-local rung, then ack.

@@ -76,6 +76,20 @@ def _step_timeout() -> float:
 
 
 # --------------------------------------------------------------- cache shape
+def _trace_collectives() -> bool:
+    return os.environ.get("MLX_VLM_GLM5_TP_TRACE", "") not in ("", "0", "false")
+
+
+def _collectives() -> int:
+    """all_sums constructed so far, or -1 when the transport is not up."""
+    try:
+        from ..tp.transport import collective_count
+
+        return collective_count()
+    except Exception:
+        return -1
+
+
 def _cache_is_empty(cache) -> bool:
     """Is this prompt cache freshly made -- i.e. exactly what rank 1 would build?
 
@@ -358,8 +372,12 @@ class MirroredLanguageModel:
             # for 19 minutes with the watchdog disarmed, because it had already
             # been disarmed when the control send returned.
             with self._guard(f"forward b={shape[0]} s={shape[1]}"):
+                n0 = _collectives()
                 out = self._lm(inputs, cache=cache, **kw)
                 _force_same_graph(out)
+                if _trace_collectives():
+                    logger.info("rank0 forward b=%s s=%s collectives=%d",
+                                shape[0], shape[1], _collectives() - n0)
             return out
 
     @contextlib.contextmanager
@@ -426,8 +444,13 @@ class MirroredLanguageModel:
 
     def announce_vault_store(self, name: str, prefix_len: int) -> None:
         with self._lock:
+            n0 = _collectives()
             self._announce(OP_VAULT_STORE, None, arg0=int(prefix_len), name=name,
                            label=f"vault_store {name[:8]}@{prefix_len}")
+            if _trace_collectives():
+                logger.info("rank0 vault_store %s@%s collectives=%d (1 = the "
+                            "announce itself; anything more is not local)",
+                            name[:12], prefix_len, _collectives() - n0)
 
     def announce_vault_restore(self, cache, name: str, prefix_len: int) -> bool:
         """Tell rank 1 to rebuild its half, and believe its answer.

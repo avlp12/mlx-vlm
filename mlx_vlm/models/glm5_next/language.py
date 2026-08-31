@@ -834,8 +834,23 @@ class Glm5NextIndexer(nn.Module):
         select_k = min(self.index_topk // kp, P)
         scores = q @ pool_keys[:, None].swapaxes(-1, -2)
         scores = mx.maximum(scores * self.softmax_scale, 0.0)
-        weights = self.weights_proj(x) * (self.n_heads**-0.5)
+        weights = self.weights_proj(x) * (self._scale_heads**-0.5)
         index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
+        # Reduce before the top-k, exactly as the eager path does.  Two reasons,
+        # and the second is the one that bites:
+        #
+        # (1) correctness -- this is the same head-axis contraction, so under
+        #     sharding it is the same partial sum, and ranking it selects the
+        #     wrong blocks;
+        # (2) COUNT PARITY -- the eager path issues one reduce per query chunk,
+        #     so at S=1 it issues exactly one.  If this path issued none, the
+        #     number of collectives in a forward would depend on which path a
+        #     rank took, and the two ranks do not always take the same one (a
+        #     vault-restored cache has no _pool/_no_pad, so it is forced eager
+        #     while a live cache is not).  A mirror whose collective count
+        #     depends on local cache state deadlocks the moment they differ.
+        if self._tp_reduce is not None:
+            index_scores = self._tp_reduce(index_scores)
         # (a) valid_candidates == pool_valid: `visible` is all-True here.
         valid_candidates = mx.broadcast_to(pool_valid[:, None], (B, 1, P))
         index_scores = mx.where(valid_candidates, index_scores, -1e30)

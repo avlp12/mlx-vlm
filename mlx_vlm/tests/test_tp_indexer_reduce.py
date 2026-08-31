@@ -169,3 +169,86 @@ def test_a_partial_sum_ranks_differently_from_the_full_sum():
     top_partial = mx.argsort(-a, axis=-1)[..., :4]
     top_full = mx.argsort(-(a + b), axis=-1)[..., :4]
     assert not bool(mx.all(top_partial == top_full).item())
+
+
+# ------------------------------------------------- fast/slow path count parity
+def _count_reduces(attn, cfg, cache, x, mask):
+    calls = []
+    attn.indexer._tp_reduce = lambda z: (calls.append(1), z)[1]
+    qr = attn.q_a_layernorm(attn.q_a_proj(x))
+    attn.indexer(x, qr, mask, cache=cache)
+    return len(calls)
+
+
+def test_fast_and_eager_decode_paths_issue_the_same_number_of_reduces(monkeypatch):
+    """Count parity is a mirror invariant, not an optimisation detail.
+
+    The indexer has two decode implementations: an incremental fast path gated
+    on the cache carrying ``_no_pad`` and a pool, and the eager chunked path.
+    A vault-restored cache has neither, so it is forced eager while a live
+    cache is not -- meaning the two ranks CAN take different paths on the same
+    logical step.  That is survivable only if both paths issue the same number
+    of collectives.  When only the eager path had the reduce, they differed by
+    one per DSA layer and the ranks deadlocked.
+    """
+    # MLX_VLM_GLM5_IDX_FAST is opt-in and off by default, so the fast path has
+    # no live mileage yet -- which is why this parity bug was latent rather
+    # than fatal.  Turn it on here so the test exercises what it claims to.
+    import mlx_vlm.models.glm5_next.language as L
+
+    monkeypatch.setenv("MLX_VLM_GLM5_IDX_FAST", "1")
+    monkeypatch.setattr(L, "_IDX_FAST_ENV", None, raising=False)
+
+    cfg = _cfg()
+    a = _attn(cfg)
+    primed = 4 * cfg.index_topk
+    x = mx.random.normal((1, 1, cfg.hidden_size))
+
+    def valid_prime():
+        """A primed cache whose validity channel is actually valid.
+
+        _prime_arrays fills every channel with normals, so the last one -- the
+        validity flag -- comes out negative about half the time and _no_pad is
+        False, which silently gates the fast path off.
+        """
+        lat, packed = _prime_arrays(cfg, primed)
+        packed = mx.concatenate(
+            [packed[..., :-1], mx.ones(packed.shape[:-1] + (1,))], axis=-1)
+        return lat, packed
+
+    # Eager: a cache with no derived state, exactly what a restore produces.
+    eager_cache = _dsa_cache(cfg, primed, valid_prime())[1]
+    n_eager = _count_reduces(a, cfg, eager_cache, x,
+                             mx.ones((1, 1, 1, primed + 1), dtype=mx.bool_))
+
+    # Fast: prime the same cache through one eager forward so _pool/_no_pad
+    # exist, then step it again with mask=None, which is the fast path's gate.
+    fast_cache = _dsa_cache(cfg, primed, valid_prime())[1]
+    _count_reduces(a, cfg, fast_cache, x,
+                   mx.ones((1, 1, 1, primed + 1), dtype=mx.bool_))
+    entered = []
+    real_fast = type(a.indexer)._decode_fast
+
+    def spy(self, *args, **kw):
+        entered.append(1)
+        return real_fast(self, *args, **kw)
+
+    type(a.indexer)._decode_fast = spy
+    try:
+        n_fast = _count_reduces(a, cfg, fast_cache, x, None)
+    finally:
+        type(a.indexer)._decode_fast = real_fast
+    assert entered, ("the fast path was never taken, so this test has no "
+                     "teeth -- check the gate in Glm5NextIndexer.__call__")
+
+    assert n_eager == n_fast, (
+        f"path-dependent collective count: eager={n_eager} fast={n_fast}. "
+        "Two ranks taking different indexer paths would deadlock.")
+    assert n_eager >= 1, "S=1 must issue exactly one indexer reduce"
+
+
+def test_fast_path_scale_also_uses_the_global_head_count():
+    cfg = _cfg()
+    a = shard_dsa(_attn(cfg), 0, 2, lambda z: z)
+    src = __import__("inspect").getsource(type(a.indexer)._decode_fast)
+    assert "_scale_heads" in src and "self.n_heads**-0.5" not in src

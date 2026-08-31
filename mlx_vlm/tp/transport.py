@@ -211,10 +211,25 @@ def tp_rank() -> int:
     return _GROUP.rank() if _GROUP is not None else 0
 
 
+# How many all_sums this process has *constructed*.  Not the same as how many
+# it executed -- MLX is lazy and prunes nodes nothing evaluates, which is a
+# distinction this campaign has already been bitten by once.  Counting
+# construction is still the cheap first question when two ranks stop pairing:
+# if the counts differ, the ranks are running different forwards; if they
+# agree, the divergence is in execution and needs a different probe.
+_ALL_SUM_CALLS = 0
+
+
+def collective_count() -> int:
+    return _ALL_SUM_CALLS
+
+
 def all_sum(x: mx.array) -> mx.array:
     """The one collective the sharded forward needs."""
+    global _ALL_SUM_CALLS
     if _GROUP is None or _GROUP.size() == 1:
         return x
+    _ALL_SUM_CALLS += 1
     return mx.distributed.all_sum(x, group=_GROUP)
 
 
