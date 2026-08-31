@@ -25,8 +25,8 @@ import pytest
 
 import mlx_vlm.models.glm5_next.language as glm5
 from mlx_vlm.models.cache import ArraysCache
-from mlx_vlm.models.glm5_next.fused_kda import fused_kda_probe
 from mlx_vlm.models.glm5_next.config import TextConfig
+from mlx_vlm.models.glm5_next.fused_kda import fused_kda_probe
 
 # GLM-5.3-Flash text_config, restricted to what the KDA layer reads.  The kernel
 # is parameterised by linear_num_heads / linear_head_dim / short_conv_kernel_size
@@ -89,9 +89,9 @@ def _layer(config, seed=0):
     # A_log / dt_bias are kept in fp32 by the converter's cast_predicate.
     layer.forget_gate.A_log = (mx.random.normal((H,)) * 0.5).astype(mx.float32)
     layer.forget_gate.dt_bias = (mx.random.normal((H * D,)) * 0.5).astype(mx.float32)
-    layer.o_norm.weight = (
-        mx.ones((D,)) + 0.02 * mx.random.normal((D,))
-    ).astype(mx.bfloat16)
+    layer.o_norm.weight = (mx.ones((D,)) + 0.02 * mx.random.normal((D,))).astype(
+        mx.bfloat16
+    )
     # The live build quantises the KDA projections to 8-bit, group 64.
     nn.quantize(layer, group_size=64, bits=8)
     mx.eval(layer.parameters())
@@ -205,7 +205,7 @@ def test_fused_kda_matches_eager_over_32_decode_steps():
     # this is exact rather than merely close.  Keep a bf16-scale tolerance in the
     # assertion so a future MLX rounding change degrades to "still fine" rather
     # than a hard failure, but report the real number.
-    assert worst[0] <= 2.0 ** -6, f"max abs diff {worst[0]:.3e} (rel {worst[1]:.3e})"
+    assert worst[0] <= 2.0**-6, f"max abs diff {worst[0]:.3e} (rel {worst[1]:.3e})"
     assert worst == (0.0, 0.0), f"expected bit-identical, got {worst}"
 
 
@@ -439,8 +439,11 @@ def _bench(n_layers=34, iters=20, warmup=5):  # pragma: no cover - manual bench
 
         return run
 
-    for tag, on, qp in (("eager", False, False), ("fused", True, False),
-                        ("qproj", True, True)):
+    for tag, on, qp in (
+        ("eager", False, False),
+        ("fused", True, False),
+        ("qproj", True, True),
+    ):
         for layer in layers:
             _set_toggle(layer, on, qproj=qp)
         caches = [_cache(config, seed=100 + i) for i in range(n_layers)]
@@ -519,9 +522,7 @@ def test_fused_kda_batch_gate():
     ref = mx.zeros((4, 1, config.hidden_size), mx.bfloat16)
     ok = dict(B=4, S=1, mask=None, cache=cache, gdn_sink=None, ref=ref)
     assert layer._fused_kda_eligible(**ok)
-    assert layer._fused_kda_eligible(
-        **{**ok, "mask": mx.ones((4, 1), dtype=mx.bool_)}
-    )
+    assert layer._fused_kda_eligible(**{**ok, "mask": mx.ones((4, 1), dtype=mx.bool_)})
     over = glm5._FUSED_KDA_MAX_BATCH + 1
     assert not layer._fused_kda_eligible(
         B=over,
@@ -564,14 +565,27 @@ def test_fused_kda_batched_capture_matches_eager_gdn_sink(batch):
 
         def replay(e):
             return gated_delta_update(
-                e[0][:, :1], e[1][:, :1], e[2][:, :1], e[3][:, :1], e[4][:, :1],
-                e[5], e[6], state=e[7], lower_bound=e[10],
+                e[0][:, :1],
+                e[1][:, :1],
+                e[2][:, :1],
+                e[3][:, :1],
+                e[4][:, :1],
+                e[5],
+                e[6],
+                state=e[7],
+                lower_bound=e[10],
             )[1]
 
         eager_roll, fused_roll = replay(eager_sink[0]), replay(fused_sink[0])
         mx.eval(
-            eager_out, fused_out, eager_cache.cache, fused_cache.cache,
-            eager_sink[0][:9], fused_sink[0][:9], eager_roll, fused_roll,
+            eager_out,
+            fused_out,
+            eager_cache.cache,
+            fused_cache.cache,
+            eager_sink[0][:9],
+            fused_sink[0][:9],
+            eager_roll,
+            fused_roll,
         )
         pairs = [
             (eager_out, fused_out),
