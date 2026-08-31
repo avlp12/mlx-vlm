@@ -94,18 +94,39 @@ def _dflash_hazard(draft_model: nn.Module) -> Optional[float]:
     return min(0.98, max(0.05, p))
 
 
-def _dflash_block_size_for_hazard(p: float, cap: int, floor: int = 2) -> int:
+def _dflash_block_size_for_hazard(
+    p: float,
+    cap: int,
+    floor: int = 2,
+    fixed: Optional[float] = None,
+    cost: Optional[float] = None,
+) -> int:
     """argmax over block widths of (1 + E[accepted]) / round cost.
 
     E[accepted] for a geometric hazard truncated at K = cap-1 drafted tokens is
     sum_j p^j, and the round costs fixed + cost*K, so the optimum is a genuine
-    interior maximum: too narrow wastes the fixed cost, too wide pays 0.186 of a
-    decode step for a token that probably will not survive.
+    interior maximum: too narrow wastes the fixed cost, too wide pays for a token
+    that probably will not survive.
+
+    ``fixed``/``cost`` default to the DFlash block-drafter constants but are
+    parameters because the same optimisation answers the MTP rollout-depth
+    question with different economics: a DFlash block costs one drafter forward
+    however wide it is, whereas each MTP rollout step costs its own forward, so
+    MTP's marginal cost per unit depth is several times higher and its optimum
+    correspondingly shallower.  ``floor`` may be 1, which means "propose
+    nothing" -- for MTP that is a plain decode step, and it is how the never-lose
+    guarantee falls out of the same formula instead of needing a separate gate.
     """
-    fixed, cost = _round_cost_params()
+    if fixed is None or cost is None:
+        f, c = _round_cost_params()
+        fixed = f if fixed is None else fixed
+        cost = c if cost is None else cost
     best, best_gain = floor, -1.0
     e = 0.0
     pk = 1.0
+    if floor <= 1:
+        best_gain = 1.0 / fixed          # width 1 == propose nothing
+        best = 1
     for width in range(2, cap + 1):
         pk *= p
         e += pk                       # E[accepted] at width-1 drafted tokens

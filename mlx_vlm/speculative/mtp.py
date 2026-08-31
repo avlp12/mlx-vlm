@@ -447,6 +447,26 @@ def _slice_shared_kv_after_reject(shared_kv_states: dict, rejected: int) -> dict
 
 
 _MTP_NO_PAUSE = None
+_MTP_ADAPTIVE_DEPTH = None
+
+
+def _mtp_adaptive_depth_enabled() -> bool:
+    """MLX_VLM_MTP_ADAPTIVE_DEPTH=1 -- choose the rollout depth from the measured
+    hazard and the measured per-depth cost, instead of the binary pause.
+
+    The binary gate cannot express depth, and its acceptance metric does not even
+    survive being asked to: it records a round as good only when *every* drafted
+    token was accepted, so at depth 6 it is measuring P(all six accepted), which
+    is 0.53 at a hazard of 0.9 and 0.12 at 0.7.  Measured, that pinned the
+    controller into pausing 36 rounds out of 53 and made every requested depth
+    report identical numbers.
+    """
+    global _MTP_ADAPTIVE_DEPTH
+    if _MTP_ADAPTIVE_DEPTH is None:
+        _MTP_ADAPTIVE_DEPTH = os.environ.get(
+            "MLX_VLM_MTP_ADAPTIVE_DEPTH", "0"
+        ).lower() in ("1", "true", "yes", "on")
+    return _MTP_ADAPTIVE_DEPTH
 
 
 def _mtp_pause_disabled() -> bool:
@@ -569,6 +589,7 @@ class _AdaptivePauseController:
         self.since_probe = 0
         self._t: Optional[float] = None
         self._pending: Optional[str] = None  # "draft" | "plain" during calibration
+        self._drafter = None                 # set by the orchestrator; hazard source
 
     def _calibrating(self) -> bool:
         return self.break_even is None
@@ -601,6 +622,8 @@ class _AdaptivePauseController:
             plain = _median(self._plain_times)
             draft = _median(self._draft_times)
             self.break_even = max(0.0, draft / plain - 1.0) if plain > 0 else 0.0
+        if _mtp_adaptive_depth_enabled():
+            return self._depth_from_cost_model(remaining)
         # Steady state: gate on rolling acceptance against the measured break-even.
         if not self._accepts:
             return self.configured
@@ -613,6 +636,42 @@ class _AdaptivePauseController:
             self.since_probe = 0
             return self.configured
         return 1
+
+    def _depth_from_cost_model(self, remaining: int) -> int:
+        """Pick the rollout depth that maximises tokens per unit time.
+
+        Reuses the calibration this controller already does, rather than
+        replacing it: the measured draft/plain ratio at the configured depth
+        gives the marginal cost of one unit of depth, in plain-step units, on
+        *this* box at *this* context length and batch size.  That is exactly the
+        constant the width optimiser needs, and measuring it beats hard-coding
+        it -- the whole reason the original controller timed itself.
+
+        Width 1 (propose nothing) is inside the search, so the never-lose
+        guarantee falls out of the same argmax instead of needing its own gate:
+        if the hazard does not clear the cost, the optimum is a plain step.
+        """
+        from .dflash import _dflash_block_size_for_hazard, _dflash_hazard
+
+        depth = max(1, self.configured - 1)
+        cost = (self.break_even or 0.0) / depth      # plain-steps per unit depth
+        if cost <= 0.0:
+            cost = 1e-3
+        p = _dflash_hazard(self._drafter) if self._drafter is not None else None
+        if p is None:
+            return self.configured
+        cap = min(self.configured, max(1, remaining))
+        chosen = _dflash_block_size_for_hazard(p, cap, floor=1, fixed=1.0, cost=cost)
+        # Keep probing occasionally so a workload that starts accepting again is
+        # noticed: a collapsed depth otherwise produces no acceptance evidence.
+        if chosen <= 1:
+            self.since_probe += 1
+            if self.since_probe >= self.probe_every:
+                self.since_probe = 0
+                return min(cap, 2)
+        else:
+            self.since_probe = 0
+        return chosen
 
     def record(
         self,
@@ -734,6 +793,8 @@ def _mtp_rounds(
         if getattr(draft_model, "adaptive_pause", False) and not _mtp_pause_disabled()
         else None
     )
+    if pause_ctl is not None:
+        pause_ctl._drafter = draft_model
 
     while emitted < max_tokens:
         if pause_ctl is not None:
@@ -1040,6 +1101,8 @@ def _mtp_rounds_batch(
         if getattr(draft_model, "adaptive_pause", False) and not _mtp_pause_disabled()
         else None
     )
+    if pause_ctl is not None:
+        pause_ctl._drafter = draft_model
 
     while len(active_idx) > 0:
         remaining = [
