@@ -80,6 +80,15 @@ def _trace_collectives() -> bool:
     return os.environ.get("MLX_VLM_GLM5_TP_TRACE", "") not in ("", "0", "false")
 
 
+def _reset_forward_counter() -> None:
+    try:
+        from ..tp.transport import reset_forward_counter
+
+        reset_forward_counter()
+    except Exception:
+        pass
+
+
 def _collectives() -> int:
     """all_sums constructed so far, or -1 when the transport is not up."""
     try:
@@ -373,6 +382,7 @@ class MirroredLanguageModel:
             # been disarmed when the control send returned.
             with self._guard(f"forward b={shape[0]} s={shape[1]}"):
                 n0 = _collectives()
+                _reset_forward_counter()
                 out = self._lm(inputs, cache=cache, **kw)
                 _force_same_graph(out)
                 if _trace_collectives():
@@ -573,6 +583,9 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
         f"{ENV_HOSTS}='{','.join(hosts)}' {ENV_RANK}=1 "
         f"MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD={_max_tok()} "
         f"MLX_VLM_GLM5_TP_TRACE={os.environ.get('MLX_VLM_GLM5_TP_TRACE', '')} "
+        f"MLX_VLM_GLM5_TP_TRACE_DEEP="
+        f"{os.environ.get('MLX_VLM_GLM5_TP_TRACE_DEEP', '')} "
+        f"MLX_VLM_GLM5_IDX_FAST={os.environ.get('MLX_VLM_GLM5_IDX_FAST', '')} "
         f"MLX_VLM_GLM5_VAULT={os.environ.get('MLX_VLM_GLM5_VAULT', '')} "
         # Passed through so the peer's store can be sized independently -- which
         # is also the only way to exercise the peer-miss path on purpose: give

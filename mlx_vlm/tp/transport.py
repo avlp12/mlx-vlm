@@ -33,6 +33,10 @@ from typing import List, Optional
 
 import mlx.core as mx
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 _GROUP = None
 _BACKEND = None
 
@@ -218,18 +222,39 @@ def tp_rank() -> int:
 # if the counts differ, the ranks are running different forwards; if they
 # agree, the divergence is in execution and needs a different probe.
 _ALL_SUM_CALLS = 0
+# Index within the current forward, so a stalled pair can be compared position
+# by position rather than in aggregate: "rank 0 reached #57 and rank 1 reached
+# #58" names the reduce, and the shape names which kind it was.
+_FWD_IDX = 0
+_DEEP_ENV = None
+
+
+def _deep_trace() -> bool:
+    global _DEEP_ENV
+    if _DEEP_ENV is None:
+        _DEEP_ENV = os.environ.get("MLX_VLM_GLM5_TP_TRACE_DEEP", "") not in (
+            "", "0", "false", "False")
+    return _DEEP_ENV
 
 
 def collective_count() -> int:
     return _ALL_SUM_CALLS
 
 
+def reset_forward_counter() -> None:
+    global _FWD_IDX
+    _FWD_IDX = 0
+
+
 def all_sum(x: mx.array) -> mx.array:
     """The one collective the sharded forward needs."""
-    global _ALL_SUM_CALLS
+    global _ALL_SUM_CALLS, _FWD_IDX
     if _GROUP is None or _GROUP.size() == 1:
         return x
     _ALL_SUM_CALLS += 1
+    _FWD_IDX += 1
+    if _deep_trace():
+        logger.info("all_sum #%d shape=%s", _FWD_IDX, tuple(x.shape))
     return mx.distributed.all_sum(x, group=_GROUP)
 
 

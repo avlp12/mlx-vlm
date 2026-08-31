@@ -362,9 +362,10 @@ class _WorkerState:
             # half back.  Rank 1 passes the empty list: it allocates the sink
             # without capturing hidden states, which only rank 0's drafter reads.
             kw = {"capture_layer_ids": []} if msg.capture else {}
-            from ..tp.transport import collective_count
+            from ..tp.transport import collective_count, reset_forward_counter
 
             n0 = collective_count()
+            reset_forward_counter()
             out = self.lm(ids, cache=c, **kw)
             mx.eval(out.logits)
             if _trace():
