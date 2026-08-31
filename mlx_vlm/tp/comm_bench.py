@@ -73,7 +73,14 @@ def main(argv=None):
     p.add_argument("--ops", type=int, default=101, help="all-reduces per step")
     p.add_argument("--shape", default="1,1,4096")
     p.add_argument("--steps", type=int, default=1000)
-    p.add_argument("--soak", type=float, default=0.0, help="soak seconds after the run")
+    p.add_argument(
+        "--soak-steps",
+        type=int,
+        default=0,
+        help="soak length in STEPS, not seconds: a wall-clock deadline makes the "
+        "ranks stop at different times, and a jaccl collective whose peer has "
+        "exited busy-spins forever with no timeout",
+    )
     p.add_argument("--eval-each", action="store_true", help="pessimistic: sync per op")
     p.add_argument("--out", default=None)
     a = p.parse_args(argv)
@@ -126,27 +133,25 @@ def main(argv=None):
         "per_op_us": 1e6 * _pct(times, 0.50) / a.ops,
     }
 
-    if a.soak > 0:
-        errs, checks, buckets = 0, 0, []
-        t_end = time.time() + a.soak
-        t_bucket, bt = time.time() + 60.0, []
-        while time.time() < t_end:
+    if a.soak_steps > 0:
+        errs, buckets, bt = 0, [], []
+        t_bucket = time.time() + 60.0
+        for i in range(a.soak_steps):
             try:
                 t0 = time.perf_counter()
                 step_chain(x0, a.ops, scale, a.eval_each)
                 bt.append(time.perf_counter() - t0)
-                checks += 1
-                if checks % 200 == 0:
+                if i % 200 == 0:
                     v = float(all_sum(probe)[0].item())
                     if abs(v - expect) > 1e-3:
                         errs += 1
             except Exception as e:  # noqa: BLE001
                 errs += 1
-                buckets.append({"error": repr(e)})
+                buckets.append({"error": repr(e)[:160]})
             if time.time() >= t_bucket and bt:
                 buckets.append(
                     {
-                        "minute": len(buckets),
+                        "bucket": len(buckets),
                         "steps": len(bt),
                         "p50_ms": 1e3 * _pct(bt, 0.50),
                         "p99_ms": 1e3 * _pct(bt, 0.99),
@@ -155,11 +160,12 @@ def main(argv=None):
                 )
                 bt, t_bucket = [], time.time() + 60.0
         res["soak"] = {
-            "seconds": a.soak,
-            "steps": checks,
+            "steps": a.soak_steps,
             "errors": errs,
-            "per_minute": buckets,
+            "wall_s": sum(bt) if not buckets else None,
+            "per_bucket": buckets,
         }
+        mx.eval(all_sum(probe))  # final barrier: both ranks leave together
 
     if r == 0:
         print(json.dumps(res, indent=1), flush=True)
