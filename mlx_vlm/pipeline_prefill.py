@@ -193,6 +193,79 @@ def from_wire(buf: bytearray, shape) -> mx.array:
     return mx.array(a).view(mx.bfloat16)
 
 
+# --------------------------------------------------- stage-B cache handoff
+
+
+def _flatten_state(obj, path, out):
+    if obj is None:
+        return
+    if isinstance(obj, mx.array):
+        out.append((path, obj))
+        return
+    if isinstance(obj, (list, tuple)):
+        for i, o in enumerate(obj):
+            _flatten_state(o, f"{path}.{i}", out)
+        return
+    raise TypeError(f"unhandled cache state node at {path}: {type(obj)}")
+
+
+def collect_state(caches):
+    out = []
+    for i, c in enumerate(caches):
+        if c is None:
+            continue
+        _flatten_state(c.state, str(i), out)
+    return out
+
+
+def handoff_send(sock, caches):
+    """Stretch goal: ship stage B's KDA/DSA caches back so decode can run on box A."""
+    entries = collect_state(caches)
+    mx.eval([a for _, a in entries])
+    meta = [
+        {
+            "path": p,
+            "dtype": str(a.dtype).rsplit(".", 1)[-1],
+            "shape": list(a.shape),
+            "nbytes": int(a.nbytes),
+        }
+        for p, a in entries
+    ]
+    _send_json(sock, {"cmd": "handoff", "meta": meta})
+    t0 = time.perf_counter()
+    for _, a in entries:
+        if a.nbytes == 0:
+            continue
+        nb = np.array(a.view(mx.uint8), copy=False)
+        sock.sendall(memoryview(nb).cast("B"))
+    dt = time.perf_counter() - t0
+    return {
+        "handoff_send_s": dt,
+        "handoff_bytes": sum(m["nbytes"] for m in meta),
+        "handoff_tensors": len(meta),
+    }
+
+
+def handoff_recv(sock):
+    msg = _recv_json(sock)
+    assert msg.get("cmd") == "handoff", msg
+    total = sum(m["nbytes"] for m in msg["meta"])
+    t0 = time.perf_counter()
+    for m in msg["meta"]:
+        n = m["nbytes"]
+        if n == 0:
+            continue
+        buf = bytearray(n)
+        _recv_exact(sock, memoryview(buf), n)
+    dt = time.perf_counter() - t0
+    return {
+        "handoff_recv_s": dt,
+        "handoff_bytes": total,
+        "handoff_tensors": len(msg["meta"]),
+        "handoff_MB_per_s": (total / 2**20) / dt if dt else None,
+    }
+
+
 # ------------------------------------------------------------------- roles
 
 
@@ -259,6 +332,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
             "chunk": chunk,
             "split": args.split,
             "n_chunks": n_chunks,
+            "handoff": bool(args.handoff),
         },
     )
     ack = _recv_json(sock)
@@ -311,8 +385,13 @@ def _head_one(args, stage: Stage, sock, tokens: int):
     if err:
         raise RuntimeError(err[0])
 
-    tail = _recv_json(sock)
+    # tail signals "last chunk retired" before any optional handoff so the
+    # pipeline wall clock is not polluted by the stretch-goal transfer
+    done = _recv_json(sock)
+    assert done.get("cmd") == "done", done
     t_total = time.perf_counter() - t_start
+    handoff = handoff_recv(sock) if args.handoff else None
+    tail = _recv_json(sock)
 
     hc = stage.hc_mult
     D = stage.lm.layers[stage.local[0]].input_layernorm.weight.shape[0]
@@ -330,6 +409,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
         "wire_send_s": sum(send_times),
         "wire_send_each": send_times,
         "head_chunks": per_chunk,
+        "handoff": handoff,
         "tail": tail,
     }
 
@@ -371,14 +451,15 @@ def _tail_one(args, stage: Stage, sock, req):
         try:
             hdrbuf = bytearray(HDR.size)
             while True:
-                t0 = time.perf_counter()
                 _recv_exact(sock, memoryview(hdrbuf), HDR.size)
                 magic, idx, B, S, HC, D, nbytes = HDR.unpack(bytes(hdrbuf))
                 assert magic == MAGIC, magic
                 if idx == EOF_IDX:
                     recvq.put(None)
                     return
+                # header already arrived -> this times the payload transfer only
                 buf = bytearray(nbytes)
+                t0 = time.perf_counter()
                 _recv_exact(sock, memoryview(buf), nbytes)
                 recv_times.append(time.perf_counter() - t0)
                 recvq.put((idx, buf, (B, S, HC, D)))
@@ -423,7 +504,10 @@ def _tail_one(args, stage: Stage, sock, req):
         lg = stage.finish(last_logits)
         mx.eval(lg)
         tok = int(mx.argmax(lg[0, -1]).item())
+    _send_json(sock, {"cmd": "done"})
+    ho = handoff_send(sock, stage.caches) if req.get("handoff") else None
     return {
+        "handoff": ho,
         "tail_gpu_s": sum(c["gpu_s"] for c in per_chunk),
         "tail_wait_s": sum(c["wait_s"] for c in per_chunk),
         "tail_deser_s": sum(c["deser_s"] for c in per_chunk),
@@ -516,6 +600,11 @@ def main(argv=None):
     p.add_argument("--connect-timeout", type=float, default=1800.0)
     p.add_argument("--out", default=None)
     p.add_argument("--no-prune", dest="prune", action="store_false")
+    p.add_argument(
+        "--handoff",
+        action="store_true",
+        help="after prefill, ship stage B's caches back to stage A and time it",
+    )
     args = p.parse_args(argv)
 
     mx.random.seed(args.seed)
