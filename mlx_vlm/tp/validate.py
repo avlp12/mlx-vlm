@@ -56,8 +56,71 @@ TINY = dict(
 )
 
 
-def _cfg():
-    return TextConfig.from_dict(TINY)
+# Quantized variant. Dimensions are chosen so every ROW-parallel split stays
+# aligned to group_size=64 after halving, and so no quantized linear has an
+# input narrower than one group:
+#   KDA/DSA o_proj in = 256 -> 128 per rank (128 % 64 == 0)
+#   dense MLP down in = 256 -> 128 ; MoE down in = 128 -> 64
+#   g_b_proj / f_b_proj in = head_dim = 64 -> exactly one group
+TINY_Q = dict(
+    TINY,
+    hidden_size=256,
+    intermediate_size=256,
+    moe_intermediate_size=128,
+    num_attention_heads=4,
+    v_head_dim=64,
+    qk_nope_head_dim=64,
+    kv_lora_rank=64,
+    q_lora_rank=64,
+    index_head_dim=64,
+    index_n_heads=4,
+    index_topk=8,
+    linear_attn_config={"num_heads": 4, "head_dim": 64, "short_conv_kernel_size": 4,
+                        "gate_lower_bound": -5.0},
+)
+
+
+def _cfg(quant=False):
+    return TextConfig.from_dict(TINY_Q if quant else TINY)
+
+
+def _quantize(module, group_size=64, bits=4):
+    """Quantize every Linear / SwitchLinear under `module`, in place.
+
+    MultiLinear (DSA embed_q/unembed_out) is left in fp: its head-axis split is
+    a plain axis-0 slice with no group alignment to get wrong, so quantizing it
+    would test nothing new here.
+    """
+    import mlx.nn as nn
+
+    def maybe_q(child):
+        if hasattr(child, "to_quantized") and type(child).__name__ in (
+            "Linear", "SwitchLinear",
+        ):
+            return child.to_quantized(group_size=group_size, bits=bits)
+        return None
+
+    def walk(m):
+        for name, child in list(m.children().items()):
+            if isinstance(child, list):
+                # Module lists (e.g. Glm5NextModel.layers) are plain lists
+                for i, sub in enumerate(child):
+                    q = maybe_q(sub)
+                    if q is not None:
+                        child[i] = q
+                    elif hasattr(sub, "children"):
+                        walk(sub)
+                continue
+            if isinstance(child, dict) or not hasattr(child, "children"):
+                continue
+            q = maybe_q(child)
+            if q is not None:
+                setattr(m, name, q)
+            else:
+                walk(child)
+
+    walk(module)
+    return module
 
 
 def _rel(a, b):
@@ -85,15 +148,15 @@ def _dsa_cache(cfg, primed=0, arrays=None):
     return c
 
 
-def validate(size: int = 2, seed: int = 0, verbose: bool = True) -> dict:
+def validate(size: int = 2, seed: int = 0, verbose: bool = True, quant: bool = False) -> dict:
     mx.random.seed(seed)
-    cfg = _cfg()
+    cfg = _cfg(quant)
     out = {}
     x = mx.random.normal((1, 1, cfg.hidden_size))
 
     # ---- KDA attention -----------------------------------------------------
     layer = Glm5NextDecoderLayer(cfg, 0)          # linear_attention
-    ref_attn = layer.self_attn
+    ref_attn = _quantize(layer.self_attn) if quant else layer.self_attn
     ref = ref_attn(x, None, _kda_cache())
     parts = []
     for r in range(size):
@@ -103,7 +166,7 @@ def validate(size: int = 2, seed: int = 0, verbose: bool = True) -> dict:
 
     # ---- DSA attention, cache short enough that the indexer bypasses -------
     dl = Glm5NextDecoderLayer(cfg, 3)             # full attention
-    ref_dsa = dl.self_attn
+    ref_dsa = _quantize(dl.self_attn) if quant else dl.self_attn
     ref = ref_dsa(x, None, _dsa_cache(cfg, 0))
     parts = []
     for r in range(size):
@@ -169,12 +232,16 @@ def validate(size: int = 2, seed: int = 0, verbose: bool = True) -> dict:
 
     # ---- dense MLP ---------------------------------------------------------
     ref_mlp = Glm5NextDecoderLayer(cfg, 0).mlp
+    if quant:
+        ref_mlp = _quantize(ref_mlp)
     ref = ref_mlp(x)
     parts = [shard_mlp(copy.deepcopy(ref_mlp), r, size)(x) for r in range(size)]
     out["dense_mlp"] = _rel(sum(parts), ref)
 
     # ---- MoE ---------------------------------------------------------------
     ref_moe = Glm5NextDecoderLayer(cfg, 3).mlp
+    if quant:
+        ref_moe = _quantize(ref_moe)
     ref = ref_moe(x)
     parts = [shard_moe(copy.deepcopy(ref_moe), r, size)(x) for r in range(size)]
     out["moe"] = _rel(sum(parts), ref)
@@ -185,4 +252,7 @@ def validate(size: int = 2, seed: int = 0, verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    print("--- fp ---")
     validate()
+    print("--- quantized (4-bit, group 64) ---")
+    validate(quant=True)
