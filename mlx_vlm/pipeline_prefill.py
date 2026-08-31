@@ -64,6 +64,7 @@ import argparse
 import gc
 import json
 import os
+import ctypes
 import queue
 import socket
 import struct
@@ -194,50 +195,147 @@ def from_wire(buf: bytearray, shape) -> mx.array:
     return mx.array(a).view(mx.bfloat16)
 
 
-# ----------------------------------------------------------- ring transport
+# ---------------------------------------------------------- fast-link transport
 
-_RING_GROUP = None
+_LINK_GROUP = None
+_LIBRDMA = "/usr/lib/librdma.dylib"
 
 
-def ring_group():
-    """Lazily join the MLX ring backend.
+class _Gid(ctypes.Union):
+    _fields_ = [("raw", ctypes.c_ubyte * 16)]
 
-    Requires ``MLX_HOSTFILE`` (a file holding e.g. ``[["10.0.0.1:39400"],
-    ["10.0.0.2:39401"]]``) and ``MLX_RANK``; ``--ring-hosts`` writes that file
-    for you. Deliberately *not* jaccl: that backend wants RDMA device
-    enumeration and a Thunderbolt Bridge, which is out of bounds on this fleet.
-    The ring backend is plain TCP over whatever IPs you hand it, so it rides
-    the existing tbnet with no interface changes at all.
+
+def rdma_ipv4_gids() -> dict:
+    """{rdma device name: IPv4 address of its IPv4-mapped GID}.
+
+    macOS exposes one RDMA device per Thunderbolt port (``rdma_en2..en7``) and
+    each carries an IPv4-mapped GID derived from whatever IP is configured on
+    the matching ``enN``.  These exist independently of the "Thunderbolt Bridge"
+    network service -- verified with that service disabled on both boxes -- so
+    jaccl rides the tbnet addresses that are already up, with no interface,
+    bridge or service change.  jaccl refuses a port without such a GID
+    ("[jaccl] No IPv4-mapped GID for this device").
     """
-    global _RING_GROUP
-    if _RING_GROUP is None:
-        _RING_GROUP = mx.distributed.init(backend="ring")
-    return _RING_GROUP
+    out = {}
+    try:
+        lib = ctypes.CDLL(_LIBRDMA)
+    except OSError:
+        return out
+    lib.ibv_get_device_list.restype = ctypes.POINTER(ctypes.c_void_p)
+    lib.ibv_get_device_list.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    lib.ibv_get_device_name.restype = ctypes.c_char_p
+    lib.ibv_get_device_name.argtypes = [ctypes.c_void_p]
+    lib.ibv_open_device.restype = ctypes.c_void_p
+    lib.ibv_open_device.argtypes = [ctypes.c_void_p]
+    lib.ibv_query_gid.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint8,
+        ctypes.c_int,
+        ctypes.POINTER(_Gid),
+    ]
+    n = ctypes.c_int(0)
+    lst = lib.ibv_get_device_list(ctypes.byref(n))
+    if not lst:
+        return out
+    for i in range(n.value):
+        name = lib.ibv_get_device_name(lst[i]).decode()
+        ctx = lib.ibv_open_device(lst[i])
+        if not ctx:
+            continue
+        for idx in range(8):
+            g = _Gid()
+            if lib.ibv_query_gid(ctx, 1, idx, ctypes.byref(g)) != 0:
+                continue
+            raw = bytes(g.raw)
+            if raw[:10] == b"\x00" * 10 and raw[10:12] == b"\xff\xff":
+                out[name] = socket.inet_ntoa(raw[12:16])
+                break
+    return out
 
 
-def setup_ring_env(ring_hosts: Optional[str], rank: int):
-    if not ring_hosts:
-        return
-    hosts = [h.strip() for h in ring_hosts.split(",") if h.strip()]
-    path = Path(os.environ.get("TMPDIR", "/tmp")) / "mlx_pipeline_ring_hosts.json"
-    path.write_text(json.dumps([[h] for h in hosts]))
-    os.environ["MLX_HOSTFILE"] = str(path)
+def _peer_ips(spec: str):
+    """Accept both "10.0.0.1,10.0.0.2" and the legacy "ip:port,ip:port"."""
+    ips, ports = [], []
+    for item in (spec or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        host, _, port = item.partition(":")
+        ips.append(host)
+        ports.append(int(port) if port else None)
+    return ips, ports
+
+
+def setup_link_env(transport: str, peers: str, rank: int, jaccl_port: int = 39500,
+                   rdma_dev: Optional[str] = None):
+    """Fill in the env protocol mlx.launch would set, minus the launcher.
+
+    The launcher insists on one python path for every host, which does not hold
+    here (different users, different venvs), so each box is started on its own
+    and only the env is shared.
+    """
+    if transport == "socket" or not peers:
+        return transport
+    ips, ports = _peer_ips(peers)
+    tmp = Path(os.environ.get("TMPDIR", "/tmp"))
     os.environ["MLX_RANK"] = str(rank)
+    if transport == "jaccl":
+        dev = rdma_dev or next(
+            (d for d, ip in rdma_ipv4_gids().items() if ip == ips[rank]), None
+        )
+        if dev is None:
+            print(
+                f"[link] no RDMA device carries {ips[rank]} "
+                f"({rdma_ipv4_gids()}); falling back to ring",
+                flush=True,
+            )
+            transport = "ring"
+        else:
+            n = len(ips)
+            # rdma[i][j] = device rank i uses to reach rank j; None on the
+            # diagonal (mlx asserts "RDMA device of self should be null")
+            table = [[None if i == j else dev for j in range(n)] for i in range(n)]
+            path = tmp / "mlx_vlm_pipeline_ibv.json"
+            path.write_text(json.dumps(table))
+            os.environ["MLX_IBV_DEVICES"] = str(path)
+            os.environ["MLX_JACCL_COORDINATOR"] = f"{ips[0]}:{jaccl_port}"
+    if transport == "ring":
+        pp = [p if p is not None else 39400 + i for i, p in enumerate(ports)]
+        path = tmp / "mlx_vlm_pipeline_ring.json"
+        path.write_text(json.dumps([[f"{h}:{p}"] for h, p in zip(ips, pp)]))
+        os.environ["MLX_HOSTFILE"] = str(path)
+    return transport
 
 
-def ring_send(h: mx.array, dst: int, stream):
+def link_group(backend: str = "ring"):
+    """Lazily join the fast link. Deliberately not via mlx.launch (see above)."""
+    global _LINK_GROUP
+    if _LINK_GROUP is None:
+        _LINK_GROUP = mx.distributed.init(backend=backend)
+    return _LINK_GROUP
+
+
+def link_send(h: mx.array, dst: int, stream):
     # Send/Recv have no GPU implementation -- they must run on a CPU stream, and
     # MLX streams are thread-local, so the stream is created inside the worker
-    # thread that uses it. Measured: 12.7 ms for the 64 MiB boundary tensor with
-    # the GPU fully loaded, and no measurable slowdown of the compute stream.
-    mx.eval(mx.distributed.send(h, dst, group=ring_group(), stream=stream))
+    # thread that uses it.  The pipeline pays exactly one CPU<->GPU crossing per
+    # chunk (~0.2 ms against a 2.4-4.6 s chunk), which is why this structure is
+    # fine here and fatal for tensor parallelism.
+    mx.eval(mx.distributed.send(h, dst, group=_LINK_GROUP, stream=stream))
 
 
-def ring_recv(shape, src: int, stream) -> mx.array:
+def link_recv(shape, src: int, stream) -> mx.array:
     tmpl = mx.zeros(shape, dtype=mx.bfloat16)
-    h = mx.distributed.recv_like(tmpl, src, group=ring_group(), stream=stream)
+    h = mx.distributed.recv_like(tmpl, src, group=_LINK_GROUP, stream=stream)
     mx.eval(h)
     return h
+
+
+# back-compat aliases
+setup_ring_env = setup_link_env
+ring_group = link_group
+ring_send = link_send
+ring_recv = link_recv
 
 
 # --------------------------------------------------- stage-B cache handoff
@@ -406,9 +504,9 @@ def run_head(args):
     _send_json(sock, {"cmd": "hello", "transport": args.transport, "split": args.split})
     hi = _recv_json(sock)
     assert hi.get("ok"), hi
-    if args.transport == "ring":
-        g = ring_group()
-        print(f"[head] ring rank {g.rank()}/{g.size()}", flush=True)
+    if args.transport != "socket":
+        g = link_group(args.transport)
+        print(f"[head] {args.transport} rank {g.rank()}/{g.size()}", flush=True)
 
     results = []
     for tokens in args.tokens:
@@ -462,7 +560,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
     def sender():
         try:
             # MLX streams are thread-local: the comm stream must be made here.
-            stream = mx.new_stream(mx.cpu) if args.transport == "ring" else None
+            stream = mx.new_stream(mx.cpu) if args.transport != "socket" else None
             while True:
                 item = sendq.get()
                 if item is None:
@@ -475,8 +573,8 @@ def _head_one(args, stage: Stage, sock, tokens: int):
                 # sub-ms) so chunk shapes need not be predicted by the peer.
                 nbytes = 0 if nb is None else nb.nbytes
                 sock.sendall(HDR.pack(MAGIC, idx, B, S, HC, D, nbytes))
-                if args.transport == "ring":
-                    ring_send(keep, 1, stream)
+                if args.transport != "socket":
+                    link_send(keep, 1, stream)
                 else:
                     sock.sendall(memoryview(nb).cast("B"))
                 send_times.append(time.perf_counter() - t0)
@@ -497,7 +595,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
         mx.eval(h)
         stage.eval_state()
         t_gpu = time.perf_counter() - t0
-        nb = None if args.transport == "ring" else to_wire(h)
+        nb = None if args.transport != "socket" else to_wire(h)
         t1 = time.perf_counter()
         sendq.put((idx, h, nb))  # blocks when the tail is behind -> backpressure
         t_block = time.perf_counter() - t1
@@ -561,9 +659,9 @@ def run_tail(args):
     assert hello["split"] == args.split, (hello, args.split)
     args.transport = hello["transport"]
     _send_json(sock, {"ok": True, "load_s": load_s})
-    if args.transport == "ring":
-        g = ring_group()
-        print(f"[tail] ring rank {g.rank()}/{g.size()}", flush=True)
+    if args.transport != "socket":
+        g = link_group(args.transport)
+        print(f"[tail] {args.transport} rank {g.rank()}/{g.size()}", flush=True)
 
     while True:
         req = _recv_json(sock)
@@ -585,7 +683,7 @@ def _tail_one(args, stage: Stage, sock, req):
 
     def receiver():
         try:
-            stream = mx.new_stream(mx.cpu) if args.transport == "ring" else None
+            stream = mx.new_stream(mx.cpu) if args.transport != "socket" else None
             hdrbuf = bytearray(HDR.size)
             while True:
                 _recv_exact(sock, memoryview(hdrbuf), HDR.size)
@@ -596,8 +694,8 @@ def _tail_one(args, stage: Stage, sock, req):
                     return
                 # header already arrived -> this times the payload transfer only
                 t0 = time.perf_counter()
-                if args.transport == "ring":
-                    payload = ring_recv((B, S, HC, D), 0, stream)
+                if args.transport != "socket":
+                    payload = link_recv((B, S, HC, D), 0, stream)
                 else:
                     buf = bytearray(nbytes)
                     _recv_exact(sock, memoryview(buf), nbytes)
@@ -740,14 +838,26 @@ def main(argv=None):
     p.add_argument("--depth", type=int, default=2, help="in-flight chunk queue depth")
     p.add_argument(
         "--transport",
-        choices=["socket", "ring"],
+        choices=["socket", "ring", "jaccl"],
         default="ring",
-        help="boundary-tensor transport; 'socket' is the fallback",
+        help="boundary-tensor transport; jaccl is Thunderbolt RDMA, "
+        "ring is TCP over the same IPs, socket is the plain-python fallback",
+    )
+    p.add_argument(
+        "--peers",
+        default=None,
+        help="comma separated ip per rank (rank 0 first), e.g. 10.0.0.1,10.0.0.2",
     )
     p.add_argument(
         "--ring-hosts",
         default=None,
-        help="comma separated ip:port per rank, e.g. 10.0.0.1:39400,10.0.0.2:39401",
+        help="legacy alias for --peers; ip:port form is accepted for ring",
+    )
+    p.add_argument("--jaccl-port", type=int, default=39500)
+    p.add_argument(
+        "--rdma-dev",
+        default=None,
+        help="override the autodetected rdma_enN (matched by IPv4-mapped GID)",
     )
     p.add_argument("--connect-timeout", type=float, default=1800.0)
     p.add_argument("--out", default=None)
@@ -760,8 +870,14 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     mx.random.seed(args.seed)
-    if args.role != "single" and args.transport == "ring":
-        setup_ring_env(args.ring_hosts, 0 if args.role == "head" else 1)
+    if args.role != "single" and args.transport != "socket":
+        args.transport = setup_link_env(
+            args.transport,
+            args.peers or args.ring_hosts,
+            0 if args.role == "head" else 1,
+            jaccl_port=args.jaccl_port,
+            rdma_dev=args.rdma_dev,
+        )
     if args.role == "head":
         run_head(args)
     elif args.role == "tail":

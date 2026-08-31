@@ -7,7 +7,8 @@ Enable by setting ``MLX_VLM_PIPELINE_HOSTS`` (the worker's control endpoint);
 everything else has a default::
 
     MLX_VLM_PIPELINE_HOSTS=10.0.0.2:39210          # required, enables the feature
-    MLX_VLM_PIPELINE_RING=10.0.0.1:39400,10.0.0.2:39401   # ring backend (default transport)
+    MLX_VLM_PIPELINE_PEERS=10.0.0.1,10.0.0.2       # per-rank IPs on the fast link
+    MLX_VLM_PIPELINE_TRANSPORT=jaccl               # jaccl | ring | socket
     MLX_VLM_PIPELINE_SPLIT=23                      # int, or "auto" for the micro-sweep
     MLX_VLM_PIPELINE_MIN_TOKENS=4096               # below this, stay single-box
     MLX_VLM_PIPELINE_CALIB=~/.cache/mlx_vlm/pipeline_splits.json
@@ -66,9 +67,9 @@ from .pipeline_prefill import (
     _send_json,
     handoff_recv,
     install_state,
-    ring_group,
-    ring_send,
-    setup_ring_env,
+    link_group,
+    link_send,
+    setup_link_env,
     to_wire,
 )
 
@@ -80,13 +81,14 @@ _CTX = None
 
 
 class PipelineSettings:
-    def __init__(self, peer, ring, split, min_tokens, calib_path, transport):
-        self.peer = peer
-        self.ring = ring
+    def __init__(self, peer, peers, split, min_tokens, calib_path, transport, jaccl_port):
+        self.peer = peer                # worker control endpoint (host, port)
+        self.peers = peers              # per-rank IPs on the fast link, rank 0 first
         self.split = split
         self.min_tokens = min_tokens
         self.calib_path = calib_path
         self.transport = transport
+        self.jaccl_port = jaccl_port
 
     @classmethod
     def from_env(cls):
@@ -94,19 +96,28 @@ class PipelineSettings:
         if not hosts:
             return None
         host, _, port = hosts.partition(":")
-        ring = os.environ.get("MLX_VLM_PIPELINE_RING", "").strip() or None
-        split = os.environ.get("MLX_VLM_PIPELINE_SPLIT", "auto").strip()
-        calib = os.environ.get(
-            "MLX_VLM_PIPELINE_CALIB",
-            str(Path.home() / ".cache/mlx_vlm/pipeline_splits.json"),
+        # MLX_VLM_PIPELINE_RING is the legacy spelling and may carry ip:port
+        peers = (
+            os.environ.get("MLX_VLM_PIPELINE_PEERS", "").strip()
+            or os.environ.get("MLX_VLM_PIPELINE_RING", "").strip()
+            or None
         )
+        transport = os.environ.get(
+            "MLX_VLM_PIPELINE_TRANSPORT", "ring" if peers else "socket"
+        ).strip()
+        if transport != "socket" and not peers:
+            transport = "socket"
         return cls(
             peer=(host, int(port or 39210)),
-            ring=ring,
-            split=split,
+            peers=peers,
+            split=os.environ.get("MLX_VLM_PIPELINE_SPLIT", "auto").strip(),
             min_tokens=int(os.environ.get("MLX_VLM_PIPELINE_MIN_TOKENS", "4096")),
-            calib_path=calib,
-            transport="ring" if ring else "socket",
+            calib_path=os.environ.get(
+                "MLX_VLM_PIPELINE_CALIB",
+                str(Path.home() / ".cache/mlx_vlm/pipeline_splits.json"),
+            ),
+            transport=transport,
+            jaccl_port=int(os.environ.get("MLX_VLM_PIPELINE_JACCL_PORT", "39500")),
         )
 
 
@@ -253,8 +264,11 @@ class PipelineHead:
 
     # -- connection ---------------------------------------------------------
     def connect(self, timeout=60.0):
-        if self.transport == "ring":
-            setup_ring_env(self.settings.ring, 0)
+        if self.transport != "socket":
+            self.transport = setup_link_env(
+                self.transport, self.settings.peers, 0,
+                jaccl_port=self.settings.jaccl_port,
+            )
         s = socket.socket()
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         deadline = time.time() + timeout
@@ -270,8 +284,8 @@ class PipelineHead:
         _send_json(s, {"cmd": "hello", "transport": self.transport, "split": self.split})
         ack = _recv_json(s)
         assert ack.get("ok"), ack
-        if self.transport == "ring":
-            ring_group()
+        if self.transport != "socket":
+            link_group(self.transport)
         return self
 
     def close(self):
@@ -306,7 +320,7 @@ class PipelineHead:
 
     def _sender(self):
         try:
-            stream = mx.new_stream(mx.cpu) if self.transport == "ring" else None
+            stream = mx.new_stream(mx.cpu) if self.transport != "socket" else None
             while True:
                 item = self._q.get()
                 if item is None:
@@ -318,8 +332,8 @@ class PipelineHead:
                 self.sock.sendall(
                     HDR.pack(MAGIC, idx, B, S, HC, D, 0 if nb is None else nb.nbytes)
                 )
-                if self.transport == "ring":
-                    ring_send(h, 1, stream)
+                if self.transport != "socket":
+                    link_send(h, 1, stream)
                 else:
                     self.sock.sendall(memoryview(nb).cast("B"))
                 self.stats["wire_send_s"] += time.perf_counter() - t0
@@ -343,7 +357,7 @@ class PipelineHead:
             raise RuntimeError(f"pipeline peer failed: {self._err[0]}")
         idx = len(self.stats["chunks"])
         self.stats["chunks"].append(h.shape[1])
-        self._q.put((idx, h, None if self.transport == "ring" else to_wire(h)))
+        self._q.put((idx, h, None if self.transport != "socket" else to_wire(h)))
 
     def finalize(self, cache):
         """End the stream, pull stage B's caches back, install them for decode."""
