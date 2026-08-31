@@ -643,6 +643,7 @@ def maybe_load_tp(model_path: str):
         # single-box resident does not, and the box freezes rather than swaps.
         logger.info("tp: fleet preflight %s",
                     require_quiet_fleet(hosts, label="tp serving load"))
+        _require_live_gpus(hosts)
 
         worker = launch_worker(model_path, hosts)
         info = preflight(hosts, 0)
@@ -670,6 +671,34 @@ def maybe_load_tp(model_path: str):
         logger.error("tp: unavailable (%s); serving single-box", e, exc_info=True)
         _reap_worker(worker, hosts)
         return None
+
+
+def _require_live_gpus(hosts) -> None:
+    """Refuse if either box's Metal device has stopped executing work.
+
+    Memory is not the only way a box goes unusable.  Measured 2026-09-01:
+    gesicht reached a state where a 4x4 ``mx.eval`` never returned, with 302 GB
+    free and nothing resident.  Every memory check passed, and a load into that
+    box would have hung for the full step timeout and then aborted -- costing a
+    shard's worth of leaked memory on the way out.  Seconds to check, minutes
+    to discover otherwise.
+    """
+    from ..tp.fleet import gpu_responsive
+
+    if os.environ.get("MLX_VLM_GLM5_TP_SKIP_GPU_CHECK", "") not in ("", "0"):
+        return
+    if not gpu_responsive():
+        raise TPUnavailable(
+            "this box's Metal device is not executing work (a 4x4 eval did "
+            "not return). Nothing will run here until it is rebooted; serving "
+            "single-box would hang the same way.")
+    if len(hosts or []) >= 2:
+        py = os.environ.get(ENV_WORKER_PY, "/Users/m3ms/venv_mlx321/bin/python")
+        if not gpu_responsive(f"m3ms@{hosts[1]}", python=py):
+            raise TPUnavailable(
+                f"the peer {hosts[1]}'s Metal device is not executing work; "
+                f"rank 1 would load its shard and then hang. Reboot it, or "
+                f"serve single-box.")
 
 
 def _reap_worker(worker, hosts) -> None:

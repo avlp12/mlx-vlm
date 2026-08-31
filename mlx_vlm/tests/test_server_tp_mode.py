@@ -667,3 +667,34 @@ def test_guard_disarms_even_when_the_forward_raises():
     except ValueError:
         pass
     assert m._watchdog._inflight is None
+
+
+def test_a_wedged_gpu_falls_back_instead_of_hanging(monkeypatch):
+    """Memory is not the only way a box goes unusable.
+
+    Measured 2026-09-01: a 4x4 mx.eval never returned with 302 GB free and
+    nothing resident.  Every memory check passed.  Loading into that would have
+    hung for the whole step timeout and then aborted, leaking a shard on the
+    way out.
+    """
+    os.environ[T.ENV_HOSTS] = "10.0.0.1,10.0.0.2"
+    from mlx_vlm.tp import fleet
+
+    monkeypatch.setattr(fleet, "require_quiet_fleet", lambda *a, **k: {})
+    monkeypatch.setattr(fleet, "gpu_responsive", lambda *a, **k: False)
+    assert T.maybe_load_tp("/some/model") is None
+
+
+def test_gpu_check_can_be_skipped(monkeypatch):
+    os.environ[T.ENV_HOSTS] = "10.0.0.1,10.0.0.2"
+    os.environ["MLX_VLM_GLM5_TP_SKIP_GPU_CHECK"] = "1"
+    try:
+        called = []
+        from mlx_vlm.tp import fleet
+
+        monkeypatch.setattr(fleet, "gpu_responsive",
+                            lambda *a, **k: called.append(1) or True)
+        T._require_live_gpus(["10.0.0.1", "10.0.0.2"])
+        assert called == []
+    finally:
+        os.environ.pop("MLX_VLM_GLM5_TP_SKIP_GPU_CHECK", None)

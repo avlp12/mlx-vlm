@@ -290,3 +290,42 @@ def test_enough_headroom_passes():
     r = fleet.require_quiet_fleet(threshold_gb=20, ps_runner=lambda host: _QUIET)
     assert r["quiet"] is True
     assert r["pressure"]["localhost"]["free_gb"] == 180.0
+
+
+# ------------------------------------------------------------- GPU liveness
+def test_gpu_probe_is_a_subprocess_with_a_timeout(monkeypatch):
+    """It has to be a subprocess: a wedged Metal device ignores signals, so an
+    in-process probe would hang the very guard meant to detect the hang."""
+    seen = {}
+
+    class _R:
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["timeout"] = cmd, kw.get("timeout")
+        return _R()
+
+    monkeypatch.setattr(fleet.subprocess, "run", fake_run)
+    assert fleet.gpu_responsive() is True
+    assert seen["timeout"] is not None, "the probe must be bounded"
+    assert "mlx.core" in " ".join(seen["cmd"])
+
+
+def test_a_wedged_gpu_reports_not_responsive(monkeypatch):
+    def boom(cmd, **kw):
+        raise fleet.subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+
+    monkeypatch.setattr(fleet.subprocess, "run", boom)
+    assert fleet.gpu_responsive() is False
+
+
+def test_gpu_probe_targets_the_peer_over_ssh(monkeypatch):
+    seen = {}
+
+    class _R:
+        returncode = 0
+
+    monkeypatch.setattr(fleet.subprocess, "run",
+                        lambda cmd, **kw: (seen.update(cmd=cmd), _R())[1])
+    fleet.gpu_responsive("m3ms@10.0.0.2")
+    assert seen["cmd"][0] == "ssh" and "m3ms@10.0.0.2" in seen["cmd"]

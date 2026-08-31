@@ -38,6 +38,7 @@ import logging
 import os
 import socket
 import subprocess
+import sys
 import time
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -49,6 +50,8 @@ __all__ = [
     "MAX_SWAP_GB",
     "MIN_FREE_GB",
     "MIN_FREE_PCT",
+    "GpuWedged",
+    "gpu_responsive",
     "heavy_processes",
     "memory_snapshot",
     "phys_footprint_gb",
@@ -105,6 +108,43 @@ _PROBE = ("/usr/bin/top -l 1 -o mem -n 40 -stats pid,mem; "
 
 class HeavyRunActive(RuntimeError):
     """A heavy run is still resident somewhere on the fleet."""
+
+
+class GpuWedged(RuntimeError):
+    """The Metal device is not executing work, so a load would hang."""
+
+
+# A 4x4 add.  If THIS does not come back, nothing will.
+_GPU_PROBE = "import mlx.core as mx; mx.eval(mx.ones((4,4))+1)"
+
+
+def gpu_responsive(host: Optional[str] = None, timeout_s: float = 25.0,
+                   python: Optional[str] = None) -> bool:
+    """Does the Metal device still execute a trivial kernel?
+
+    Memory is not the only way a box goes unusable.  On 2026-09-01 gesicht
+    reached a state where ``mx.eval(mx.ones((4,4)) + 1)`` never returned, with
+    302 GB free and nothing resident -- the device was wedged, most likely by
+    the session's repeated aborted runs, in the same way the jaccl fabric had
+    wedged earlier.  Every memory check passed and a load into that box would
+    simply have hung.
+
+    Run in a SUBPROCESS with a timeout, because the whole point is that the
+    operation cannot be interrupted in-process: a wedged device ignores signals
+    (see tp.transport.Deadman).  Killing a fresh child costs nothing.
+    """
+    py = python or sys.executable
+    cmd = [py, "-c", _GPU_PROBE]
+    if host:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+               f"{py} -c {_GPU_PROBE!r}"]
+    try:
+        return subprocess.run(cmd, capture_output=True,
+                              timeout=timeout_s).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _run_ps(host: Optional[str] = None, timeout: float = 30.0) -> str:
