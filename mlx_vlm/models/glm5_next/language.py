@@ -679,6 +679,18 @@ class Glm5NextIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
+        # Tensor parallelism splits the indexer's head axis, and the scorer
+        # CONTRACTS that axis -- so each rank ends up holding a partial sum and
+        # the full score only exists after an all-reduce.  ``_tp_reduce`` is
+        # that reduce; ``mlx_vlm.tp.glm5_next.shard_dsa`` installs it and it is
+        # None (identity) everywhere else.
+        self._tp_reduce = None
+        # The weight scale must use the GLOBAL head count, or the summed
+        # partials come out scaled by sqrt(size) relative to the unsharded
+        # reference.  Uniform and positive, so it cannot change the top-k --
+        # but it does change the scores, and the scores are compared against a
+        # reference in the validator.
+        self._scale_heads = self.n_heads
         self.index_kpool_compress_ape = mx.zeros((self.index_kpool, self.head_dim))
         self.index_kpool_compress_gate = mx.zeros((self.head_dim, self.dim))
 
@@ -1044,7 +1056,7 @@ class Glm5NextIndexer(nn.Module):
                 ]
             scores = q[:, c0:c1] @ pool_keys_t
             scores = mx.maximum(scores * self.softmax_scale, 0.0)
-            weights = self.weights_proj(x[:, c0:c1]) * (self.n_heads**-0.5)
+            weights = self.weights_proj(x[:, c0:c1]) * (self._scale_heads**-0.5)
             # Contract the head axis as a batched matmul rather than an
             # elementwise product + sum: it never materializes the
             # [B, cs, n_heads, P] product (halving the scorer transient),
@@ -1053,6 +1065,14 @@ class Glm5NextIndexer(nn.Module):
             # to the large-strided-shape reduction issue of mx.sum over a
             # non-last axis (ml-explore/mlx#3784) should the chunk ever grow.
             index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
+            # Reduce BEFORE the top-k.  Each rank has contracted only its own
+            # half of the head axis, so ranking a partial sum selects a
+            # different set of KV blocks on each rank -- and the ranks then
+            # feed different gathered states into the o_proj all-reduce, whose
+            # sum is two halves of different computations.  It does not hang
+            # and it does not look wrong; it just is.
+            if self._tp_reduce is not None:
+                index_scores = self._tp_reduce(index_scores)
             if bundle is None:
                 pool_visible = mx.take_along_axis(
                     visible, mx.broadcast_to(pool_end[:, None, :], (B, cs, P)), axis=-1

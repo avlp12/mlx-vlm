@@ -3,10 +3,21 @@
 Sync map (per decode step, GLM-5.3-Flash: 45 layers = 34 KDA + 11 DSA):
 
     34  KDA  o_proj row-parallel                      -> 1 all-reduce each
-    22  DSA  o_proj row-parallel + indexer head-axis   -> 2 all-reduces each
+    11  DSA  o_proj row-parallel                       -> 1 all-reduce each
+    11  DSA  indexer head-axis contraction             -> 1 per query CHUNK
     45  MLP/MoE down_proj row-parallel                -> 1 all-reduce each
     ---
-    101 all-reduces / step
+    101 all-reduces / decode step (S=1, so one indexer chunk per DSA layer)
+
+The indexer term is per query chunk (``chunk = 512 if S > 512``), so a prefill
+of S tokens costs ``11 * ceil(S/512)`` there rather than 11.  Both ranks derive
+the chunk count from S alone, which rank 0 announces, so the counts agree.
+
+Until 2026-09-01 the indexer reduce was installed but never called -- the model
+had no call site -- so the real count was 90/step and each rank ranked its own
+half of the head scores.  ``tp/validate.py`` checked that summed partials match
+the reference, which was true and did not catch it, because it supplied the
+reduce itself as a capture hook.
 
 What is deliberately NOT sharded:
 
