@@ -11,6 +11,30 @@ Run (rank 1 first, it is not the coordinator)::
 
     MLX_RANK=1 python -m mlx_vlm.tp.comm_bench --hosts 10.0.0.1,10.0.0.2
     MLX_RANK=0 python -m mlx_vlm.tp.comm_bench --hosts 10.0.0.1,10.0.0.2 --steps 1000 --soak 600
+
+RESULT (twin M3 Ultra, tbnet, jaccl): the gate FAILS. Expected ~4.5 ms of comm
+per step, measured 45.4 ms.
+
+The cause is not the network. An isolated all_sum of this shape is 20.4 us, and
+101 of them chained with nothing in between is 8.2 us each -- MLX pipelines
+them on the CPU stream. But ``[AllReduce::eval_gpu] has no GPU implementation``,
+so every reduce placed between two pieces of GPU compute forces a CPU<->GPU
+stream crossing. Measured with a real 2-rank group: 270.2 us/op compute-only vs
+719.8 us/op interleaved = 449.6 us added per reduce.
+
+That penalty is intrinsic to MLX, not to jaccl. With no collective anywhere,
+swapping a trivial GPU-stream op for a trivial CPU-stream op inside a GPU chain
+costs 215.3 us (301.7 -> 517.0 us/op), and the penalty stays flat at ~207 us
+while the GPU block between crossings grows from 257 to 719 us -- it is hard
+serialization, not a latency that more compute can hide.
+
+Budget: TP=2 can save at most half the step (13.5 ms at B=1, 36.9 ms at B=8),
+so it affords 30 crossings at B=1 and 82 at B=8. Megatron needs 101 and EP=2
+needs 84. No scheme fits at either batch size.
+
+Unblock: AllReduce::eval_gpu for the Metal backend. MLX already ships GPU
+collectives for nccl/CUDA, so this is a backend gap. Receipt:
+glm53flash/logs/tp2/phase1_gate.json
 """
 
 from __future__ import annotations
