@@ -16,6 +16,33 @@ Prefill only. When prefill ends, stage B ships its caches back and decode
 continues on this box with all layers resident -- single-stream decode gains
 nothing from layer pipelining because both stage latencies serialize inside
 every token step.
+
+Receipts (twin M3 Ultra 512GB, tbnet, GLM-5.3-Flash q4, split 23, chunk 2048,
+repro_mlxvlm_dflash2.py --skip-spec, 32768-token prompt)::
+
+    metric              single box     two box      ratio
+    prefill tok/s          348.3        555.6       1.60x
+    TTFT                   94.13 s      59.00 s     -37%
+    decode tok/s            24.89        25.19      1.01x  (unaffected)
+    peak memory           200.2 GB     197.9 GB
+
+Identity: on the same-tree loopback arrangement the pipelined path reproduces
+the single-box text_preview byte-for-byte with generation_tps 26.716 vs 26.722
+-- the cache handoff restores stage B's state exactly, so decode is untouched.
+
+The 1.60x is lower than the 1.85x the internal stage accounting suggests
+because splitting the stack forces the boundary tensor to be materialized every
+chunk instead of letting MLX keep the whole 45-layer graph in flight; measured
+at ~7% of aggregate stage time on real text (nil on random tokens). 59.00 s is
+~99% of this split's structural floor (max stage 55.2 s + fill 3.2 s).
+
+Transport: ring and the raw Python socket are indistinguishable under real
+prefill load -- 31.9 vs 30.6/33.4 ms per 64 MiB boundary, tail_wait 2.81 vs
+2.67/2.93 s, 582.0 vs 582.1/579.0 tok/s. The 28-41 ms in-flight cost is
+memory-bandwidth contention with the prefill itself, not a transport property
+(both fall to ~12 ms when the box is only running matmuls). Ring's one clear
+win is deserialization: 0.01 ms vs 5.3 ms per chunk, since it hands back an
+mx.array instead of a 64 MiB host copy.
 """
 
 from __future__ import annotations
