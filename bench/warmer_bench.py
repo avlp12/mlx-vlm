@@ -39,7 +39,7 @@ def main() -> None:
     from mlx_vlm.model_warmer import warm_model
     from mlx_vlm.prompt_utils import apply_chat_template
     from mlx_vlm.tokenizer_utils import load_tokenizer
-    from mlx_vlm.utils import get_model_path, load_model
+    from mlx_vlm.utils import StoppingCriteria, get_model_path, load_model
 
     path = get_model_path(args.model)
     t0 = time.perf_counter()
@@ -47,6 +47,13 @@ def main() -> None:
     load_s = time.perf_counter() - t0
 
     wrapper = load_tokenizer(path)
+    eos = getattr(model.config, "eos_token_id", None)
+    if eos is None:
+        text_cfg = getattr(model.config, "text_config", None)
+        eos = getattr(text_cfg, "eos_token_id", None) if text_cfg is not None else None
+    criteria = StoppingCriteria(eos, wrapper)
+    wrapper.stopping_criteria = criteria
+    wrapper._tokenizer.stopping_criteria = criteria
 
     class _P:
         def __init__(self, w):
