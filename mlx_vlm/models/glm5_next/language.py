@@ -61,7 +61,7 @@ def _fused_kda_enabled() -> bool:
 # K/V transient to O(chunk * index_topk) latents at prefill while staying wide
 # enough to keep the GPU busy. The short speculative-verify block (L <= 8) is
 # always a single chunk.
-_GATHER_Q_CHUNK = 1024
+_GATHER_Q_CHUNK = int(os.environ.get("MLX_VLM_GLM5_GATHER_Q_CHUNK", "1024"))
 
 # Context length above which gathered prefill beats the dense masked path.
 # The PR's microbench put the per-chunk crossover at ~16k, but END-TO-END on
