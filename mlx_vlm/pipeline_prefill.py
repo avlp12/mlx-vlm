@@ -135,42 +135,14 @@ class Stage:
         self.fa_local = next((i for i in local if not self.lm.layers[i].is_linear), None)
 
     def __call__(self, h: mx.array, inputs: Optional[mx.array] = None) -> mx.array:
-        """Run this stage over one chunk.
-
-        head: ``inputs`` is int token ids -> embed + hc-broadcast.
-        tail/middle: ``h`` is the already-expanded (B, S, hc, D) boundary tensor.
-        """
-        if self.is_head:
-            h = self.lm.embed_tokens(inputs)
-
-        fa_cache = self.caches[self.fa_local] if self.fa_local is not None else None
-        fa_mask = (
-            create_attention_mask(h, fa_cache[0] if fa_cache else None, return_array=True)
-            if self.fa_local is not None
-            else None
+        """Run this stage over one chunk (delegates to Glm5NextModel)."""
+        return self.lm.pipeline_forward(
+            h, self.caches, self.local[0], self.local[-1] + 1, inputs=inputs
         )
-        ssm_mask = (
-            create_ssm_mask(h, self.caches[self.ssm_local])
-            if self.ssm_local is not None
-            else None
-        )
-
-        if self.is_head:
-            h = mx.broadcast_to(
-                h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[2])
-            )
-            h = mx.contiguous(h)
-
-        for i in self.local:
-            layer = self.lm.layers[i]
-            h = layer(h, mask=ssm_mask if layer.is_linear else fa_mask, cache=self.caches[i])
-        return h
 
     def finish(self, h: mx.array) -> mx.array:
-        """Tail only: pool the hc streams, final norm, LM head on the last position."""
-        h = h.mean(axis=2)
-        h = self.lm.norm(h)
-        return self.model.language_model._logits(h[:, -1:, :])
+        """Tail only: collapse the hc streams, final norm, LM head on the last position."""
+        return self.model.language_model._logits(self.lm.pipeline_finish(h)[:, -1:, :])
 
     def eval_state(self):
         st = []
@@ -271,74 +243,137 @@ def ring_recv(shape, src: int, stream) -> mx.array:
 # --------------------------------------------------- stage-B cache handoff
 
 
-def _flatten_state(obj, path, out):
+def describe_state(obj):
+    """Structure descriptor for a cache state tree (arrays -> shape/dtype)."""
     if obj is None:
-        return
+        return {"k": "none"}
     if isinstance(obj, mx.array):
-        out.append((path, obj))
-        return
+        return {
+            "k": "arr",
+            "dtype": str(obj.dtype).rsplit(".", 1)[-1],
+            "shape": list(obj.shape),
+            "nbytes": int(obj.nbytes),
+        }
     if isinstance(obj, (list, tuple)):
-        for i, o in enumerate(obj):
-            _flatten_state(o, f"{path}.{i}", out)
-        return
-    raise TypeError(f"unhandled cache state node at {path}: {type(obj)}")
+        return {"k": "seq", "items": [describe_state(o) for o in obj]}
+    raise TypeError(f"unhandled cache state node: {type(obj)}")
 
 
-def collect_state(caches):
-    out = []
-    for i, c in enumerate(caches):
-        if c is None:
-            continue
-        _flatten_state(c.state, str(i), out)
+def collect_arrays(obj, out):
+    """Arrays in the same order describe_state walks them."""
+    if isinstance(obj, mx.array):
+        out.append(obj)
+    elif isinstance(obj, (list, tuple)):
+        for o in obj:
+            collect_arrays(o, out)
     return out
 
 
-def handoff_send(sock, caches):
-    """Stretch goal: ship stage B's KDA/DSA caches back so decode can run on box A."""
-    entries = collect_state(caches)
-    mx.eval([a for _, a in entries])
-    meta = [
-        {
-            "path": p,
-            "dtype": str(a.dtype).rsplit(".", 1)[-1],
-            "shape": list(a.shape),
-            "nbytes": int(a.nbytes),
-        }
-        for p, a in entries
-    ]
-    _send_json(sock, {"cmd": "handoff", "meta": meta})
-    t0 = time.perf_counter()
-    for _, a in entries:
-        if a.nbytes == 0:
+def rebuild_state(desc, it):
+    k = desc["k"]
+    if k == "none":
+        return None
+    if k == "arr":
+        return next(it)
+    return [rebuild_state(d, it) for d in desc["items"]]
+
+
+def collect_state(caches):
+    """(layer index, descriptor, arrays) for every populated local cache."""
+    entries = []
+    for i, c in enumerate(caches):
+        if c is None:
             continue
-        nb = np.array(a.view(mx.uint8), copy=False)
-        sock.sendall(memoryview(nb).cast("B"))
+        st = c.state
+        entries.append((i, describe_state(st), collect_arrays(st, [])))
+    return entries
+
+
+def handoff_send(sock, caches):
+    """Stretch goal: ship stage B's KDA/DSA caches back so decode can run on box A.
+
+    Always on the control socket: measured 4.6 GB/s at 131k, and it is a
+    one-shot cost (0.18% of a 131k prefill), so it is not worth the extra
+    ring-template plumbing.
+    """
+    entries = collect_state(caches)
+    mx.eval([a for _, _, arrs in entries for a in arrs])
+    meta = [{"layer": i, "desc": d} for i, d, _ in entries]
+    _send_json(sock, {"cmd": "handoff", "meta": meta})
+    total = 0
+    t0 = time.perf_counter()
+    for _, _, arrs in entries:
+        for a in arrs:
+            if a.nbytes == 0:
+                continue
+            nb = np.array(a.view(mx.uint8), copy=False)
+            sock.sendall(memoryview(nb).cast("B"))
+            total += a.nbytes
     dt = time.perf_counter() - t0
     return {
         "handoff_send_s": dt,
-        "handoff_bytes": sum(m["nbytes"] for m in meta),
-        "handoff_tensors": len(meta),
+        "handoff_bytes": total,
+        "handoff_tensors": sum(len(a) for _, _, a in entries),
     }
 
 
-def handoff_recv(sock):
+_DTYPES = {
+    n: getattr(mx, n)
+    for n in ("bfloat16", "float16", "float32", "uint8", "uint16", "int32", "int64")
+}
+
+
+def _walk_arrays(desc, fn, out):
+    if desc["k"] == "arr":
+        out.append(fn(desc))
+    elif desc["k"] == "seq":
+        for d in desc["items"]:
+            _walk_arrays(d, fn, out)
+    return out
+
+
+def handoff_recv(sock, rebuild: bool = False):
+    """Receive stage B's caches. ``rebuild`` materializes them for decode."""
     msg = _recv_json(sock)
     assert msg.get("cmd") == "handoff", msg
-    total = sum(m["nbytes"] for m in msg["meta"])
+    total = 0
+    states = {}
     t0 = time.perf_counter()
-    for m in msg["meta"]:
-        n = m["nbytes"]
-        if n == 0:
-            continue
-        buf = bytearray(n)
-        _recv_exact(sock, memoryview(buf), n)
+    for ent in msg["meta"]:
+        descs = _walk_arrays(ent["desc"], lambda d: d, [])
+        arrays = []
+        for d in descs:
+            n = d["nbytes"]
+            dt = _DTYPES[d["dtype"]]
+            if n == 0:
+                arrays.append(mx.zeros(tuple(d["shape"]), dtype=dt))
+                continue
+            buf = bytearray(n)
+            _recv_exact(sock, memoryview(buf), n)
+            total += n
+            if rebuild:
+                flat = mx.array(np.frombuffer(buf, dtype=np.uint8))
+                arrays.append(flat.view(dt).reshape(tuple(d["shape"])))
+            else:
+                arrays.append(None)
+        if rebuild:
+            states[ent["layer"]] = rebuild_state(ent["desc"], iter(arrays))
     dt = time.perf_counter() - t0
     return {
         "handoff_recv_s": dt,
         "handoff_bytes": total,
-        "handoff_tensors": len(msg["meta"]),
+        "handoff_tensors": sum(
+            len(_walk_arrays(e["desc"], lambda d: d, [])) for e in msg["meta"]
+        ),
         "handoff_MB_per_s": (total / 2**20) / dt if dt else None,
+        "states": states if rebuild else None,
     }
+
+
+def install_state(caches, states):
+    """Install received stage-B state into the head's own cache list."""
+    for i, st in states.items():
+        caches[i].state = st
 
 
 # ------------------------------------------------------------------- roles
@@ -481,6 +516,8 @@ def _head_one(args, stage: Stage, sock, tokens: int):
     assert done.get("cmd") == "done", done
     t_total = time.perf_counter() - t_start
     handoff = handoff_recv(sock) if args.handoff else None
+    if handoff is not None:
+        handoff.pop("states", None)
     tail = _recv_json(sock)
 
     hc = stage.hc_mult
