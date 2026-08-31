@@ -168,12 +168,90 @@ tile per *active* expert costs more than the boundary passes it removes, and bel
 sits at 12 with margin. Decode and the speculative verify block are therefore untouched,
 and so is the MTP drafter's own decode step.
 
-**Related free lever.** The waste is `1 + 16*(E-1)/N`, so it shrinks as the prefill
-chunk grows. Same synthetic layer, stock kernel: 28.46 us/token/layer at chunk 2048,
-25.12 at 4096, 23.45 at 8192 (1.21x). With `R=32` at chunk 8192 it is 22.08 (1.29x
-against chunk-2048 stock). Raising `--prefill-step-size` is orthogonal to this toggle
-and composes with it; whether the rest of the stack pays for the larger chunk has to
-be measured live.
+**Live verdict (2026-08-31).** The synthetic +5% does **not** survive end to end, and
+the reason is measured, not guessed. Four-arm in-situ ablation through the same
+`generate()` the A/B harness uses (GLM-5.3-Flash-vlm-q4-quasar, M3 Ultra, 4 reps,
+spread <0.4%; receipts `~/glm53flash/prep/serving/logs/moegemm_ablate2.json`):
+
+| arm                                   | PAD prompt @2048 | real code @2048 |
+| ------------------------------------- | ---------------- | --------------- |
+| A stock                               | 477.29 tok/s     | 471.56 tok/s    |
+| B stock + only the host syncs the path forces | 471.56 (-1.20%) | 467.78 (-0.80%) |
+| C toggle ON                           | 473.18 (**-0.86%**) | 481.64 (**+2.14%**) |
+| D routed experts -> zeros             | 866.12           | 886.81          |
+| => live routed-expert share of prefill | **44.9%**       | **46.8%**       |
+| layout benefit alone (C/B)            | +0.34%           | +2.96%          |
+
+Three corrections fall out:
+
+1. **The routed-expert share is 44.9-46.8%, not the 53.6%** estimated by dividing a
+   synthetic layer by an assumed 4551 ms chunk. Every projected gain scales down ~0.85x.
+2. **The plan forces host syncs costing a flat -0.8 to -1.2%**, which is unconditional:
+   `T` (the padded tile count) is data dependent, so its `.item()` cannot be hoisted out
+   of the layer loop, and `MLX_VLM_GLM5_MOE_GEMM_ROWS=auto` spends three syncs per layer
+   rather than one. This tax is structural, not a tuning bug.
+3. **The benefit is routing dependent**, and the A/B harness's own prompt is the
+   worst case for it. Live per-layer expert histograms
+   (`~/glm53flash/prep/serving/logs/moegemm_routing_hist.json`) over the harness's
+   repetitive `PAD` template vs a real source file vs real prose:
+
+   | prompt | active experts / 288 | stock waste | pad16 waste | predicted gain |
+   | ------ | -------------------- | ----------- | ----------- | -------------- |
+   | PAD (harness A/B), chunk 0 | 252.7 | 1.230 | 1.136 | 1.083 |
+   | PAD, chunk 2 of an 8k prompt | 157.9 | 1.143 | 1.098 | 1.041 |
+   | real code | 284.2 | 1.259 | 1.134 | **1.111** |
+   | real prose | 283.9 | 1.258 | 1.136 | **1.108** |
+
+   The repeated pad sentence routes to ~55-160 fewer experts per chunk, which shrinks
+   the boundary term the padding removes; real text does not, and matches the synthetic
+   model exactly.
+
+So: keep the toggle **OFF by default**; it is a ~+2% prefill win on real text and a
+~-1% loss on highly repetitive text, and the -1% floor is unavoidable. Do not judge it
+on the `PAD` benchmark again.
+
+**The waste model, pinned against mlx core.** A bm=16/32/64 sweep of
+`affine_gather_qmm_rhs` (experiment build at `~/src/mlx-core-pr`, runtime
+`MLX_GATHER_QMM_BM`; receipt `bench/stage3_core_bm.json`) discriminates two candidate
+models over 18 points:
+
+| model | form | mean abs error |
+| ----- | ---- | -------------- |
+| boundary-pass (this file) | `sum_e (blocks expert e touches) * bm / N` | **3.3%** |
+| row-padding | `1 + bm / (2 * rows_per_expert)` | 16.9% |
+
+The row-padding form mispredicts every bm-aligned case (it claims waste where the
+measurement shows none) and underestimates the stock bm=16 waste at 56.9 rows/expert as
+1.14x when it is **1.263x**. The kernel does not pad; it *re-runs a full block-gemm per
+distinct expert in the block*, which is why the correct term is ~2x larger.
+
+**No core-side prize on M3.** The same sweep, useful TFLOPS at the real gate/up shape:
+
+| rows/expert | bm=16 | bm=32 | bm=64 |
+| ----------- | ----- | ----- | ----- |
+| 32          | 21.15 | 22.31 | 12.10 |
+| 56.9 (chunk 2048) | **17.00** | 14.81 | 11.52 |
+| 64          | 21.64 | 22.89 | 24.15 |
+| 128         | 22.12 | 23.28 | 24.60 |
+| realistic chunk-2048 route | **17.12** | 14.82 | 11.54 |
+
+Bigger tiles win only when the counts are tile-aligned; at the MoE-typical 56.9
+rows/expert they lose (0.87x at bm=32, 0.68x at bm=64) because the boundary re-runs
+scale with `bm`. Mirroring the nax heuristic (`bm = (M/E<64) ? 32 : 64`,
+`quantized.cpp:1497`) to the non-nax path would be a regression on M3. `bm=16` is
+already the right choice; ml-explore/mlx#4246 has no fix to wait for.
+
+**Prefill chunk size is not a lever either.** `--prefill-step-size` sweep on the
+serving stack, 2 reps in both orders (receipts
+`~/glm53flash/prep/serving/logs/chunksweep_step*_rep*.json`):
+
+| prompt | step 2048 | step 4096 | step 8192 |
+| ------ | --------- | --------- | --------- |
+| 8195 tok  | 463.69 tok/s / 191.9 GB | 462.46 (-0.26%) / 198.2 GB | 438.34 (**-5.47%**) / 210.6 GB |
+| 32781 tok | 345.87 tok/s / 200.2 GB | 345.07 (-0.23%) / 211.1 GB | 329.69 (**-4.68%**) / 229.7 GB |
+
+The 1.21x drop in MoE us/token at chunk 8192 is real but is more than paid for by the
+rest of the stack, and peak memory grows 19-30 GB. **Keep `prefill_step_size=2048.**
 
 ## Self-speculative decoding (MTP)
 
