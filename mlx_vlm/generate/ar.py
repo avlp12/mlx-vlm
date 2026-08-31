@@ -9,7 +9,7 @@ import time
 import warnings
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -196,7 +196,8 @@ def generate_step(
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
-    prompt_cache_checkpoint_len: Optional[int] = None,
+    prompt_cache_checkpoint_len: Optional[Union[int, Sequence[int]]] = None,
+    warm_prefix: bool = False,
     seed: Optional[int] = None,
     verbose: bool = False,
     **kwargs,
@@ -431,18 +432,35 @@ def generate_step(
             prefill_kwargs=policy_kwargs,
         ):
             prefill_step_size = None
-        checkpoint_len = (
-            int(prompt_cache_checkpoint_len)
-            if prompt_cache_checkpoint is not None
-            and prompt_cache_checkpoint_len is not None
-            else None
-        )
-        checkpoint_done = False
+        # ``prompt_cache_checkpoint_len`` accepts an int (single checkpoint, the
+        # original contract) or a sequence of ints (a Warm Context Vault boundary
+        # ladder). Boundaries are consumed in ascending order; each one fires the
+        # callback exactly once.
+        if prompt_cache_checkpoint is None or prompt_cache_checkpoint_len is None:
+            checkpoint_boundaries: List[int] = []
+        elif isinstance(prompt_cache_checkpoint_len, (list, tuple, set)):
+            checkpoint_boundaries = sorted(
+                {int(b) for b in prompt_cache_checkpoint_len if int(b) > 0}
+            )
+        else:
+            checkpoint_boundaries = [int(prompt_cache_checkpoint_len)]
+        from ..context_vault import CheckpointLadder
+
+        ladder = CheckpointLadder(checkpoint_boundaries, inputs_embeds.shape[1])
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
-        ) or (
-            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
-        )
+        ) or bool(ladder) or (warm_prefix and inputs_embeds.shape[1] > 1)
+        # ``warm_prefix`` marks a request resuming from an already-populated
+        # prompt cache (vault restore / APC prefix hit). Without it, a tail
+        # shorter than prefill_step_size skips the chunk loop entirely and the
+        # WHOLE tail -- final token included -- is processed by a single _step
+        # forward, while a cold prefill always splits the last token off into
+        # its own _step. The two decompositions are mathematically equal but not
+        # bit-identical: measured on GLM-5.3-Flash the KDA conv/recurrent state
+        # then diverges by up to 3e-2 in 101 of 112 cache components, and greedy
+        # decode splits from the cold reference at token 35 of 64. Forcing the
+        # loop reproduces the cold path's exact tail split (n-1 chunked, 1
+        # stepped) and restores token identity.
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -465,13 +483,13 @@ def generate_step(
             ) as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
-                    if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens < checkpoint_len
-                        and processed_tokens + n_to_process > checkpoint_len
-                    ):
-                        n_to_process = checkpoint_len - processed_tokens
+                    # Land exactly on the next boundary. Vault boundaries are
+                    # multiples of prefill_step_size, so this clamp is a no-op
+                    # for them and the chunk decomposition -- and thus
+                    # bit-identity against a straight-through prefill -- is
+                    # preserved. An unaligned caller-supplied boundary still
+                    # works, but trades that guarantee away.
+                    n_to_process = ladder.clamp(processed_tokens, n_to_process)
                     chunk_kwargs = kwargs
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**kwargs, "logits_to_keep": 1}
@@ -495,13 +513,8 @@ def generate_step(
                         quantize_cache_fn(prompt_cache)
                         mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
-                    if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens == checkpoint_len
-                    ):
-                        prompt_cache_checkpoint(processed_tokens, prompt_cache)
-                        checkpoint_done = True
+                    for reached in ladder.reached(processed_tokens):
+                        prompt_cache_checkpoint(reached, prompt_cache)
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
