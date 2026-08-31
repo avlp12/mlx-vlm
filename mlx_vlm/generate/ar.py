@@ -472,7 +472,10 @@ def generate_step(
             # Disabled when an APC checkpoint is requested (the checkpoint
             # would capture a half-populated cache).
             pipeline = None
-            if checkpoint_len is None:
+            # (vault merge fix: the old single ``checkpoint_len`` became the
+            # boundary ladder -- pipeline stays disabled whenever any
+            # checkpoint boundary is requested.)
+            if not ladder:
                 from ..pipeline_runtime import maybe_open_pipeline
 
                 pipeline = maybe_open_pipeline(model, total_tokens, verbose=verbose)
