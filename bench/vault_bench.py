@@ -55,13 +55,27 @@ class _TextProcessor:
 
 def _load(model_dir: str):
     from mlx_vlm.tokenizer_utils import load_tokenizer
-    from mlx_vlm.utils import get_model_path, load_model
+    from mlx_vlm.utils import StoppingCriteria, get_model_path, load_model
 
     path = get_model_path(model_dir)
     t0 = time.perf_counter()
     model = load_model(path, lazy=False)
     load_s = time.perf_counter() - t0
     wrapper = load_tokenizer(path)
+    # Same EOS resolution the DFlash2 repro harness uses: the VLM config keeps
+    # eos_token_id on text_config, and dispatch expects the criteria attached to
+    # both the wrapper and the raw HF tokenizer.
+    eos = getattr(model.config, "eos_token_id", None)
+    if eos is None:
+        text_cfg = getattr(model.config, "text_config", None)
+        eos = getattr(text_cfg, "eos_token_id", None) if text_cfg is not None else None
+    if eos is None:
+        eos = getattr(wrapper, "eos_token_id", None)
+    if getattr(model.config, "eos_token_id", None) is None:
+        model.config.eos_token_id = eos
+    criteria = StoppingCriteria(eos, wrapper)
+    wrapper.stopping_criteria = criteria
+    wrapper._tokenizer.stopping_criteria = criteria
     return model, _TextProcessor(wrapper), load_s
 
 
@@ -73,11 +87,11 @@ def _doc_text(tokenizer, n_tokens: int, seed_text: str) -> str:
     return tokenizer.decode((ids * reps)[:n_tokens])
 
 
-def _prompt(processor, doc: str, question: str) -> str:
+def _prompt(processor, config, doc: str, question: str) -> str:
     from mlx_vlm.prompt_utils import apply_chat_template
 
     return apply_chat_template(
-        processor, None, doc + "\n\n" + question, num_images=0
+        processor, config, doc + "\n\n" + question, num_images=0
     )
 
 
@@ -155,19 +169,19 @@ def main() -> None:
         out["runs"][key] = {}
 
         # store: first sighting, lays the ladder
-        p_store = _prompt(processor, doc, "Summarize the document in one sentence.")
+        p_store = _prompt(processor, model.config, doc, "Summarize the document in one sentence.")
         out["runs"][key]["store"] = _run(model, processor, p_store, args.max_tokens)
         if vault is not None:
             out["runs"][key]["store"]["vault_stats"] = vault.stats_dict()
 
         # warm: same document, DIFFERENT question -> only the suffix may prefill
-        p_warm = _prompt(processor, doc, "List three key themes from the document.")
+        p_warm = _prompt(processor, model.config, doc, "List three key themes from the document.")
         out["runs"][key]["warm"] = _run(model, processor, p_warm, args.max_tokens)
         if vault is not None:
             out["runs"][key]["warm"]["vault_stats"] = vault.stats_dict()
 
         # repeat the warm arm to show steady-state (second hit on the same rung)
-        p_warm2 = _prompt(processor, doc, "Give the document a title.")
+        p_warm2 = _prompt(processor, model.config, doc, "Give the document a title.")
         out["runs"][key]["warm2"] = _run(model, processor, p_warm2, args.max_tokens)
         if vault is not None:
             out["runs"][key]["warm2"]["vault_stats"] = vault.stats_dict()

@@ -1,0 +1,43 @@
+{
+ "mode": "local",
+ "tokens": 32768,
+ "scale": 0.25,
+ "reps": [
+  {
+   "bytes": 498633136,
+   "gib": 0.46438829600811005,
+   "pack_s": 0.09710000001359731,
+   "unpack_s": 0.0004579999949783087,
+   "pack_gbps": 5.135253717097573,
+   "unpack_gbps": 1088.7186494917225
+  },
+  {
+   "bytes": 498633136,
+   "gib": 0.46438829600811005,
+   "pack_s": 0.04588045901618898,
+   "unpack_s": 0.00044966599671170115,
+   "pack_gbps": 10.868093883368878,
+   "unpack_gbps": 1108.896691425155
+  },
+  {
+   "bytes": 498633136,
+   "gib": 0.46438829600811005,
+   "pack_s": 0.04161650000605732,
+   "unpack_s": 0.000335916003677994,
+   "pack_gbps": 11.981621134103625,
+   "unpack_gbps": 1484.398273795806
+  }
+ ],
+ "median": {
+  "bytes": 498633136,
+  "gib": 0.46438829600811005,
+  "pack_s": 0.04588045901618898,
+  "unpack_s": 0.00044966599671170115,
+  "pack_gbps": 10.868093883368878,
+  "unpack_gbps": 1108.896691425155
+ },
+ "extrapolated_full_gib": 1.8575531840324402,
+ "tbnet_measured_gbps": 4.6,
+ "est_ship_s_at_4.6GBps": 0.4335940313043478,
+ "note": "serialization is one contiguous buffer, so cost is linear in bytes; ring transport time is additive on top of pack+unpack"
+}

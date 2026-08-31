@@ -1,0 +1,51 @@
+{
+ "started": "2026-08-31T12:41:37+0900",
+ "model": "/Users/gesicht/glm53flash/builds/GLM-5.3-Flash-vlm-q4-quasar",
+ "src": "/Users/gesicht/src/mlx-vlm-vault",
+ "head": "5281fe1c3c765c0427d279febd98ff01780bce01",
+ "branch": "glm5-context-vault",
+ "vault_enabled": false,
+ "vault_env": {},
+ "load_seconds": 5.848636957991403,
+ "protocol": {
+  "greedy": true,
+  "temperature": 0.0,
+  "max_tokens": 16,
+  "metric": "mlx_vlm.generate prompt_tps / cached_tokens"
+ },
+ "runs": {
+  "p32768": {
+   "store": {
+    "wall_s": 86.52820816601161,
+    "prompt_tokens": 30270,
+    "generation_tokens": 16,
+    "prompt_tps": 356.9554507215244,
+    "generation_tps": 32.443231315759476,
+    "cached_tokens": 0,
+    "peak_memory_gb": 223.268904119,
+    "text_preview": "The user has pasted a document that is just the same sentence repeated hundreds of"
+   },
+   "warm": {
+    "wall_s": 84.80724095803453,
+    "prompt_tokens": 30269,
+    "generation_tokens": 16,
+    "prompt_tps": 359.2368979994417,
+    "generation_tps": 32.459367633472766,
+    "cached_tokens": 0,
+    "peak_memory_gb": 223.377465652,
+    "text_preview": "The user has pasted a document that is just the same sentence repeated hundreds of"
+   },
+   "warm2": {
+    "wall_s": 86.08485879102955,
+    "prompt_tokens": 30267,
+    "generation_tokens": 16,
+    "prompt_tps": 353.84927572819174,
+    "generation_tps": 32.407688723510354,
+    "cached_tokens": 0,
+    "peak_memory_gb": 223.377449272,
+    "text_preview": "The user has pasted a document that consists of the same sentence repeated many times"
+   }
+  }
+ },
+ "finished": "2026-08-31T12:45:54+0900"
+}

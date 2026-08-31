@@ -1,0 +1,102 @@
+{
+ "started": "2026-08-31T12:37:51+0900",
+ "model": "/Users/gesicht/glm53flash/builds/GLM-5.3-Flash-vlm-q4-quasar",
+ "src": "/Users/gesicht/src/mlx-vlm-vault",
+ "head": "5281fe1c3c765c0427d279febd98ff01780bce01",
+ "branch": "glm5-context-vault",
+ "vault_enabled": true,
+ "vault_env": {
+  "MLX_VLM_GLM5_VAULT": "1",
+  "MLX_VLM_GLM5_VAULT_STRIDE": "2048"
+ },
+ "load_seconds": 5.889872708998155,
+ "protocol": {
+  "greedy": true,
+  "temperature": 0.0,
+  "max_tokens": 16,
+  "metric": "mlx_vlm.generate prompt_tps / cached_tokens"
+ },
+ "runs": {
+  "p32768": {
+   "store": {
+    "wall_s": 87.42161787505029,
+    "prompt_tokens": 30270,
+    "generation_tokens": 16,
+    "prompt_tps": 352.84510967580087,
+    "generation_tps": 32.68403321453605,
+    "cached_tokens": 0,
+    "peak_memory_gb": 223.268904119,
+    "text_preview": "The user has pasted a document that is just the same sentence repeated hundreds of",
+    "vault_stats": {
+     "lookups": 1,
+     "hits": 0,
+     "misses": 1,
+     "hit_rate": 0.0,
+     "inserts": 4,
+     "evictions": 0,
+     "tokens_saved": 0,
+     "rungs_resident": 4,
+     "bytes_resident": 2033397760,
+     "gb_resident": 1.8937492370605469,
+     "budget_bytes": 274877906944,
+     "budget_gb": 256.0,
+     "utilization": 0.007397457957267761,
+     "rejected_unsupported": 0
+    }
+   },
+   "warm": {
+    "wall_s": 7.18140320800012,
+    "prompt_tokens": 30269,
+    "generation_tokens": 16,
+    "prompt_tps": 4616.191135211953,
+    "generation_tps": 30.123560743132696,
+    "cached_tokens": 28672,
+    "peak_memory_gb": 208.852076855,
+    "text_preview": "The user has pasted a document that is just the same sentence repeated hundreds of",
+    "vault_stats": {
+     "lookups": 2,
+     "hits": 1,
+     "misses": 1,
+     "hit_rate": 0.5,
+     "inserts": 4,
+     "evictions": 0,
+     "tokens_saved": 28672,
+     "rungs_resident": 4,
+     "bytes_resident": 2033397760,
+     "gb_resident": 1.8937492370605469,
+     "budget_bytes": 274877906944,
+     "budget_gb": 256.0,
+     "utilization": 0.007397457957267761,
+     "rejected_unsupported": 0
+    }
+   },
+   "warm2": {
+    "wall_s": 7.022892375010997,
+    "prompt_tokens": 30267,
+    "generation_tokens": 16,
+    "prompt_tps": 4743.733059606153,
+    "generation_tps": 29.28049813497817,
+    "cached_tokens": 28672,
+    "peak_memory_gb": 208.827172629,
+    "text_preview": "The user has pasted a document that is just the same sentence repeated hundreds of",
+    "vault_stats": {
+     "lookups": 3,
+     "hits": 2,
+     "misses": 1,
+     "hit_rate": 0.6666666666666666,
+     "inserts": 4,
+     "evictions": 0,
+     "tokens_saved": 57344,
+     "rungs_resident": 4,
+     "bytes_resident": 2033397760,
+     "gb_resident": 1.8937492370605469,
+     "budget_bytes": 274877906944,
+     "budget_gb": 256.0,
+     "utilization": 0.007397457957267761,
+     "rejected_unsupported": 0
+    }
+   }
+  }
+ },
+ "finished": "2026-08-31T12:39:33+0900"
+}
