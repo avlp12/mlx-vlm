@@ -274,3 +274,85 @@ def test_pool_layout_split_is_verbatim():
     b = ix._pooled_states(keys, gate, valid, layout=ix._pool_layout(valid, S))
     for u, v in zip(a, b):
         assert bool(mx.all(u == v))
+
+
+# ------------------------------------------------- end-to-end model lifecycle
+_MODEL_CFG = dict(
+    model_type="glm5_next_text", vocab_size=128, hidden_size=64,
+    intermediate_size=128, moe_intermediate_size=32, num_hidden_layers=4,
+    num_attention_heads=4, num_key_value_heads=4, n_shared_experts=1,
+    n_routed_experts=4, routed_scaling_factor=2.5, kv_lora_rank=16,
+    q_lora_rank=16, qk_rope_head_dim=0, v_head_dim=16, qk_nope_head_dim=16,
+    num_experts_per_tok=2, first_k_dense_replace=0, max_position_embeddings=2048,
+    rms_norm_eps=1e-05, index_topk=16, index_kpool=4, index_head_dim=16,
+    index_n_heads=4,
+    layer_types=["linear_attention", "deepseek_sparse_attention",
+                 "linear_attention", "deepseek_sparse_attention"],
+    mlp_layer_types=["dense"] * 4,
+    linear_attn_config={"num_heads": 4, "gate_lower_bound": -5.0,
+                        "head_dim": 16, "short_conv_kernel_size": 4},
+)
+
+
+def _tiny_model():
+    from mlx_vlm.models.glm5_next.config import TextConfig as TC
+    mx.random.seed(0)
+    model = glm5.Glm5NextModel(TC.from_dict(dict(_MODEL_CFG)))
+
+    def rand(tree):
+        if isinstance(tree, dict):
+            return {k: rand(v) for k, v in tree.items()}
+        if isinstance(tree, list):
+            return [rand(v) for v in tree]
+        return (mx.random.normal(tree.shape) * 0.05).astype(mx.float32)
+
+    model.update(rand(model.parameters()))
+    mx.eval(model.parameters())
+    return model
+
+
+def _model_forward(model, seq=48):
+    from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+    caches = [
+        ArraysCache(size=2) if l.is_linear else CacheList(KVCache(), KVCache())
+        for l in model.layers
+    ]
+    out = model(mx.arange(seq, dtype=mx.int32)[None], cache=caches)
+    mx.eval(out)
+    return out
+
+
+def test_model_forward_registers_and_scopes_the_memo():
+    """The lifecycle itself: registration in __init__, open/close around the
+    layer loop, and no leak of the context past the forward."""
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    model = _tiny_model()
+    n_dsa = sum(1 for l in model.layers if not l.is_linear)
+    assert len(model._dsa_indexer_ids) == n_dsa == 2
+    assert glm5._VIS_MEMO_CTX is None
+    _model_forward(model)
+    assert glm5._VIS_MEMO_CTX is None, "memo context leaked past the forward"
+
+
+def test_model_forward_bit_identical_on_vs_off():
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    model = _tiny_model()
+    on = _model_forward(model)
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="0")
+    off = _model_forward(model)
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    assert bool(mx.all(on == off))
+
+
+def test_model_forward_under_verify_mode():
+    """VERIFY recomputes every memoized tensor inside all 11 (here 2) DSA layers
+    and raises on the first divergence -- run the whole model under it."""
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1", MLX_VLM_GLM5_VIS_MEMO_VERIFY="1")
+    try:
+        model = _tiny_model()
+        checked = _model_forward(model)
+        _reset_env(MLX_VLM_GLM5_VIS_MEMO="0", MLX_VLM_GLM5_VIS_MEMO_VERIFY=None)
+        plain = _model_forward(model)
+        assert bool(mx.all(checked == plain))
+    finally:
+        _reset_env(MLX_VLM_GLM5_VIS_MEMO="1", MLX_VLM_GLM5_VIS_MEMO_VERIFY=None)
