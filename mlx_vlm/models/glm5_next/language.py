@@ -36,6 +36,15 @@ _FUSED_KDA_QPROJ_ENV = None
 # grid.z), but batched decode past this point is untested here.
 _FUSED_KDA_MAX_BATCH = 8
 
+# The projection fold stops paying once the batch is wide enough to amortise the
+# weight read.  mx.quantized_matmul reads f_b/g_b once for all B rows (it becomes
+# a GEMM); folding it in makes every (batch row, head) threadgroup re-read its
+# head's rows, so weight traffic scales with B while the saving stays at two
+# dispatches.  Measured on the 34-layer sweep (M3 Ultra, KDA stack ms,
+# base-fused vs +qproj): B=1 8.82 -> 8.55, B=2 10.06 -> 9.49, B=4 10.85 -> 11.65,
+# B=8 15.83 -> 20.95.  Crossover sits between 2 and 4.
+_FUSED_KDA_QPROJ_MAX_BATCH = 2
+
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
@@ -345,8 +354,10 @@ class Glm5NextLinearAttention(nn.Module):
         capture = gdn_sink is not None
         # The capture variant hands back `a` in gdn_sink, so it keeps the
         # projections outside; folding them in is for the plain decode step.
-        use_qproj = not capture and self._fused_kda_qproj_ready(
-            q_o.dtype, cache[1].dtype
+        use_qproj = (
+            not capture
+            and q_o.shape[0] <= _FUSED_KDA_QPROJ_MAX_BATCH
+            and self._fused_kda_qproj_ready(q_o.dtype, cache[1].dtype)
         )
         qproj = (fa_o, fg.f_b_proj, ga_o, self.g_b_proj) if use_qproj else None
         ty = self._fused_kda_qproj_ty if use_qproj else self._fused_kda_ty
