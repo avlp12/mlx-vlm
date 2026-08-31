@@ -343,3 +343,84 @@ class TestCheckpointLadder(unittest.TestCase):
 
         ladder = CheckpointLadder([4096, 2048, 4096, -5, 0], 10000)
         self.assertEqual(ladder.pending, [2048, 4096])
+
+
+class TestWireFormat(unittest.TestCase):
+    """Stage 3: pack/unpack must be byte-exact and single-buffer."""
+
+    def test_pack_unpack_roundtrip_is_bit_identical(self):
+        from mlx_vlm.context_vault_wire import pack_fragments, unpack_fragments
+
+        original = drive(make_glm5_shaped_cache(), 24, seed=70)
+        frags = capture_fragments(original, 24)
+        manifest, payload = pack_fragments(frags)
+        rebuilt = unpack_fragments(manifest, payload)
+
+        fresh_a, fresh_b = make_glm5_shaped_cache(), make_glm5_shaped_cache()
+        restore_fragments(fresh_a, frags)
+        restore_fragments(fresh_b, rebuilt)
+        assert_bit_identical(self, fresh_a, fresh_b, "wire roundtrip")
+
+    def test_payload_is_one_contiguous_buffer(self):
+        from mlx_vlm.context_vault_wire import pack_fragments
+
+        frags = capture_fragments(drive(make_glm5_shaped_cache(), 24, seed=71), 24)
+        manifest, payload = pack_fragments(frags)
+        self.assertEqual(payload.dtype, mx.uint8)
+        self.assertEqual(payload.ndim, 1, "one flat buffer -> one ring transfer")
+        self.assertEqual(int(payload.size), manifest["total_bytes"])
+        self.assertEqual(manifest["total_bytes"], fragments_nbytes(frags))
+
+    def test_kv_offset_survives_the_wire(self):
+        from mlx_vlm.context_vault_wire import pack_fragments, unpack_fragments
+
+        frags = capture_fragments(drive(make_glm5_shaped_cache(), 20, seed=72), 20)
+        rebuilt = unpack_fragments(*pack_fragments(frags))
+        fresh = make_glm5_shaped_cache()
+        restore_fragments(fresh, rebuilt)
+        for c in fresh[KDA_LAYERS:]:
+            for sub in c.caches:
+                self.assertEqual(sub.offset, 20)
+
+
+class TestPeerProtocol(unittest.TestCase):
+    def test_boundary_hash_is_identity_scoped(self):
+        from mlx_vlm.context_vault_wire import boundary_hash
+
+        toks = list(range(100))
+        self.assertNotEqual(
+            boundary_hash(toks, 64, "id-a"), boundary_hash(toks, 64, "id-b")
+        )
+        self.assertEqual(
+            boundary_hash(toks, 64, "id-a"), boundary_hash(toks + [9, 9], 64, "id-a")
+        )
+
+    def test_fetch_rejected_on_identity_mismatch(self):
+        from mlx_vlm.context_vault_wire import PeerDigest, boundary_hash, fetch_plan
+
+        toks = list(range(70000))
+        peer = PeerDigest("other-id", {boundary_hash(toks, 65536, "other-id"): 65536}, {})
+        self.assertIsNone(fetch_plan(0, toks, "my-id", peer, [65536]))
+
+    def test_fetch_plan_picks_deepest_and_beats_prefill(self):
+        from mlx_vlm.context_vault_wire import PeerDigest, boundary_hash, fetch_plan
+
+        ident = "same-id"
+        toks = list(range(70000))
+        rungs = {boundary_hash(toks, d, ident): d for d in (8192, 32768, 65536)}
+        peer = PeerDigest(ident, rungs, {})
+        plan = fetch_plan(0, toks, ident, peer, [8192, 32768, 65536])
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["depth"], 65536)
+        # 65536 tok at ~250 tok/s is ~262 s of prefill; ~2 GiB at 4.6 GB/s is <1 s.
+        self.assertGreater(plan["speedup"], 100)
+
+    def test_trivial_gain_is_suppressed(self):
+        from mlx_vlm.context_vault_wire import PeerDigest, boundary_hash, fetch_plan
+
+        ident = "same-id"
+        toks = list(range(70000))
+        peer = PeerDigest(ident, {boundary_hash(toks, 65536, ident): 65536}, {})
+        self.assertIsNone(
+            fetch_plan(65000, toks, ident, peer, [65536], min_gain_tokens=4096)
+        )
