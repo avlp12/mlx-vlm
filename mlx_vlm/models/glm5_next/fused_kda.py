@@ -28,9 +28,12 @@ Not a drop-in for prefill: this is decode-only (B=1, S=1, no SSM mask).
 preconditions does not hold.
 """
 
+import logging
 from typing import Optional, Tuple
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 # MLX's own elementwise ops, transcribed so the fused kernel rounds identically:
 #   mlx/backend/metal/kernels/unary_ops.h -> Sigmoid / Exp / Rsqrt
@@ -76,7 +79,12 @@ inline float sq_acc(float acc, float v) {
 """
 
 _SOURCE = """
-  const uint h    = threadgroup_position_in_grid.z;
+  // grid.z is B * H threadgroups: one per (batch row, head).  B never appears
+  // in this source -- only in grid.z and the buffer extents -- so the compiled
+  // pipeline (and therefore its threadgroup limit) is identical at every B.
+  const uint bh   = threadgroup_position_in_grid.z;
+  const uint b    = bh / (uint)H;
+  const uint h    = bh - b * (uint)H;
   const uint lane = thread_position_in_threadgroup.x;
   const uint ty   = thread_position_in_threadgroup.y;
   const uint tid  = thread_index_in_threadgroup;
@@ -88,6 +96,8 @@ _SOURCE = """
   constexpr int NDV  = D / TY;       // value-dim rows walked per thread
   constexpr uint QKVD = (uint)(H * D);
   constexpr uint CDIM = 3u * QKVD;   // conv1d channel count
+  const uint qkv_off  = b * QKVD;                 // [B, 1, H*D] rows
+  const size_t cs_off = (size_t)b * (K - 1) * CDIM;  // [B, K-1, 3*H*D]
 
   threadgroup float sq[D];
   threadgroup float sk[D];
@@ -100,8 +110,8 @@ _SOURCE = """
   // Issue the recurrent-state read first: it is 4 MB per layer and by far the
   // longest-latency operation here, so it overlaps the conv / gate / norm work
   // below instead of starting after three threadgroup barriers.
-  device const ST* si = state_in  + (size_t)h * D * D;
-  device ST*       so = state_out + (size_t)h * D * D;
+  device const ST* si = state_in  + (size_t)bh * D * D;   // [B, H, D, D]
+  device ST*       so = state_out + (size_t)bh * D * D;
   float st[NDV][NDK];
   for (int j = 0; j < NDV; ++j) {
     uint dv = ty + (uint)TY * (uint)j;
@@ -121,10 +131,15 @@ _SOURCE = """
     device const T* wc = conv_w + (size_t)c * K;
     float acc = 0.0f;
     for (uint j = 0; j + 1 < (uint)K; ++j) {
-      acc += float(conv_state[(size_t)j * CDIM + c]) * float(wc[j]);
+      acc += float(conv_state[cs_off + (size_t)j * CDIM + c]) * float(wc[j]);
     }
-    T xnew = (part == 0u) ? mq[h * (uint)D + d]
-           : ((part == 1u) ? mk[h * (uint)D + d] : mv[h * (uint)D + d]);
+    // `mixed = mx.where(mask[..., None], mixed, 0)`: batched decode masks the
+    // *pre-conv* input of a padded row (history and the recurrence still run),
+    // so the zero has to land here, before both the conv and the window write.
+    T xnew = valid[b] ? ((part == 0u) ? mq[qkv_off + h * (uint)D + d]
+                      : ((part == 1u) ? mk[qkv_off + h * (uint)D + d]
+                                      : mv[qkv_off + h * (uint)D + d]))
+                      : static_cast<T>(0);
     acc += float(xnew) * float(wc[K - 1]);
 
     T xb  = static_cast<T>(acc);           // mx.conv1d writes its output in T
@@ -136,9 +151,10 @@ _SOURCE = """
 
     // new window = [old[1 .. K-2], x_t]
     for (uint j = 0; j + 2 < (uint)K; ++j) {
-      conv_state_out[(size_t)j * CDIM + c] = conv_state[(size_t)(j + 1) * CDIM + c];
+      conv_state_out[cs_off + (size_t)j * CDIM + c] =
+          conv_state[cs_off + (size_t)(j + 1) * CDIM + c];
     }
-    conv_state_out[(size_t)(K - 2) * CDIM + c] = xnew;
+    conv_state_out[cs_off + (size_t)(K - 2) * CDIM + c] = xnew;
   }
 
   // ---------------------------------------------------------------- phase 0b
@@ -147,12 +163,12 @@ _SOURCE = """
   {
     float a_exp = metal::precise::exp(A_log[h]);   // mx.exp -> precise
     for (uint d = tid; d < (uint)D; d += NT) {
-      float av = float(a[h * (uint)D + d]) + dt_bias[h * (uint)D + d];
+      float av = float(a[qkv_off + h * (uint)D + d]) + dt_bias[h * (uint)D + d];
       sg[d]    = metal::precise::exp(lower_bound * mlx_sigmoid_fast<float>(a_exp * av));
-      sgate[d] = float(gate[h * (uint)D + d]);
+      sgate[d] = float(gate[qkv_off + h * (uint)D + d]);
     }
     if (tid == 0u) {
-      shr[2] = float(mlx_sigmoid_precise(bvec[h]));  // beta = mx.sigmoid(b), in T
+      shr[2] = float(mlx_sigmoid_precise(bvec[b * (uint)H + h]));  // beta = mx.sigmoid(b), in T
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -261,7 +277,7 @@ _SOURCE = """
       float x = sy[d] * rn;
       x = float(o_w[d]) * x;
       x = x * mlx_sigmoid_precise<float>(sgate[d]);
-      y[h * (uint)D + d] = static_cast<T>(x);
+      y[qkv_off + h * (uint)D + d] = static_cast<T>(x);
     }
   }
 """
@@ -276,9 +292,9 @@ _SINK_SOURCE = """
   // rollback_speculative_cache replays the accepted prefix on identical inputs.
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint d = tid; d < (uint)D; d += NT) {
-    q_out[h * (uint)D + d] = static_cast<T>(sq[d]);
-    k_out[h * (uint)D + d] = static_cast<T>(sk[d]);
-    v_out[h * (uint)D + d] = static_cast<T>(sv[d]);
+    q_out[qkv_off + h * (uint)D + d] = static_cast<T>(sq[d]);
+    k_out[qkv_off + h * (uint)D + d] = static_cast<T>(sk[d]);
+    v_out[qkv_off + h * (uint)D + d] = static_cast<T>(sv[d]);
   }
   // conv_input = concatenate([conv_state, mixed], axis=1), i.e. [1, K, 3*H*D].
   for (uint idx = tid; idx < 3u * (uint)D; idx += NT) {
@@ -286,11 +302,14 @@ _SINK_SOURCE = """
     uint d    = idx - part * (uint)D;
     uint c    = part * QKVD + h * (uint)D + d;
     for (uint j = 0; j + 1 < (uint)K; ++j) {
-      conv_input_out[(size_t)j * CDIM + c] = conv_state[(size_t)j * CDIM + c];
+      conv_input_out[(size_t)b * K * CDIM + (size_t)j * CDIM + c] =
+          conv_state[cs_off + (size_t)j * CDIM + c];
     }
-    conv_input_out[(size_t)(K - 1) * CDIM + c] =
-        (part == 0u) ? mq[h * (uint)D + d]
-      : ((part == 1u) ? mk[h * (uint)D + d] : mv[h * (uint)D + d]);
+    conv_input_out[(size_t)b * K * CDIM + (size_t)(K - 1) * CDIM + c] =
+        valid[b] ? ((part == 0u) ? mq[qkv_off + h * (uint)D + d]
+                 : ((part == 1u) ? mk[qkv_off + h * (uint)D + d]
+                                 : mv[qkv_off + h * (uint)D + d]))
+                 : static_cast<T>(0);
   }
 """
 
@@ -328,7 +347,8 @@ _QPROJ_COMPUTE = """
       uint proj = t / (uint)D;
       uint d    = t - proj * (uint)D;
       uint row  = h * (uint)D + d;
-      device const T* xp = (proj == 0u ? fa : ga) + qlid * (uint)VPT;
+      device const T* xp =
+          (proj == 0u ? fa : ga) + b * (uint)D + qlid * (uint)VPT;
       float xs = 0.0f;                                  // load_vector's `sum`
       for (int i = 0; i < VPT; ++i) xs += float(xp[i]);
       size_t wb = (size_t)row * D + (size_t)qlid * VPT; // byte offset (bits == 8)
@@ -367,12 +387,13 @@ def _qproj_source(source: str) -> str:
         1,
     )
     out = out.replace(
-        "      float av = float(a[h * (uint)D + d]) + dt_bias[h * (uint)D + d];",
+        "      float av = float(a[qkv_off + h * (uint)D + d]) + "
+        "dt_bias[h * (uint)D + d];",
         "      float av = sa[d] + dt_bias[h * (uint)D + d];",
         1,
     )
     out = out.replace(
-        "      sgate[d] = float(gate[h * (uint)D + d]);\n", "", 1
+        "      sgate[d] = float(gate[qkv_off + h * (uint)D + d]);\n", "", 1
     )
     return out
 
@@ -393,6 +414,7 @@ _INPUT_NAMES = [
     "lower_bound",
     "qscale",
     "norm_eps",
+    "valid",
 ]
 _OUTPUT_NAMES = ["y", "state_out", "conv_state_out"]
 _SINK_OUTPUT_NAMES = _OUTPUT_NAMES + ["q_out", "k_out", "v_out", "conv_input_out"]
@@ -406,9 +428,33 @@ _QPROJ_INPUT_NAMES = [
 _KERNELS = {}
 _KERNEL_TRIED = False
 
-# Threadgroup y-extent.  32 * TY threads per threadgroup, one threadgroup per head;
-# TY must divide head_dim and 32 * TY must stay <= 1024.
-_TY = 32
+# Batched decode always supplies a per-row bool mask -- BatchGenerator sets
+# left_padding on the ArraysCache even for a uniform-length batch -- so the
+# kernel takes one unconditionally.  A mask-free call gets a cached all-true
+# vector rather than allocating one per step.
+_ONES_MASK = {}
+
+
+def _all_valid(batch: int) -> mx.array:
+    m = _ONES_MASK.get(batch)
+    if m is None:
+        m = mx.ones((batch,), dtype=mx.bool_)
+        mx.eval(m)
+        _ONES_MASK[batch] = m
+    return m
+
+# Threadgroup y-extent: 32 * TY threads per threadgroup, one threadgroup per head.
+#
+# TY only controls how many value-dim rows each thread walks (NDV = head_dim / TY)
+# and how many output rows each quad walks in the projection fold.  Every
+# reduction -- the simd_sum over the 32 key lanes, the 32-lane row reduction in
+# the two norms, and quad_sum in the folded GEMV -- is over the same lanes with
+# the same operand order at every TY, so lowering it is partition-preserving and
+# stays bit-identical.  That matters because `maxTotalThreadsPerThreadgroup` is a
+# *per-pipeline* limit driven by register pressure: some GPUs (notably the
+# virtualized ones on CI runners) admit 1024 threads for the base kernel but cap
+# the higher-pressure qproj pipeline lower.  We probe downwards.
+_TY_CANDIDATES = (32, 16, 8, 4)
 
 
 def _kernel(kind: str = "base"):
@@ -445,6 +491,152 @@ def _kernel(kind: str = "base"):
     return _KERNELS.get(kind)
 
 
+# (kind, dtype, state dtype, H, D, K, bits, group_size) -> usable TY, or None if
+# the device cannot run this variant at any admissible threadgroup size.
+_TY_PROBE_CACHE = {}
+
+
+def _probe_launch(kind, ty, dt, st, num_heads, head_dim, conv_kernel_size, bits, gs):
+    """Run one throwaway launch at ``ty`` and force it, so the driver's
+    per-pipeline threadgroup limit is exercised here rather than mid-forward."""
+    h, d, k = num_heads, head_dim, conv_kernel_size
+    zeros = lambda shape, dtype: mx.zeros(shape, dtype=dtype)  # noqa: E731
+    args = dict(
+        q_in=zeros((1, 1, h * d), dt),
+        k_in=zeros((1, 1, h * d), dt),
+        v_in=zeros((1, 1, h * d), dt),
+        conv_state=zeros((1, k - 1, 3 * h * d), dt),
+        conv_w=zeros((3 * h * d, k, 1), dt),
+        b=zeros((1, 1, h), dt),
+        A_log=zeros((h,), mx.float32),
+        dt_bias=zeros((h * d,), mx.float32),
+        state=zeros((1, h, d, d), st),
+        o_weight=zeros((d,), dt),
+    )
+    if kind == "qproj":
+        pack = 32 // bits
+        w = zeros((h * d, d // pack), mx.uint32)
+        sc = zeros((h * d, d // gs), dt)
+        proj = _ProbeLinear(w, sc, bits, gs)
+        args["a"] = None
+        args["gate"] = None
+        qproj = (zeros((1, 1, d), dt), proj, zeros((1, 1, d), dt), proj)
+    else:
+        args["a"] = zeros((1, 1, h * d), dt)
+        args["gate"] = zeros((1, 1, h * d), dt)
+        qproj = None
+    outs = fused_kda_decode_step(
+        args["q_in"],
+        args["k_in"],
+        args["v_in"],
+        args["conv_state"],
+        args["conv_w"],
+        args["a"],
+        args["b"],
+        args["A_log"],
+        args["dt_bias"],
+        args["state"],
+        args["gate"],
+        args["o_weight"],
+        num_heads=h,
+        head_dim=d,
+        conv_kernel_size=k,
+        lower_bound=-5.0,
+        norm_eps=1e-5,
+        ty=ty,
+        qproj=qproj,
+    )
+    mx.eval(outs)
+
+
+class _ProbeLinear:
+    """Minimal stand-in carrying just what the folded GEMV reads."""
+
+    def __init__(self, weight, scales, bits, group_size):
+        self.weight = weight
+        self.scales = scales
+        self.biases = scales
+        self.bits = bits
+        self.group_size = group_size
+
+
+def fused_kda_probe(
+    *,
+    kind: str,
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    dtype,
+    state_dtype,
+    bits: Optional[int] = None,
+    group_size: Optional[int] = None,
+) -> Optional[int]:
+    """Largest threadgroup extent this device will run ``kind`` at, else ``None``.
+
+    ``maxTotalThreadsPerThreadgroup`` is a *per-pipeline* limit set by register
+    pressure, not a device constant: a GPU can admit 1024 threads for the base
+    kernel and cap the heavier qproj pipeline lower (CI's virtualized runners cap
+    it at 640).  MLX reports that as a ValueError at eval time, far from the call
+    site, so probe it up front and remember the answer.  Lowering TY is
+    partition-preserving -- every reduction keeps the same lanes and the same
+    operand order -- so a degraded launch is still bit-identical.
+    """
+    key = (
+        kind,
+        dtype,
+        state_dtype,
+        num_heads,
+        head_dim,
+        conv_kernel_size,
+        bits,
+        group_size,
+    )
+    if key in _TY_PROBE_CACHE:
+        return _TY_PROBE_CACHE[key]
+    result = None
+    for ty in _TY_CANDIDATES:
+        if head_dim % ty:
+            continue
+        try:
+            _probe_launch(
+                kind,
+                ty,
+                dtype,
+                state_dtype,
+                num_heads,
+                head_dim,
+                conv_kernel_size,
+                bits,
+                group_size,
+            )
+        except ValueError as exc:
+            if "threads per threadgroup" not in str(exc):
+                raise
+            continue
+        except RuntimeError as exc:  # kernel would not build on this device
+            logger.info("glm5_next fused KDA (%s) unavailable: %s", kind, exc)
+            break
+        result = ty
+        break
+    _TY_PROBE_CACHE[key] = result
+    if result is None:
+        logger.info(
+            "glm5_next fused KDA (%s) declined: this device's threadgroup limit "
+            "is below the kernel's requirement at every supported size",
+            kind,
+        )
+    elif result != _TY_CANDIDATES[0]:
+        logger.info(
+            "glm5_next fused KDA (%s) running at a reduced threadgroup "
+            "(%d threads): the device caps this pipeline below %d.  Results are "
+            "unchanged; this only lowers occupancy.",
+            kind,
+            32 * result,
+            32 * _TY_CANDIDATES[0],
+        )
+    return result
+
+
 def fused_kda_supported(
     *,
     num_heads: int,
@@ -465,9 +657,9 @@ def fused_kda_supported(
         return False  # only the "safe gate" branch is transcribed
     if conv_kernel_size < 2:
         return False
-    if head_dim % 32 != 0 or head_dim % _TY != 0:
+    if head_dim % 32 != 0:
         return False
-    if 32 * _TY > 1024:
+    if not any(head_dim % ty == 0 for ty in _TY_CANDIDATES):
         return False
     if num_heads <= 0:
         return False
@@ -532,49 +724,60 @@ def fused_kda_decode_step(
     conv_kernel_size: int,
     lower_bound: float,
     norm_eps: float,
+    mask: Optional[mx.array] = None,
+    ty: int = 32,
     capture: bool = False,
     qproj: Optional[Tuple] = None,
 ) -> Tuple[mx.array, ...]:
-    """One fused KDA decode step.
+    """One fused KDA decode step, S=1, any batch size.
 
-    Args (all B=1, S=1):
-      q_in, k_in, v_in: ``[1, 1, H*D]`` pre-conv projections, dtype ``T``.
-      conv_state:       ``[1, K-1, 3*H*D]`` cached conv window, dtype ``T``.
+    Args (S=1):
+      q_in, k_in, v_in: ``[B, 1, H*D]`` pre-conv projections, dtype ``T``.
+      conv_state:       ``[B, K-1, 3*H*D]`` cached conv window, dtype ``T``.
       conv_w:           ``[3*H*D, K, 1]`` depthwise conv weight, dtype ``T``.
-      a:                ``[1, 1, H*D]`` forget-gate ``f_b_proj`` output, dtype ``T``.
-      b:                ``[1, 1, H]`` beta logits, dtype ``T``.
+      a:                ``[B, 1, H*D]`` forget-gate ``f_b_proj`` output, dtype ``T``.
+      b:                ``[B, 1, H]`` beta logits, dtype ``T``.
       A_log:            ``[H]`` float32.   dt_bias: ``[H*D]`` float32.
-      state:            ``[1, H, D, D]`` recurrent state (float32 in practice).
-      gate:             ``[1, 1, H*D]`` ``g_b_proj`` output, dtype ``T``.
+      state:            ``[B, H, D, D]`` recurrent state (float32 in practice).
+      gate:             ``[B, 1, H*D]`` ``g_b_proj`` output, dtype ``T``.
       o_weight:         ``[D]`` gated-RMSNorm weight, dtype ``T``.
+      mask:             optional ``[B, 1]`` bool; a false row has its pre-conv
+                        input zeroed, matching the eager
+                        ``mx.where(mask[..., None], mixed, 0)``.
 
-    Returns ``(y, state_out, conv_state_out)`` where ``y`` is ``[1, 1, H*D]`` and is
+    Returns ``(y, state_out, conv_state_out)`` where ``y`` is ``[B, 1, H*D]`` and is
     exactly what the eager path feeds to ``o_proj``.
 
     With ``capture=True`` it additionally returns
     ``(q_out, k_out, v_out, conv_input_out)``: the post-conv / post-L2-norm q, k, v
-    as ``[1, 1, H, D]`` and ``concatenate([conv_state, mixed], axis=1)`` as
-    ``[1, K, 3*H*D]`` -- the tensors ``gdn_sink`` carries for speculative rollback.
+    as ``[B, 1, H, D]`` and ``concatenate([conv_state, mixed], axis=1)`` as
+    ``[B, K, 3*H*D]`` -- the tensors ``gdn_sink`` carries for speculative rollback.
+
+    One threadgroup per (batch row, head).  B does not appear in the kernel
+    source, only in grid.z and the buffer extents, so the compiled pipeline is
+    identical at every B and the threadgroup probe result carries over.
     """
     H, D, K = num_heads, head_dim, conv_kernel_size
+    B = q_in.shape[0]
     dt = q_in.dtype
+    valid = _all_valid(B) if mask is None else mask.reshape(B)
     kind = "capture" if capture else ("qproj" if qproj is not None else "base")
     kernel = _kernel(kind)
-    out_shapes = [(1, 1, H * D), state.shape, conv_state.shape]
+    out_shapes = [(B, 1, H * D), state.shape, conv_state.shape]
     out_dtypes = [dt, state.dtype, dt]
     if capture:
-        out_shapes += [(1, 1, H, D)] * 3 + [(1, K, 3 * H * D)]
+        out_shapes += [(B, 1, H, D)] * 3 + [(B, K, 3 * H * D)]
         out_dtypes += [dt] * 4
     head = [q_in, k_in, v_in, conv_state, conv_w]
     tail = [b, A_log, dt_bias, state, o_weight]
-    scalars = [float(lower_bound), float(head_dim**-0.5), float(norm_eps)]
+    scalars = [float(lower_bound), float(head_dim**-0.5), float(norm_eps), valid]
     template = [
         ("T", dt),
         ("ST", state.dtype),
         ("H", num_heads),
         ("D", head_dim),
         ("K", conv_kernel_size),
-        ("TY", _TY),
+        ("TY", ty),
     ]
     if qproj is not None:
         fa, f_b_proj, ga, g_b_proj = qproj
@@ -599,8 +802,8 @@ def fused_kda_decode_step(
     return kernel(
         inputs=inputs,
         template=template,
-        grid=(32, _TY, num_heads),
-        threadgroup=(32, _TY, 1),
+        grid=(32, ty, B * num_heads),
+        threadgroup=(32, ty, 1),
         output_shapes=out_shapes,
         output_dtypes=out_dtypes,
     )

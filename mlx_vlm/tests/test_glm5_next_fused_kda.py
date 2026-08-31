@@ -25,6 +25,7 @@ import pytest
 
 import mlx_vlm.models.glm5_next.language as glm5
 from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.models.glm5_next.fused_kda import fused_kda_probe
 from mlx_vlm.models.glm5_next.config import TextConfig
 
 # GLM-5.3-Flash text_config, restricted to what the KDA layer reads.  The kernel
@@ -138,6 +139,37 @@ def _set_toggle(layer, on, qproj=False):
     glm5._FUSED_KDA_QPROJ_ENV = qproj
     layer._fused_kda = None
     layer._fused_kda_qproj = None
+    layer._fused_kda_ty = None
+    layer._fused_kda_qproj_ty = None
+
+
+def _require_device(config, kind, layer=None):
+    """Skip where the GPU cannot run this pipeline at any supported size."""
+    kwargs = dict(
+        kind=kind,
+        num_heads=config.linear_num_heads,
+        head_dim=config.linear_head_dim,
+        conv_kernel_size=config.linear_conv_kernel_dim,
+        dtype=mx.bfloat16,
+        state_dtype=mx.float32,
+    )
+    if kind == "qproj":
+        kwargs["bits"] = int(layer.forget_gate.f_b_proj.bits)
+        kwargs["group_size"] = int(layer.forget_gate.f_b_proj.group_size)
+    if fused_kda_probe(**kwargs) is None:
+        pytest.skip(f"device threadgroup cap below the {kind} kernel's requirement")
+
+
+def _masks(kind, batch, steps, seed=99):
+    """The three regimes batched decode actually produces."""
+    if kind == "none":
+        return [None] * steps
+    if kind == "all-true":
+        return [mx.ones((batch, 1), dtype=mx.bool_)] * steps
+    mx.random.seed(seed)
+    m = [mx.random.uniform(shape=(batch, 1)) > 0.35 for _ in range(steps)]
+    mx.eval(m)
+    return m
 
 
 def test_fused_kda_matches_eager_over_32_decode_steps():
@@ -266,7 +298,7 @@ def test_fused_kda_qproj_matches_eager_over_32_decode_steps():
     config = _config()
     layer = _layer(config)
     _set_toggle(layer, True, qproj=True)
-    if not layer._fused_kda_qproj_ready():
+    if not layer._fused_kda_qproj_ready(mx.bfloat16, mx.float32):
         pytest.skip("projection fold unsupported for this quantization")
 
     eager_cache = _cache(config)
@@ -325,7 +357,12 @@ def test_fused_kda_declines_ineligible_shapes():
     assert layer._fused_kda_eligible(**ok)
     assert not layer._fused_kda_eligible(**{**ok, "B": 2})
     assert not layer._fused_kda_eligible(**{**ok, "S": 8})
-    assert not layer._fused_kda_eligible(**{**ok, "mask": mx.array([[True]])})
+    # A bool [B, S] mask is supported now (batched decode always sends one);
+    # anything else still declines.
+    assert layer._fused_kda_eligible(**{**ok, "mask": mx.array([[True]])})
+    assert not layer._fused_kda_eligible(
+        **{**ok, "mask": mx.ones((1, 1), dtype=mx.float32)}
+    )
     assert layer._fused_kda_eligible(**{**ok, "gdn_sink": []})  # capture variant
     assert not layer._fused_kda_eligible(**{**ok, "cache": None})
     assert not layer._fused_kda_eligible(**{**ok, "cache": ArraysCache(size=2)})
@@ -421,3 +458,130 @@ def _bench(n_layers=34, iters=20, warmup=5):  # pragma: no cover - manual bench
 
 if __name__ == "__main__":  # pragma: no cover
     _bench()
+
+
+@pytest.mark.parametrize("batch", [2, 4, 8])
+@pytest.mark.parametrize("mask_kind", ["none", "all-true", "ragged"])
+def test_fused_kda_batched_matches_eager(batch, mask_kind):
+    """Batched decode (B <= 8), across the three mask regimes it actually sees.
+
+    BatchGenerator sets left_padding on the ArraysCache even for a uniform-length
+    batch, so batched decode always arrives with a bool mask -- all-true once the
+    rows have caught up, ragged while some are still left-padded.  The eager path
+    uses it only to zero the pre-conv input of a padded row (history and the
+    recurrence still run), and the kernel does the same, per (batch row, head)
+    threadgroup.  Every reduction is per (batch, head) and unchanged, so this is
+    exact for the same reason the B=1 path is.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    _require_device(config, "base")
+    layer = _layer(config)
+    n_steps = 32
+    masks = _masks(mask_kind, batch, n_steps)
+    mx.random.seed(20260831)
+    steps = [
+        mx.random.normal((batch, 1, config.hidden_size)).astype(mx.bfloat16)
+        for _ in range(n_steps)
+    ]
+    mx.eval(steps)
+
+    eager_cache = _cache(config, batch=batch)
+    fused_cache = _clone(eager_cache)
+    worst = (0.0, 0.0)
+    for x, m in zip(steps, masks):
+        _set_toggle(layer, False)
+        eager_out = layer(x, m, eager_cache)
+        _set_toggle(layer, True)
+        assert layer._fused_kda_ready()
+        assert layer._fused_kda_eligible(batch, 1, m, fused_cache, None, x)
+        fused_out = layer(x, m, fused_cache)
+        mx.eval(eager_out, fused_out, eager_cache.cache, fused_cache.cache)
+        for ref, got in (
+            (eager_out, fused_out),
+            (eager_cache[0], fused_cache[0]),
+            (eager_cache[1], fused_cache[1]),
+        ):
+            worst = max(worst, _max_abs_rel(ref, got))
+    assert worst == (0.0, 0.0), f"expected bit-identical, got {worst}"
+
+
+def test_fused_kda_batch_gate():
+    """The batch cap, the cache-shape contract and the mask contract."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    _require_device(config, "base")
+    layer = _layer(config)
+    _set_toggle(layer, True)
+    cache = _cache(config, batch=4)
+    ref = mx.zeros((4, 1, config.hidden_size), mx.bfloat16)
+    ok = dict(B=4, S=1, mask=None, cache=cache, gdn_sink=None, ref=ref)
+    assert layer._fused_kda_eligible(**ok)
+    assert layer._fused_kda_eligible(
+        **{**ok, "mask": mx.ones((4, 1), dtype=mx.bool_)}
+    )
+    over = glm5._FUSED_KDA_MAX_BATCH + 1
+    assert not layer._fused_kda_eligible(
+        B=over,
+        S=1,
+        mask=None,
+        cache=_cache(config, batch=over),
+        gdn_sink=None,
+        ref=mx.zeros((over, 1, config.hidden_size), mx.bfloat16),
+    )
+    # cache batch must match the request
+    assert not layer._fused_kda_eligible(**{**ok, "cache": _cache(config, batch=2)})
+    assert not layer._fused_kda_eligible(
+        **{**ok, "mask": mx.ones((4, 1), dtype=mx.float32)}
+    )
+
+
+@pytest.mark.parametrize("batch", [2, 8])
+def test_fused_kda_batched_capture_matches_eager_gdn_sink(batch):
+    """The speculative sink must be exact at B > 1 too (rollback replays it)."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    from mlx_vlm.models.gated_delta import gated_delta_update
+
+    config = _config()
+    _require_device(config, "base")
+    layer = _layer(config)
+    eager_cache = _cache(config, batch=batch)
+    fused_cache = _clone(eager_cache)
+    names = ["q", "k", "v", "a", "b", "A_log", "dt_bias", "state", "conv_input"]
+    mx.random.seed(4242)
+    worst = (0.0, 0.0)
+    for _ in range(8):
+        x = mx.random.normal((batch, 1, config.hidden_size)).astype(mx.bfloat16)
+        mx.eval(x)
+        eager_sink, fused_sink = [], []
+        _set_toggle(layer, False)
+        eager_out = layer(x, None, eager_cache, gdn_sink=eager_sink)
+        _set_toggle(layer, True)
+        fused_out = layer(x, None, fused_cache, gdn_sink=fused_sink)
+
+        def replay(e):
+            return gated_delta_update(
+                e[0][:, :1], e[1][:, :1], e[2][:, :1], e[3][:, :1], e[4][:, :1],
+                e[5], e[6], state=e[7], lower_bound=e[10],
+            )[1]
+
+        eager_roll, fused_roll = replay(eager_sink[0]), replay(fused_sink[0])
+        mx.eval(
+            eager_out, fused_out, eager_cache.cache, fused_cache.cache,
+            eager_sink[0][:9], fused_sink[0][:9], eager_roll, fused_roll,
+        )
+        pairs = [
+            (eager_out, fused_out),
+            (eager_cache[1], fused_cache[1]),
+            (eager_roll, fused_roll),
+        ]
+        for i, name in enumerate(names):
+            r, g = eager_sink[0][i], fused_sink[0][i]
+            assert r.shape == g.shape, f"{name}: {r.shape} vs {g.shape}"
+            pairs.append((r, g))
+        for r, g in pairs:
+            worst = max(worst, _max_abs_rel(r, g))
+    assert worst == (0.0, 0.0), f"expected bit-identical sink, got {worst}"

@@ -21,6 +21,7 @@ from ..mlp import DeepseekMLP
 from .config import ModelConfig, TextConfig
 from .fused_kda import (
     fused_kda_decode_step,
+    fused_kda_probe,
     fused_kda_qproj_supported,
     fused_kda_supported,
 )
@@ -30,6 +31,10 @@ _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
 
 _FUSED_KDA_ENV = None
 _FUSED_KDA_QPROJ_ENV = None
+
+# Policy cap, not a kernel limit: the kernel is batch-agnostic (B only widens
+# grid.z), but batched decode past this point is untested here.
+_FUSED_KDA_MAX_BATCH = 8
 
 
 def _env_flag(name: str) -> bool:
@@ -307,6 +312,8 @@ class Glm5NextLinearAttention(nn.Module):
         self._fused_ready = False
         self._fused_kda = None
         self._fused_kda_qproj = None
+        self._fused_kda_ty = None
+        self._fused_kda_qproj_ty = None
 
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
@@ -371,9 +378,14 @@ class Glm5NextLinearAttention(nn.Module):
             )
         return self._fused_kda
 
-    def _fused_kda_qproj_ready(self) -> bool:
+    def _fused_kda_qproj_ready(self, dtype=None, state_dtype=None) -> bool:
+        # Needs the dtypes to probe the device: the fold is a separate pipeline
+        # with its own threadgroup limit, so it can be declined (or run at a
+        # smaller threadgroup) independently of the base kernel.
         if self._fused_kda_qproj is None:
-            self._fused_kda_qproj = (
+            if dtype is None:
+                return False
+            supported = (
                 _fused_kda_qproj_enabled()
                 and self._fused_kda_ready()
                 and fused_kda_qproj_supported(
@@ -382,22 +394,44 @@ class Glm5NextLinearAttention(nn.Module):
                     head_dim=self.head_dim,
                 )
             )
+            ty = None
+            if supported:
+                ty = fused_kda_probe(
+                    kind="qproj",
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
+                    conv_kernel_size=self.conv_kernel_size,
+                    dtype=dtype,
+                    state_dtype=state_dtype,
+                    bits=int(self.forget_gate.f_b_proj.bits),
+                    group_size=int(self.forget_gate.f_b_proj.group_size),
+                )
+            self._fused_kda_qproj_ty = ty
+            self._fused_kda_qproj = ty is not None
         return self._fused_kda_qproj
 
     def _fused_kda_eligible(self, B, S, mask, cache, gdn_sink, ref) -> bool:
         # Per-step preconditions.  Anything unusual (prefill, S>1 verify block,
-        # batched / left-padded decode, a checkpoint whose gate params were not
-        # kept in fp32) falls back to the eager path.  A speculative capture is
-        # fine: the kernel's capture variant emits the gdn_sink tensors itself.
+        # a checkpoint whose gate params were not kept in fp32) falls back to the
+        # eager path.  A speculative capture is fine: the kernel's capture variant
+        # emits the gdn_sink tensors itself.
         del gdn_sink
-        if B != 1 or S != 1 or mask is not None:
+        if S != 1 or B < 1 or B > _FUSED_KDA_MAX_BATCH:
+            return False
+        # Batched decode hands down a per-row bool mask (BatchGenerator sets
+        # left_padding even for a uniform batch); the kernel applies it exactly
+        # where the eager path does.  Anything else -- a non-bool mask, or a
+        # shape this layer would broadcast differently -- falls back.
+        if mask is not None and (
+            mask.dtype != mx.bool_ or mask.shape != (B, S)
+        ):
             return False
         if cache is None or cache[0] is None or cache[1] is None:
             return False
         H, D, K = self.num_heads, self.head_dim, self.conv_kernel_size
-        if cache[0].shape != (1, K - 1, 3 * H * D):
+        if cache[0].shape != (B, K - 1, 3 * H * D):
             return False
-        if cache[1].shape != (1, H, D, D):
+        if cache[1].shape != (B, H, D, D):
             return False
         fg = self.forget_gate
         if fg.A_log.dtype != mx.float32 or fg.dt_bias.dtype != mx.float32:
@@ -405,16 +439,33 @@ class Glm5NextLinearAttention(nn.Module):
         if fg.A_log.size != H or fg.dt_bias.size != H * D:
             return False
         dt = ref.dtype
-        return (
+        if not (
             self.conv1d.weight.dtype == dt
             and self.o_norm.weight.dtype == dt
             and cache[0].dtype == dt
             and self.conv1d.weight.shape == (3 * H * D, K, 1)
             and self.o_norm.weight.size == D
-        )
+        ):
+            return False
+        # Device capability, probed once (see fused_kda_probe).  B does not enter
+        # the kernel source, so one probe covers every batch size.
+        if self._fused_kda_ty is None:
+            ty = fused_kda_probe(
+                kind="base",
+                num_heads=H,
+                head_dim=D,
+                conv_kernel_size=K,
+                dtype=dt,
+                state_dtype=cache[1].dtype,
+            )
+            if ty is None:
+                self._fused_kda = False  # stop retrying; stay on the eager path
+                return False
+            self._fused_kda_ty = ty
+        return True
 
     def _fused_kda_step(
-        self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink=None
+        self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink=None, mask=None
     ) -> mx.array:
         # One custom Metal kernel for the whole post-projection chain: conv1d
         # window update + silu, both L2 norms, the safe forget gate, beta, the
@@ -427,13 +478,13 @@ class Glm5NextLinearAttention(nn.Module):
         capture = gdn_sink is not None
         # The capture variant hands back `a` in gdn_sink, so it keeps the
         # projections outside; folding them in is for the plain decode step.
-        qproj = (
-            (fa_o, fg.f_b_proj, ga_o, self.g_b_proj)
-            if not capture and self._fused_kda_qproj_ready()
-            else None
+        use_qproj = not capture and self._fused_kda_qproj_ready(
+            q_o.dtype, cache[1].dtype
         )
-        a = None if qproj is not None else fg.f_b_proj(fa_o)
-        gate = None if qproj is not None else self.g_b_proj(ga_o)
+        qproj = (fa_o, fg.f_b_proj, ga_o, self.g_b_proj) if use_qproj else None
+        ty = self._fused_kda_qproj_ty if use_qproj else self._fused_kda_ty
+        a = None if use_qproj else fg.f_b_proj(fa_o)
+        gate = None if use_qproj else self.g_b_proj(ga_o)
         entry_state = cache[1]
         outs = fused_kda_decode_step(
             q_o,
@@ -453,6 +504,8 @@ class Glm5NextLinearAttention(nn.Module):
             conv_kernel_size=self.conv_kernel_size,
             lower_bound=fg.safe_gate_lower_bound,
             norm_eps=self.o_norm.eps,
+            mask=mask,
+            ty=ty,
             capture=capture,
             qproj=qproj,
         )
@@ -464,7 +517,7 @@ class Glm5NextLinearAttention(nn.Module):
                     q_n,
                     k_n,
                     v_n,
-                    a.reshape(1, 1, H, D),
+                    a.reshape(-1, 1, H, D),
                     b_o,
                     fg.A_log.reshape(H, 1),
                     fg.dt_bias.reshape(H, D),
@@ -494,7 +547,7 @@ class Glm5NextLinearAttention(nn.Module):
                 B, S, mask, cache, gdn_sink, q_o
             ):
                 return self._fused_kda_step(
-                    q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink
+                    q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask
                 )
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
         else:
@@ -511,7 +564,7 @@ class Glm5NextLinearAttention(nn.Module):
                 B, S, mask, cache, gdn_sink, q_o
             ):
                 return self._fused_kda_step(
-                    q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink
+                    q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask
                 )
         if mask is not None and mask.dtype == mx.bool_:
             mixed = mx.where(mask[..., None], mixed, 0)
