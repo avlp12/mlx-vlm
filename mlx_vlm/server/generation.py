@@ -1158,7 +1158,13 @@ class ResponseGenerator:
             else int(prefill_step_size)
         )
 
-    def stop_and_join(self, timeout: float = 10.0):
+    def stop_and_join(self, timeout: float = 10.0) -> bool:
+        """Stop the GPU thread. Returns True when it actually exited.
+
+        The return value matters at shutdown: a thread that is still draining
+        still owns the model, so "we asked it to stop" and "the memory is back"
+        are different facts and the caller must be able to tell them apart.
+        """
         self._stop = True
         self.requests.put(None)
         self._thread.join(timeout=timeout)
@@ -1167,6 +1173,8 @@ class ResponseGenerator:
                 "Generation thread still draining in-flight requests; "
                 "letting it finish in the background."
             )
+            return False
+        return True
 
     def wait_until_ready(self, timeout: Optional[float] = None):
         if not self._ready.wait(timeout):
@@ -1773,6 +1781,22 @@ class ResponseGenerator:
             self._run_impl()
         finally:
             clear_mlx_streams()
+            # The GPU thread is the last owner of the model on the way down.
+            # Its frame holds the BatchGenerator (already closed above, which
+            # releases the wired-memory limit) and this object holds the model,
+            # the drafter and the processor; dropping them here means a
+            # subsequent gc.collect() actually returns the weights instead of
+            # finding them still reachable from a stopped generator.
+            self._release_model_refs()
+
+    def _release_model_refs(self):
+        self.model = None
+        self.draft_model = None
+        self.processor = None
+        self.tokenizer = None
+        self.config = None
+        self.vision_cache = None
+        self.apc_manager = None
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""

@@ -19,6 +19,18 @@ rank 1 contributes zeros, the sum hands both the same message.  No side channel,
 no second transport to keep alive, and it cannot desynchronise from the data
 collectives because it *is* one.
 
+WHAT THE MIRROR OWES.  Rank 1's cache must always be reconstructible from what
+rank 0 announced.  Three things can break that, and each has a verb or a
+refusal here rather than a silent divergence:
+
+* a forward rank 1 cannot reproduce from token ids (multimodal ``inputs_embeds``)
+  -> refused;
+* a *mutation* of the cache outside a forward (speculative rollback, vault
+  restore) -> announced, so rank 1 performs the same mutation on its own half;
+* a cache that appears from nowhere already populated (a merged continuous
+  batch, an APC warm cache) -> refused, because ``OP_MAKE_CACHE`` only tells
+  rank 1 to make an *empty* one.  See ``_require_reconstructible``.
+
 REPRODUCIBILITY.  TP mode does not reproduce single-box tokens: all_sum adds two
 partial sums where one device summed all 4096, and at a one-ULP top-2 gap the
 argmax flips (measured: 16.875 vs 16.75, exactly one bf16 ULP at that
@@ -27,31 +39,145 @@ invariant is rank0 == rank1, asserted by the identity test.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import subprocess
 import threading
+import time
+import weakref
 from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
 from ..tp.worker import (  # noqa: F401  re-exported for the rank-0 side
     ENV_HOSTS, ENV_MAX_TOK, ENV_RANK, ENV_WORKER_PY, ENV_WORKER_SRC,
-    HEADER, OP_EXIT, OP_FORWARD, OP_MAKE_CACHE, TPUnavailable,
-    ENV_WORKER_MODEL,
-    _ctrl_recv, _ctrl_send, _max_tok, decode, encode, preflight,
-    tp_enabled, tp_hosts, tp_rank, worker_loop,
+    ENV_WORKER_MODEL, FLAG_CAPTURE, FLAG_HAS_NAME, HEADER, NAME_WORDS,
+    PROTO_VERSION,
+    OP_EXIT, OP_FORWARD, OP_MAKE_CACHE, OP_ROLLBACK, OP_VAULT_RESTORE,
+    OP_VAULT_STORE, Ctrl, TPDesync, TPUnavailable,
+    _ack_recv, _ctrl_recv, _ctrl_send, _max_tok, decode, encode,
+    name_to_words, preflight, tp_enabled, tp_hosts, tp_rank, words_to_name,
+    worker_loop,
 )
+
+# How long a single announced step may take before we conclude the peer is
+# gone.  Generous: a 65k prefill chunk on a half shard is seconds, not
+# milliseconds, and a false abort is worse than a slow one.
+ENV_STEP_TIMEOUT = "MLX_VLM_GLM5_TP_STEP_TIMEOUT_S"
+
+
+def _step_timeout() -> float:
+    try:
+        return max(10.0, float(os.environ.get(ENV_STEP_TIMEOUT, "300")))
+    except ValueError:
+        return 300.0
+
+
+# --------------------------------------------------------------- cache shape
+def _cache_is_empty(cache) -> bool:
+    """Is this prompt cache freshly made -- i.e. exactly what rank 1 would build?
+
+    ``OP_MAKE_CACHE`` says "make an empty cache".  It is only a faithful
+    instruction if rank 0's cache is empty too.  Anything else (a continuous
+    batch that just merged a second row via ``_extend_cache``, an APC warm
+    cache, a vault rung restored without announcing it) means rank 1 would start
+    from nothing while rank 0 starts from history -- and their partial sums
+    would be halves of different computations.
+    """
+    for c in cache or ():
+        if c is None:
+            continue
+        sub = getattr(c, "caches", None)
+        if sub is not None:                       # CacheList
+            if not _cache_is_empty(sub):
+                return False
+            continue
+        off = getattr(c, "offset", None)
+        if off is not None:
+            if int(off) != 0:
+                return False
+            continue
+        entries = getattr(c, "cache", None)       # ArraysCache (KDA)
+        if entries is not None:
+            if any(e is not None for e in entries):
+                return False
+            continue
+        # Unknown cache type: treat as non-empty.  Guessing "empty" here would
+        # convert a new cache kind into a silent desync.
+        return False
+    return True
+
+
+class _Watchdog:
+    """Bound the wall time of one announced step, with O(1) cost per step.
+
+    A dead peer leaves the fast fence's GPU kernel spinning on a shared counter;
+    nothing on the host can preempt that (see ``tp.transport.Deadman``), so the
+    only available recovery is to exit and let a supervisor restart us.  What
+    this adds over arming a timer per forward is that it costs a tuple store on
+    the hot path instead of a thread launch: at B=8 the server takes ~20 steps a
+    second, and a per-step ``threading.Timer`` is a measurable fraction of one.
+    """
+
+    def __init__(self, timeout_s: float, poll_s: float = 1.0, on_timeout=None):
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+        self._inflight: Optional[tuple] = None
+        self._stop = threading.Event()
+        self._on_timeout = on_timeout or self._abort
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._loop, name="tp-watchdog", daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def arm(self, label: str):
+        self._inflight = (label, time.monotonic())
+
+    def disarm(self):
+        self._inflight = None
+
+    def _loop(self):
+        while not self._stop.wait(self.poll_s):
+            inflight = self._inflight
+            if inflight is None:
+                continue
+            label, started = inflight
+            waited = time.monotonic() - started
+            if waited > self.timeout_s and self._inflight is inflight:
+                self._on_timeout(label, waited)
+
+    @staticmethod
+    def _abort(label: str, waited: float):
+        msg = (f"[tp watchdog] rank 0: '{label}' has been in flight for "
+               f"{waited:.0f}s (> {_step_timeout():.0f}s). The peer is stalled "
+               f"or dead and the GPU-side fence is spinning, which nothing on "
+               f"this host can preempt. Exiting 75 so a supervisor can restart "
+               f"the server instead of leaving a wedged 94 GiB process.")
+        print(msg, flush=True)
+        logger.error(msg)
+        os._exit(75)  # EX_TEMPFAIL
+
 
 class MirroredLanguageModel:
     """Rank-0 wrapper: announce each forward, then run it locally.
 
-    Only the plain ``inputs`` path is mirrored.  ``inputs_embeds`` and
-    ``capture_layer_ids`` are refused rather than silently diverging the ranks,
-    which is why speculative decoding is disabled in TP mode for now.
+    Also the single place where cache-mutating verbs are intercepted, because
+    the mirror is only sound if *every* change to rank 0's cache has a matching
+    announcement.  Attribute access falls through to the wrapped model, so a
+    mutator that is added upstream and not intercepted here would silently
+    become a desync -- which is why ``rollback_speculative_cache`` is spelled
+    out rather than inherited.
     """
 
-    def __init__(self, lm):
+    def __init__(self, lm, *, wire=None, shard_report=None, watchdog=None):
         self._lm = lm
         self._epoch = 0
         self._last_cache_id = None
@@ -64,36 +190,229 @@ class MirroredLanguageModel:
         # Cost is bounded: one extra cache stays alive between generations, and
         # during steady decode it is the same object we are already using.
         self._last_cache_obj = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._closed = False
+        self.shard_report = shard_report
+        # The entered ``wired_limit`` context.  Held here, not dropped as a
+        # local: a bare local is collected the moment the loader returns, and
+        # the generator's ``finally`` then quietly restores the old limit --
+        # so the process that thinks it wired the model has not.  Owning it
+        # makes both the raise and the release explicit and shutdown-ordered.
+        self._wire = wire
+        self._watchdog = watchdog
+        # Bound method in atexit would pin ``self`` -- and through it the whole
+        # 94 GiB shard -- for the life of the interpreter, defeating every
+        # unload the server performs.  A weakref hook releases the moment the
+        # mirror is dropped, and unregisters cleanly on an ordinary shutdown.
+        ref = weakref.ref(self)
+
+        def _atexit_shutdown():
+            m = ref()
+            if m is not None:
+                m.shutdown()
+
+        self._atexit_hook = _atexit_shutdown
+        atexit.register(_atexit_shutdown)
 
     def __getattr__(self, name):
         return getattr(self._lm, name)
 
+    # ------------------------------------------------------------ discipline
+    def _embeds_are_just_the_ids(self, inputs, embeds) -> bool:
+        """Is ``inputs_embeds`` exactly what rank 1 gets by embedding the ids?
+
+        generate_step passes inputs_embeds on every prefill (generate/ar.py, the
+        chunk loop and the final step), so refusing it outright would refuse
+        every request.  For text-only glm5_next it is literally
+        ``embed_tokens(inputs)`` (models/glm5_next/language.py: ``h =
+        self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds``),
+        so rank 1 reproduces the identical hidden by embedding the broadcast ids
+        itself.  For a multimodal prefill it is NOT -- image embeddings are
+        spliced in -- and rank 1 could not reconstruct it from ids at all.
+
+        Checked per call, never cached.  Whether a prefill is multimodal is a
+        property of the *request*, not of the model: on a VLM checkpoint the
+        first request can be text-only and the second can carry an image, and a
+        cached "yes" would wave that second one through -- precisely the silent
+        desync this class exists to prevent.  The cost is one embedding gather
+        per prefill chunk against forty-five MoE layers of work.
+        """
+        import mlx.core as mx
+
+        try:
+            inner = getattr(self._lm, "model", None)
+            emb = getattr(inner, "embed_tokens", None)
+            if emb is None:
+                return False
+            ref = emb(inputs)
+            return bool(ref.shape == embeds.shape and mx.all(ref == embeds).item())
+        except Exception:
+            logger.warning("tp: inputs_embeds check failed", exc_info=True)
+            return False
+
+    def _require_reconstructible(self, cache) -> None:
+        if _cache_is_empty(cache):
+            return
+        raise TPDesync(
+            "TP mode was handed a cache that is already populated but was "
+            "never announced. OP_MAKE_CACHE tells rank 1 to build an EMPTY "
+            "cache, so rank 1 would start from nothing while rank 0 starts "
+            "from history. Known producers: continuous batching admitting a "
+            "second request mid-generation (generate/ar.py _extend_cache "
+            "merges the batch caches in place and hands back a new list), and "
+            "APC warm caches. Serve those single-box, or set "
+            "MLX_VLM_MAX_NUM_SEQS=1 to keep the batch composition fixed.")
+
+    # ------------------------------------------------------------ the forward
     def __call__(self, inputs=None, cache=None, **kw):
-        if inputs is None or kw.get("inputs_embeds") is not None:
+        embeds = kw.get("inputs_embeds")
+        if inputs is None:
+            raise TPUnavailable("TP mode needs token ids to mirror a forward")
+        if embeds is not None and not self._embeds_are_just_the_ids(inputs, embeds):
             raise TPUnavailable(
-                "TP mode mirrors token-id forwards only; inputs_embeds is not "
-                "supported (vision / spec paths must stay off)")
-        if kw.get("capture_layer_ids") is not None:
-            raise TPUnavailable(
-                "TP mode does not mirror hidden capture; speculative decoding "
-                "is disabled in TP mode (TODO: mirror the capture + rollback)")
+                "TP mode cannot mirror inputs_embeds that are not embed_tokens("
+                "inputs) -- multimodal prefill is unsupported in TP mode")
+        # A capturing forward is a speculative verify.  Rank 1 is told to
+        # capture too (flag, not the id list: the drafter lives on rank 0) so
+        # that its KDA layers stash the block inputs its own rollback needs.
+        capture = kw.get("capture_layer_ids") is not None
         with self._lock:
-            cid = id(cache)
-            if cid != self._last_cache_id or cache is not self._last_cache_obj:
-                self._epoch += 1
-                self._last_cache_id = cid
-                self._last_cache_obj = cache
-                _ctrl_send(OP_MAKE_CACHE, self._epoch, None)
-            _ctrl_send(OP_FORWARD, self._epoch, inputs)
+            self._ensure_epoch(cache)
+            self._announce(OP_FORWARD, inputs,
+                           flags=FLAG_CAPTURE if capture else 0,
+                           label=f"forward b={getattr(inputs, 'shape', ('?',))[0]}")
             return self._lm(inputs, cache=cache, **kw)
 
-    def shutdown(self) -> None:
+    def _ensure_epoch(self, cache) -> None:
+        """Announce a fresh cache if this is one rank 1 has not been told about."""
+        cid = id(cache)
+        if cid == self._last_cache_id and cache is self._last_cache_obj:
+            return
+        self._require_reconstructible(cache)
+        self._epoch += 1
+        self._last_cache_id = cid
+        self._last_cache_obj = cache
+        self._announce(OP_MAKE_CACHE, None, label="make_cache")
+
+    def _announce(self, op, ids, *, flags=0, arg0=0, name="", label="") -> None:
+        if self._watchdog is not None:
+            self._watchdog.arm(label or f"op{op}")
+        try:
+            _ctrl_send(op, self._epoch, ids, flags=flags, arg0=arg0, name=name)
+        finally:
+            if self._watchdog is not None:
+                self._watchdog.disarm()
+
+    # ------------------------------------------------------- speculative verbs
+    def rollback_speculative_cache(self, caches, gdn_states, accepted,
+                                   block_size: int) -> int:
+        """Announce the rejection, then roll this rank's own half back.
+
+        The rolled-back state is shard-local on both sides -- the KDA recurrence
+        is head-split and each rank replays only its own heads, the DSA latent
+        is replicated and each rank trims its own copy -- so nothing but the two
+        integers crosses.  ``accepted`` may be an int, a list, or an mx.array
+        (batched rounds); it is normalised to a list because that is what the
+        target's own implementation reduces it to.
+        """
+        acc = _accepted_list(accepted)
         with self._lock:
+            if caches is not self._last_cache_obj:
+                raise TPDesync(
+                    "TP rollback on a cache that is not the announced one; "
+                    "rank 1 would roll back a different conversation.")
+            self._announce(OP_ROLLBACK, acc, arg0=int(block_size),
+                           label=f"rollback a={acc} bs={block_size}")
+            return self._lm.rollback_speculative_cache(
+                caches, gdn_states, accepted, block_size)
+
+    # ------------------------------------------------------------ vault verbs
+    def tp_mirror_vault(self, vault):
+        """Wrap rank 0's token-shaped vault so its rungs are announced."""
+        from ..tp.mirror_vault import MirroredVault
+
+        return MirroredVault(vault, self)
+
+    def announce_vault_store(self, name: str, prefix_len: int) -> None:
+        with self._lock:
+            self._announce(OP_VAULT_STORE, None, arg0=int(prefix_len), name=name,
+                           label=f"vault_store {name[:8]}@{prefix_len}")
+
+    def announce_vault_restore(self, cache, name: str, prefix_len: int) -> bool:
+        """Tell rank 1 to rebuild its half, and believe its answer.
+
+        Returns False when rank 1 does not hold the rung.  The two vaults evict
+        independently, so "rank 0 has it" does not imply "rank 1 has it"; the
+        ack is the only way to know, and serving a warm rank 0 against a cold
+        rank 1 would sum halves of different states into fluent nonsense.
+        """
+        with self._lock:
+            self._epoch += 1
+            self._last_cache_id = id(cache)
+            self._last_cache_obj = cache
+            self._announce(OP_VAULT_RESTORE, None, arg0=int(prefix_len),
+                           name=name, label=f"vault_restore {name[:8]}")
+            if self._watchdog is not None:
+                self._watchdog.arm("vault_restore ack")
+            try:
+                ok = bool(_ack_recv())
+            finally:
+                if self._watchdog is not None:
+                    self._watchdog.disarm()
+            if not ok:
+                # Rank 1 missed. Forget the epoch so the next forward announces
+                # a fresh MAKE_CACHE and both ranks prefill cold together.
+                self._last_cache_id = None
+                self._last_cache_obj = None
+                logger.info("tp: peer vault miss for %s; cold prefill", name[:12])
+            return ok
+
+    # --------------------------------------------------------------- teardown
+    def shutdown(self) -> None:
+        """Stop rank 1, release the wired limit, and drop the shard.
+
+        Ordered, because the order is the point.  Announce EXIT first so the
+        peer stops waiting in a collective; then leave ``wired_limit``, which
+        synchronises the stream and puts the wired budget back; then drop the
+        reference to the model so the caller's ``gc.collect()`` /
+        ``mx.clear_cache()`` can actually return the memory.  A shutdown that
+        skips the last step is what left 183 GiB resident while the next load
+        started, and froze the box.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             try:
                 _ctrl_send(OP_EXIT, self._epoch, None)
             except Exception:  # teardown must never mask the real error
                 logger.warning("tp: EXIT broadcast failed", exc_info=True)
+            if self._watchdog is not None:
+                self._watchdog.stop()
+                self._watchdog = None
+            if self._wire is not None:
+                try:
+                    self._wire.__exit__(None, None, None)
+                except Exception:
+                    logger.warning("tp: releasing wired limit failed", exc_info=True)
+                self._wire = None
+            self._last_cache_obj = None
+            self._last_cache_id = None
+            self._lm = None
+            if self._atexit_hook is not None:
+                try:
+                    atexit.unregister(self._atexit_hook)
+                except Exception:
+                    pass
+                self._atexit_hook = None
+
+
+def _accepted_list(accepted) -> List[int]:
+    if isinstance(accepted, int):
+        return [int(accepted)]
+    if hasattr(accepted, "reshape") and hasattr(accepted, "tolist"):
+        return [int(v) for v in accepted.reshape(-1).tolist()]
+    return [int(v) for v in accepted]
 
 
 def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
@@ -106,12 +425,23 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
         f"cd {src} && MLX_VLM_GLM5_FUSED_KDA=1 PYTHONPATH={src} "
         f"{ENV_HOSTS}='{','.join(hosts)}' {ENV_RANK}=1 "
         f"MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD={_max_tok()} "
+        f"MLX_VLM_GLM5_VAULT={os.environ.get('MLX_VLM_GLM5_VAULT', '')} "
         f"nohup {py} -m mlx_vlm.tp.worker --model {remote_model} "
         f"> ~/tp_worker.log 2>&1 &"
     )
     cmd = ["ssh", "-o", "BatchMode=yes", f"m3ms@{host}", inner]
     logger.info("tp: launching rank1 on %s", host)
     return subprocess.Popen(cmd)
+
+
+def _refuse_unmirrorable_env() -> None:
+    """Startup guards for settings whose effects happen outside a forward."""
+    if os.environ.get("KV_BITS"):
+        raise TPUnavailable(
+            "KV cache quantization is not mirrored: generate_step calls "
+            "maybe_quantize_kv_cache on the prompt cache between forwards "
+            "(generate/ar.py), and rank 1 is never told. Unset KV_BITS to "
+            "serve TP, or serve single-box with KV quantization.")
 
 
 def maybe_load_tp(model_path: str):
@@ -128,10 +458,20 @@ def maybe_load_tp(model_path: str):
     try:
         import mlx.core as mx
 
+        from ..context_vault import set_tp_topology
         from ..generate import wired_limit
+        from ..tp.fleet import require_quiet_fleet
         from ..tp.load import load_sharded, materialize
         from ..tp.transport import tp_rank as _r, tp_size
-        from ..utils import get_model_path, load_tokenizer
+        from ..tp.vault import topology_descriptor
+        from ..utils import (get_model_path, load_image_processor,
+                             load_processor)
+
+        _refuse_unmirrorable_env()
+        # Two 94 GiB shards fit; a 94 GiB shard beside a leftover 183 GiB
+        # single-box resident does not, and the box freezes rather than swaps.
+        logger.info("tp: fleet preflight %s",
+                    require_quiet_fleet(hosts, label="tp serving load"))
 
         worker = launch_worker(model_path, hosts)
         info = preflight(hosts, 0)
@@ -139,15 +479,30 @@ def maybe_load_tp(model_path: str):
         model, report = load_sharded(model_path, _r(), tp_size())
         peak = materialize(model)
         logger.info("tp: sharded %s peak %.1f GiB", report, peak)
+        # Every vault identity from here on carries which half of which model
+        # this process holds, so a TP rung and a single-box rung -- and rank 0's
+        # and rank 1's -- can never name the same boundary.
+        set_tp_topology(topology_descriptor(report, model_path))
         wire = wired_limit(model, [mx.default_stream(mx.default_device())])
         wire.__enter__()
+        watchdog = _Watchdog(_step_timeout()).start()
         inner = model.language_model if hasattr(model, "language_model") else model
-        mirrored = MirroredLanguageModel(inner)
+        mirrored = MirroredLanguageModel(
+            inner, wire=wire, shard_report=report, watchdog=watchdog)
         if hasattr(model, "language_model"):
             model.language_model = mirrored
         else:
             model = mirrored
-        processor = load_tokenizer(get_model_path(model_path))
+        # Build the processor exactly as utils.load() does.  Returning a bare
+        # TokenizerWrapper here is not enough: the server calls the processor,
+        # and a wrapper is not callable -- which is how the first HTTP request
+        # 500'd even though TP itself had come up correctly.
+        mp = get_model_path(model_path)
+        eos = getattr(model.config, "eos_token_id", None)
+        processor = load_processor(mp, True, eos_token_ids=eos)
+        image_processor = load_image_processor(mp)
+        if image_processor is not None:
+            processor.image_processor = image_processor
         return model, processor, model.config if hasattr(model, "config") else None
     except Exception as e:
         logger.error("tp: unavailable (%s); serving single-box", e, exc_info=True)
@@ -157,3 +512,17 @@ def maybe_load_tp(model_path: str):
             except Exception:
                 pass
         return None
+
+
+def shutdown_tp(model) -> bool:
+    """Shut the mirror down if ``model`` has one. Safe on any model.
+
+    Called from the server's unload path, so that dropping a model group also
+    stops the peer instead of leaving it blocked in a collective with a shard
+    resident.
+    """
+    lm = getattr(model, "language_model", model)
+    if not isinstance(lm, MirroredLanguageModel):
+        return False
+    lm.shutdown()
+    return True

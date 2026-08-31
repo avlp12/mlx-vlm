@@ -1,0 +1,418 @@
+"""Rank-1 side of TP=2 serving, and the both-sides replay of a whole spec round.
+
+The rank-0 tests (``test_server_tp_mode.py``) pin what gets announced.  These
+pin what rank 1 *does* with it, and then close the loop: a real speculative
+round loop is driven against a scripted target on rank 0, the control stream it
+emits is captured, and that stream is replayed into a worker holding a twin
+model.  What comes out is the sequence of forwards, capture flags and rollbacks
+rank 1 would actually have performed -- which is the only thing that has to
+match, because everything else about the two ranks is already symmetric.
+
+No GPU, no second box, no group: every collective is stubbed, so the properties
+under test are protocol properties rather than hardware ones.
+"""
+
+import mlx.core as mx
+import pytest
+from types import SimpleNamespace
+
+from mlx_vlm.tp import worker as W
+
+
+# --------------------------------------------------------------- proto guard
+def test_handshake_rejects_a_peer_on_a_different_revision(monkeypatch):
+    """A header-width skew between the boxes is a HANG, not an error.
+
+    ``_ctrl_recv`` allocates ``HEADER + n`` words and ``_ctrl_send`` sends the
+    same; mismatched shapes in a jaccl all_sum do not raise, they wedge.  The
+    handshake rides a vector whose width is frozen forever, so the skew gets
+    diagnosed by the one collective that cannot itself be a victim of it.
+    """
+    class _FakeTransport:
+        @staticmethod
+        def all_sum(x):
+            # Peer claims header width 12 while we are on 14.
+            row = x[0].tolist()
+            peer = [W.PROTO_VERSION, 12, W._max_tok(), 0, 0, 0, 0, 0]
+            return mx.array([[a + b for a, b in zip(row, peer)]], dtype=mx.int32)
+
+    monkeypatch.setattr(W, "_proto_handshake", _real_handshake_with(_FakeTransport))
+    with pytest.raises(W.TPUnavailable, match="header_width mismatch"):
+        W._proto_handshake()
+
+
+def _real_handshake_with(transport):
+    """Re-bind ``_proto_handshake`` onto a stub transport."""
+    def _handshake(timeout_s: float = 60.0) -> dict:
+        mine = [W.PROTO_VERSION, W.HEADER, W._max_tok(), 0, 0, 0, 0, 0]
+        out = transport.all_sum(mx.array([mine], dtype=mx.int32))
+        total = [int(v) for v in out[0].tolist()]
+        n = 2
+        for i, label in enumerate(("proto_version", "header_width", "max_tokens")):
+            if total[i] != mine[i] * n:
+                raise W.TPUnavailable(f"tp {label} mismatch")
+        return {}
+    return _handshake
+
+
+# ------------------------------------------------------------- worker basics
+class _TwinLM:
+    """Rank 1's half: records what it was asked to run."""
+
+    def __init__(self, hidden=4, vocab=8):
+        self.forwards = []      # (batch, seqlen, captured)
+        self.rollbacks = []
+        self.caches = []
+        self._h, self._v = hidden, vocab
+
+    def make_cache(self):
+        c = ["cache", len(self.caches)]
+        self.caches.append(c)
+        return c
+
+    def __call__(self, ids, cache=None, **kw):
+        captured = kw.get("capture_layer_ids") is not None
+        self.forwards.append((ids.shape[0], ids.shape[1], captured))
+        return SimpleNamespace(
+            logits=mx.zeros((ids.shape[0], ids.shape[1], self._v)),
+            hidden_states=[mx.zeros((ids.shape[0], ids.shape[1], self._h))],
+            gdn_states=["gdn"] if captured else None,
+        )
+
+    def rollback_speculative_cache(self, caches, gdn, accepted, bs):
+        self.rollbacks.append((list(accepted), bs, gdn))
+        return max(accepted)
+
+
+def _msg(op, epoch, *, ids=None, flags=0, arg0=0, name=""):
+    shape = (1, len(ids)) if ids is not None else None
+    return W.decode(W.encode(op, epoch, shape, ids, n=64,
+                             flags=flags, arg0=arg0, name=name))
+
+
+def test_worker_makes_a_cache_then_forwards_into_it():
+    lm = _TwinLM()
+    st = W._WorkerState(lm)
+    assert st.handle(_msg(W.OP_MAKE_CACHE, 1)) is True
+    assert st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2, 3])) is True
+    assert lm.forwards == [(1, 3, False)]
+    assert len(lm.caches) == 1
+
+
+def test_worker_replaces_the_cache_on_a_new_epoch():
+    """One live cache: rank 0 drives one conversation at a time, and holding the
+    previous one would pin its KV for nothing."""
+    lm = _TwinLM()
+    st = W._WorkerState(lm)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[1]))
+    st.handle(_msg(W.OP_MAKE_CACHE, 2))
+    assert list(st.caches) == [2]
+
+
+def test_worker_exits_on_exit():
+    assert W._WorkerState(_TwinLM()).handle(_msg(W.OP_EXIT, 0)) is False
+
+
+def test_worker_rejects_an_unknown_verb():
+    """A verb this worker does not know means the ranks disagree about the
+    protocol; guessing would be a desync with no symptom."""
+    with pytest.raises(W.TPDesync, match="unknown control op"):
+        W._WorkerState(_TwinLM()).handle(_msg(99, 1))
+
+
+# --------------------------------------------------------- capture + rollback
+def test_capture_flag_allocates_the_sink_on_rank_1():
+    lm = _TwinLM()
+    st = W._WorkerState(lm)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2, 3, 4], flags=W.FLAG_CAPTURE))
+    assert lm.forwards[-1] == (1, 4, True)
+    assert st.last_gdn == ["gdn"]
+
+
+def test_rollback_replays_this_ranks_own_half():
+    lm = _TwinLM()
+    st = W._WorkerState(lm)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2, 3, 4], flags=W.FLAG_CAPTURE))
+    st.handle(_msg(W.OP_ROLLBACK, 1, ids=[2], arg0=4))
+    assert lm.rollbacks == [([2], 4, ["gdn"])]
+    assert st.last_gdn is None, "a consumed round must not be rolled back twice"
+
+
+def test_rollback_without_a_captured_round_is_refused():
+    """Rank 1 cannot roll back what it never captured.  Silently skipping would
+    leave rank 1 holding the whole rejected block while rank 0 dropped it."""
+    lm = _TwinLM()
+    st = W._WorkerState(lm)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2]))          # no capture flag
+    with pytest.raises(W.TPDesync, match="no captured round"):
+        st.handle(_msg(W.OP_ROLLBACK, 1, ids=[0], arg0=2))
+
+
+# ------------------------------------------------------------- vault on rank 1
+class _FakeShardVault:
+    def __init__(self, holds=()):
+        self.holds = dict(holds)
+        self.stored = []
+        self.restored = []
+
+    def store(self, name, prefix_len, caches):
+        self.stored.append((name, prefix_len, caches))
+        self.holds[name] = prefix_len
+        return True
+
+    def restore(self, name, prefix_len, caches):
+        ok = self.holds.get(name) == prefix_len
+        self.restored.append((name, prefix_len, ok))
+        return ok
+
+
+def test_vault_store_checkpoints_this_ranks_own_cache(monkeypatch):
+    lm, v = _TwinLM(), _FakeShardVault()
+    st = W._WorkerState(lm, vault=v)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2]))
+    st.handle(_msg(W.OP_VAULT_STORE, 1, arg0=2048, name="ab" * 16))
+    assert v.stored == [("ab" * 16, 2048, lm.caches[0])]
+
+
+def test_vault_restore_acks_a_hit_and_installs_the_cache(monkeypatch):
+    acks = []
+    monkeypatch.setattr(W, "_ack_send", acks.append)
+    lm, v = _TwinLM(), _FakeShardVault({"cd" * 16: 4096})
+    st = W._WorkerState(lm, vault=v)
+    st.handle(_msg(W.OP_VAULT_RESTORE, 5, arg0=4096, name="cd" * 16))
+    assert acks == [1]
+    assert list(st.caches) == [5]
+
+
+def test_vault_restore_acks_a_miss_without_installing_anything(monkeypatch):
+    """The two vaults evict independently.  Rank 1 answering "no" is the only
+    thing that stops rank 0 serving warm against a cold peer."""
+    acks = []
+    monkeypatch.setattr(W, "_ack_send", acks.append)
+    lm, v = _TwinLM(), _FakeShardVault()
+    st = W._WorkerState(lm, vault=v)
+    st.handle(_msg(W.OP_VAULT_RESTORE, 5, arg0=4096, name="ef" * 16))
+    assert acks == [0]
+    assert list(st.caches) == []
+
+
+def test_vault_restore_without_a_vault_still_acks(monkeypatch):
+    """Never leave rank 0 waiting on an ack that is not coming: an unanswered
+    collective is a hang, and a worker built without a vault is a supported
+    configuration (MLX_VLM_GLM5_VAULT unset)."""
+    acks = []
+    monkeypatch.setattr(W, "_ack_send", acks.append)
+    st = W._WorkerState(_TwinLM(), vault=None)
+    st.handle(_msg(W.OP_VAULT_RESTORE, 1, arg0=8, name="11" * 16))
+    assert acks == [0]
+
+
+# =============================================================================
+# The whole loop: a real speculative round loop, replayed on rank 1
+# =============================================================================
+class _PlanExhausted(Exception):
+    """The script ran out; stop the round loop deterministically."""
+
+
+class _ScriptedPair:
+    """A target whose acceptance is dictated per round.
+
+    ``plan[i]`` is how many of round ``i``'s drafted tokens the target agrees
+    with; ``None`` means "all of them" (a full-accept round, which must NOT
+    produce a rollback).
+    """
+
+    def __init__(self, plan, hidden=4, vocab=64):
+        self.plan = plan
+        self.round = 0
+        self.last_draft = None
+        self.hidden, self.vocab = hidden, vocab
+        self.forwards = []
+        self.rollbacks = []
+        self.aborted = False
+
+    # -- target side --
+    def make_cache(self):
+        return ["target-cache"]
+
+    def _onehot(self, row):
+        out = mx.zeros((1, len(row), self.vocab))
+        idx = mx.array(row, dtype=mx.int32)
+        return out + (mx.arange(self.vocab)[None, None, :] == idx[None, :, None]) * 10.0
+
+    def __call__(self, ids, cache=None, **kw):
+        if self.round >= len(self.plan):
+            self.aborted = True
+            raise _PlanExhausted
+        captured = kw.get("capture_layer_ids") is not None
+        S = ids.shape[1]
+        self.forwards.append((ids.shape[0], S, captured))
+        draft = self.last_draft or []
+        a = self.plan[self.round] if self.plan[self.round] is not None else len(draft)
+        # Token ids must stay inside the fake vocab or the one-hot never fires
+        # and every round would silently look like a zero-accept.
+        row = list(draft[:a]) + [40 + self.round]
+        row += [50] * (S - len(row))
+        self.round += 1
+        return SimpleNamespace(
+            logits=self._onehot(row[:S]),
+            hidden_states=[mx.zeros((1, S, self.hidden))],
+            gdn_states=["gdn"],
+        )
+
+    def rollback_speculative_cache(self, caches, gdn, accepted, bs):
+        self.rollbacks.append((int(accepted) if isinstance(accepted, int)
+                               else accepted, bs))
+        return 0
+
+    # -- drafter side --
+    def draft_block(self, b, hidden, draft_cache, bs, sampler, token_dtype, **kw):
+        self.last_draft = [10 + i for i in range(bs - 1)]
+        return mx.array([self.last_draft], dtype=token_dtype)
+
+
+def _drive_spec_rounds(monkeypatch, plan, block_size=4, max_tokens=64):
+    """Run ``_dflash_rounds`` through the mirror; return (tokens, control stream)."""
+    from mlx_vlm.server import tp_mode as T
+    from mlx_vlm.speculative.dflash import _dflash_rounds
+
+    sent = []
+
+    def _send(op, ep, ids, *, flags=0, arg0=0, name=""):
+        shape = None
+        flat = None
+        if ids is not None:
+            if hasattr(ids, "reshape"):
+                shape, flat = (ids.shape[0], ids.shape[1]), ids.reshape(-1).tolist()
+            else:
+                shape, flat = (1, len(ids)), [int(v) for v in ids]
+        sent.append(W.decode(W.encode(op, ep, shape, flat, n=256,
+                                      flags=flags, arg0=arg0, name=name)))
+
+    monkeypatch.setattr(T, "_ctrl_send", _send)
+
+    pair = _ScriptedPair(plan)
+    mirror = T.MirroredLanguageModel(pair)
+    model = SimpleNamespace(language_model=mirror)
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[0], block_size=block_size,
+                               runtime_block_size=block_size),
+        accept_lens=[], draft_lens=[],
+        dflash_deferred_walk=True,
+        reset=lambda m: ["draft-cache"],
+        draft_block=pair.draft_block,
+    )
+    # A cache the mirror has not seen yet, and that is genuinely empty -- which
+    # is what OP_MAKE_CACHE tells rank 1 to build.  (In the live path the spec
+    # loop inherits the *prefilled* cache, but the mirror has already announced
+    # that one, so the identity short-circuit fires before the emptiness check.)
+    cache = [SimpleNamespace(offset=0)]
+    hidden = mx.zeros((1, 1, 4))
+    rounds = _dflash_rounds(
+        model, drafter, cache, hidden,
+        first_bonus=7, max_tokens=max_tokens,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        draft_block_size=block_size, use_model_initial_block_size=False,
+    )
+    tokens = []
+    try:
+        for tok, _ in rounds:
+            tokens.append(int(tok))
+    except _PlanExhausted:
+        pass
+    finally:
+        rounds.close()
+    if pair.aborted:
+        # Drop the announce for the round the script refused to serve: rank 0
+        # announced it and then raised, so it is an artefact of the harness,
+        # not of the protocol.
+        last = max(i for i, m in enumerate(sent) if m.op == W.OP_FORWARD)
+        sent = sent[:last]
+    return pair, sent, tokens
+
+
+def _replay(sent):
+    """Feed rank 0's control stream to a worker and report what it did."""
+    twin = _TwinLM()
+    st = W._WorkerState(twin)
+    for msg in sent:
+        st.handle(msg)
+    return twin, st
+
+
+def test_spec_round_loop_partial_accept_is_mirrored_exactly(monkeypatch):
+    """Partial accept: a verify forward at width W, then a rollback verb.
+
+    This is the round shape that actually happens most of the time, and the one
+    that mutates the cache outside a forward.  Rank 1 must see both halves.
+    """
+    pair, sent, tokens = _drive_spec_rounds(monkeypatch, plan=[2])
+    assert pair.rollbacks == [(2, 4)], "rank 0 rolled back a partial round"
+    twin, _ = _replay(sent)
+    assert twin.forwards == [(1, 4, True)], "one width-4 capturing verify"
+    assert twin.rollbacks == [([2], 4, ["gdn"])], "rank 1 rolled back the same"
+    assert pair.forwards == twin.forwards
+
+
+def test_spec_round_loop_full_accept_emits_no_rollback(monkeypatch):
+    """A fully accepted round must NOT announce a rollback.
+
+    An unconditional rollback verb would be the mirror-image bug: rank 1
+    replaying a trim that rank 0 never performed.
+    """
+    pair, sent, _ = _drive_spec_rounds(monkeypatch, plan=[None])
+    assert pair.rollbacks == []
+    twin, _ = _replay(sent)
+    assert twin.rollbacks == []
+    assert [m.op for m in sent].count(W.OP_ROLLBACK) == 0
+
+
+def test_spec_round_loop_zero_accept_is_mirrored(monkeypatch):
+    """Abstain: the drafter was wrong immediately, so the whole block is
+    trimmed and only the target's own token survives."""
+    pair, sent, _ = _drive_spec_rounds(monkeypatch, plan=[0])
+    assert pair.rollbacks == [(0, 4)]
+    twin, _ = _replay(sent)
+    assert twin.rollbacks == [([0], 4, ["gdn"])]
+
+
+def test_spec_round_loop_mixed_sequence_is_mirrored_step_for_step(monkeypatch):
+    """The gate: partial, full, abstain in one loop, replayed step for step.
+
+    Every verify is capturing on both ranks (the KDA block inputs rank 1 needs
+    for its own rollback exist only if its sink was allocated), every rollback
+    carries the same (accepted, block_size), and no rollback appears on one rank
+    without the other.
+    """
+    pair, sent, _ = _drive_spec_rounds(monkeypatch, plan=[2, None, 0])
+    twin, st = _replay(sent)
+
+    assert len(pair.forwards) == 3
+    assert pair.forwards == twin.forwards, "same widths, same capture flags"
+    assert all(captured for _, _, captured in twin.forwards)
+    # Partial and abstain roll back; the fully accepted round does not.
+    assert [a for a, _ in pair.rollbacks] == [2, 0]
+    assert [(a, bs) for a, bs, _ in twin.rollbacks] == \
+           [([a], bs) for a, bs in pair.rollbacks]
+    # And the announced stream never asks rank 1 to build a cache it was not
+    # told about, nor to forward into one that does not exist.
+    epochs = {m.epoch for m in sent if m.op == W.OP_FORWARD}
+    assert epochs <= set(st.caches) | {st.epoch}
+
+
+def test_verify_width_varies_with_acceptance_and_is_announced(monkeypatch):
+    """Width-W verify: W is decided by rank 0's cost model and changes between
+    rounds, so it has to travel rather than be assumed."""
+    pair, sent, _ = _drive_spec_rounds(monkeypatch, plan=[2, None, 0], block_size=6)
+    widths = [m.seqlen for m in sent if m.op == W.OP_FORWARD]
+    # The adaptive block-size cost model shrinks W after a partial accept, so
+    # the stream really does carry more than one width -- which is the point:
+    # a width rank 1 assumed rather than received would be wrong by round two.
+    assert len(set(widths)) > 1, f"expected varying verify widths, got {widths}"
+    twin, _ = _replay(sent)
+    assert [s for _, s, _ in twin.forwards] == widths

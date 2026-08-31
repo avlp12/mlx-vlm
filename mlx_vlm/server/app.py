@@ -424,12 +424,19 @@ async def lifespan(app):
     try:
         yield
     finally:
-        if runtime.audio_queue is not None:
-            runtime.audio_queue.stop_and_join()
-            runtime.audio_queue = None
-        if runtime.realtime_engine is not None:
-            runtime.realtime_engine.stop_and_join()
-            runtime.realtime_engine = None
+        # Unload for real on the way out.  Previously this stopped the audio
+        # and realtime workers and left the language model, its generation
+        # thread and (in TP mode) the peer's shard alive until the interpreter
+        # exited -- which is why a shutdown could sit at uvicorn's "Waiting for
+        # background tasks to complete" with 183 GiB still mapped.  The next
+        # load then started against a box that had not given the memory back.
+        # unload_model_sync() is the same path /unload uses and is idempotent.
+        try:
+            unload_model_sync()
+        except Exception:  # noqa: BLE001 - never mask the real shutdown reason
+            logger.exception("Error unloading models during shutdown.")
+        report = _teardown_report()
+        logger.info("Shutdown teardown: %s", report)
 
 
 app = FastAPI(
@@ -480,8 +487,27 @@ def _unload_model_cache_group(cache_group: str) -> bool:
     if response_generator is not None:
         logger.info("Stopping response generator.")
         response_generator.stop_and_join()
+        # The generation thread holds the model, the processor and the
+        # BatchGenerator (whose ExitStack owns the wired-memory limit).  Joining
+        # the thread is not the same as dropping them: a ResponseGenerator that
+        # outlives the cache entry keeps the whole graph reachable, so the
+        # gc.collect() below frees nothing and the memory stays resident.
+        _release_generator_state(response_generator)
         if runtime.response_generator is response_generator:
             runtime.response_generator = None
+
+    # In TP mode the model is a mirror over the peer.  Announce EXIT before
+    # dropping it, or rank 1 blocks in a collective with its shard resident
+    # until its own deadman fires.
+    _model = cache.get("model")
+    if _model is not None:
+        try:
+            from .tp_mode import shutdown_tp
+
+            if shutdown_tp(_model):
+                logger.info("TP mirror shut down; peer told to exit.")
+        except Exception:  # noqa: BLE001
+            logger.warning("TP mirror shutdown failed.", exc_info=True)
 
     if apc_manager is not None:
         # A worker that was already draining may have completed an APC store
@@ -495,9 +521,66 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache["vision_cache"].clear()
 
     registry.pop(cache_group)
+    cache.clear()
     gc.collect()
     mx.clear_cache()
     return True
+
+
+def _release_generator_state(response_generator) -> None:
+    """Drop a stopped generator's references to the model and its GPU state.
+
+    The generation thread releases its own on the way out (its ``BatchGenerator``
+    is closed there, which is what puts the wired-memory limit back).  This is
+    the case where the thread did NOT exit inside the join window: it is still
+    draining, so nothing has been released, and leaving the caller believing
+    otherwise is how a "finished" shutdown ends up still holding the weights.
+    """
+    thread = getattr(response_generator, "_thread", None)
+    if thread is not None and thread.is_alive():
+        # Deliberately NOT nulling its references here.  A draining thread is
+        # still calling through them, and yanking the model out from under it
+        # trades a memory leak for a traceback in a request that was about to
+        # finish.  Say so loudly instead: the operator's guard
+        # (mlx_vlm.tp.fleet) is what stops the next load, and it reads RSS,
+        # which is the truth either way.
+        logger.warning(
+            "Generation thread did not exit within the join window; the model "
+            "it holds is NOT released yet. Do not start another heavy run "
+            "until `python -m mlx_vlm.tp.fleet` reports the box quiet."
+        )
+        return
+    # The thread exited, and its own ``finally`` dropped the model, the drafter
+    # and the BatchGenerator (whose close() put the wired-memory limit back).
+    # Nothing left to do but confirm the object is not itself a second owner.
+    release = getattr(response_generator, "_release_model_refs", None)
+    if callable(release):
+        try:
+            release()
+        except Exception:  # noqa: BLE001
+            logger.warning("Releasing generator model refs failed.", exc_info=True)
+
+
+def _teardown_report() -> dict:
+    """What the process actually gave back, not what it intended to.
+
+    A shutdown that logs "unloaded" while RSS is unchanged is the failure this
+    campaign already paid for once (2026-08-31: an e2e server hung in shutdown
+    with its model resident, the next load started anyway, and the box froze).
+    So the shutdown path emits a number a receipt can carry.
+    """
+    report = {"active_memory_gb": None, "rss_gb": None}
+    try:
+        report["active_memory_gb"] = round(mx.get_active_memory() / 1024**3, 2)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..tp.fleet import self_rss_gb
+
+        report["rss_gb"] = round(self_rss_gb(), 2)
+    except Exception:  # noqa: BLE001
+        pass
+    return report
 
 
 def _audio_model_kind(model_kind: str) -> bool:

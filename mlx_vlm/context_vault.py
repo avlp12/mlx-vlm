@@ -40,6 +40,7 @@ boundary re-pays 140.8 MiB regardless of depth.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -49,6 +50,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import mlx.core as mx
 
 from .apc_adapters import Capability, StateFragment, resolve_adapter
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ContextVault",
@@ -290,6 +293,13 @@ class VaultCheckpoint:
     created: float = field(default_factory=time.monotonic)
     last_used: float = field(default_factory=time.monotonic)
     hits: int = 0
+    # The vault identity that produced this rung. Carried on the checkpoint,
+    # not merely on the store, because a checkpoint is the thing that travels:
+    # between vaults in-process, across the peer-tier wire, and -- once TP
+    # exists -- between processes holding different halves of the weights.
+    # Restoring a shard of somebody else's topology yields a cache of exactly
+    # the right shape and entirely the wrong contents.
+    origin: str = ""
 
 
 class _Node:
@@ -321,6 +331,7 @@ class VaultStats:
     tokens_saved: int = 0
     bytes_resident: int = 0
     rejected_unsupported: int = 0
+    rejected_foreign: int = 0
 
     def as_dict(self, budget: int, rungs: int) -> dict:
         return {
@@ -338,6 +349,7 @@ class VaultStats:
             "budget_gb": budget / (1024**3),
             "utilization": (self.bytes_resident / budget) if budget else 0.0,
             "rejected_unsupported": self.rejected_unsupported,
+            "rejected_foreign": self.rejected_foreign,
         }
 
 
@@ -497,7 +509,10 @@ class ContextVault:
                 return False
             self._evict_until(nbytes)
             node.checkpoint = VaultCheckpoint(
-                prefix_len=prefix_len, fragments=frags, nbytes=nbytes
+                prefix_len=prefix_len,
+                fragments=frags,
+                nbytes=nbytes,
+                origin=self.identity,
             )
             self._resident += nbytes
             self._rungs += 1
@@ -506,6 +521,23 @@ class ContextVault:
             return True
 
     def restore_into(self, caches: Sequence[Any], checkpoint: VaultCheckpoint) -> bool:
+        """Rebuild ``caches`` from ``checkpoint``, unless it came from elsewhere.
+
+        The refusal is not belt-and-braces over the identity-keyed store: a
+        checkpoint can reach this method without ever having been in this vault
+        (the peer tier hands one over; a TP rank could be handed the other
+        rank's half). Shapes would match and the restore would "work", so the
+        check has to be on provenance rather than on structure. Refusing costs
+        a cold prefill; accepting costs a fluent wrong answer.
+        """
+        origin = getattr(checkpoint, "origin", "")
+        if origin and origin != self.identity:
+            self.stats.rejected_foreign += 1
+            logger.warning(
+                "vault: refusing a checkpoint from a different topology/build "
+                "(rung origin %s..., this vault %s...); falling back to a cold "
+                "prefill", origin[:12], self.identity[:12])
+            return False
         return restore_fragments(caches, checkpoint.fragments)
 
     def clear(self) -> None:
@@ -575,6 +607,52 @@ _NUMERIC_TOGGLES = (
 )
 
 
+# --------------------------------------------------------------------------
+# Sharding topology: which half of which model this process is holding
+# --------------------------------------------------------------------------
+#
+# A cache is only meaningful to a process holding the weights that produced it.
+# Under TP each rank holds half of them, so a rung stored by rank 1 describes
+# rank 1's half of the state and nothing else -- restoring it into a single-box
+# run, or into rank 0, or into a tp=4 run, produces a cache of exactly the right
+# shape and entirely the wrong contents. Folding the topology into the identity
+# means those stores cannot even agree on a rung *name*, which is the level at
+# which the peer tier and the TP mirror both address each other.
+#
+# Default "tp1" is the single-box case, so an unsharded process keeps the
+# identity it has always had modulo this constant, and every sharded process
+# differs from it and from its peer.
+
+_TP_TOPOLOGY = "tp1"
+_TOPOLOGY_LOCK = threading.Lock()
+
+
+def set_tp_topology(descriptor: Optional[str]) -> str:
+    """Declare this process's sharding topology; returns the value in force.
+
+    Called once by the TP loader with the sharding report. Changing it resets
+    the process vault, because every rung already stored was named under the
+    old topology and is no longer nameable -- keeping them would be paying
+    memory for entries that can never be found again.
+    """
+    global _TP_TOPOLOGY
+    with _TOPOLOGY_LOCK:
+        new = descriptor or "tp1"
+        if new != _TP_TOPOLOGY:
+            logger.info("vault: topology %s -> %s; dropping the store",
+                        _TP_TOPOLOGY, new)
+            _TP_TOPOLOGY = new
+            reset_vault()
+        return _TP_TOPOLOGY
+
+
+def tp_topology() -> str:
+    return _TP_TOPOLOGY
+
+
+__all__ += ["set_tp_topology", "tp_topology"]
+
+
 def _code_identity() -> str:
     """Revision of the running ``mlx_vlm`` tree, or a mtime fallback."""
     import subprocess
@@ -629,6 +707,8 @@ def vault_identity(model_path: Any, extra: str = "") -> str:
     except OSError:
         pass
     h.update(_code_identity().encode())
+    # Folded in here rather than at the call sites so no caller can forget it.
+    h.update(f"topology={tp_topology()}".encode())
     for name in _NUMERIC_TOGGLES:
         h.update(f"{name}={os.environ.get(name, '')}".encode())
     if extra:

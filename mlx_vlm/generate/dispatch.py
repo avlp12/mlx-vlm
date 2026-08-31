@@ -942,6 +942,15 @@ def stream_generate(
     if _vault_mod.vault_enabled() and pixel_values is None:
         try:
             _vault = _vault_mod.get_vault(_vault_mod.vault_identity_for_model(model))
+            # Under TP=2 the language model is a mirror, and a rung is only
+            # usable if BOTH ranks hold their own half of it -- so stores and
+            # restores are announced to rank 1 over the control collective.
+            # With TP off this is one getattr that returns None.
+            _tp_wrap = getattr(
+                getattr(model, "language_model", model), "tp_mirror_vault", None
+            )
+            if _tp_wrap is not None:
+                _vault = _tp_wrap(_vault)
         except Exception:  # noqa: BLE001 - a vault fault must never fail a request
             _vault = None
     if _vault is not None and reused_prefix_len == 0:
