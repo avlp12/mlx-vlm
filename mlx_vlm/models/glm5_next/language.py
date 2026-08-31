@@ -422,9 +422,7 @@ class Glm5NextLinearAttention(nn.Module):
         # left_padding even for a uniform batch); the kernel applies it exactly
         # where the eager path does.  Anything else -- a non-bool mask, or a
         # shape this layer would broadcast differently -- falls back.
-        if mask is not None and (
-            mask.dtype != mx.bool_ or mask.shape != (B, S)
-        ):
+        if mask is not None and (mask.dtype != mx.bool_ or mask.shape != (B, S)):
             return False
         if cache is None or cache[0] is None or cache[1] is None:
             return False

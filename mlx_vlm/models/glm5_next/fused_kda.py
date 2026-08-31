@@ -421,9 +421,16 @@ _SINK_OUTPUT_NAMES = _OUTPUT_NAMES + ["q_out", "k_out", "v_out", "conv_input_out
 
 # "a" / "gate" (the f_b_proj / g_b_proj outputs) are replaced by their inputs and
 # quantized weights when the projections are folded in.
-_QPROJ_INPUT_NAMES = [
-    n for n in _INPUT_NAMES if n not in ("a", "gate")
-] + ["fa", "fbw", "fbs", "fbb", "ga", "gbw", "gbs", "gbb"]
+_QPROJ_INPUT_NAMES = [n for n in _INPUT_NAMES if n not in ("a", "gate")] + [
+    "fa",
+    "fbw",
+    "fbs",
+    "fbb",
+    "ga",
+    "gbw",
+    "gbs",
+    "gbb",
+]
 
 _KERNELS = {}
 _KERNEL_TRIED = False
@@ -442,6 +449,7 @@ def _all_valid(batch: int) -> mx.array:
         mx.eval(m)
         _ONES_MASK[batch] = m
     return m
+
 
 # Threadgroup y-extent: 32 * TY threads per threadgroup, one threadgroup per head.
 #
