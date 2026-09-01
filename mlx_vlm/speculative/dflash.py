@@ -41,12 +41,6 @@ def _adaptive_k_enabled() -> bool:
 def _round_cost_params():
     """Round cost in units of one plain decode step: ``fixed + cost * K``.
 
-    Measured directly (probe_verify_width_v2.py, wired_limit + mx.eval +
-    mx.synchronize, cache restored between reps): a verify forward costs
-    44.7 + 4.75*L ms for L >= 2, against a 35.5 ms serving decode step.  With
-    the block-8 round at 99.6 ms that is fixed = 1.87 decode-steps and
-    cost = 0.134 per drafted token.
-
     The marginal cost is high because GLM-5.3-Flash is a 288-expert MoE: eight
     tokens route to ~58 distinct experts instead of 8, so widening the verify
     multiplies FFN weight traffic.  On a dense model verify width would be
@@ -54,11 +48,50 @@ def _round_cost_params():
 
     Both constants belong to the target and the box, not to the drafter, so
     they are env-tunable and must be refitted when the serving stack changes.
+    THEY WERE NOT, AND THE STACK CHANGED TWICE.
+
+    The original fit (probe_verify_width_v2.py, committed at 9a9b7d82) read
+    verify = 44.7 + 4.75*L ms against a 35.5 ms decode step, giving fixed = 1.87
+    and cost = 0.134.  That commit precedes BOTH 4bb3b97b -- which generalised
+    MLA absorption to L > 1, so a verify block stopped materialising the latent
+    KV cache -- and 5c59cfa7, which found the server's speculative loop running
+    unwired and paging on every forward.  Each bug hid the other's magnitude, so
+    the width model was fitted on a cost curve that no longer exists.
+
+    Refitted from the campaign's own post-fix receipt (EAGLE3_REBASED_GATES.json:
+    verify 36.54 / 63.95 / 91.75 ms at W = 1 / 4 / 8, draft 1.717 ms per drafted
+    token, greedy decode step 32.84 ms).  Fitting verify on the W >= 2 anchors
+    gives 36.15 + 6.95*W ms; adding (W-1) drafted tokens and dividing by the
+    decode step gives fixed = 1.312 and cost = 0.264.  The shipped pair overstated
+    the fixed cost by 1.43x and understated the marginal cost by 2x, which is the
+    entire argument of the width argmax.
+
+    Measured live, one load, in-process interleaved, 3 cycles, natural prompts at
+    a 1024-token prime (receipt logs/sweep3/R9_spec_width_r9.json, analysis
+    R9_RESULT.json).  Adaptive-K driven by each pair, median of cycles 1-2:
+
+        constants     code tok/s    prose tok/s
+        shipped          41.93          42.01
+        measured         51.00          38.60
+
+    Code +21.4%, prose -5.6%.  The prose regression is NOT the cost constants
+    failing: feeding the realised acceptance back through this same model says
+    the wider choice was right there (2.415 tokens/round at width 3.56 scores
+    0.0370 tok/ms against 3.084 at width 4.80 scoring 0.0406).  What failed is the
+    hazard estimate that feeds it -- a narrow block drafts fewer tokens, so the
+    16-round window sees less evidence and the Laplace-smoothed estimate stays
+    low, which is self-reinforcing.  That is a defect in _dflash_hazard, recorded
+    here rather than papered over by leaving a known-wrong cost model in place.
+
+    Against the shipped default path (the threshold ladder, adaptive-K off)
+    adaptive-K with these constants wins BOTH workloads -- code +2.34/+7.56/+7.06%
+    and prose +4.41/+4.49/+4.66% across three paired cycles.  Turning it on by
+    default is a policy change and is deliberately NOT made here.
     """
     global _ROUND_FIXED, _ROUND_COST
     if _ROUND_FIXED is None:
-        _ROUND_FIXED = float(os.environ.get("MLX_VLM_DFLASH_ROUND_FIXED", 1.87))
-        _ROUND_COST = float(os.environ.get("MLX_VLM_DFLASH_ROUND_COST", 0.134))
+        _ROUND_FIXED = float(os.environ.get("MLX_VLM_DFLASH_ROUND_FIXED", 1.3124))
+        _ROUND_COST = float(os.environ.get("MLX_VLM_DFLASH_ROUND_COST", 0.2639))
     return _ROUND_FIXED, _ROUND_COST
 
 

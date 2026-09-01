@@ -99,10 +99,32 @@ def test_cold_start_falls_back():
 
 
 @pytest.mark.parametrize(
-    "p,expected", [(0.55, 4), (0.68, 5), (0.75, 7), (0.81, 8), (0.85, 8), (0.93, 8)]
+    "p,expected", [(0.55, 3), (0.68, 4), (0.75, 4), (0.81, 5), (0.85, 6), (0.93, 8)]
 )
 def test_optimum_width_by_hazard(p, expected):
+    """These moved when the cost constants were refitted, and that is the point.
+
+    Under the old fixed=1.87 / cost=0.134 the table read 4, 5, 7, 8, 8, 8 -- the
+    argmax pinned at the cap for every hazard at or above 0.81, because the fit
+    understated the marginal cost of a drafted token by 2x.  The refit
+    (see _round_cost_params) pulls the optimum back to a genuine interior
+    maximum across the whole useful range.
+    """
     assert dflash._dflash_block_size_for_hazard(p, 8) == expected
+
+
+def test_the_shipped_constants_are_the_refitted_ones():
+    """A guard on the number itself, so a silent revert is a loud failure.
+
+    Provenance is in _round_cost_params; the live A/B that justifies it is
+    logs/sweep3/R9_spec_width_r9.json.
+    """
+    dflash._ROUND_FIXED = dflash._ROUND_COST = None
+    os.environ.pop("MLX_VLM_DFLASH_ROUND_FIXED", None)
+    os.environ.pop("MLX_VLM_DFLASH_ROUND_COST", None)
+    fixed, cost = dflash._round_cost_params()
+    assert (round(fixed, 4), round(cost, 4)) == (1.3124, 0.2639)
+    dflash._ROUND_FIXED = dflash._ROUND_COST = None
 
 
 def test_optimum_is_an_interior_maximum():
