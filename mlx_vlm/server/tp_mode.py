@@ -588,6 +588,11 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
         f"MLX_VLM_GLM5_IDX_FAST={os.environ.get('MLX_VLM_GLM5_IDX_FAST', '')} "
         f"MLX_VLM_GLM5_SYNC_TRACE="
         f"{os.environ.get('MLX_VLM_GLM5_SYNC_TRACE', '')} "
+        # The gather gate changes which attention path a DSA layer takes.  Both
+        # ranks must take the same one, so a gate A/B that set it on rank 0
+        # only would be measuring a desync, not a gate.
+        f"MLX_VLM_GLM5_GATHER_MIN_CONTEXT="
+        f"{os.environ.get('MLX_VLM_GLM5_GATHER_MIN_CONTEXT', '')} "
         f"MLX_VLM_GLM5_VAULT={os.environ.get('MLX_VLM_GLM5_VAULT', '')} "
         # Passed through so the peer's store can be sized independently -- which
         # is also the only way to exercise the peer-miss path on purpose: give

@@ -37,9 +37,24 @@ _IDX_FAST_ENV = None
 # ``index_kpool`` tokens, so 512 pools = 2048 tokens of headroom per growth).
 _IDX_POOL_STEP = 512
 
-# Policy cap, not a kernel limit: the kernel is batch-agnostic (B only widens
-# grid.z), but batched decode past this point is untested here.
-_FUSED_KDA_MAX_BATCH = 8
+# How wide a batch the fused kernel is allowed to serve.  This is a *policy* cap
+# recording how far parity has actually been run -- not a kernel limit, and the
+# distinction is checkable rather than asserted: the literal ``B`` does not occur
+# in any of the three kernel sources outside a comment (pinned by
+# test_fused_kda_kernel_source_is_batch_agnostic).  One threadgroup serves one
+# (batch row, head) pair, so widening the batch adds threadgroups; it does not
+# make any threadgroup ask for more.  At the live dims (H=64, D=128) each one
+# takes 3084 B of threadgroup memory (3596 B with the projection fold) out of
+# Apple's 32 KiB budget and holds st[D/TY][D/32] = 16 floats per thread, at every
+# B.  What does grow with B is device traffic: the recurrent state is
+# B*H*D*D*4 bytes per layer, so a decode step streams 2.12 GiB through the 34
+# KDA layers at B=8 and 4.25 GiB at B=16.  That is a throughput question, which
+# is why raising this number needs measurements and not a kernel change.
+#
+# Env-tunable, so the cap can be walked back (or pushed further) on a device that
+# measures differently without editing the model.  It is also the A/B lever: the
+# same process, the same code path, one number apart.
+_FUSED_KDA_MAX_BATCH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", "16"))
 
 # The projection fold stops paying once the batch is wide enough to amortise the
 # weight read.  mx.quantized_matmul reads f_b/g_b once for all B rows (it becomes

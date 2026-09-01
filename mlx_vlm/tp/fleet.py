@@ -55,6 +55,7 @@ __all__ = [
     "heavy_processes",
     "memory_snapshot",
     "phys_footprint_gb",
+    "require_quiet_box",
     "require_quiet_fleet",
     "self_rss_gb",
     "wait_for_quiet",
@@ -339,6 +340,19 @@ def heavy_processes(
     for t in targets:
         found[t or "localhost"] = _parse_ps(runner(t), threshold_gb, ignore_pids)
     return found
+
+
+def require_quiet_box(host: Optional[str] = None, **kw) -> dict:
+    """Gate ONE box, for work that only loads on that box.
+
+    With two lanes running on two machines, gating the whole fleet makes the
+    guard a global mutex and the lanes serialise for no reason -- a single-box
+    measurement on the peer does not care what this box is holding.  Whole-fleet
+    gating stays the default for anything that loads on both (TP).
+    """
+    hosts = () if host in (None, "", "localhost", "127.0.0.1") else (host,)
+    kw.setdefault("label", f"box {host or 'localhost'}")
+    return require_quiet_fleet(hosts, **kw)
 
 
 def require_quiet_fleet(
