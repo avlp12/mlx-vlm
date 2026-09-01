@@ -586,6 +586,8 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
         f"MLX_VLM_GLM5_TP_TRACE_DEEP="
         f"{os.environ.get('MLX_VLM_GLM5_TP_TRACE_DEEP', '')} "
         f"MLX_VLM_GLM5_IDX_FAST={os.environ.get('MLX_VLM_GLM5_IDX_FAST', '')} "
+        f"MLX_VLM_GLM5_SYNC_TRACE="
+        f"{os.environ.get('MLX_VLM_GLM5_SYNC_TRACE', '')} "
         f"MLX_VLM_GLM5_VAULT={os.environ.get('MLX_VLM_GLM5_VAULT', '')} "
         # Passed through so the peer's store can be sized independently -- which
         # is also the only way to exercise the peer-miss path on purpose: give

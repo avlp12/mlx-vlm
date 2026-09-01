@@ -66,6 +66,16 @@ def _fused_kda_qproj_enabled() -> bool:
     return _FUSED_KDA_QPROJ_ENV
 
 
+_SYNC_TRACE_ENV = None
+
+
+def _sync_trace() -> bool:
+    global _SYNC_TRACE_ENV
+    if _SYNC_TRACE_ENV is None:
+        _SYNC_TRACE_ENV = _env_flag("MLX_VLM_GLM5_SYNC_TRACE")
+    return _SYNC_TRACE_ENV
+
+
 def _idx_fast_enabled() -> bool:
     # Opt-in fast decode path for the DSA indexer's *active* regime (T >
     # index_topk).  The eager path redoes O(T) work every step -- a full-context
@@ -1038,7 +1048,19 @@ class Glm5NextIndexer(nn.Module):
                 k_full, gate_full, valid, layout=layout
             )
             if cache is not None:
-                cache._no_pad = bool(mx.all(valid))
+                # Instrumented: this is the only forced host-side sync between
+                # the sixth hidden all-reduce and the indexer's own reduce, and
+                # a TP pair was observed stalled in exactly that window after a
+                # vault restore.  Gated so it costs nothing normally.
+                if _sync_trace():
+                    import logging as _lg
+                    _lg.getLogger("glm5.sync").info(
+                        "indexer no_pad sync ENTER T=%s S=%s", T, S)
+                    cache._no_pad = bool(mx.all(valid))
+                    _lg.getLogger("glm5.sync").info(
+                        "indexer no_pad sync EXIT  -> %s", cache._no_pad)
+                else:
+                    cache._no_pad = bool(mx.all(valid))
         if cache is not None:
             cache._pool = (pool_keys, pool_indices, pool_valid, T)
             cache._fpool = None
