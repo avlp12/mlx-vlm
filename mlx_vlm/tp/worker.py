@@ -38,7 +38,7 @@ ENV_WORKER_MODEL = "MLX_VLM_GLM5_TP_WORKER_MODEL"
 # Bumped whenever the wire layout below changes.  Both ranks check it in
 # preflight over a vector whose width never changes, so a version skew is a
 # clean refusal instead of a shape-mismatched collective that hangs.
-PROTO_VERSION = 2
+PROTO_VERSION = 3
 
 OP_EXIT, OP_MAKE_CACHE, OP_FORWARD = 0, 1, 2
 OP_ROLLBACK = 3         # speculative round rejected: roll my own shard back
@@ -51,6 +51,19 @@ IDX_OP, IDX_EPOCH, IDX_B, IDX_S, IDX_FLAGS, IDX_ARG0 = range(6)
 IDX_NAME = 6
 NAME_WORDS = 8          # 8 x 16 bits = the 128-bit boundary name, exactly
 HEADER = IDX_NAME + NAME_WORDS   # 14
+
+# Per-verb shape agreement.  The formation handshake proves the ranks agree on
+# protocol version and vector widths ONCE, at startup.  Nothing checks agreement
+# again, and jaccl will not tell us: a collective whose ranks disagree about SIZE
+# completes silently there -- measured, 8 elements against 256, returning 3.0 to
+# both ranks with no diagnostic, where the ring backend raises.  So a runtime
+# disagreement about batch or sequence length is not a crash, it is wrong output.
+#
+# The check costs ZERO extra collectives.  The last ECHO_WORDS of the payload are
+# reserved: rank 0 writes +its own view of the PREVIOUS verb's shape, rank 1
+# contributes -its own, and the sum must be zero.  Any drift shows up on the very
+# next verb, named.
+ECHO_WORDS = 3          # last_b, last_s, last_epoch
 
 # Flags
 FLAG_CAPTURE = 1 << 0   # this forward is a speculative verify: allocate gdn_sink
@@ -192,17 +205,19 @@ def words_to_name(words: Sequence[int]) -> str:
 
 
 def encode(op: int, epoch: int, shape=None, flat=None, n: Optional[int] = None,
-           *, flags: int = 0, arg0: int = 0, name: str = ""):
+           *, flags: int = 0, arg0: int = 0, name: str = "", echo=None):
     """Control message as a flat int32 vector. Separated from transport so the
     codec is testable without a group."""
     n = _max_tok() if n is None else n
     buf = [0] * (HEADER + n)
     b = s = 0
+    payload_room = n - ECHO_WORDS
     if flat is not None:
         b, s = int(shape[0]), int(shape[1])
-        if len(flat) > n:
+        if len(flat) > payload_room:
             raise TPUnavailable(
-                f"forward of {len(flat)} tokens exceeds {ENV_MAX_TOK}={n}")
+                f"forward of {len(flat)} tokens exceeds {ENV_MAX_TOK}={n} "
+                f"minus {ECHO_WORDS} reserved agreement words")
         buf[HEADER:HEADER + len(flat)] = [int(v) for v in flat]
     buf[IDX_OP], buf[IDX_EPOCH], buf[IDX_B], buf[IDX_S] = int(op), int(epoch), b, s
     # A presence bit, not "is it nonzero": an all-zero hash is a legitimate
@@ -212,7 +227,15 @@ def encode(op: int, epoch: int, shape=None, flat=None, n: Optional[int] = None,
         flags |= FLAG_HAS_NAME
     buf[IDX_FLAGS], buf[IDX_ARG0] = int(flags), int(arg0)
     buf[IDX_NAME:IDX_NAME + NAME_WORDS] = name_to_words(name)
+    if echo is not None:
+        buf[HEADER + n - ECHO_WORDS:HEADER + n] = [int(v) for v in echo]
     return buf
+
+
+def read_echo(row, n: Optional[int] = None):
+    """The agreement slots: rank0's view PLUS rank1's negated view, so zeros."""
+    n = _max_tok() if n is None else n
+    return [int(v) for v in row[HEADER + n - ECHO_WORDS:HEADER + n]]
 
 
 def decode(row) -> Ctrl:
@@ -237,6 +260,20 @@ def _flatten(ids):
     return (1, len(flat)), flat
 
 
+# Each rank's view of the LAST verb's shape.  Compared on the next message.
+_LAST_SHAPE = [0, 0, 0]
+
+
+def _shape_disagreement(row, n=None):
+    """None if the ranks agree, else a human description of the drift."""
+    got = read_echo(row, n)
+    if not any(got):
+        return None
+    fields = ("batch", "seqlen", "epoch")
+    bad = [f"{fields[i]}: ranks differ by {got[i]}" for i in range(ECHO_WORDS) if got[i]]
+    return "; ".join(bad) if bad else None
+
+
 def _ctrl_send(op: int, epoch: int, ids, *, flags: int = 0, arg0: int = 0,
                name: str = "") -> None:
     """Rank 0: publish a control message through the data collective."""
@@ -246,9 +283,19 @@ def _ctrl_send(op: int, epoch: int, ids, *, flags: int = 0, arg0: int = 0,
 
     shape, flat = _flatten(ids)
     msg = mx.array([encode(op, epoch, shape, flat, flags=flags, arg0=arg0,
-                           name=name)], dtype=mx.int32)
+                           name=name, echo=_LAST_SHAPE)], dtype=mx.int32)
     out = all_sum(msg)
     mx.eval(out)
+    drift = _shape_disagreement(out[0].tolist())
+    if drift is not None:
+        raise TPDesync(
+            f"TP shape disagreement before op{op}: {drift}. The ranks no longer "
+            f"agree about the last forward's shape, so their partial sums are "
+            f"halves of different computations. jaccl does not report this -- a "
+            f"size-mismatched collective completes there silently -- which is why "
+            f"the check is carried in the control message itself.")
+    b, s = (int(shape[0]), int(shape[1])) if shape is not None else (0, 0)
+    _LAST_SHAPE[:] = [b, s, int(epoch)]
 
 
 ENV_CTRL_IDLE = "MLX_VLM_GLM5_TP_CTRL_IDLE_S"
@@ -331,9 +378,24 @@ def _ctrl_recv() -> Ctrl:
     # (see the note above), so the bound is purely time.
     with Deadman(bound, "tp control wait", on_timeout="none",
                  harm_probe=lambda _w: None, on_fire=_release_and_exit):
-        out = all_sum(mx.zeros((1, HEADER + n), dtype=mx.int32))
+        out = all_sum(contrib)
         mx.eval(out)
-    return decode(out[0].tolist())
+    return _decode_checked(out[0].tolist(), n)
+
+
+def _decode_checked(row, n):
+    """Decode, and refuse if the ranks have drifted apart on shape."""
+    drift = _shape_disagreement(row, n)
+    if drift is not None:
+        raise TPDesync(
+            f"TP shape disagreement on rank 1: {drift}. Rank 0's view of the "
+            f"last forward's shape does not match mine, so we would contribute "
+            f"halves of different computations to the next reduce. jaccl "
+            f"completes size-mismatched collectives silently, so this check is "
+            f"carried in the control message rather than left to the transport.")
+    msg = decode(row)
+    _LAST_SHAPE[:] = [int(msg.b), int(msg.s), int(msg.epoch)]
+    return msg
 
 
 def _ack_send(value: int) -> None:
