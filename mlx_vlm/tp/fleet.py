@@ -56,6 +56,9 @@ __all__ = [
     "memory_snapshot",
     "phys_footprint_gb",
     "SHARD_GB",
+    "SINGLE_BOX_BASE_GB",
+    "SINGLE_BOX_PER_ROW_GB",
+    "single_box_gb",
     "require_headroom",
     "require_quiet_box",
     "require_quiet_fleet",
@@ -89,6 +92,37 @@ MIN_FREE_GB = float(os.environ.get("MLX_VLM_TP_MIN_FREE_GB", "100"))
 # Typical resident sizes on this fleet, so a caller can say what it is about to
 # load instead of guessing a floor.
 SHARD_GB = {"tp": 86.0, "single": 183.0}
+
+# ``single`` is one operating point, not a constant, and treating it as a
+# constant is a way to under-request.  A single-box decode arm's peak grows with
+# the batch it serves, because the KDA recurrent state (B*H*D*D*4 per layer), the
+# KV cache and the prompt logits are all per-row.  Measured on the 320B tree
+# (receipts logs/tp2/kda_bench_*_202609011436.json, 2026-09-01):
+#
+#     B      1      2      4      8     16     32
+#   GiB  173.9  175.3  177.7  183.2  193.5  211.9
+#
+# which is linear in B to within 0.82 GiB:  peak_GiB = 173.0 + 1.23 * B.
+# 183.0 -- the number in the table above -- is that line at B = 8.1, so the
+# entry is right for the batch it was taken at and wrong everywhere else: it
+# over-requests below B=8 and under-requests above it, by 9.7 GiB at B=16, 29.4
+# at B=32 and 68.7 at B=64.  require_headroom is only as good as the size it is
+# handed, so callers serving a batch should hand it this instead.
+SINGLE_BOX_BASE_GB = 173.0
+SINGLE_BOX_PER_ROW_GB = 1.23
+
+
+def single_box_gb(batch: int) -> float:
+    """Peak resident size, in GiB, of a single-box decode arm serving ``batch``.
+
+    ``batch`` is required rather than defaulted: the whole point is that the
+    answer depends on it, and a default would reintroduce the constant this
+    replaces.  Prefill sets the peak, not decode, so this assumes the campaign's
+    512-token prompt; a much longer one moves the intercept, not the slope.
+    """
+    if batch < 1:
+        raise ValueError(f"batch must be >= 1, got {batch}")
+    return round(SINGLE_BOX_BASE_GB + SINGLE_BOX_PER_ROW_GB * batch, 1)
 
 _GB = 1024.0 ** 3
 _PS_SEP = "===PS==="

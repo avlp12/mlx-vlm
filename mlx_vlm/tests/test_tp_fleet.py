@@ -399,3 +399,34 @@ def test_debtwatch_allows_a_clean_sweep():
     w = fleet.DebtWatch(ps_runner=lambda h: next(seq))
     r = w.check("arm 2")
     assert r["growth_gb"]["localhost"] <= 1.5
+
+
+def test_single_box_size_tracks_the_batch():
+    """SHARD_GB["single"] is the B=8 measurement, not a constant.
+
+    Reproduces the six measured peaks to within a gibibyte, and pins the two
+    that matter for a gate: at B=8 the table entry is right, and above it the
+    table under-requests -- by 29 GiB at B=32, which is half of require_headroom's
+    default margin handed back silently.
+    """
+    measured = {1: 173.9, 2: 175.3, 4: 177.7, 8: 183.2, 16: 193.5, 32: 211.9}
+    for batch, peak in measured.items():
+        assert abs(fleet.single_box_gb(batch) - peak) <= 1.0, batch
+    assert abs(fleet.single_box_gb(8) - fleet.SHARD_GB["single"]) <= 1.0
+    assert fleet.single_box_gb(32) - fleet.SHARD_GB["single"] > 25.0
+    with pytest.raises(ValueError):
+        fleet.single_box_gb(0)
+
+
+def test_headroom_refuses_a_wide_batch_a_fixed_size_would_have_admitted():
+    """The under-request, as a gate outcome rather than an arithmetic claim.
+
+    265 GB free clears a 183 GiB "single" load plus the 60 GB margin, so the
+    fixed size admits a B=32 arm.  The arm actually peaks at 212 GiB, which does
+    not clear it -- and being wrong in that direction is how boxes freeze.
+    """
+    fleet.require_headroom(fleet.SHARD_GB["single"],
+                           ps_runner=lambda h: _mem(265.0, 8.0))
+    with pytest.raises(fleet.HeavyRunActive, match="headroom"):
+        fleet.require_headroom(fleet.single_box_gb(32),
+                               ps_runner=lambda h: _mem(265.0, 8.0))
