@@ -4,7 +4,9 @@ This file groups drafter-kind resolution, Gemma 4 assistant mask handling,
 and Qwen3.5 DFlash cache rollback coverage in one place.
 """
 
+import contextlib
 import importlib
+import os
 import json
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -2169,16 +2171,39 @@ def test_dflash_config_defaults_to_checkpoint_block_size():
     assert speculative_utils._dflash_block_total(draft_model, None) == 16
 
 
+# The threshold ladder is no longer the default policy -- adaptive-K is (see
+# mlx_vlm/speculative/dflash.py, shipped on the receipts in logs/sweep3/).  The
+# ladder is still the documented fallback and still reachable through the kill
+# switch, so it still gets tested; these cases just have to say which policy they
+# are exercising instead of relying on it being the default.
+@contextlib.contextmanager
+def _ladder_policy():
+    import mlx_vlm.speculative.dflash as _df
+    prev = os.environ.get("MLX_VLM_DFLASH_ADAPTIVE_K")
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "0"
+    _df._ADAPTIVE_K_ENV = None
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("MLX_VLM_DFLASH_ADAPTIVE_K", None)
+        else:
+            os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = prev
+        _df._ADAPTIVE_K_ENV = None
+
+
 def test_dflash_next_block_size_starts_at_requested_ceiling():
     draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
 
-    assert _dflash_next_block_size(draft_model, 16, 20) == 16
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 16, 20) == 16
 
 
 def test_dflash_next_block_size_uses_model_initial_size():
     draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
 
-    assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
 
 
 def test_dflash_next_block_size_honors_model_minimum():
@@ -2188,7 +2213,8 @@ def test_dflash_next_block_size_honors_model_minimum():
         dflash_min_block_size=3,
     )
 
-    assert _dflash_next_block_size(draft_model, 5, 20) == 3
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 5, 20) == 3
 
 
 def test_dflash_next_block_size_grows_from_model_minimum():
@@ -2198,25 +2224,29 @@ def test_dflash_next_block_size_grows_from_model_minimum():
         dflash_min_block_size=3,
     )
 
-    assert _dflash_next_block_size(draft_model, 5, 20) == 5
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 5, 20) == 5
 
 
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
     draft_model = SimpleNamespace(accept_lens=[1, 2], draft_lens=[15, 7])
 
-    assert _dflash_next_block_size(draft_model, 16, 20) == 4
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 16, 20) == 4
 
 
 def test_dflash_next_block_size_grows_after_full_prefix_hits():
     draft_model = SimpleNamespace(accept_lens=[3, 3, 3, 3], draft_lens=[3, 3, 3, 3])
 
-    assert _dflash_next_block_size(draft_model, 16, 20) == 6
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 16, 20) == 6
 
 
 def test_dflash_next_block_size_does_not_grow_on_middling_acceptance():
     draft_model = SimpleNamespace(accept_lens=[3, 2, 1, 3], draft_lens=[3, 3, 3, 3])
 
-    assert _dflash_next_block_size(draft_model, 16, 20) == 4
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 16, 20) == 4
 
 
 def test_dflash_next_block_size_can_prefer_requested_size():
@@ -2226,7 +2256,8 @@ def test_dflash_next_block_size_can_prefer_requested_size():
         prefer_requested_block_size=True,
     )
 
-    assert _dflash_next_block_size(draft_model, 16, 8) == 8
+    with _ladder_policy():
+        assert _dflash_next_block_size(draft_model, 16, 8) == 8
 
 
 def test_dflash_committed_hidden_segments_keep_per_row_lengths():

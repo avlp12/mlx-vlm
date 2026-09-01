@@ -22,18 +22,52 @@ _ADAPTIVE_K_MINROUNDS = None
 
 
 def _adaptive_k_enabled() -> bool:
-    """MLX_VLM_DFLASH_ADAPTIVE_K=1 -- pick the block width that maximises
-    measured throughput instead of ratcheting on thresholds.
+    """Pick the block width that maximises measured throughput instead of
+    ratcheting on thresholds.  ON by default; ``MLX_VLM_DFLASH_ADAPTIVE_K=0``
+    is the kill switch back to the ladder.
 
-    Opt-in, and it deliberately takes precedence over
-    ``prefer_requested_block_size`` (the harness's --fixed-block): pinning the
-    width is exactly what this is trying to replace, so honouring the pin would
-    make the A/B a no-op.
+    It deliberately takes precedence over ``prefer_requested_block_size`` (the
+    harness's --fixed-block): pinning the width is exactly what this replaces,
+    so honouring the pin would make the comparison a no-op.
+
+    IT SHIPPED OFF, AND THE REASON IT SHIPPED OFF WAS THE COST MODEL, NOT THE
+    POLICY.  With the stale constants (see _round_cost_params) this lost 11% to
+    the very ladder it was meant to replace, because a fixed cost overstated by
+    1.43x and a marginal cost understated by 2x pinned the argmax at the cap for
+    every hazard at or above 0.81 -- it was not adapting, it was just choosing
+    block 8 with extra steps.  On the refitted constants it wins both workloads.
+
+    Measured against the shipped ladder, one load, arms interleaved in-process,
+    three cycles, natural prompts at a 1024-token prime (receipt
+    logs/sweep3/R9_spec_width_r9.json, analysis R9_RESULT.json):
+
+        workload   adaptive-K vs ladder, per cycle
+        code       +2.34%  +7.56%  +7.06%
+        prose      +4.41%  +4.49%  +4.66%
+
+    Six paired comparisons, six positive, on two workloads that disagree about
+    almost everything else.
+
+    WHY THE LADDER LOSES, mechanically.  The ladder has no notion of what a
+    drafted token costs, so it can only ratchet between thresholds calibrated to
+    nothing measurable; on prose it settles at a mean width of 3.03 and takes 118
+    rounds for 256 tokens, where the cost model takes 106.  Note that this is the
+    mirror of the estimator defect recorded in _round_cost_params: there the
+    hazard estimate starves itself narrow on prose, here the ladder starves
+    itself narrow for a different reason.  Both are width-too-narrow failures and
+    the cost model is only ahead of the ladder, not at the optimum -- fixed W=5
+    still beats it on prose (42.31 against 38.60 tok/s).  Closing that gap means
+    fixing _dflash_hazard, and it is the largest remaining item on this lever.
+
+    No identity question attached: in the same session all seven width policies
+    produced identical decoded text for a given workload and all returned 256
+    tokens, which is what speculative decoding's exactness guarantee predicts.
+    Width selection moves wall clock and nothing else.
     """
     global _ADAPTIVE_K_ENV
     if _ADAPTIVE_K_ENV is None:
         _ADAPTIVE_K_ENV = os.environ.get(
-            "MLX_VLM_DFLASH_ADAPTIVE_K", "0"
+            "MLX_VLM_DFLASH_ADAPTIVE_K", "1"
         ).lower() in ("1", "true", "yes", "on")
     return _ADAPTIVE_K_ENV
 
