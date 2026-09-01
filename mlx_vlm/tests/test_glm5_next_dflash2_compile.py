@@ -231,10 +231,31 @@ def test_sampled_walk_is_never_compiled():
     assert out.shape == (B, L)
 
 
-def test_toggle_defaults_off():
+def test_toggle_defaults_on_and_the_env_can_still_turn_it_off():
+    """The default flipped, and this guard flipped with it rather than being deleted.
+
+    It shipped OFF on a live A/B that read -15.6% (AIF I842) -- n=1 per arm, fixed
+    order, at a HEAD that predates the MLA L>1 fix, with both arms sitting at a
+    speculative multiple near 1.0 that no longer exists.  Re-measured in-process
+    with interleaved arms over three cycles it is +0.31 to +1.03% on code and
+    +0.49 to +0.70% on prose -- six paired comparisons, six positive -- with
+    rounds, accepted-per-round and decoded text byte-identical between the arms.
+    Receipt: logs/sweep3/R9_spec_width_r9.json.
+
+    The point of this test is unchanged: the default is a claim, and a claim gets
+    a test.  If someone flips it back, this fails and they have to say why.
+    """
     os.environ.pop("MLX_VLM_DFLASH_COMPILE", None)
     dflash2_mod._COMPILE_ENV = None
-    assert dflash2_mod._compile_enabled() is False
+    assert dflash2_mod._compile_enabled() is True
+
+    os.environ["MLX_VLM_DFLASH_COMPILE"] = "0"
+    dflash2_mod._COMPILE_ENV = None
+    try:
+        assert dflash2_mod._compile_enabled() is False
+    finally:
+        os.environ.pop("MLX_VLM_DFLASH_COMPILE", None)
+        dflash2_mod._COMPILE_ENV = None
 
 
 @pytest.mark.parametrize("block_size", [3, 8])

@@ -20,17 +20,43 @@ def _compile_enabled() -> bool:
     _grouped_dynamic_convolve (four calls per layer, twenty per block) and the
     selector's per-position edge scoring.
 
-    Off by default.  mx.compile is known on this model family to silently bake
-    cache offsets into a trace, so only regions that are provably pure with
-    respect to cache state are compiled here: the conv/norm halves around
-    self_attn, and the selector step.  self_attn (which reads and writes the KV
-    cache) and the MLP (whose silu carries a sigmoid, and JIT'd Metal swaps the
-    precise exp for the fast approximation) are both deliberately left outside
-    the boundary so the fused path stays bit-identical.
+    mx.compile is known on this model family to silently bake cache offsets into
+    a trace, so only regions that are provably pure with respect to cache state
+    are compiled here: the conv/norm halves around self_attn, and the selector
+    step.  self_attn (which reads and writes the KV cache) and the MLP (whose
+    silu carries a sigmoid, and JIT'd Metal swaps the precise exp for the fast
+    approximation) are both deliberately left outside the boundary so the fused
+    path stays bit-identical.
+
+    ON by default since it was re-measured.  It shipped OFF because a live A/B
+    put it at -15.6% (AIF I842), but that verdict was n=1 per arm, in a fixed
+    order, at HEAD 3ac662d1 -- before 4bb3b97b generalised MLA absorption to
+    L > 1 -- and both of its arms sat at a speculative multiple of 0.94x and
+    1.11x, a regime that no longer exists.  Its own component receipt disagreed
+    with it at the time: dflash2_compile_paired.json measured the draft block
+    8.2% faster compiled over 60 paired samples.
+
+    Re-measured in-process, one load, arms interleaved, three cycles, natural
+    prompts at a 1024-token prime (logs/sweep3/R9_spec_width_r9.json):
+
+        workload   compile-on vs compile-off, per cycle
+        code       +1.03%  +0.33%  +0.31%
+        prose      +0.49%  +0.58%  +0.70%
+
+    Six paired comparisons, six positive; a sign test on that is p = 0.016.  The
+    effect is small because the draft call is only ~6.2 ms of a ~66 ms round, so
+    an 8% draft win is worth well under 1% end to end -- which is what shows up.
+
+    Arithmetic is untouched, and the run says so rather than assuming it: rounds
+    and accepted-per-round are byte-identical between the arms (79 / 2.2278 on
+    code, 118 / 1.1695 on prose) and the decoded text matches.  Speculative
+    decoding is exact by construction, and in the same session all seven width
+    policies produced identical output for a given workload -- so this is a
+    wall-clock lever with no identity question attached.
     """
     global _COMPILE_ENV
     if _COMPILE_ENV is None:
-        _COMPILE_ENV = os.environ.get("MLX_VLM_DFLASH_COMPILE", "0").lower() in (
+        _COMPILE_ENV = os.environ.get("MLX_VLM_DFLASH_COMPILE", "1").lower() in (
             "1",
             "true",
             "yes",
