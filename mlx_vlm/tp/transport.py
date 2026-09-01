@@ -25,6 +25,8 @@ import ctypes
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -261,6 +263,38 @@ def all_sum(x: mx.array) -> mx.array:
 # ---------------------------------------------------------------- deadman
 
 
+def _display_stalled(window_s: float):
+    """Has the display compositor stalled in the last ``window_s`` seconds?
+
+    Reads SkyLight's display watchdog out of the unified log -- the same signal
+    the wedge canary uses.  "has become stuck" is the escalation that precedes an
+    unrecoverable freeze; "regained readiness" is the milder stall that precedes
+    it.  Returns a short description, or None.
+
+    Costs about 0.75 s, which is why the deadman only calls it after a region has
+    already been outstanding for HARM_GRACE_S.  Note /usr/bin/log explicitly:
+    zsh has a `log` builtin that shadows the binary.
+    """
+    if sys.platform != "darwin":
+        return None
+    w = max(5, int(window_s))
+    try:
+        out = subprocess.run(
+            ["/usr/bin/log", "show", "--last", f"{w}s", "--style", "compact",
+             "--predicate", 'process == "WindowServer"'],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except Exception:
+        return None
+    stuck = out.count("has become stuck")
+    stalls = out.count("regained readiness")
+    if stuck:
+        return f"{stuck} stuck, {stalls} stalls in {w}s"
+    if stalls >= 3:
+        return f"{stalls} stalls in {w}s"
+    return None
+
+
 class Deadman:
     """Bound the wall time of a region that blocks inside a collective.
 
@@ -278,19 +312,40 @@ class Deadman:
     library can do.
     """
 
-    def __init__(self, seconds: float = 120.0, label: str = "", on_timeout="abort"):
+    # Harm-triggered early abort.  The 120 s fallback is far too late to protect
+    # the UI: on 2026-09-01 a hung tp_spec arm started at 21:43:06 and the display
+    # compositor began stalling at 21:43:59 -- 53 s in, 67 s before the deadman
+    # fired.  Rather than guess a shorter blind timeout (the transport documents a
+    # legitimate tolerance of "at least 40 s", so the safe window is a narrow
+    # 40-53 s), poll the actual harm signal and abort the moment it appears while
+    # a collective is outstanding.  That fires exactly when the wedge is real and
+    # never on a healthy-but-slow run, and needs no threshold calibration.
+    #
+    # The signal is the same one the wedge canary reads: SkyLight's display
+    # watchdog.  Only events INSIDE this region count -- the lookback window is
+    # capped at the elapsed time -- so a stall left over from an earlier incident
+    # cannot abort a healthy run.
+    HARM_GRACE_S = 12.0      # no probing before this; healthy regions never pay it
+    HARM_POLL_S = 8.0        # probe costs ~0.75 s, so this is ~9% duty while hung
+    HARM_WINDOW_CAP_S = 30.0
+
+    def __init__(self, seconds: float = 120.0, label: str = "", on_timeout="abort",
+                 harm_probe=None):
         self.seconds = seconds
         self.label = label
         self.on_timeout = on_timeout
+        self.harm_probe = harm_probe if harm_probe is not None else _display_stalled
         self._timer = None
         self._armed = False
+        self._reason = None
 
     def _fire(self):
         if not self._armed:
             return
         rank = tp_rank() if _GROUP is not None else "?"
+        why = self._reason or f"exceeded {self.seconds}s"
         msg = (
-            f"[tp deadman] rank {rank}: '{self.label}' exceeded {self.seconds}s. "
+            f"[tp deadman] rank {rank}: '{self.label}' {why}. "
             f"A peer is stalled or dead and the GPU-side fence is spinning; "
             f"aborting so the surviving peer fails fast instead of deadlocking."
         )
@@ -299,17 +354,46 @@ class Deadman:
         if self.on_timeout == "abort":
             os._exit(75)  # EX_TEMPFAIL
 
+    def _watch(self, t0):
+        """Poll for harm; fall back to the unconditional timeout."""
+        while self._armed:
+            elapsed = time.time() - t0
+            if elapsed >= self.seconds:
+                self._reason = f"exceeded {self.seconds}s"
+                self._fire()
+                return
+            if elapsed >= self.HARM_GRACE_S:
+                try:
+                    window = min(elapsed, self.HARM_WINDOW_CAP_S)
+                    hit = self.harm_probe(window)
+                except Exception:
+                    hit = None          # probe unavailable -> timeout only
+                if hit and self._armed:
+                    self._reason = (
+                        f"display stalled ({hit}) after {elapsed:.0f}s while a "
+                        f"collective was outstanding -- aborting early to stop the "
+                        f"spinning fence from wedging the UI"
+                    )
+                    self._fire()
+                    return
+                slept = 0.0
+                while slept < self.HARM_POLL_S and self._armed:
+                    time.sleep(0.25); slept += 0.25
+            else:
+                time.sleep(0.25)
+
     def __enter__(self):
         self._armed = True
-        self._timer = threading.Timer(self.seconds, self._fire)
-        self._timer.daemon = True
+        self._reason = None
+        self._timer = threading.Thread(
+            target=self._watch, args=(time.time(),),
+            name=f"tp-deadman-{self.label}", daemon=True
+        )
         self._timer.start()
         return self
 
     def __exit__(self, *exc):
         self._armed = False
-        if self._timer is not None:
-            self._timer.cancel()
         return False
 
 
