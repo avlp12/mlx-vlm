@@ -51,13 +51,14 @@ def _adaptive_k_enabled() -> bool:
     WHY THE LADDER LOSES, mechanically.  The ladder has no notion of what a
     drafted token costs, so it can only ratchet between thresholds calibrated to
     nothing measurable; on prose it settles at a mean width of 3.03 and takes 118
-    rounds for 256 tokens, where the cost model takes 106.  Note that this is the
-    mirror of the estimator defect recorded in _round_cost_params: there the
-    hazard estimate starves itself narrow on prose, here the ladder starves
-    itself narrow for a different reason.  Both are width-too-narrow failures and
-    the cost model is only ahead of the ladder, not at the optimum -- fixed W=5
-    still beats it on prose (42.31 against 38.60 tok/s).  Closing that gap means
-    fixing _dflash_hazard, and it is the largest remaining item on this lever.
+    rounds for 256 tokens, where the cost model takes 106.
+
+    THE COST MODEL IS AHEAD OF THE LADDER, NOT AT THE OPTIMUM.  Fixed W=5 still
+    beats it on prose, 42.33 against 38.83 tok/s.  That gap was investigated
+    under PA780 and it does NOT close: see _empirical_enabled for the three
+    independent reasons and logs/sweep3/R12_RESULT.json for the receipts.  It is
+    the drafter's cost of workload-blindness and it is structural, not a tuning
+    miss.
 
     No identity question attached: in the same session all seven width policies
     produced identical decoded text for a given workload and all returned 256
@@ -111,11 +112,16 @@ def _round_cost_params():
     Code +21.4%, prose -5.6%.  The prose regression is NOT the cost constants
     failing: feeding the realised acceptance back through this same model says
     the wider choice was right there (2.415 tokens/round at width 3.56 scores
-    0.0370 tok/ms against 3.084 at width 4.80 scoring 0.0406).  What failed is the
-    hazard estimate that feeds it -- a narrow block drafts fewer tokens, so the
-    16-round window sees less evidence and the Laplace-smoothed estimate stays
-    low, which is self-reinforcing.  That is a defect in _dflash_hazard, recorded
-    here rather than papered over by leaving a known-wrong cost model in place.
+    0.0370 tok/ms against 3.084 at width 4.80 scoring 0.0406).  What fails is the
+    NUMERATOR -- E[accepted] predicted as sum(p^k) from a pooled hazard.
+
+    CORRECTION.  This used to say the 16-round window starves itself of evidence.
+    That is wrong, and it was wrong when I wrote it: the estimator is
+    asymptotically consistent at any fixed width, because for a geometric process
+    p_hat -> E[a]/(E[a] + 1 - p^d) and substituting E[a] = p(1-p^d)/(1-p) the
+    (1 - p^d) cancels exactly.  Fewer observations per round is not a biased
+    estimate.  The real defect is misspecification of the geometric SHAPE; see
+    _empirical_enabled for the measured misfit and for why it does not close.
 
     Against the shipped default path (the threshold ladder, adaptive-K off)
     adaptive-K with these constants wins BOTH workloads -- code +2.34/+7.56/+7.06%
@@ -203,6 +209,132 @@ def _dflash_block_size_for_hazard(
     return max(floor, min(cap, best))
 
 
+_HAZ_EMPIRICAL = None
+_HAZ_PARAMS = None
+
+
+def _empirical_enabled() -> bool:
+    """MLX_VLM_DFLASH_HAZARD_EMPIRICAL=1 -- measure E[accepted] per width instead
+    of predicting it from a hazard and a geometric shape.
+
+    WHY THIS EXISTS.  The cost model's denominator (fixed + cost*(W-1)) was
+    refitted and validated.  Its NUMERATOR is the problem: it predicts
+    E[accepted] as sum(p^k) from a single pooled hazard, and acceptance on this
+    stack is not actually a constant-hazard geometric process.  Fitting one p per
+    workload and predicting per width misfits by width, and misfits in the
+    direction that flips the ranking (measured on the fixed-width arms of
+    logs/sweep3/R9_spec_width_r9.json):
+
+        prose, pooled p = 0.711     code, pooled p = 0.806
+          W4  1.577 vs 1.383  +14.0%   W4  1.980 vs 2.122   -6.7%
+          W5  1.832 vs 2.072  -11.6%   W5  2.402 vs 2.200   +9.2%
+          W8  2.236 vs 2.312   -3.3%   W8  3.238 vs 3.250   -0.4%
+
+    On prose the shape overstates W4 and understates W5, so the model ranks W4
+    above W5 while measured throughput ranks W5 far above it (42.31 against 36.47
+    tok/s).  And because a geometric MLE fitted at narrow widths returns a lower
+    p than one fitted at wide widths (0.660 at W4 against 0.754 at W5), narrowing
+    lowers the estimate, which justifies narrowing again.
+
+    NOTE THAT THIS IS NOT THE MECHANISM I FIRST RECORDED.  The docstring on
+    _round_cost_params and on _adaptive_k_enabled said the 16-round window
+    starves itself of evidence.  That is wrong: the estimator is asymptotically
+    consistent at any fixed width, because for a geometric process
+    p_hat -> E[a]/(E[a] + 1 - p^d) and the (1 - p^d) cancels exactly.  Fewer
+    observations per round is not a biased estimate.  The loop is real but it
+    runs through the SHAPE assumption, not through the sample size.
+
+    AND THIS POLICY DOES NOT FIX IT.  Measured against the shipped configuration,
+    one load, 4 policies interleaved, 3 cycles (logs/sweep3/R9_spec_width_r12.json,
+    analysis R12_RESULT.json): code 49.44 against 51.43 (-3.9%) and prose 37.53
+    against 38.83 (-3.3%).  It lost on both, and prose never came near fixed W5's
+    42.33.  Three reasons that is not a tuning miss:
+
+      1  dosage.  A probe every 11 rounds over a 106-round generation is 9 probe
+         rounds against 7 candidate widths needing 2 observations each.  Mean
+         width came out 3.545 against adaptive-K's 3.557 -- it never moved, it
+         just paid for 9 wasted rounds.
+      2  the exploration cannot be afforded at ANY dosage.  Separating W4 from W5
+         on prose (E=1.383 sd=1.221 against E=2.074 sd=1.601) needs 33
+         observations per width at 2 sigma -- 65 rounds, against a generation
+         that finishes in 83 rounds at W5.  Even a 1-sigma coin flip costs 17.
+         And the ceiling of any width policy on prose IS W5, so a learner's best
+         case is W5 minus an exploration cost comparable to the whole run.
+      3  no better fixed shape model rescues it either.  The correction the
+         geometric prediction needs (measured / predicted) is 0.878 on prose
+         against 1.072 on code at W4, and 1.131 against 0.916 at W5 -- OPPOSITE
+         directions at the two widths whose ranking decides the question.  The
+         correction is workload-dependent by nature.
+
+    Kept in the tree, off, with the numbers, so it is not rediscovered.
+    """
+    global _HAZ_EMPIRICAL
+    if _HAZ_EMPIRICAL is None:
+        _HAZ_EMPIRICAL = os.environ.get(
+            "MLX_VLM_DFLASH_HAZARD_EMPIRICAL", "0"
+        ).lower() in ("1", "true", "yes", "on")
+    return _HAZ_EMPIRICAL
+
+
+def _empirical_params():
+    """window per width, minimum observations before trusting a width, probe period."""
+    global _HAZ_PARAMS
+    if _HAZ_PARAMS is None:
+        _HAZ_PARAMS = (
+            int(os.environ.get("MLX_VLM_DFLASH_HAZARD_WINDOW", 8)),
+            int(os.environ.get("MLX_VLM_DFLASH_HAZARD_MIN_OBS", 2)),
+            int(os.environ.get("MLX_VLM_DFLASH_HAZARD_PROBE_EVERY", 11)),
+        )
+    return _HAZ_PARAMS
+
+
+def _dflash_width_table(draft_model, window: int):
+    """Accepted-draft counts bucketed by the width they were actually drafted at.
+
+    Keyed on drafted length, so bucket ``d`` describes block width ``d + 1``.
+    """
+    accept_lens = getattr(draft_model, "accept_lens", None) or []
+    draft_lens = getattr(draft_model, "draft_lens", None) or []
+    table = {}
+    for a, d in zip(accept_lens, draft_lens):
+        d = int(d)
+        if d > 0:
+            table.setdefault(d, []).append(float(a))
+    return {d: v[-window:] for d, v in table.items()}
+
+
+def _dflash_block_size_empirical(draft_model, p, cap, floor, fixed, cost):
+    """argmax of (1 + measured E[accepted at w]) / (fixed + cost*(w-1)).
+
+    A width with too few observations falls back to the geometric prediction, so
+    this STARTS exactly where the hazard model starts and only departs where it
+    has measured something the shape got wrong.  The periodic probe is what makes
+    the narrow trap inescapable by construction rather than by luck: no candidate
+    width can be starved of observations by the policy's own choices.
+    """
+    window, min_obs, probe_every = _empirical_params()
+    table = _dflash_width_table(draft_model, window)
+    n_rounds = len(getattr(draft_model, "draft_lens", None) or [])
+    cands = list(range(floor, cap + 1))
+    if not cands:
+        return cap
+    if probe_every > 0 and n_rounds and n_rounds % probe_every == 0:
+        # least-observed candidate; ties go to the WIDER one, because the trap
+        # this exists to escape is always a narrow one.
+        return max(cands, key=lambda w: (-len(table.get(w - 1, ())), w))
+    best, best_gain = floor, -1.0
+    for w in cands:
+        obs = table.get(w - 1, ())
+        if len(obs) >= min_obs:
+            e = sum(obs) / len(obs)
+        else:
+            e = sum(p ** j for j in range(1, w))
+        gain = (1.0 + e) / (fixed + cost * (w - 1))
+        if gain > best_gain:
+            best_gain, best = gain, w
+    return best
+
+
 def _dflash_next_block_size(
     draft_model: nn.Module,
     requested_block_total: int,
@@ -230,6 +362,11 @@ def _dflash_next_block_size(
         p = _dflash_hazard(draft_model)
         if p is not None:
             floor = max(2, int(getattr(draft_model, "dflash_min_block_size", 2)))
+            if _empirical_enabled():
+                f, c = _round_cost_params()
+                return _dflash_block_size_empirical(
+                    draft_model, p, block_total, floor, f, c
+                )
             return _dflash_block_size_for_hazard(p, block_total, floor=floor)
         if initial_block_size is not None:
             return min(block_total, max(2, int(initial_block_size)))
