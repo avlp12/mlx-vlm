@@ -120,6 +120,12 @@ def single_box_gb(batch: int) -> float:
     answer depends on it, and a default would reintroduce the constant this
     replaces.  Prefill sets the peak, not decode, so this assumes the campaign's
     512-token prompt; a much longer one moves the intercept, not the slope.
+
+    Two things this line does NOT cover, both measured 2026-09-01: enlarged MLX
+    command buffers (MLX_MAX_MB_PER_BUFFER=2048) add ~39 GiB at B=16 -- 232.7
+    GiB observed against 193.5 without -- and the fit is drawn from fused-KDA
+    runs on one model at one quantization.  Size a load with either of those
+    changed by measuring it, not by extrapolating this.
     """
     if batch < 1:
         raise ValueError(f"batch must be >= 1, got {batch}")

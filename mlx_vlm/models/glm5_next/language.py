@@ -61,10 +61,31 @@ _IDX_POOL_STEP = 512
 # tree, two arms per cap alternating which led, 64 timed steps each): B=16
 # total throughput 141.9 tok/s fused vs 133.2 eager, +6.50%, and the two pairs
 # agreed (+6.91% / +6.09%).  B=32 is equally bit-identical and measured +3.76%
-# (178.6 vs 172.2), but its arms scattered 2.4% against the campaign's 0.5%
-# bar and the worst-case pairing is +1.29%, under the +2% adoption threshold --
-# so 32 stays opt-in until it has been measured again.  Receipts: logs/tp2/
-# kda_b16_parity_202609011436.json, kda_bench_x{1,2}_cap{8,32}_202609011436.json.
+# (178.6 vs 172.2) on two pairs that scattered too much to adopt on.  It was then
+# measured again -- five pairs total -- and the answer did not improve:
+#
+#   per-pair gain  +1.29  +6.30  +2.36  +3.95  +8.57 %   median +5.00%
+#   fused arms     176.5  180.8  183.0  183.3  183.7     spread 3.94%
+#   eager arms     174.2  170.1  178.7  176.4  169.2     spread 5.48%
+#
+# Every pair is positive and the median is well over the bar, so the effect is
+# almost certainly real -- but the pre-registered rule asks for the WORST pair to
+# clear +2% with spread inside the campaign's 0.5%, and the worst pair is -1.26%
+# against spreads of 3.9% and 5.5%.  The noise is not in the kernel: the five
+# fused arms rise monotonically (a warm-up trend, and the last three agree to
+# 0.40%), while the eager arms scatter 5.5% with no trend at all.  A B=32 eager
+# step drives ~30 dispatches per layer over 34 layers at a 211.9 GiB peak that
+# is evicting page cache, and that is what is being measured.  Until the eager
+# reference can be measured stably, 32 stays opt-in.  B=8 held at 1.00% across
+# all ten arms, so the pairing itself is sound.
+#
+# Receipts: logs/tp2/kda_b16_parity_202609011436.json,
+# kda_bench_x{1,2}_cap{8,32}_202609011436.json,
+# kda_followup_s{1,2,3}_cap{8,32}_202609011456.json.
+#
+# Not to be combined with the PA733 command-buffer settings at this width:
+# MLX_MAX_MB_PER_BUFFER=2048 costs 7.5% at B=16 (131.2 vs 141.9 tok/s) and adds
+# 39 GiB of peak.  It is a B=1 lever; see kda_followup_buf_*.
 _FUSED_KDA_MAX_BATCH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", "16"))
 
 # The projection fold stops paying once the batch is wide enough to amortise the
