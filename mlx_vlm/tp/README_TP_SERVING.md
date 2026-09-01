@@ -263,6 +263,39 @@ Spread within each arm is ≤0.5%.
   same blocks), and unmirrored forward kwargs (the whitelist would name them).
   Do not enable `MLX_VLM_GLM5_VAULT` under TP until this is understood.
 
+## The gather gate is per-lane: TP defaults to 65536
+
+Measured 2026-09-01 as a per-chunk prefill cost curve (`prep/tp2/lc_curve.py`),
+2048-token chunks:
+
+| lane | dense cost | gather plateau | crossover |
+|---|---|---|---|
+| single-box | 3924 + **252.8**·chunk ms | 8670 ms | **~38k** |
+| TP=2 | 2306 + **122.9**·chunk ms | 6394 ms | **~68k** |
+
+TP splits the attention heads, so the dense `O(S*T)` term halves (252.8 → 122.9,
+a 2.06× ratio) while the gather path's fixed cost falls only 1.36× — it is
+dominated by indexer and gather work that parallelises less. The crossover
+therefore moves right. Leaving the single-box default of 32768 in place under TP
+costs **13.9%** of prefill time to 65k (153.8 s vs a projected 132.4 s
+all-dense).
+
+`shard_model` raises the gate to 65536 for the TP lane; an explicit
+`MLX_VLM_GLM5_GATHER_MIN_CONTEXT` always wins. It is applied at sharding rather
+than passed through the environment, so **both ranks get it without a
+passthrough** — passthroughs are how rank 1 once received `NAME=` and died at
+`int('')`.
+
+**Where the curves stop, and what is extrapolation.** They were measured to 65k.
+Beyond that: extrapolating dense to 131k (chunk 64) gives
+`2306 + 122.9*64 = 10.2 s/chunk` against a flat **6.4 s** gather plateau, so
+gather is well ahead past the ~68k crossover and 65536 engages it about where it
+starts paying. The 131k end of that is arithmetic, not measurement.
+
+The knee was verified to move with the gate — 32768 → knee at kv_len 32768,
+16384 → knee at kv_len 16384 — which is what identifies dense-attention depth
+(rather than, say, indexer pooling) as the thing that grows.
+
 ## Long-context checklist
 
 * `MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD` caps `b * s` per announced forward,

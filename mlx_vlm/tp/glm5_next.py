@@ -184,11 +184,50 @@ def shard_layer(layer, rank: int, size: int, reduce_fn):
     return layer
 
 
+# The gather gate is a per-LANE tuning constant, not a per-model one.
+#
+# Measured 2026-09-01 as a per-chunk prefill cost curve (prep/tp2/lc_curve.py),
+# 2048-token chunks, GLM-5.3-Flash q4:
+#
+#   single-box   dense 3924 + 252.8*chunk ms | gather plateau 8670 ms
+#   TP=2         dense 2306 + 122.9*chunk ms | gather plateau 6394 ms
+#
+# TP splits the attention heads, so the dense O(S*T) term halves (252.8 ->
+# 122.9, a 2.06x ratio) while the gather path's fixed cost falls only 1.36x --
+# it is dominated by indexer and gather work that parallelises less.  The
+# crossover therefore moves right: ~38k single-box (which is what makes 32768
+# the right default there, as originally measured) and ~68k under TP.  At the
+# 32768 default a TP prefill to 65k spends 153.8 s instead of a projected
+# 132.4 s all-dense: 13.9% given away.
+#
+# Why 65536 and not higher, stated as arithmetic because the curves stop at
+# 65k: extrapolating dense to 131k (chunk 64) gives 2306 + 122.9*64 = 10.2
+# s/chunk against a flat 6.4 s gather plateau, so gather is well ahead beyond
+# the ~68k crossover.  65536 engages it just about exactly where it starts
+# paying.  The 131k end of that is extrapolation, not measurement.
+_TP_GATHER_MIN_CONTEXT = 65536
+
+
+def _apply_tp_gather_default() -> None:
+    """Raise the gather gate for the TP lane unless the operator chose one."""
+    import os
+
+    from ..models.glm5_next import language as _lang
+
+    if os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT"):
+        return                      # explicit wins, on either lane
+    _lang._GATHER_MIN_CONTEXT = _TP_GATHER_MIN_CONTEXT
+
+
 def shard_model(model, rank: int, size: int, reduce_fn=None) -> dict:
     """In-place TP surgery on a loaded glm5_next. Returns a small report."""
     if reduce_fn is None:
         from .transport import all_sum as reduce_fn  # noqa: N813
 
+    # Both ranks call shard_model, so setting the lane default here reaches
+    # them both without an env passthrough -- and passthroughs are how rank 1
+    # got NAME= and died at import earlier today.
+    _apply_tp_gather_default()
     lm = model.language_model.model if hasattr(model, "language_model") else model
     n_kda = n_dsa = n_moe = n_dense = 0
     for layer in lm.layers:

@@ -252,3 +252,33 @@ def test_fast_path_scale_also_uses_the_global_head_count():
     a = shard_dsa(_attn(cfg), 0, 2, lambda z: z)
     src = __import__("inspect").getsource(type(a.indexer)._decode_fast)
     assert "_scale_heads" in src and "self.n_heads**-0.5" not in src
+
+
+# ----------------------------------------------------- lane-specific gate
+def test_tp_raises_the_gather_gate_and_single_box_does_not(monkeypatch):
+    """The gate is a per-LANE constant, and 32768 is the single-box answer.
+
+    Measured per-chunk prefill: single-box dense 3924 + 252.8*chunk vs a gather
+    plateau of 8670 ms -> crossover ~38k, which is what makes 32768 right there.
+    TP splits the attention heads, so dense halves (122.9/chunk) while the
+    gather plateau falls only to 6394 -> crossover ~68k.  Leaving 32768 in place
+    under TP gives away 13.9% of prefill time to 65k.
+    """
+    from mlx_vlm.models.glm5_next import language as L
+    from mlx_vlm.tp.glm5_next import _apply_tp_gather_default
+
+    monkeypatch.delenv("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", raising=False)
+    monkeypatch.setattr(L, "_GATHER_MIN_CONTEXT", 32768, raising=False)
+    _apply_tp_gather_default()
+    assert L._GATHER_MIN_CONTEXT == 65536
+
+
+def test_an_explicit_gate_beats_the_lane_default(monkeypatch):
+    """An operator who set the variable meant it -- on either lane."""
+    from mlx_vlm.models.glm5_next import language as L
+    from mlx_vlm.tp.glm5_next import _apply_tp_gather_default
+
+    monkeypatch.setenv("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "16384")
+    monkeypatch.setattr(L, "_GATHER_MIN_CONTEXT", 16384, raising=False)
+    _apply_tp_gather_default()
+    assert L._GATHER_MIN_CONTEXT == 16384
