@@ -251,16 +251,55 @@ def _gather_q_chunk_for(kv_len: int, dim: int) -> int:
     return max(_GATHER_Q_CHUNK_MIN, min(_GATHER_Q_CHUNK, chunk))
 
 # Context length above which gathered prefill beats the dense masked path.
-# The PR's microbench put the per-chunk crossover at ~16k, but END-TO-END on
-# M3 Ultra at GLM-5.3-Flash dims the gathered path loses until much deeper
-# context (e2e prefill: 16k -6%, 32k -15% with a 16384 gate; 421.9/351.1
-# tok/s = parity with dense at a 65536 gate; 131k +52.7% either way).
-# Receipts: sparse_gate65536_16k32k.json / sparse_{ref,new}131k.json.
-# Env-tunable per workload. 32768 measured best end-to-end on M3 Ultra:
-# vs a 65536 gate it adds +11% prefill at 65k and +5% at 131k (131k lands at
-# +57% over dense, above even the always-gather 16384 gate) at a within-noise
-# -2% at 32k. Receipt: unified_gate32768_32k65k131k.json (AIF I819).
-_GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "32768"))
+#
+# HISTORY, because the number moved twice and for different reasons.  The PR's
+# microbench put the per-chunk crossover near 16k; end-to-end on M3 Ultra the
+# gathered path lost until much deeper, and 32768 measured best against a
+# two-point grid of {32768, 65536} (AIF I819, receipt
+# unified_gate32768_32k65k131k.json).  That value went upstream in PR #2087.
+#
+# It was measured against a gather path that cost ~40% more than it needs to.
+# A gate is a crossover between two costs and _gather_q_chunk_for above moved
+# one of them: with the query chunk off the 2**31 boundary a gather chunk costs
+# ~6.6 s instead of ~9.3 s at these dims, so the depth at which gather starts
+# beating dense falls a long way.  Re-swept on one load, real source+prose,
+# 4 interleaved cycles with a declared and discarded warm-up arm (receipt
+# logs/sweep3/R8_gate_band_r8.json, analysis R8_RESULT.json):
+#
+#     gate     wall, 16384-token prefill, 4 cycles (ms)
+#    32768     48819  48834  49766  50671
+#    16384     47725  47616  49008  49865
+#    12288     46952  47158  48341  49043
+#
+# 12288 wins every cycle.  The decisive region is chunks 5-6, the only place
+# 12288 and 16384 differ, and there 12288 wins by 785/731/819/885 ms -- against
+# a within-cycle control spread of 0.17-1.24% on chunks 0-4, which are identical
+# work in all three arms.  The per-chunk curves put the crossover between chunk
+# 4 and chunk 5 exactly: dense wins by 403 ms at depth 10240 and gather wins by
+# 47 ms at 12288.  Arms run in the order 32768, 16384, 12288 and the box heats
+# through a cycle, so 12288 is measured under a headwind and wins anyway.
+#
+# Paired with the depth-derived query chunk this is 257.4 -> 325.7 tok/s at a
+# 40960-token prefill, 3/3 cycles in one load (logs/sweep3/R7_HEADLINE_RESULT.json).
+#
+# Identity is CHAOS-LIMITED, not bit-exact, and that is not new: any gather-gate
+# value produces a different token stream from any other, which is what I819's
+# 65536 -> 32768 move already shipped.  At prime 16384 with 48 greedy tokens
+# 12288 gives identical tokens and identical text to 32768 with differing logits
+# (max 0.77 on a scale of 27.5); at prime 30720 with 64 tokens the same class of
+# change does flip a token at index 15.  Both are what chaos-limited means.
+#
+# NOTE ON THE PUBLISHED DEFAULT.  mlx-vlm PR #2087 carries 32768, taken from our
+# I819 data, and that remains correct for the configuration it was measured in --
+# a gather path pinned to a fixed query chunk.  The shipped default here and the
+# published recommendation are allowed to differ; reconciling them upstream is a
+# separate decision and not made by this change.
+#
+# The TP lane keeps its own default (_TP_GATHER_MIN_CONTEXT, 65536) and is
+# unaffected by this line -- but that value was fitted against the same
+# pre-formula gather cost and is stale for the same reason.  It needs its own
+# re-sweep on two boxes.
+_GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "12288"))
 
 
 # --------------------------------------------------------------- indexer memo

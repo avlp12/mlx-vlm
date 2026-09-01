@@ -259,10 +259,18 @@ def test_tp_raises_the_gather_gate_and_single_box_does_not(monkeypatch):
     """The gate is a per-LANE constant, and 32768 is the single-box answer.
 
     Measured per-chunk prefill: single-box dense 3924 + 252.8*chunk vs a gather
-    plateau of 8670 ms -> crossover ~38k, which is what makes 32768 right there.
-    TP splits the attention heads, so dense halves (122.9/chunk) while the
-    gather plateau falls only to 6394 -> crossover ~68k.  Leaving 32768 in place
-    under TP gives away 13.9% of prefill time to 65k.
+    plateau of 8670 ms -> crossover ~38k.  TP splits the attention heads, so
+    dense halves (122.9/chunk) while the gather plateau falls only to 6394 ->
+    crossover ~68k, and leaving the single-box gate in place under TP gives away
+    13.9% of prefill time to 65k.
+
+    Both of those crossovers were fitted against a gather path pinned to a fixed
+    query chunk.  The single-box gate has since been re-swept on top of
+    _gather_q_chunk_for and is now 12288 (logs/sweep3/R8_RESULT.json); the TP
+    number has NOT been re-swept and is expected to move for the same reason.
+    This test pins the LANE SPLIT, not either value: it patches the module
+    global explicitly so it keeps testing that TP overrides whatever single-box
+    ships, however either default moves.
     """
     from mlx_vlm.models.glm5_next import language as L
     from mlx_vlm.tp.glm5_next import _apply_tp_gather_default

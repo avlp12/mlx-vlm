@@ -90,3 +90,29 @@ class TestGatherQChunk(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGatherGateDefault(unittest.TestCase):
+    """The shipped single-box gate is the measured crossover, not a legacy value."""
+
+    def test_default_is_the_measured_crossover(self):
+        import importlib, os
+        os.environ.pop("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", None)
+        mod = importlib.reload(L)
+        try:
+            # Receipt logs/sweep3/R8_gate_band_r8.json: 12288 beats both 16384 and
+            # 32768 on total wall in 4 of 4 interleaved cycles, and beats 16384 on
+            # the only region where they differ (chunks 5-6) by 731-885 ms.
+            self.assertEqual(mod._GATHER_MIN_CONTEXT, 12288)
+        finally:
+            importlib.reload(L)
+
+    def test_the_env_still_wins(self):
+        import importlib, os
+        os.environ["MLX_VLM_GLM5_GATHER_MIN_CONTEXT"] = "32768"
+        try:
+            mod = importlib.reload(L)
+            self.assertEqual(mod._GATHER_MIN_CONTEXT, 32768)
+        finally:
+            os.environ.pop("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", None)
+            importlib.reload(L)
