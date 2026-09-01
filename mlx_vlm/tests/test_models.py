@@ -2898,13 +2898,20 @@ class TestModels(unittest.TestCase):
         gath = run(gathered=True)
         self.assertLess(float(mx.max(mx.abs(gath - dense))), 1e-3)
 
-        # multi-chunk gather (chunk smaller than the block) is a pure reshape
+        # multi-chunk gather (chunk smaller than the block) is a pure reshape.
+        # The chunk is now derived from the cache depth as well as the env knob
+        # (see _gather_q_chunk_for), so the floor has to come down too or this
+        # case silently collapses back to a single chunk and stops testing what
+        # it says it tests.
         old_chunk = glm5_lang._GATHER_Q_CHUNK
+        old_floor = glm5_lang._GATHER_Q_CHUNK_MIN
         try:
             glm5_lang._GATHER_Q_CHUNK = 8
+            glm5_lang._GATHER_Q_CHUNK_MIN = 1
             chunked = run(gathered=True)
         finally:
             glm5_lang._GATHER_Q_CHUNK = old_chunk
+            glm5_lang._GATHER_Q_CHUNK_MIN = old_floor
         self.assertLess(float(mx.max(mx.abs(chunked - gath))), 1e-6)
 
         # tail selection off: the first index_kpool - 1 queries select nothing

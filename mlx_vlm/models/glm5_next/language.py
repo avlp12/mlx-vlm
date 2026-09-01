@@ -199,6 +199,57 @@ def _fused_kda_enabled() -> bool:
 # always a single chunk.
 _GATHER_Q_CHUNK = int(os.environ.get("MLX_VLM_GLM5_GATHER_Q_CHUNK", "1024"))
 
+# Floor for the depth-derived query chunk below.  Only reached past ~260k of
+# context; it exists so the Python loop cannot be driven to a pathological
+# iteration count by an arbitrarily deep cache.
+_GATHER_Q_CHUNK_MIN = int(os.environ.get("MLX_VLM_GLM5_GATHER_Q_CHUNK_MIN", "16"))
+
+# MLX indexes a gather with 32-bit arithmetic while the operand has fewer than
+# 2**31 elements and takes a slower path at or above it.  The operand here is
+# the broadcast ``(B, chunk, Kv, dim)`` in _gathered_attention, so the boundary
+# lands on ``chunk * Kv * dim`` and moves with the cache depth -- which means no
+# constant chunk can stay on the fast side of it at every context length.
+#
+# Measured on the 320B tree, one load, gate 24576 so chunks 11-19 take the
+# gathered path, real source+prose, two interleaved cycles reproducing to 0.3%
+# (receipt logs/sweep3/R2b_arms_r5.json, analysis R5_RESULT.json):
+#
+#     chunk   gather region c11-19      vs 512
+#       512   84074.8 / 83973.4 ms        --
+#       256   82036.6 / 82038.1 ms      +2.4%
+#       128   70813.6 / 70650.3 ms     +15.8%
+#        64   59339.9 / 59609.7 ms     +29.2%
+#
+# and the step is not gradual.  The 128 arm crosses the boundary exactly at
+# chunk 15, where 128 * 32768 * 512 == 2**31, and its per-chunk cost jumps
+# 6564 -> 8894 ms at that chunk and nowhere else.  512 and 256 are both above
+# the boundary for every depth past 8192, which is why they differ by only 2.4%
+# and why sweeping upward from the 1024 default (AIF I827) never found this.
+#
+# Identity: bit-exact.  A 30720-token prefill plus 48 greedy tokens at chunk
+# 512, 128 and 64 gives byte-identical first-step logits (max |diff| 0.0 on a
+# logit scale of 20.75), identical tokens and identical text, with a repeated
+# control arm demonstrating determinism.  Receipt logs/sweep3/
+# R5_identity_cliff_c1.json.  That check is mandatory rather than a formality:
+# mlx#4437 concerns this same 32-bit boundary as a CORRECTNESS issue, and the
+# test_gather_q_chunk_* cases below exist to fail loudly if the arithmetic ever
+# stops holding.
+def _gather_q_chunk_for(kv_len: int, dim: int) -> int:
+    """Largest query chunk that keeps ``chunk * kv_len * dim`` under 2**31.
+
+    Rounded down to a power of two so the chunk still divides the prefill block
+    evenly and the gathered shapes stay regular, then clamped into
+    ``[_GATHER_Q_CHUNK_MIN, _GATHER_Q_CHUNK]`` -- the env knob keeps its meaning
+    as the upper bound, and this only ever lowers it.
+    """
+    if kv_len <= 0 or dim <= 0:
+        return _GATHER_Q_CHUNK
+    bound = (2**31 - 1) // (kv_len * dim)
+    chunk = 1
+    while chunk * 2 <= bound:
+        chunk *= 2
+    return max(_GATHER_Q_CHUNK_MIN, min(_GATHER_Q_CHUNK, chunk))
+
 # Context length above which gathered prefill beats the dense masked path.
 # The PR's microbench put the per-chunk crossover at ~16k, but END-TO-END on
 # M3 Ultra at GLM-5.3-Flash dims the gathered path loses until much deeper
@@ -1444,8 +1495,12 @@ class Glm5NextSparseAttention(nn.Module):
         clamped = mx.clip(sel, 0, Kv - 1)
         q_e = self.embed_q(q)  # [B, H, L, dim]
         outs = []
-        for a0 in range(0, L, _GATHER_Q_CHUNK):
-            a1 = min(a0 + _GATHER_Q_CHUNK, L)
+        # Depth-derived, not constant: see _gather_q_chunk_for.  At L <= 8 (a
+        # speculative verify block) every candidate chunk exceeds L, so this is
+        # a single iteration exactly as before.
+        q_chunk = _gather_q_chunk_for(Kv, dim)
+        for a0 in range(0, L, q_chunk):
+            a1 = min(a0 + q_chunk, L)
             lc = a1 - a0
             kv_g = mx.take_along_axis(
                 mx.broadcast_to(kv_latent, (B, lc, Kv, dim)),
