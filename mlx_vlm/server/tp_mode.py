@@ -578,34 +578,28 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
     src = os.environ.get(ENV_WORKER_SRC, "/Users/m3ms/src/mlx-vlm-tp2serve")
     host = hosts[1]
     remote_model = os.environ.get(ENV_WORKER_MODEL) or model_path
+    # Forward only the variables that are actually SET.  Emitting
+    # ``NAME=`` for an unset one puts an empty string in rank 1's environment,
+    # and a consumer that parses rather than tests -- glm5_next reads
+    # ``int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "32768"))`` --
+    # gets int('') and dies at import.  Rank 0 then waits on a peer that never
+    # joined until the watchdog fires.  Observed 2026-09-01: every TP run that
+    # did not happen to set the gate was broken this way.
+    passthrough = [
+        "MLX_VLM_GLM5_TP_TRACE", "MLX_VLM_GLM5_TP_TRACE_DEEP",
+        "MLX_VLM_GLM5_IDX_FAST", "MLX_VLM_GLM5_SYNC_TRACE",
+        "MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "MLX_VLM_GLM5_VAULT",
+    ]
+    extra = " ".join(f"{k}={os.environ[k]}" for k in passthrough
+                     if os.environ.get(k, "") != "")
+    budget = os.environ.get("MLX_VLM_GLM5_TP_PEER_VAULT_BUDGET_GB", "")
+    if budget:
+        extra += f" MLX_VLM_GLM5_VAULT_BUDGET_GB={budget}"
     inner = (
         f"cd {src} && MLX_VLM_GLM5_FUSED_KDA=1 PYTHONPATH={src} "
         f"{ENV_HOSTS}='{','.join(hosts)}' {ENV_RANK}=1 "
         f"MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD={_max_tok()} "
-        f"MLX_VLM_GLM5_TP_TRACE={os.environ.get('MLX_VLM_GLM5_TP_TRACE', '')} "
-        f"MLX_VLM_GLM5_TP_TRACE_DEEP="
-        f"{os.environ.get('MLX_VLM_GLM5_TP_TRACE_DEEP', '')} "
-        f"MLX_VLM_GLM5_IDX_FAST={os.environ.get('MLX_VLM_GLM5_IDX_FAST', '')} "
-        f"MLX_VLM_GLM5_SYNC_TRACE="
-        f"{os.environ.get('MLX_VLM_GLM5_SYNC_TRACE', '')} "
-        # The gather gate changes which attention path a DSA layer takes.  Both
-        # ranks must take the same one, so a gate A/B that set it on rank 0
-        # only would be measuring a desync, not a gate.
-        f"MLX_VLM_GLM5_GATHER_MIN_CONTEXT="
-        f"{os.environ.get('MLX_VLM_GLM5_GATHER_MIN_CONTEXT', '')} "
-        f"MLX_VLM_GLM5_VAULT={os.environ.get('MLX_VLM_GLM5_VAULT', '')} "
-        # Passed through so the peer's store can be sized independently -- which
-        # is also the only way to exercise the peer-miss path on purpose: give
-        # rank 1 a budget too small to hold a rung and rank 0 keeps one it
-        # cannot use, which is exactly the divergence the ack exists to catch.
-        f"MLX_VLM_GLM5_VAULT_BUDGET_GB="
-        f"{os.environ.get('MLX_VLM_GLM5_TP_PEER_VAULT_BUDGET_GB', '')} "
-        # -u: the worker's log is a redirected file, so Python block-buffers
-        # it and a SIGTERM discards everything not yet flushed.  Observed
-        # 2026-08-31: rank 0 hung on its first control send, rank 1 was alive
-        # and had written a completely empty log, leaving no way to tell what
-        # rank 1 was doing.  A mirror whose peer cannot be observed is a mirror
-        # that can only be debugged by guessing.
+        + (extra + " " if extra else "") +
         f"nohup {py} -u -m mlx_vlm.tp.worker --model {remote_model} "
         f">> ~/tp_worker.log 2>&1 &"
     )

@@ -698,3 +698,46 @@ def test_gpu_check_can_be_skipped(monkeypatch):
         assert called == []
     finally:
         os.environ.pop("MLX_VLM_GLM5_TP_SKIP_GPU_CHECK", None)
+
+
+def test_unset_passthrough_vars_are_not_forwarded_as_empty(monkeypatch):
+    """Regression: ``NAME=`` in the worker's env is not the same as unset.
+
+    glm5_next parses the gather gate with int(), so an empty string is
+    int('') -> ValueError at import, rank 1 dies before it can join, and rank 0
+    waits on a peer that never arrives until the watchdog fires.  Observed
+    2026-09-01: every TP run that did not happen to set the gate was broken
+    this way, and the lc arms hid it because they always set it.
+    """
+    os.environ[T.ENV_HOSTS] = "10.0.0.1,10.0.0.2"
+    os.environ.pop("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", None)
+    seen = {}
+
+    class P:
+        def __init__(self, cmd):
+            seen["cmd"] = cmd
+    monkeypatch.setattr(T.subprocess, "Popen", P)
+
+    T.launch_worker("/m", T.tp_hosts())
+    assert "GATHER_MIN_CONTEXT" not in seen["cmd"][4]
+
+    monkeypatch.setenv("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "65536")
+    T.launch_worker("/m", T.tp_hosts())
+    assert "MLX_VLM_GLM5_GATHER_MIN_CONTEXT=65536" in seen["cmd"][4]
+
+
+def test_no_passthrough_var_is_ever_emitted_empty(monkeypatch):
+    """The general form: nothing may reach the worker as NAME= ."""
+    os.environ[T.ENV_HOSTS] = "10.0.0.1,10.0.0.2"
+    for k in ("MLX_VLM_GLM5_TP_TRACE", "MLX_VLM_GLM5_TP_TRACE_DEEP",
+              "MLX_VLM_GLM5_IDX_FAST", "MLX_VLM_GLM5_SYNC_TRACE",
+              "MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "MLX_VLM_GLM5_VAULT"):
+        os.environ.pop(k, None)
+    seen = {}
+
+    class P:
+        def __init__(self, cmd):
+            seen["cmd"] = cmd
+    monkeypatch.setattr(T.subprocess, "Popen", P)
+    T.launch_worker("/m", T.tp_hosts())
+    assert "= " not in seen["cmd"][4].replace("' ", "").replace("= '", "")
