@@ -136,6 +136,53 @@ def _idx_fast_enabled() -> bool:
     return _IDX_FAST_ENV
 
 
+_MLA_ABSORB_MULTI_ENV = None
+
+
+def _mla_absorb_multi_enabled() -> bool:
+    """Use the absorbed MLA form for L > 1 as well as L == 1.
+
+    The absorbed form keeps k = v = kv_latent ([B, 1, T, kv_lora_rank]) and pushes
+    the per-head projections onto the query and the output. The materialised form
+    expands the latent cache into [B, num_heads, T, head_dim] for BOTH k and v --
+    64x more data at this config -- on every step. That expansion is why a width-8
+    verify block costs 24.5x a width-1 step, and why its cost climbs as the cache
+    grows within a single generation.
+
+    It is algebraically exact and independent of L: q_h (c W_k[h]^T)^T =
+    (q_h W_k[h]) c^T, and attn (c W_v[h]^T) = (attn c) W_v[h]^T. It is clean at
+    this config in particular because qk_rope_head_dim == 0, so there is no
+    positional component that would have to be split out and carried separately.
+
+    DEFAULT ON. Set MLX_VLM_GLM5_MLA_ABSORB_MULTI=0 to restore the materialised
+    form. Measured before flipping, at width 8:
+
+        T=512   1748.30 -> 91.33 ms   19.14x
+        T=1024   194.81 -> 91.75 ms    2.12x
+        T=2048   109.15 -> 105.97 ms   1.03x
+        T=8192   109.27 -> 109.31 ms   1.00x
+
+    The win is entirely BELOW index_topk (2048). Above it the indexer returns
+    topk and lines 1284-1309 route L>1 into _gathered_attention, which returns
+    before this branch is ever reached -- so there is nothing left to fix there.
+    Below it the indexer bypasses, topk_indices is None, and L>1 fell into the
+    materialised form. In speculation terms that band went from 0.09x (spec was
+    ELEVEN TIMES SLOWER than plain decode) to 1.67x at hazard 0.86.
+
+    On identity: not bit-exact, because the contraction order changes. It is
+    inside this model's noise floor -- flipping a SINGLE bfloat16 ulp in one
+    embedding element gives 96.88% token match over 256 carried tokens, while
+    this change gives 95.70%, against a 100% determinism control. Per layer the
+    two branches differ by 3.09e-05 on scores versus a bf16 ulp of ~3.9e-03, and
+    under exact dequantization the two orientations agree to 6.5e-09.
+    """
+    global _MLA_ABSORB_MULTI_ENV
+    if _MLA_ABSORB_MULTI_ENV is None:
+        v = os.environ.get("MLX_VLM_GLM5_MLA_ABSORB_MULTI")
+        _MLA_ABSORB_MULTI_ENV = True if v is None else v not in ("0", "", "false", "False")
+    return _MLA_ABSORB_MULTI_ENV
+
+
 def _fused_kda_enabled() -> bool:
     # Opt-in: the fused decode kernel replaces ~30 dispatches per KDA layer with
     # one, but it is decode-only and only the "safe gate" variant is transcribed,
@@ -1355,7 +1402,11 @@ class Glm5NextSparseAttention(nn.Module):
         ):
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
-        if L == 1:
+        # attn_mask and the resulting score shape [B, num_heads, L, T] are the
+        # same either way -- only the k/v representation differs -- so masking and
+        # broadcasting are unaffected by this choice.
+        absorb = L == 1 or _mla_absorb_multi_enabled()
+        if absorb:
             q = self.embed_q(q)
             k = v = kv_latent
         else:
@@ -1365,7 +1416,7 @@ class Glm5NextSparseAttention(nn.Module):
         output = scaled_dot_product_attention(
             q, k, v, cache=cache, scale=self.scale, mask=attn_mask
         )
-        if L == 1:
+        if absorb:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
