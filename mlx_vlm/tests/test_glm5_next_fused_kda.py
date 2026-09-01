@@ -132,9 +132,19 @@ def _max_abs_rel(a, b):
 
 @pytest.fixture(autouse=True)
 def _reset_toggle():
-    saved = (glm5._FUSED_KDA_ENV, glm5._FUSED_KDA_QPROJ_ENV)
+    saved = (glm5._FUSED_KDA_ENV, glm5._FUSED_KDA_QPROJ_ENV, glm5._FUSED_KDA_MAX_BATCH)
     yield
-    glm5._FUSED_KDA_ENV, glm5._FUSED_KDA_QPROJ_ENV = saved
+    glm5._FUSED_KDA_ENV, glm5._FUSED_KDA_QPROJ_ENV, glm5._FUSED_KDA_MAX_BATCH = saved
+
+
+def _allow_batch(batch):
+    """Let a parity cell run at a width the shipped cap does not yet permit.
+
+    The cap is a policy number about evidence; this suite is where the evidence
+    comes from, so it has to be able to run ahead of it.  Restored by the autouse
+    fixture, so a parity cell can never leave the cap raised for anything else.
+    """
+    glm5._FUSED_KDA_MAX_BATCH = max(batch, glm5._FUSED_KDA_MAX_BATCH)
 
 
 def _set_toggle(layer, on, qproj=False):
@@ -501,6 +511,7 @@ def test_fused_kda_batched_matches_eager(batch, mask_kind):
 
     eager_cache = _cache(config, batch=batch)
     fused_cache = _clone(eager_cache)
+    _allow_batch(batch)
     worst = (0.0, 0.0)
     for x, m in zip(steps, masks):
         _set_toggle(layer, False)
@@ -569,6 +580,7 @@ def test_fused_kda_batched_capture_matches_eager_gdn_sink(batch):
     layer = _layer(config)
     eager_cache = _cache(config, batch=batch)
     fused_cache = _clone(eager_cache)
+    _allow_batch(batch)
     names = ["q", "k", "v", "a", "b", "A_log", "dt_bias", "state", "conv_input"]
     mx.random.seed(4242)
     worst = (0.0, 0.0)
