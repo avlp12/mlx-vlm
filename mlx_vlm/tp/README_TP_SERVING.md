@@ -191,6 +191,30 @@ workers that got a signal instead of a verb. **Prefer `OP_EXIT` / `/unload`
 anyway** — the handler cannot run while the process is blocked inside a
 collective, so a genuinely wedged rank still costs a reboot.
 
+## Running heavy sweeps safely
+
+Three freezes in this campaign came from the same shape: a box approved for a
+load it could not actually finish. The rules that came out of them:
+
+* **Gate on headroom for the load, not a floor.** `require_headroom(load_gb,
+  margin_gb)` asks for `free >= load + margin`. A fixed floor says nothing about
+  what is left *after* an 86 GiB shard lands — a box at 118 GB free passes a
+  100 GB floor and then runs at 32 GB. `SHARD_GB` carries the usual sizes.
+* **Watch the trend, not just the level.** `DebtWatch` records wired at sweep
+  start and stops the sweep once it grows by more than a shard. Every watchdog
+  abort leaks one, so an N-arm sweep degrades monotonically and each individual
+  gate call still says yes.
+* **Short step timeouts for long context** — 120 s, not 900. A wedged rank holds
+  its shard and spins the GPU fence for the whole window; at 32k a prefill chunk
+  is ~18 s, so 120 s is generous and caps the damage at two minutes.
+* **Measure a curve, not a monolith.** `prep/tp2/lc_curve.py` drives the chunk
+  loop directly, times every chunk, and stops on a wall-clock budget. The old
+  monolithic 32k/65k prefill produced one number per hour and could not be
+  abandoned safely.
+* **No concurrent GPU work on a box running a long-context arm** — not even a
+  test suite. The 2026-09-01 freeze had a wedged rank spinning the fence next to
+  another lane's kernels on the same device.
+
 ## Fault behaviour
 
 A dead peer leaves the fast fence's GPU kernel spinning on a shared counter, and
