@@ -410,6 +410,26 @@ acceptance). See
 [`mlx_vlm/speculative/drafters/glm5_next_mtp/README.md`](mlx_vlm/speculative/drafters/glm5_next_mtp/README.md)
 for the full sweep, split tool, and architecture notes.
 
+##### Verify-block numerics (`MLX_VLM_GLM5_MLA_ABSORB_MULTI`)
+
+Multi-token verify blocks use the absorbed MLA form, the same one single-token
+decode has always used: the latent KV cache stays at `[B, 1, T, kv_lora_rank]`
+and the per-head projections move onto the query and the output, instead of the
+cache being expanded into full `[B, num_heads, T, head_dim]` keys and values on
+every step. The identity is exact and independent of block width, and it is
+clean for this checkpoint because `qk_rope_head_dim` is 0, so no positional
+component has to be split out and carried separately.
+
+Absorption at width > 1 is numerically tighter than one bfloat16 ulp per layer
+(measured: 3.09e-05 between the two forms on attention scores, against a bf16
+ulp of about 3.9e-03; 6.5e-09 between them under exact dequantization). Output is
+therefore not bit-identical to the expanded form, and token trajectories may
+diverge at near-tie argmaxes exactly as any sub-ulp reordering does. For scale,
+flipping a single bfloat16 ulp in one embedding element of this model changes
+about 3% of tokens over 256 carried tokens, so token-exact comparison is
+chaos-limited here rather than a meaningful correctness signal. Set
+`MLX_VLM_GLM5_MLA_ABSORB_MULTI=0` to restore the expanded form.
+
 ### Chat UI with Gradio
 
 The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
