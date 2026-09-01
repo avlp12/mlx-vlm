@@ -1134,6 +1134,10 @@ class ResponseGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
         self.apc_manager = apc_manager
+        # Warm Context Vault. Built once at model init when the toggle is on
+        # (``_build_vault``); None otherwise, which is what keeps every vault
+        # branch in BatchGenerator dead by default.
+        self.vault = None
         self.prefill_step_size = (
             get_prefill_step_size()
             if prefill_step_size is None
@@ -1258,6 +1262,44 @@ class ResponseGenerator:
         if self.apc_manager is not None:
             language_model = getattr(model, "language_model", model)
             self.apc_mode = _apc.model_apc_mode(language_model)
+        self.vault = self._build_vault(model)
+
+    @staticmethod
+    def _build_vault(model):
+        """The Warm Context Vault for this model, or None.
+
+        Off unless ``MLX_VLM_GLM5_VAULT=1``, and off under TP regardless: the
+        mirror's rungs have to be announced to rank 1 over the control
+        collective, and a restore in that path is a known stall (the TP wrapper
+        exists -- ``tp_mode.tp_mirror_vault`` -- but the server request path has
+        not been validated against it, and a plausible-looking hang is worse
+        than a cold prefill).  A vault fault must never fail a load, so this
+        returns None on any error rather than raising.
+        """
+        from .. import context_vault as _vault_mod
+
+        if not _vault_mod.vault_enabled():
+            return None
+        try:
+            from .tp_mode import tp_enabled
+
+            if tp_enabled():
+                logger.info(
+                    "vault: TP is enabled; the server request path does not carry "
+                    "vault rungs to rank 1, so the vault stays off"
+                )
+                return None
+            vault = _vault_mod.get_vault(_vault_mod.vault_identity_for_model(model))
+            logger.info(
+                "vault: enabled, budget %.0f GB, stride %d tokens",
+                _vault_mod.vault_budget_bytes() / 1e9,
+                _vault_mod.default_boundary_stride(),
+            )
+            return vault
+        except Exception:  # noqa: BLE001 - a vault fault must never fail a load
+            logger.warning("vault: could not be created; continuing without it",
+                           exc_info=True)
+            return None
 
     def generate(
         self,
@@ -1798,6 +1840,7 @@ class ResponseGenerator:
         self.config = None
         self.vision_cache = None
         self.apc_manager = None
+        self.vault = None
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
@@ -1914,6 +1957,11 @@ class ResponseGenerator:
                             top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
+                            # getattr, not self.vault: the server tests build
+                            # ResponseGenerator with object.__new__ and set only
+                            # the attributes they exercise, and every other
+                            # optional attribute here is read the same way.
+                            vault=getattr(self, "vault", None),
                             draft_model=self.draft_model,
                             draft_kind=self.draft_kind,
                             draft_block_size=_get_draft_block_size_from_env(),

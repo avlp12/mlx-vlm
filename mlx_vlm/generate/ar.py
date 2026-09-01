@@ -16,6 +16,7 @@ import mlx.nn as nn
 from tqdm import tqdm
 
 from .. import apc as _apc
+from .. import context_vault as _context_vault
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -1677,6 +1678,7 @@ class PromptProcessingBatch:
         existing_left_padding: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
+        vault: Optional[Any] = None,
         draft_model: Optional[nn.Module] = None,
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
@@ -1745,6 +1747,10 @@ class PromptProcessingBatch:
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
         self._apc_mode = apc_mode
+        # Warm Context Vault.  ``None`` unless the caller passed one, and every
+        # vault branch below is gated on that, so with the vault off this class
+        # takes exactly the code path it took before.
+        self._vault = vault
         self._apc_harvest_enabled = True
         self._prompt_time_s = 0.0
         self._prompt_tokens_per_row: List[int] = []
@@ -1866,20 +1872,48 @@ class PromptProcessingBatch:
         if checkpoint_len <= prefix_len:
             meta["checkpoint_done"] = True
             return None
+        return self._checkpoint_column_for_len(batch_idx, meta, checkpoint_len)
+
+    def _checkpoint_column_for_len(
+        self, batch_idx: int, meta: dict, target_len: int
+    ) -> Optional[int]:
+        """Batch column at which row ``batch_idx`` reaches ``target_len`` tokens.
+
+        Split out of ``_apc_checkpoint_column_for_meta`` verbatim so the vault's
+        boundary ladder is placed by the same arithmetic the single APC
+        checkpoint has always used, rather than by a second copy of it.
+        """
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        if target_len <= prefix_len:
+            return None
         if self._right_pad_per_row is not None:
-            suffix_checkpoint = checkpoint_len - prefix_len
+            suffix_checkpoint = target_len - prefix_len
             if suffix_checkpoint >= self._suffix_lens[batch_idx]:
                 return None
             return suffix_checkpoint
-        return self._left_padding_per_row[batch_idx] + checkpoint_len
+        return self._left_padding_per_row[batch_idx] + target_len
+
+    def _vault_checkpoint_columns_for_meta(
+        self, batch_idx: int, meta: dict
+    ) -> List[int]:
+        out: List[int] = []
+        for target in meta.get("vault_rungs") or ():
+            col = self._checkpoint_column_for_len(batch_idx, meta, int(target))
+            if col is not None:
+                out.append(col)
+        return out
 
     def _next_apc_checkpoint_column(self) -> Optional[int]:
-        if (
-            self._apc_manager is None
-            or self._apc_mode != "exact"
-            or not self._apc_meta
-            or self._inputs_embeds is None
-        ):
+        """Column the next chunk must stop on, over APC's checkpoint and the vault's ladder.
+
+        With ``self._vault is None`` this reduces term for term to what it was:
+        ``apc_on`` reproduces the old two-clause guard, the vault list is empty,
+        and the min is taken over the same single column per row.
+        """
+        if not self._apc_meta or self._inputs_embeds is None:
+            return None
+        apc_on = self._apc_manager is not None and self._apc_mode == "exact"
+        if not apc_on and self._vault is None:
             return None
         start = self._processed_prompt_columns
         end = start + self._inputs_embeds.shape[1]
@@ -1887,10 +1921,17 @@ class PromptProcessingBatch:
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
                 continue
-            col = self._apc_checkpoint_column_for_meta(batch_idx, meta)
-            if col is None or col <= start or col >= end:
-                continue
-            next_col = col if next_col is None else min(next_col, col)
+            cols: List[int] = []
+            if apc_on:
+                col = self._apc_checkpoint_column_for_meta(batch_idx, meta)
+                if col is not None:
+                    cols.append(col)
+            if self._vault is not None:
+                cols.extend(self._vault_checkpoint_columns_for_meta(batch_idx, meta))
+            for col in cols:
+                if col <= start or col >= end:
+                    continue
+                next_col = col if next_col is None else min(next_col, col)
         return next_col
 
     def _row_real_tokens_processed(self, batch_idx: int) -> int:
@@ -1931,6 +1972,42 @@ class PromptProcessingBatch:
             )
             meta["checkpoint_done"] = True
 
+    def _store_vault_checkpoints(self) -> None:
+        """Store every vault rung this chunk landed on, per row.
+
+        Unlike the APC exact checkpoint there are many boundaries per row, so a
+        rung is dropped from the row's pending list once passed rather than
+        marked with a single done flag.  Storing is best-effort: a vault fault
+        must never fail a request, and a rung that fails to capture is simply
+        not stored (``capture_fragments`` returns None rather than a partial
+        ladder, and ``insert`` refuses None).
+        """
+        if self._vault is None or not self._apc_meta:
+            return
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None:
+                continue
+            rungs = meta.get("vault_rungs")
+            if not rungs:
+                continue
+            done = self._row_real_tokens_processed(batch_idx)
+            landed = [r for r in rungs if int(r) == done]
+            remaining = [r for r in rungs if int(r) > done]
+            if landed:
+                row_cache = self._apc_prompt_cache_for_store(batch_idx)
+                if row_cache is not None:
+                    full_ids = meta.get("full_input_ids") or []
+                    for r in landed:
+                        try:
+                            self._vault.insert(
+                                full_ids,
+                                int(r),
+                                _context_vault.capture_fragments(row_cache, int(r)),
+                            )
+                        except Exception:  # noqa: BLE001 - storing is best-effort
+                            pass
+            meta["vault_rungs"] = remaining
+
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
         if n is None or not self._prompt_length_aware_keys:
             return self._prompt_kwargs
@@ -1962,6 +2039,7 @@ class PromptProcessingBatch:
         mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
+        self._store_vault_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         for k in self._prompt_length_aware_keys:
@@ -2274,6 +2352,7 @@ class BatchGenerator:
         ] = None,
         stream=None,
         apc_manager: Optional["_apc.APCManager"] = None,
+        vault: Optional[Any] = None,
         draft_model: Optional[nn.Module] = None,
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
@@ -2310,6 +2389,21 @@ class BatchGenerator:
             if self.apc_mode is None:
                 apc_manager = None
         self.apc_manager = apc_manager
+        # Warm Context Vault, supplied by the caller (the server builds it from
+        # the toggle; nothing here reads an env var).  The vault needs the same
+        # whole-cache snapshot contract APC's "exact" mode needs -- this stack's
+        # ArraysCache KDA state is CHECKPOINT-only -- so a model that cannot
+        # offer it does not get a vault rather than getting a broken one.
+        self.vault = vault
+        if self.vault is not None:
+            if self.apc_mode is None:
+                self.apc_mode = _apc.model_apc_mode(model)
+            if self.apc_mode != "exact":
+                logger.info(
+                    "vault: model apc_mode=%s is not 'exact'; vault disabled for "
+                    "this generator", self.apc_mode
+                )
+                self.vault = None
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -2413,23 +2507,103 @@ class BatchGenerator:
         )
 
     def _apc_pick_for(self, sequence) -> Optional[dict]:
-        """Look up an APC prefix for ``sequence``. Returns dict with matched
-        blocks + suffix metadata when there is a usable hit, else None.
+        """Look up a warm prefix for ``sequence`` -- APC first, then the vault.
+
+        Returns a plan dict with matched blocks + suffix metadata when there is
+        a usable hit, else None.  The vault only ever *deepens* the answer: see
+        ``_vault_pick_for``.
         """
-        if self.apc_manager is None:
+        vault = getattr(self, "vault", None)
+        if self.apc_manager is None and vault is None:
             return None
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
-        return _apc.apc_lookup_plan(
-            self.apc_manager,
-            ids_list,
-            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
-            apc_mode=getattr(self, "apc_mode", "block"),
-            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
-            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),
-            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(ids_list, pl),
-        )
+        pick = None
+        if self.apc_manager is not None:
+            pick = _apc.apc_lookup_plan(
+                self.apc_manager,
+                ids_list,
+                extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+                apc_mode=getattr(self, "apc_mode", "block"),
+                safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
+                suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(
+                    ids_list, pl
+                ),
+                prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(
+                    ids_list, pl
+                ),
+            )
+        if vault is None:
+            return pick
+        return self._vault_pick_for(ids_list, prompt_kwargs, pick)
+
+    def _vault_prefix_trim_is_safe(self) -> bool:
+        """Refuse a vault warm start where trimming the prompt breaks RoPE.
+
+        ``generate/dispatch.py`` primes ``_rope_deltas`` from the FULL prompt
+        before it trims (``_prime_cached_prefix_rope_state``), because a
+        Qwen-style mRoPE model cannot recompute the original delta from the
+        suffix alone.  This path has no equivalent hook, and getting it wrong is
+        silent rather than loud, so decline instead.  GLM-5-Next is NoPE and
+        exposes no ``get_rope_index``, so this is True there.
+        """
+        return not callable(getattr(self.model, "get_rope_index", None))
+
+    def _vault_pick_for(
+        self, ids_list, prompt_kwargs, pick: Optional[dict]
+    ) -> Optional[dict]:
+        """Deepen (or supply) the warm start from the context vault.
+
+        The vault competes only when it strictly beats what APC found: a
+        shallower rung is worse than the hit already in hand, and taking it
+        would also drop APC's block references. On a win the APC blocks are
+        released, because the plan that replaces them will never reference them.
+        """
+        vault = getattr(self, "vault", None)
+        have = int(pick.get("prefix_len", 0)) if pick else 0
+        try:
+            hit = vault.lookup(list(ids_list))
+        except Exception:  # noqa: BLE001 - a vault fault must never fail a request
+            return pick
+        if hit is None or not (have < int(hit.prefix_len) < len(ids_list)):
+            return pick
+        if not self._vault_prefix_trim_is_safe():
+            return pick
+        fresh = cache.make_prompt_cache(self.model)
+        try:
+            restored = bool(vault.restore_into(fresh, hit))
+        except Exception:  # noqa: BLE001
+            restored = False
+        if not restored:
+            return pick
+        if pick is not None and self.apc_manager is not None:
+            self.apc_manager.release(pick.get("matched_blocks", []))
+        return {
+            "matched_blocks": [],
+            "warm_cache": fresh,
+            "prefix_len": int(hit.prefix_len),
+            "extra_hash": self._apc_extra_hash(prompt_kwargs or {}),
+            "full_input_ids": list(ids_list),
+            "source": "vault",
+        }
+
+    def _vault_rungs_for(self, ids_list, prefix_len: int) -> List[int]:
+        """Absolute boundaries this row should checkpoint on the way past.
+
+        Same geometric ladder ``dispatch.py`` uses, shifted past whatever prefix
+        the row starts warm from -- a rung at or below the warm prefix is
+        already stored by construction.
+        """
+        if getattr(self, "vault", None) is None:
+            return []
+        return [
+            b
+            for b in _context_vault.boundary_ladder(
+                len(ids_list), step=self.prefill_step_size
+            )
+            if b > int(prefix_len)
+        ]
 
     def _build_mixed_prompt_batch(
         self, sequences: List[tuple]
@@ -2441,10 +2615,10 @@ class BatchGenerator:
         scratch in the same batch. Right-padding aligns RoPE positions
         across rows with different prefix/suffix lengths.
 
-        Returns ``None`` if APC is disabled (in which case the caller should
-        use the cold-only path).
+        Returns ``None`` if neither APC nor the vault can offer a warm row
+        (in which case the caller should use the cold-only path).
         """
-        if self.apc_manager is None:
+        if self.apc_manager is None and getattr(self, "vault", None) is None:
             return None
 
         picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
@@ -2568,6 +2742,7 @@ class BatchGenerator:
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
                 "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
+                "vault_rungs": self._vault_rungs_for(full_ids[i], prefix_lens[i]),
             }
             for i in range(len(sequences))
         ]
@@ -2598,6 +2773,7 @@ class BatchGenerator:
             warm_cache=warm_cache,
             apc_meta=apc_meta,
             apc_manager=self.apc_manager,
+            vault=getattr(self, "vault", None),
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
@@ -2613,9 +2789,14 @@ class BatchGenerator:
         prompt_kwargs_list: List[Optional[dict]],
     ) -> Optional[List[Optional[dict]]]:
         """Build per-row harvest metadata for a cold-prefill batch so the
-        produced K/V are added to APC after prefill.
+        produced K/V are added to APC after prefill, and so the vault stores its
+        boundary ladder on the way past.
+
+        With APC off, ``_apc_extra_hash`` returns 0 and
+        ``_apc_exact_checkpoint_len`` returns 0, so the rows carry vault rungs
+        and nothing else -- no APC work is scheduled by a vault-only run.
         """
-        if self.apc_manager is None:
+        if self.apc_manager is None and getattr(self, "vault", None) is None:
             return None
         meta: List[Optional[dict]] = []
         for ids_list, kw in zip(input_ids_list, prompt_kwargs_list):
@@ -2627,6 +2808,7 @@ class BatchGenerator:
                     "extra_hash": extra_hash,
                     "apc_blocks": [],
                     "checkpoint_len": self._apc_exact_checkpoint_len(list(ids_list)),
+                    "vault_rungs": self._vault_rungs_for(list(ids_list), 0),
                 }
             )
         return meta
@@ -2910,6 +3092,7 @@ class BatchGenerator:
                 ),
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
+                vault=getattr(self, "vault", None),
                 apc_mode=self.apc_mode,
                 draft_model=getattr(self, "draft_model", None),
                 draft_kind=getattr(self, "draft_kind", None),
