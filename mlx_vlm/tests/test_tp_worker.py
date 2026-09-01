@@ -408,11 +408,18 @@ def test_spec_round_loop_mixed_sequence_is_mirrored_step_for_step(monkeypatch):
 def test_verify_width_varies_with_acceptance_and_is_announced(monkeypatch):
     """Width-W verify: W is decided by rank 0's cost model and changes between
     rounds, so it has to travel rather than be assumed."""
-    pair, sent, _ = _drive_spec_rounds(monkeypatch, plan=[2, None, 0], block_size=6)
+    # Seven rounds, not three.  Adaptive-K is now the shipped default and it
+    # needs MINROUNDS (4) of acceptance history before it has a hazard to act
+    # on, so a three-round plan holds W constant and a test that cannot move W
+    # is not testing the invariant.  This plan establishes a hazard and then
+    # breaks it, and W really does move: [6, 6, 6, 6, 5, 4, 5].
+    pair, sent, _ = _drive_spec_rounds(
+        monkeypatch, plan=[4, 4, 4, 4, 0, None, 2], block_size=6
+    )
     widths = [m.seqlen for m in sent if m.op == W.OP_FORWARD]
-    # The adaptive block-size cost model shrinks W after a partial accept, so
-    # the stream really does carry more than one width -- which is the point:
-    # a width rank 1 assumed rather than received would be wrong by round two.
+    # The block-size cost model shrinks W after acceptance falls off, so the
+    # stream really does carry more than one width -- which is the point: a
+    # width rank 1 assumed rather than received would be wrong by round five.
     assert len(set(widths)) > 1, f"expected varying verify widths, got {widths}"
     twin, _ = _replay(sent)
     assert [s for _, s, _ in twin.forwards] == widths
