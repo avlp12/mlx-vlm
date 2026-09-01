@@ -55,6 +55,8 @@ __all__ = [
     "heavy_processes",
     "memory_snapshot",
     "phys_footprint_gb",
+    "SHARD_GB",
+    "require_headroom",
     "require_quiet_box",
     "require_quiet_fleet",
     "self_rss_gb",
@@ -84,6 +86,9 @@ MIN_FREE_PCT = float(os.environ.get("MLX_VLM_TP_MIN_FREE_PCT", "10"))
 # how the box reached 95% swap.  Default 100 GB covers an 85.5 GiB TP shard
 # plus working space; raise it for a single-box 183 GiB load.
 MIN_FREE_GB = float(os.environ.get("MLX_VLM_TP_MIN_FREE_GB", "100"))
+# Typical resident sizes on this fleet, so a caller can say what it is about to
+# load instead of guessing a floor.
+SHARD_GB = {"tp": 86.0, "single": 183.0}
 
 _GB = 1024.0 ** 3
 _PS_SEP = "===PS==="
@@ -340,6 +345,49 @@ def heavy_processes(
     for t in targets:
         found[t or "localhost"] = _parse_ps(runner(t), threshold_gb, ignore_pids)
     return found
+
+
+def require_headroom(load_gb: float, hosts: Sequence[str] = (),
+                     margin_gb: float = 60.0, label: str = "",
+                     ps_runner: Optional[Callable[[Optional[str]], str]] = None
+                     ) -> dict:
+    """Refuse unless free memory exceeds what this load will ASK FOR, plus room.
+
+    THE LESSON THIS ENCODES.  ``require_quiet_fleet`` tests free memory against
+    a fixed floor *before* a load, which says nothing about what is left
+    *after* it.  With MIN_FREE_GB=100 and an 86 GiB shard, a box at 118 GB free
+    passes the gate and then runs at ~32 GB -- and on 2026-09-01 that is exactly
+    what happened: the gate approved a load onto a box already carrying ~100 GB
+    of leaked debt, the peer's worker was terminated under memory pressure
+    minutes later, the surviving rank wedged for its full 900 s timeout, and
+    the box froze.  I had written down that this check was "too tight in
+    hindsight" the previous night and had not changed it.
+
+    The floor is not wrong, it is incomplete: what matters is
+    ``free >= load + margin``.  Callers pass the size of the thing they are
+    about to load (SHARD_GB has the usual ones), so the guard scales with the
+    request instead of assuming one.
+    """
+    receipt = require_quiet_fleet(hosts, label=label or f"{load_gb:.0f}GB load",
+                                  ps_runner=ps_runner)
+    need = load_gb + margin_gb
+    short = {}
+    for host, m in (receipt.get("pressure") or {}).items():
+        free = m.get("free_gb")
+        if free is not None and free < need:
+            short[host] = (f"{free:.1f}GB free, needs {need:.0f}GB "
+                           f"({load_gb:.0f} load + {margin_gb:.0f} margin"
+                           + (f", {m['wired_gb']:.0f} already wired)"
+                              if m.get("wired_gb") else ")"))
+    receipt.update({"load_gb": load_gb, "margin_gb": margin_gb,
+                    "headroom_ok": not short, "short": short})
+    if short:
+        receipt["quiet"] = False
+        raise HeavyRunActive(
+            f"refusing {label or 'this load'}: not enough headroom for what it "
+            f"will allocate (" + "; ".join(f"{h}: {w}" for h, w in short.items())
+            + "). A floor check passes here and the box still runs out.")
+    return receipt
 
 
 def require_quiet_box(host: Optional[str] = None, **kw) -> dict:

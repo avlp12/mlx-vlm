@@ -329,3 +329,52 @@ def test_gpu_probe_targets_the_peer_over_ssh(monkeypatch):
                         lambda cmd, **kw: (seen.update(cmd=cmd), _R())[1])
     fleet.gpu_responsive("m3ms@10.0.0.2")
     assert seen["cmd"][0] == "ssh" and "m3ms@10.0.0.2" in seen["cmd"]
+
+
+# ------------------------------------------------------- headroom for a load
+def _mem(free_gb, wired_gb, pct=50):
+    return (_QUIET_HEAD + f"""
+===MEM===
+total = 4096.00M  used = 0.00M  free = 4096.00M  (encrypted)
+System-wide memory free percentage: {pct}%
+VMFREEGB {free_gb} {wired_gb}
+""")
+
+
+def test_headroom_refuses_the_state_that_froze_the_box():
+    """The 2026-09-01 14:31 freeze, encoded.
+
+    A box at 118 GB free carrying ~103 GB of leaked wired debt PASSES a
+    100 GB floor, then loads an 86 GiB shard and runs at ~32 GB.  Minutes later
+    the peer's worker was terminated under memory pressure, the surviving rank
+    wedged for its full 900 s timeout, and the box froze.  The floor was not
+    wrong, it was incomplete: what matters is free >= load + margin.
+    """
+    with pytest.raises(fleet.HeavyRunActive, match="headroom"):
+        fleet.require_headroom(fleet.SHARD_GB["tp"], label="lc arm",
+                               ps_runner=lambda h: _mem(118.0, 102.9))
+
+
+def test_headroom_allows_a_clean_box():
+    r = fleet.require_headroom(fleet.SHARD_GB["tp"],
+                               ps_runner=lambda h: _mem(400.0, 8.0))
+    assert r["headroom_ok"] is True and r["load_gb"] == 86.0
+
+
+def test_headroom_scales_with_the_load_not_a_fixed_floor():
+    """200 GB free is plenty for a TP shard and not enough for a single-box
+    model.  One floor cannot express both."""
+    fleet.require_headroom(fleet.SHARD_GB["tp"],
+                           ps_runner=lambda h: _mem(200.0, 8.0))
+    with pytest.raises(fleet.HeavyRunActive):
+        fleet.require_headroom(fleet.SHARD_GB["single"],
+                               ps_runner=lambda h: _mem(200.0, 8.0))
+
+
+def test_headroom_names_the_wired_debt_in_the_refusal():
+    try:
+        fleet.require_headroom(fleet.SHARD_GB["tp"],
+                               ps_runner=lambda h: _mem(118.0, 102.9))
+        raise AssertionError("should have refused")
+    except fleet.HeavyRunActive as e:
+        assert "already wired" in str(e)
