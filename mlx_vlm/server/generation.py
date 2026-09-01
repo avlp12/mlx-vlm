@@ -31,6 +31,7 @@ from ..generate import (
     _chunked_prefill_enabled,
     _make_cache,
     _merge_prefill_prompt_kwargs,
+    wired_limit,
 )
 from ..generate.diffusion import (
     is_diffusion_model,
@@ -1816,7 +1817,19 @@ class ResponseGenerator:
             return
 
         if self.draft_model is not None and self.draft_kind != "mtp":
-            self._run_speculative()
+            # The speculative loop owns the GPU thread for its whole life but
+            # never wired the model: BatchGenerator does that at
+            # generate/ar.py:2345 and _run_speculative does not construct one.
+            # An unwired forward costs about 1690 ms regardless of block width,
+            # against 34 ms at width 1 and 59 ms at width 5 wired -- which is
+            # exactly the 1688.8 ms this path was measured at, and why the cost
+            # looked uniform across all 45 layers and independent of width.
+            # Wiring here took the live server arm from 1.64 to 35.82 tok/s with
+            # acceptance and round counts unchanged.
+            with wired_limit(
+                self.model.language_model, [mx.default_stream(mx.default_device())]
+            ):
+                self._run_speculative()
             return
 
         generation_stream = mx.default_stream(mx.default_device())

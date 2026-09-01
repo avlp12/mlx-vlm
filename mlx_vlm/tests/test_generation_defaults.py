@@ -63,3 +63,78 @@ def test_shared_defaults_are_defined_once():
                     f"{module.__name__}.{name} is not the object defined in "
                     "mlx_vlm.generate.common"
                 )
+
+
+# --------------------------------------------------------------------------
+# The speculative GPU loop must run inside wired_limit.
+#
+# _run_speculative owns the GPU thread for its whole life but never constructed
+# a BatchGenerator, which is what wires the model (generate/ar.py:2345). So the
+# speculative path ran UNWIRED and the model paged on every forward. An unwired
+# forward costs about 1690 ms whatever the block width -- against 34 ms at width
+# 1 and 59 ms at width 5 wired -- and the server's verify measured 1688.8 ms.
+# That is why the cost looked uniform across all 45 layers and independent of
+# width, and why twelve component-level hypotheses all came back at 1.00x.
+#
+# Live effect of wiring it: 1.64 -> 45.28 tok/s, with acceptance and round counts
+# unchanged. These tests pin the invariant so the path cannot silently unwire.
+# --------------------------------------------------------------------------
+def test_speculative_loop_is_dispatched_inside_wired_limit():
+    import ast
+    import inspect
+    import textwrap
+
+    from mlx_vlm.server import generation as gen
+
+    # getsource on a method keeps the class indentation; ast needs it dedented
+    tree = ast.parse(textwrap.dedent(inspect.getsource(gen.ResponseGenerator._run_impl)))
+
+    def _calls(node):
+        return {
+            n.func.attr
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+
+    guarded = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        names = {
+            item.context_expr.func.id
+            for item in node.items
+            if isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+        }
+        if "wired_limit" in names and "_run_speculative" in _calls(node):
+            guarded = True
+            break
+
+    assert guarded, (
+        "_run_speculative() must be called inside a `with wired_limit(...)` block. "
+        "Without it the speculative path runs unwired and every forward costs "
+        "~1690 ms instead of ~59 ms (measured 1.64 vs 45.28 tok/s end to end)."
+    )
+
+
+def test_speculative_dispatch_is_the_only_unguarded_path():
+    """If _run_speculative ever gains a second call site, it must be guarded too."""
+    import ast
+    import inspect
+
+    from mlx_vlm.server import generation as gen
+
+    src = inspect.getsource(gen)
+    tree = ast.parse(src)
+    sites = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_run_speculative"
+    ]
+    assert len(sites) == 1, (
+        f"expected exactly one _run_speculative() call site, found {len(sites)}. "
+        "Every site must sit inside a wired_limit block; update this test and "
+        "the guard together."
+    )
