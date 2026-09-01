@@ -1,0 +1,20 @@
+{
+ "arm": "on",
+ "tag": "r0",
+ "toggle_enabled": true,
+ "env_MOE_GEMM": "1",
+ "prompt_tokens": 8192,
+ "chunk": 2048,
+ "reps": 4,
+ "text_kind": "real source code + prose (NOT a PAD template)",
+ "started": "2026-09-01T15:47:03+0900",
+ "run_s": [
+  18.7211,
+  19.1588,
+  19.1909,
+  19.4964
+ ],
+ "median_s": 19.1909,
+ "prefill_tok_s": 426.9,
+ "spread_pct": 4.14
+}

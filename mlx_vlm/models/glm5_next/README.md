@@ -305,3 +305,29 @@ a quantized target.
 Runs the batched `BatchGenerator` path unmodified. The lightning indexer's incremental
 pool and the DSA decode mask are batch-aware, so grow/shrink of the batch
 (`filter`/`extend`) stays correct.
+
+## MoE prefill GEMM (`MLX_VLM_GLM5_MOE_GEMM`) — ON by default since 2026-09-01
+
+Segment-aligned routed-expert GEMM for prefill. Set the variable to `0` to
+restore the stock path.
+
+Measured twice on **real text** (source code + prose), paired and interleaved,
+chunk 2048: round 1 **+2.14%**; round 2 **+2.77% / +3.92% / +3.14%** (3/3 pairs,
+median +2.77%). Round 1 saw the same real-text win and still recommended OFF on
+the strength of a −0.86% result from a repeated PAD sentence — that weighting was
+wrong, and the campaign law "never judge this toggle on PAD templates" exists
+precisely because degenerate routing is unrepresentative.
+
+**Two caveats, first-class:**
+
+* **The sign flips on degenerate prompts.** A repeated PAD sentence activates
+  158–253 of 288 experts per chunk and regresses ~0.86%; real text activates
+  281–285 and gains 2–4%. Genuinely repetitive traffic will be slightly slower.
+* **It is structurally noisier.** Run-to-run spread is 2.71–4.14% on against
+  0.41–1.64% off, because `T` (the padded tile count) is data dependent and its
+  `.item()` cannot be hoisted out of the layer loop — three host syncs per layer
+  instead of one. A property of the design, not measurement error.
+
+Receipts: `bench/moegemm_realtext_{off,on}_r{0,1,2}.json`,
+`bench/moegemm_ablate2.json`, `bench/moegemm_routing_hist.json`.
+Harness: `bench/moegemm_realtext_ab.py`.

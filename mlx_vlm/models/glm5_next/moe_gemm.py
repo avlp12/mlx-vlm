@@ -101,12 +101,48 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _env_flag_default_on(name: str) -> bool:
+    """True unless explicitly switched off, so absence means the new default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def moe_gemm_enabled(config: Any = None) -> bool:
-    """``config.moe_prefill_gemm`` (when set) wins over ``MLX_VLM_GLM5_MOE_GEMM``."""
+    """ON by default since 2026-09-01.  ``config.moe_prefill_gemm`` wins, then
+    ``MLX_VLM_GLM5_MOE_GEMM``; set it to 0 to go back to the stock path.
+
+    WHY THE DEFAULT MOVED.  Measured twice on REAL text (source code + prose),
+    paired and interleaved, at chunk 2048:
+
+        round 1   +2.14%
+        round 2   +2.77% / +3.92% / +3.14%   (3/3 pairs, median +2.77%)
+
+    Round 1 saw the same real-text win and still recommended OFF, on the
+    strength of a -0.86% result from a repeated PAD sentence.  That weighting
+    was wrong: the campaign law "never judge this toggle on PAD templates"
+    exists precisely because degenerate routing is unrepresentative.
+
+    TWO CAVEATS, first-class, not footnotes:
+
+    * The sign flips on degenerate prompts.  A repeated PAD sentence activates
+      158-253 of 288 experts per chunk and regresses ~0.86%; real text
+      activates 281-285 and gains 2-4%.  Traffic that is genuinely repetitive
+      will be slightly slower with this on.
+    * It is structurally noisier.  Run-to-run spread is 2.71-4.14% with the
+      toggle on against 0.41-1.64% off, because ``T`` (the padded tile count)
+      is data dependent and its ``.item()`` cannot be hoisted out of the layer
+      loop -- three host syncs per layer instead of one.  That is a property of
+      the design, not measurement error.
+
+    Receipts: bench/moegemm_realtext_{off,on}_r{0,1,2}.json (round 2),
+    bench/moegemm_ablate2.json and bench/moegemm_routing_hist.json (round 1).
+    """
     flag = getattr(config, "moe_prefill_gemm", None) if config is not None else None
     if flag is not None:
         return bool(flag)
-    return _env_flag(MOE_GEMM_ENV)
+    return _env_flag_default_on(MOE_GEMM_ENV)
 
 
 def tile_rows() -> Optional[int]:
