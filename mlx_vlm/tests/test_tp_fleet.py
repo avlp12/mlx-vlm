@@ -378,3 +378,24 @@ def test_headroom_names_the_wired_debt_in_the_refusal():
         raise AssertionError("should have refused")
     except fleet.HeavyRunActive as e:
         assert "already wired" in str(e)
+
+
+# ------------------------------------------------------ sweep degradation
+def test_debtwatch_stops_a_sweep_that_is_leaking():
+    """A per-arm threshold cannot see a trend.
+
+    Four lc arms were queued on 2026-09-01; arm 1 aborted and leaked ~94 GB,
+    arm 2 passed the (level-based) gate into the reduced margin, and the box
+    froze.  This watches the trend.
+    """
+    seq = iter([_mem(400.0, 8.0), _mem(300.0, 102.0)])
+    w = fleet.DebtWatch(ps_runner=lambda h: next(seq))
+    with pytest.raises(fleet.HeavyRunActive, match="growing|grown"):
+        w.check("arm 2")
+
+
+def test_debtwatch_allows_a_clean_sweep():
+    seq = iter([_mem(400.0, 8.0), _mem(398.0, 9.0)])
+    w = fleet.DebtWatch(ps_runner=lambda h: next(seq))
+    r = w.check("arm 2")
+    assert r["growth_gb"]["localhost"] <= 1.5

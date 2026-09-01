@@ -347,6 +347,56 @@ def heavy_processes(
     return found
 
 
+class DebtWatch:
+    """Abort a multi-arm sweep when the boxes are losing memory to it.
+
+    Every watchdog abort leaks roughly a shard, permanently, so a sweep of N
+    arms runs with a monotonically shrinking margin -- and a per-arm threshold
+    cannot see that, because each individual check only asks "is there enough
+    right now".  On 2026-09-01 four lc arms were queued, arm 1 aborted and leaked
+    ~94 GB, arm 2 was approved into the reduced margin, and the box froze.
+
+    This watches the trend instead of the level: record wired at sweep start,
+    and refuse to start another arm once it has grown by more than one shard.
+    """
+
+    def __init__(self, hosts: Sequence[str] = (), tolerance_gb: float = 90.0,
+                 ps_runner: Optional[Callable[[Optional[str]], str]] = None):
+        self.hosts = tuple(hosts)
+        self.tolerance_gb = tolerance_gb
+        self._runner = ps_runner
+        self.baseline = self._wired()
+
+    def _wired(self) -> Dict[str, Optional[float]]:
+        runner = self._runner or _run_ps
+        out: Dict[str, Optional[float]] = {}
+        targets: List[Optional[str]] = [None] + [h for h in self.hosts
+                                                 if h not in ("10.0.0.1",)]
+        for t in targets:
+            out[t or "localhost"] = _parse_memory(runner(t)).get("wired_gb")
+        return out
+
+    def growth(self) -> Dict[str, float]:
+        now = self._wired()
+        return {h: round((now.get(h) or 0.0) - (v or 0.0), 1)
+                for h, v in self.baseline.items()}
+
+    def check(self, label: str = "") -> dict:
+        # Poll once: two polls per check would double the ssh cost and could
+        # disagree with each other.
+        growth = self.growth()
+        grown = {h: g for h, g in growth.items() if g > self.tolerance_gb}
+        if grown:
+            raise HeavyRunActive(
+                f"stopping the sweep before {label or 'the next arm'}: wired "
+                f"memory has grown since it started ("
+                + "; ".join(f"{h} +{g:.0f}GB" for h, g in grown.items())
+                + f", tolerance {self.tolerance_gb:.0f}GB). Something is leaking "
+                f"a shard per arm; each further arm starts with less margin than "
+                f"the gate assumes.")
+        return {"baseline_wired_gb": self.baseline, "growth_gb": growth}
+
+
 def require_headroom(load_gb: float, hosts: Sequence[str] = (),
                      margin_gb: float = 60.0, label: str = "",
                      ps_runner: Optional[Callable[[Optional[str]], str]] = None
