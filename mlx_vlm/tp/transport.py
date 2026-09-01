@@ -123,6 +123,42 @@ def _write_json(path: Path, obj) -> str:
     return str(path)
 
 
+def _await_coordinator(host: str, port: int, *, attempts: int = 12,
+                       per_try_s: float = 2.0, log_every: int = 3):
+    """Side-channel readiness probe for the jaccl rendezvous.
+
+    mx.distributed.init blocks inside C when the coordinator is not up yet, and
+    a formation that never completes surfaces as errno 60 (ETIMEDOUT) after ~60 s
+    with nothing said about which side failed.  A plain TCP connect to the same
+    address answers the question in milliseconds and costs nothing when the peer
+    is healthy, so probe first and fail with a NAMED reason instead of a silent
+    minute.
+
+    Returns None on success, or a human reason string on failure.
+
+    WARNING: never point this at a jaccl coordinator port.  The connect is
+    accepted as a rank joining and breaks the formation it was meant to protect.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            with socket.create_connection((host, port), timeout=per_try_s):
+                if i:
+                    logger.info("[tp] coordinator %s:%d reachable after %d tries",
+                                host, port, i + 1)
+                return None
+        except OSError as e:
+            last = f"{type(e).__name__}: {e}"
+            if i % log_every == 0:
+                logger.info("[tp] waiting for coordinator %s:%d (try %d/%d): %s",
+                            host, port, i + 1, attempts, last)
+            time.sleep(per_try_s)
+    return (f"coordinator {host}:{port} unreachable after {attempts} tries "
+            f"({per_try_s}s each); last error {last}. Rank 0 is not listening -- "
+            f"check that it started, that the fast link is up, and that nothing "
+            f"else holds the port.")
+
+
 def init_tp(
     hosts: Optional[List[str]] = None,
     rank: Optional[int] = None,
@@ -196,7 +232,22 @@ def init_tp(
         )
         os.environ["MLX_RANK"] = str(rank)
 
-    _GROUP = mx.distributed.init(backend=backend)
+    # NOTE: do NOT probe the coordinator port before init.  A plain TCP connect
+    # to it is not passive -- jaccl's coordinator accepts the socket as a peer
+    # joining, and the real rendezvous then fails with "[jaccl] Recv failed with
+    # errno=0" on rank 0 and "Couldn't connect (error: 60)" on rank 1.  Measured:
+    # formation went from reliable to 0/1 with the probe in place.  _await_coordinator
+    # is kept below for probing OTHER services, but never this port.
+    t0 = time.time()
+    try:
+        _GROUP = mx.distributed.init(backend=backend)
+    except Exception as e:
+        raise RuntimeError(
+            f"[tp] {backend} group formation failed after {time.time()-t0:.1f}s "
+            f"as rank {rank} of {len(hosts)} ({hosts}): {type(e).__name__}: {e}"
+        ) from e
+    logger.info("[tp] %s group formed as rank %d/%d in %.2fs",
+                backend, rank, len(hosts), time.time() - t0)
     _BACKEND = backend
     return _GROUP
 
@@ -330,11 +381,16 @@ class Deadman:
     HARM_WINDOW_CAP_S = 30.0
 
     def __init__(self, seconds: float = 120.0, label: str = "", on_timeout="abort",
-                 harm_probe=None):
+                 harm_probe=None, on_fire=None):
         self.seconds = seconds
         self.label = label
         self.on_timeout = on_timeout
         self.harm_probe = harm_probe if harm_probe is not None else _display_stalled
+        # Runs IN THE WATCHER THREAD.  It has to: the guarded thread is blocked
+        # inside a collective and will not reach any code of its own again, so
+        # checking a flag after the `with` block would never happen.  Rank 1's
+        # release path depends on this.
+        self.on_fire = on_fire
         self._timer = None
         self._armed = False
         self._reason = None
@@ -351,6 +407,11 @@ class Deadman:
         )
         print(msg, flush=True)
         traceback.print_stack()
+        if self.on_fire is not None:
+            try:
+                self.on_fire(why)
+            except Exception:
+                pass
         if self.on_timeout == "abort":
             os._exit(75)  # EX_TEMPFAIL
 
@@ -391,6 +452,14 @@ class Deadman:
         )
         self._timer.start()
         return self
+
+    def tripped(self) -> bool:
+        """Did the watcher fire? Only meaningful with on_timeout != 'abort',
+        where _fire logs and returns instead of exiting the process."""
+        return self._reason is not None
+
+    def reason(self):
+        return self._reason
 
     def __exit__(self, *exc):
         self._armed = False

@@ -412,11 +412,44 @@ class MirroredLanguageModel:
         self._last_cache_obj = cache
         self._announce(OP_MAKE_CACHE, None, label="make_cache")
 
+    def _release_peer(self, why: str) -> None:
+        """Best-effort EXIT so rank 1 is never left blocked in the control wait.
+
+        Rank 1 spends its life inside a blocking all_sum waiting for the next
+        verb.  If rank 0 stops issuing verbs -- an early return, a raise, a path
+        that forgets to announce -- rank 1 waits forever.  That is the whole TP
+        hang family: the ranks never diverge, one simply stops driving, and the
+        collective does exactly what a collective is defined to do.
+
+        Reproduced directly: with rank 0 alive-but-idle after N-1 collectives,
+        rank 1 blocked on its Nth and had to be killed.  So every failure path
+        that could stop the driver emits EXIT on the way out.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            _ctrl_send(OP_EXIT, self._epoch, None)
+            logger.warning("tp: released peer with EXIT after %s", why)
+        except Exception:
+            logger.warning("tp: could not release peer after %s; reaping instead",
+                           why, exc_info=True)
+            try:
+                _reap_peer_workers(tp_hosts())
+            except Exception:
+                logger.warning("tp: peer reap also failed", exc_info=True)
+
     def _announce(self, op, ids, *, flags=0, arg0=0, name="", label="") -> None:
         if self._watchdog is not None:
             self._watchdog.arm(label or f"op{op}")
         try:
             _ctrl_send(op, self._epoch, ids, flags=flags, arg0=arg0, name=name)
+        except BaseException as e:
+            # The verb did not land, so rank 1 is either still waiting for this
+            # one or will wait for the next that never comes. Release it before
+            # propagating -- an orphaned peer holds its whole shard.
+            self._release_peer(f"{type(e).__name__} while announcing op{op}")
+            raise
         finally:
             if self._watchdog is not None:
                 self._watchdog.disarm()

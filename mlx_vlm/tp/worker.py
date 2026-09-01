@@ -251,15 +251,72 @@ def _ctrl_send(op: int, epoch: int, ids, *, flags: int = 0, arg0: int = 0,
     mx.eval(out)
 
 
+ENV_CTRL_IDLE = "MLX_VLM_GLM5_TP_CTRL_IDLE_S"
+
+
+def _ctrl_idle_bound() -> float:
+    """How long rank 1 will sit in the control wait before giving up."""
+    try:
+        return float(os.environ.get(ENV_CTRL_IDLE, "900"))
+    except ValueError:
+        return 900.0
+
+
+def _launcher_gone(_window_s: float = 0.0):
+    """Has the process that launched this worker died?
+
+    The worker is spawned over ssh by rank 0, so if rank 0's launcher goes away
+    this process is reparented to init.  That is a cheap, exact signal for the
+    'rank 0 is gone' half of the hang family.  It says nothing about the
+    'rank 0 is alive but stopped driving' half -- the idle bound covers that.
+    """
+    try:
+        return "launcher gone (reparented to init)" if os.getppid() == 1 else None
+    except Exception:
+        return None
+
+
+def _release_and_exit(reason: str) -> None:
+    """Give the wired budget back, then leave.
+
+    The main thread is blocked inside a collective, so no signal handler and no
+    finally can run -- SIGTERM was ignored for 90 s by exactly this shape
+    tonight, and the SIGKILL that followed did NOT return the 99.6 GB of wired
+    pages; only a reboot did.  Dropping the wired limit from this thread first
+    is the one piece of cleanup still reachable, and it is the piece that
+    matters.
+    """
+    logger.error("tp worker: %s -- releasing wired limit and exiting", reason)
+    try:
+        import mlx.core as mx
+
+        mx.set_wired_limit(0)
+    except Exception:
+        logger.warning("tp worker: could not drop wired limit", exc_info=True)
+    os._exit(75)  # EX_TEMPFAIL
+
+
 def _ctrl_recv() -> Ctrl:
-    """Rank 1: contribute zeros and read the sum."""
+    """Rank 1: contribute zeros and read the sum.
+
+    Bounded.  This collective is where rank 1 spends its life, and it is where
+    the whole TP hang family lands: rank 0 stops issuing verbs and rank 1 waits
+    forever, holding its entire shard.  Rank 0 now emits EXIT on its failure
+    paths, but a driver that is merely wedged sends nothing at all, so the wait
+    needs a bound of its own.
+    """
     import mlx.core as mx
 
-    from ..tp.transport import all_sum
+    from ..tp.transport import Deadman, all_sum
 
     n = _max_tok()
-    out = all_sum(mx.zeros((1, HEADER + n), dtype=mx.int32))
-    mx.eval(out)
+    # on_fire runs in the watcher thread, which is the only thread that can act:
+    # this one is about to be stuck inside the collective with no way back.
+    with Deadman(_ctrl_idle_bound(), "tp control wait",
+                 on_timeout="none", harm_probe=_launcher_gone,
+                 on_fire=_release_and_exit):
+        out = all_sum(mx.zeros((1, HEADER + n), dtype=mx.int32))
+        mx.eval(out)
     return decode(out[0].tolist())
 
 
