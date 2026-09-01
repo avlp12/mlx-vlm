@@ -60,6 +60,7 @@ __all__ = [
     "SINGLE_BOX_PER_ROW_GB",
     "single_box_gb",
     "require_headroom",
+    "require_headroom_box",
     "require_quiet_box",
     "require_quiet_fleet",
     "self_rss_gb",
@@ -471,6 +472,44 @@ def require_headroom(load_gb: float, hosts: Sequence[str] = (),
             f"refusing {label or 'this load'}: not enough headroom for what it "
             f"will allocate (" + "; ".join(f"{h}: {w}" for h, w in short.items())
             + "). A floor check passes here and the box still runs out.")
+    return receipt
+
+
+def require_headroom_box(host: Optional[str], load_gb: float,
+                         margin_gb: float = 60.0, label: str = "",
+                         ps_runner: Optional[Callable[[Optional[str]], str]] = None,
+                         threshold_gb: float = HEAVY_FOOTPRINT_GB) -> dict:
+    """Headroom + quiet check scoped to ONE box, ignoring every other machine.
+
+    require_headroom() folds in localhost because a TP load needs both boxes.
+    That makes it refuse a peer-only load whenever THIS box is busy with another
+    lane's work -- the false negative that stops two lanes sharing a fleet.  This
+    probes exactly one machine and answers about that machine only.
+    """
+    runner = ps_runner or _run_ps
+    who = host if host not in (None, "", "localhost", "127.0.0.1") else "localhost"
+    text = runner(None if who == "localhost" else host)
+    procs = _parse_ps(text, threshold_gb)
+    mem = _parse_memory(text)
+    need = load_gb + margin_gb
+    receipt = {"box": who, "label": label, "when": time.strftime("%FT%T%z"),
+               "load_gb": load_gb, "margin_gb": margin_gb, "pressure": mem,
+               "busy": procs, "quiet": not procs}
+    if procs:
+        detail = ", ".join(f"pid {p['pid']} {p['footprint_gb']}GB {p['cmd']}"
+                           for p in procs)
+        raise HeavyRunActive(
+            f"refusing {label or 'this load'} on {who}: something heavy is "
+            f"already resident there ({detail}).")
+    free = mem.get("free_gb")
+    if free is not None and free < need:
+        receipt["quiet"] = False
+        raise HeavyRunActive(
+            f"refusing {label or 'this load'} on {who}: {free:.1f}GB free, "
+            f"needs {need:.0f}GB ({load_gb:.0f} load + {margin_gb:.0f} margin"
+            + (f", {mem['wired_gb']:.0f} already wired)" if mem.get("wired_gb")
+               else ")"))
+    receipt["headroom_ok"] = True
     return receipt
 
 
