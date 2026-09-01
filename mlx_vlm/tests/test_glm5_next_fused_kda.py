@@ -720,7 +720,7 @@ def test_fused_kda_batch_cap_is_env_tunable():
     prog = (
         "import mlx_vlm.models.glm5_next.language as g\nprint(g._FUSED_KDA_MAX_BATCH)"
     )
-    for env_value, expect in ((None, "8"), ("16", "16"), ("32", "32"), ("2", "2")):
+    for env_value, expect in ((None, "16"), ("8", "8"), ("32", "32"), ("2", "2")):
         env = dict(os.environ)
         env.pop("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", None)
         if env_value is not None:

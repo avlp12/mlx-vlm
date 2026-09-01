@@ -56,7 +56,16 @@ _IDX_POOL_STEP = 512
 # the same process, the same code path, one number apart.  The default only ever
 # moves on a live measurement -- test_fused_kda_batch_cap_is_covered_by_parity
 # refuses any default the parity matrix below does not actually exercise.
-_FUSED_KDA_MAX_BATCH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", "8"))
+#
+# 16 as of 2026-09-01, on a paired single-box measurement (M3 Ultra, the 320B
+# tree, two arms per cap alternating which led, 64 timed steps each): B=16
+# total throughput 141.9 tok/s fused vs 133.2 eager, +6.50%, and the two pairs
+# agreed (+6.91% / +6.09%).  B=32 is equally bit-identical and measured +3.76%
+# (178.6 vs 172.2), but its arms scattered 2.4% against the campaign's 0.5%
+# bar and the worst-case pairing is +1.29%, under the +2% adoption threshold --
+# so 32 stays opt-in until it has been measured again.  Receipts: logs/tp2/
+# kda_b16_parity_202609011436.json, kda_bench_x{1,2}_cap{8,32}_202609011436.json.
+_FUSED_KDA_MAX_BATCH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", "16"))
 
 # The projection fold stops paying once the batch is wide enough to amortise the
 # weight read.  mx.quantized_matmul reads f_b/g_b once for all B rows (it becomes
