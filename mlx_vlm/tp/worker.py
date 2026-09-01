@@ -255,25 +255,35 @@ ENV_CTRL_IDLE = "MLX_VLM_GLM5_TP_CTRL_IDLE_S"
 
 
 def _ctrl_idle_bound() -> float:
-    """How long rank 1 will sit in the control wait before giving up."""
-    try:
-        return float(os.environ.get(ENV_CTRL_IDLE, "900"))
-    except ValueError:
-        return 900.0
+    """How long rank 1 will sit in the control wait before giving up.
 
-
-def _launcher_gone(_window_s: float = 0.0):
-    """Has the process that launched this worker died?
-
-    The worker is spawned over ssh by rank 0, so if rank 0's launcher goes away
-    this process is reparented to init.  That is a cheap, exact signal for the
-    'rank 0 is gone' half of the hang family.  It says nothing about the
-    'rank 0 is alive but stopped driving' half -- the idle bound covers that.
+    DISABLED by default (0).  A serving deployment can legitimately sit idle
+    between requests for hours, and a time-only bound cannot tell "idle" from
+    "orphaned" -- killing rank 1 on a quiet server would be a worse bug than the
+    one this guards.  The production fix for orphaning is rank 0's drive
+    guarantee (tp_mode._release_peer), which releases the peer on every failure
+    path.  This bound exists for harnesses and reproduction rigs, where the
+    absence of a verb really does mean the driver is gone.
     """
     try:
-        return "launcher gone (reparented to init)" if os.getppid() == 1 else None
-    except Exception:
-        return None
+        return float(os.environ.get(ENV_CTRL_IDLE, "0"))
+    except ValueError:
+        return 0.0
+
+
+# NOTE: there is deliberately no ppid-based liveness probe here.
+#
+# I shipped one and it was wrong.  tp_mode launches this worker over ssh as
+# `... >> ~/tp_worker.log 2>&1 &` -- backgrounded, so the shell exits and the
+# worker is reparented to init BY DESIGN.  os.getppid() == 1 is therefore true
+# for a perfectly healthy worker, and the probe fired on every rank 1 that
+# waited longer than the grace period for its first verb.  It killed rank 1
+# twelve seconds in, which left rank 0 blocked on make_cache until its own
+# 300 s watchdog: the exact "code arm" failure this was meant to prevent.
+# The prose arm only survived because its verb gaps happened to be shorter.
+#
+# A correct liveness signal would need a heartbeat from rank 0, which is a
+# protocol change.  Until then the bound below is time-only.
 
 
 def _release_and_exit(reason: str) -> None:
@@ -310,11 +320,17 @@ def _ctrl_recv() -> Ctrl:
     from ..tp.transport import Deadman, all_sum
 
     n = _max_tok()
+    bound = _ctrl_idle_bound()
+    if bound <= 0:
+        out = all_sum(mx.zeros((1, HEADER + n), dtype=mx.int32))
+        mx.eval(out)
+        return decode(out[0].tolist())
     # on_fire runs in the watcher thread, which is the only thread that can act:
     # this one is about to be stuck inside the collective with no way back.
-    with Deadman(_ctrl_idle_bound(), "tp control wait",
-                 on_timeout="none", harm_probe=_launcher_gone,
-                 on_fire=_release_and_exit):
+    # harm_probe is disabled -- there is no valid host-side liveness signal here
+    # (see the note above), so the bound is purely time.
+    with Deadman(bound, "tp control wait", on_timeout="none",
+                 harm_probe=lambda _w: None, on_fire=_release_and_exit):
         out = all_sum(mx.zeros((1, HEADER + n), dtype=mx.int32))
         mx.eval(out)
     return decode(out[0].tolist())
