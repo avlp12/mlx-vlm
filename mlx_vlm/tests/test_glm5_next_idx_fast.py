@@ -101,12 +101,22 @@ def _clone(cache):
     out.keys = mx.array(cache.keys)
     out.values = cache.values
     out.offset = cache.offset
-    out._pool = tuple(
-        mx.array(a) if isinstance(a, mx.array) else a for a in cache._pool
+    # A prefill that landed in the short-context bypass returns before `_pool`
+    # and `_no_pad` are ever written, so the boundary cells clone a cache that
+    # has neither.  Carry that state faithfully -- inventing a pool here would
+    # hand the fast path an eligibility it does not have in production.
+    pool = getattr(cache, "_pool", None)
+    out._pool = (
+        None
+        if pool is None
+        else tuple(mx.array(a) if isinstance(a, mx.array) else a for a in pool)
     )
-    out._no_pad = cache._no_pad
+    out._no_pad = getattr(cache, "_no_pad", False)
     out._fpool = None
-    mx.eval(out.keys, out._pool[0], out._pool[1], out._pool[2])
+    if out._pool is None:
+        mx.eval(out.keys)
+    else:
+        mx.eval(out.keys, out._pool[0], out._pool[1], out._pool[2])
     return out
 
 
@@ -283,3 +293,215 @@ def test_toggle_off_uses_eager_path():
         mx.eval(ix(x, qr, None, cache=cache))
     finally:
         glm5.Glm5NextIndexer._decode_fast = real
+
+
+# --------------------------------------------------------------------------
+# Boundary-adjacent cells.
+#
+# Every context above is an exact multiple of `index_kpool` and comfortably
+# inside one regime, which means the suite never ran the two off-by-one points
+# the code actually has:
+#
+#   * the short-context bypass is `T <= index_topk` (language.py's
+#     `bypass_short` guard), so `T == index_topk` is the last silent step and
+#     `T == index_topk + 1` is the first step that has to build pool state from
+#     nothing -- the bypass returns *before* `_pool` and `_no_pad` are written;
+#   * the incremental tail `_pool_tail` sees `n = ((T - 1) % index_kpool) + 1`,
+#     so a prefill length congruent to 0 mod `index_kpool` -- which is all of
+#     them above -- pins the first incremental step at `n == 1` forever.  The
+#     `n == index_kpool` case (a pool completing) and the "new pool opens"
+#     case were both unreached.
+#
+# These cells land ON those points rather than stepping over them.  They are
+# written against `_CFG` rather than the literal 2048/4 so that they follow the
+# config if it moves.
+# --------------------------------------------------------------------------
+
+_TOPK = _CFG["index_topk"]
+_KPOOL = TextConfig.from_dict(dict(_CFG)).index_kpool
+
+
+def _carry_over_boundary(ix, config, ctx, n_steps, seed=1):
+    """`_carry`, but able to walk steps that are still in the bypass regime.
+
+    Returns ``(worst_mismatch, n_bypass_steps, n_active_steps)`` so a cell can
+    assert that the run really did contain the transition it is named for --
+    a boundary cell that silently stayed on one side would pass for free.
+    """
+    eager_cache = _prefill(ix, config, ctx, seed=seed)
+    fast_cache = _clone(eager_cache)
+    worst = n_bypass = n_active = 0
+    for x, qr in _steps(config, n_steps):
+        glm5._IDX_FAST_ENV = False
+        ref = ix(x, qr, None, cache=eager_cache)
+        glm5._IDX_FAST_ENV = True
+        got = ix(x, qr, None, cache=fast_cache)
+        if ref is None or got is None:
+            # The two arms must agree about *whether* the indexer speaks at
+            # all; a one-step disagreement here would be a silent selection
+            # change that a value comparison could never see.
+            assert ref is None and got is None, (
+                f"arms disagree on the bypass at T={eager_cache.offset}: "
+                f"eager={'None' if ref is None else 'array'} "
+                f"fast={'None' if got is None else 'array'}"
+            )
+            n_bypass += 1
+            continue
+        n_active += 1
+        mx.eval(ref, got)
+        assert ref.shape == got.shape and ref.dtype == got.dtype
+        worst = max(worst, int(mx.sum((ref != got).astype(mx.int32))))
+    return worst, n_bypass, n_active
+
+
+def test_bypass_predicate_is_inclusive_at_index_topk():
+    """Pin which side of `index_topk` is silent, and how wide the other side is.
+
+    This is the off-by-one itself, with no decode loop around it: at exactly
+    `index_topk` the indexer must return None and leave the cache with no pool
+    state, and at `index_topk + 1` it must return a selection of width
+    `index_topk + index_kpool - 1` (the always-select tail) and leave `_pool`
+    and `_no_pad` behind for the incremental path to pick up.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    ix = _indexer(config)
+    seen = {}
+    for T in (_TOPK, _TOPK + 1):
+        cache = KVCache()
+        mx.random.seed(5)
+        x = (mx.random.normal((1, T, config.hidden_size)) * 0.4).astype(mx.bfloat16)
+        qr = (mx.random.normal((1, T, config.q_lora_rank)) * 0.4).astype(mx.bfloat16)
+        glm5._IDX_FAST_ENV = False
+        out = ix(x, qr, None, cache=cache)
+        seen[T] = (out, cache)
+
+    at, cache_at = seen[_TOPK]
+    assert at is None, "T == index_topk must still take the short-context bypass"
+    assert getattr(cache_at, "_pool", None) is None
+    assert getattr(cache_at, "_no_pad", None) is None, (
+        "the bypass must return before `_no_pad` is written -- if it starts "
+        "writing it, the fast path becomes eligible one step earlier"
+    )
+
+    above, cache_above = seen[_TOPK + 1]
+    assert above is not None, "T == index_topk + 1 must be the active regime"
+    assert above.shape[-1] == _TOPK + (_KPOOL - 1 if _KPOOL > 1 else 0)
+    assert getattr(cache_above, "_pool", None) is not None
+    assert cache_above._pool[3] == _TOPK + 1
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_idx_fast_matches_eager_across_the_bypass_boundary(delta):
+    """Prefill one below / exactly on / one above `index_topk`, then decode.
+
+    At delta <= 0 the first step(s) are still bypassed, so the run contains
+    the step where the pool is built from an empty cache -- the branch the
+    comment at the bypass calls "rebuilt once when T first exceeds
+    index_topk", which no cell reached before.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    ix = _indexer(config)
+    worst, n_bypass, n_active = _carry_over_boundary(ix, config, _TOPK + delta, 8)
+    assert worst == 0
+    # The cell is only meaningful if the transition actually happened in it.
+    assert n_bypass == max(0, -delta), (n_bypass, delta)
+    assert n_active >= 6
+
+
+@pytest.mark.parametrize("delta", [1, 2, 3, 4])
+def test_idx_fast_matches_eager_at_every_kpool_phase(delta):
+    """One cell per residue of the prefill length mod `index_kpool`.
+
+    The prefill length fixes the phase of the incremental tail: `_pool_tail`
+    is handed `n = ((T - 1) % index_kpool) + 1`, so delta 1..4 walks the
+    *first* fast step's `n` through 2, 3, 4, 1.  delta=3 is the pool that
+    completes exactly on that first step (`n == index_kpool`, `pool_valid`
+    True); delta=4 (`ctx` an exact multiple of `index_kpool`) is the one that
+    opens a new pool on it.  Every other context in this file is congruent to
+    0, so `_fpool` was only ever seeded from a `_pool` whose trailing pool was
+    complete.
+
+    Honest scope: unlike the bypass cells below, these are breadth rather than
+    newly-guarded ground.  A 32-step run from a congruent-to-0 context already
+    sweeps every value of `n`; what is new here is only that the seeding
+    happens on an incomplete trailing pool.  A mutation that rounds the seeded
+    `t_prev` down to a pool boundary in `_pool_buffers` -- the obvious bug of
+    this shape -- is a semantic no-op, because `_decode_fast` consumes
+    `t_prev` only through `t_prev // index_kpool`.  These cells are kept for
+    the cost of 12 steps each, not on a demonstrated catch.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    ix = _indexer(config)
+    ctx = _TOPK + delta
+    worst, n_bypass, n_active = _carry_over_boundary(ix, config, ctx, 12)
+    assert worst == 0
+    assert n_bypass == 0 and n_active == 12
+    # Say out loud which phase this parametrisation actually exercised, so a
+    # config change that collapses the four cells into one is visible.
+    assert ((ctx - 1) % _KPOOL) + 1 == ((_TOPK + delta - 1) % _KPOOL) + 1
+
+
+def test_idx_fast_survives_a_verify_block_that_crosses_the_bypass():
+    """The S>1 block that turns the bypass off.
+
+    Speculative decoding does not have to cross `index_topk` one token at a
+    time: a width-W verify applied just below the boundary makes the *first*
+    active indexer call an S>1 call on a cache that has neither `_pool` nor
+    `_no_pad`.  Neither the fast path nor the eager incremental branch is
+    eligible there, so both arms must full-rebuild and then agree on every
+    single-token step that follows.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    ix = _indexer(config)
+    width = 4
+    # Land the block so that it starts inside the bypass and ends outside it.
+    ctx = _TOPK - width + 2
+    eager_cache = _prefill(ix, config, ctx)
+    fast_cache = _clone(eager_cache)
+    assert getattr(eager_cache, "_pool", None) is None
+
+    mx.random.seed(4321)
+    plan = [width] + [1] * 6 + [width] + [1] * 3
+    crossed = False
+    for n in plan:
+        x = (mx.random.normal((1, n, config.hidden_size)) * 0.4).astype(mx.bfloat16)
+        qr = (mx.random.normal((1, n, config.q_lora_rank)) * 0.4).astype(mx.bfloat16)
+        mx.eval(x, qr)
+        glm5._IDX_FAST_ENV = False
+        ref = ix(x, qr, None, cache=eager_cache)
+        glm5._IDX_FAST_ENV = True
+        got = ix(x, qr, None, cache=fast_cache)
+        if ref is None or got is None:
+            assert ref is None and got is None
+            continue
+        crossed = True
+        mx.eval(ref, got)
+        assert ref.shape == got.shape
+        assert int(mx.sum((ref != got).astype(mx.int32))) == 0, f"diverged at S={n}"
+    assert crossed, "the plan never left the bypass regime"
+
+
+def test_idx_fast_pool_growth_at_the_bypass_boundary():
+    """Pool-buffer growth with the smallest possible seed pool.
+
+    `_pool_buffers` sizes its preallocation from the pool count it inherits,
+    and the boundary is where that count is smallest relative to the run
+    length.  Shrink the growth step so the buffers must grow repeatedly while
+    the run is also crossing pool completions.
+    """
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+    config = _config()
+    ix = _indexer(config)
+    glm5._IDX_POOL_STEP = 2
+    worst, n_bypass, n_active = _carry_over_boundary(ix, config, _TOPK + 1, 40)
+    assert worst == 0
+    assert n_bypass == 0 and n_active == 40
