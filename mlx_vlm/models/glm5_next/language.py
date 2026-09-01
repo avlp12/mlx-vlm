@@ -51,10 +51,12 @@ _IDX_POOL_STEP = 512
 # KDA layers at B=8 and 4.25 GiB at B=16.  That is a throughput question, which
 # is why raising this number needs measurements and not a kernel change.
 #
-# Env-tunable, so the cap can be walked back (or pushed further) on a device that
-# measures differently without editing the model.  It is also the A/B lever: the
-# same process, the same code path, one number apart.
-_FUSED_KDA_MAX_BATCH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", "16"))
+# Env-tunable, so a width can be tried (or walked back) on a device that measures
+# differently without editing the model.  It is also the A/B lever for moving it:
+# the same process, the same code path, one number apart.  The default only ever
+# moves on a live measurement -- test_fused_kda_batch_cap_is_covered_by_parity
+# refuses any default the parity matrix below does not actually exercise.
+_FUSED_KDA_MAX_BATCH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", "8"))
 
 # The projection fold stops paying once the batch is wide enough to amortise the
 # weight read.  mx.quantized_matmul reads f_b/g_b once for all B rows (it becomes

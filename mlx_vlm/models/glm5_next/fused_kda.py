@@ -1,6 +1,6 @@
 """Fused single-token decode step for the GLM-5-Next KDA (Kimi Delta Attention) core.
 
-At B=1, S=1 the post-projection half of ``Glm5NextLinearAttention.__call__`` is a
+At S=1 the post-projection half of ``Glm5NextLinearAttention.__call__`` is a
 long tail of tiny elementwise / small-reduction kernels: the causal conv1d window
 update, silu, two L2 norms, the forget-gate softplus-free "safe gate", the sigmoid
 beta, the gated delta-rule state update and finally the gated RMSNorm.  Each of
@@ -23,9 +23,13 @@ A ``capture=True`` variant additionally emits the tensors ``gdn_sink`` carries f
 speculative rollback (post-conv q/k/v and the pre-conv window), straight out of
 threadgroup memory, so a drafter-attached single-token step keeps the fusion.
 
-Not a drop-in for prefill: this is decode-only (B=1, S=1, no SSM mask).
+Not a drop-in for prefill: this is decode-only (S=1, no SSM mask).  Batched
+decode *is* covered -- ``grid.z`` becomes ``B * H`` threadgroups, one per (batch
+row, head) -- and the per-row validity mask that batched decode always carries is
+applied in the one place the eager path applies it, at the pre-conv input.
 ``Glm5NextLinearAttention`` falls back to the eager path whenever any of those
-preconditions does not hold.
+preconditions does not hold, and caps the batch it will serve at a width parity
+has actually been run to (``_FUSED_KDA_MAX_BATCH``).
 """
 
 import logging

@@ -19,6 +19,9 @@ projections (``f_b_proj`` / ``g_b_proj``) into the same launch.
 Run the 34-layer micro-bench with ``python -m mlx_vlm.tests.test_glm5_next_fused_kda``.
 """
 
+import os
+import re
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -158,6 +161,12 @@ def _require_device(config, kind, layer=None):
         kwargs["group_size"] = int(layer.forget_gate.f_b_proj.group_size)
     if fused_kda_probe(**kwargs) is None:
         pytest.skip(f"device threadgroup cap below the {kind} kernel's requirement")
+
+
+# Every batch width the eager-vs-fused parity suite is run at.  _FUSED_KDA_MAX_BATCH
+# is required to be one of these (test_fused_kda_batch_cap_is_covered_by_parity), so
+# the cap cannot be raised to a width nothing has ever been compared at.
+_PARITY_BATCHES = (2, 4, 8, 16)
 
 
 def _masks(kind, batch, steps, seed=99):
@@ -463,10 +472,10 @@ if __name__ == "__main__":  # pragma: no cover
     _bench()
 
 
-@pytest.mark.parametrize("batch", [2, 4, 8])
+@pytest.mark.parametrize("batch", _PARITY_BATCHES)
 @pytest.mark.parametrize("mask_kind", ["none", "all-true", "ragged"])
 def test_fused_kda_batched_matches_eager(batch, mask_kind):
-    """Batched decode (B <= 8), across the three mask regimes it actually sees.
+    """Batched decode, across the three mask regimes it actually sees.
 
     BatchGenerator sets left_padding on the ArraysCache even for a uniform-length
     batch, so batched decode always arrives with a bool mask -- all-true once the
@@ -523,6 +532,15 @@ def test_fused_kda_batch_gate():
     ok = dict(B=4, S=1, mask=None, cache=cache, gdn_sink=None, ref=ref)
     assert layer._fused_kda_eligible(**ok)
     assert layer._fused_kda_eligible(**{**ok, "mask": mx.ones((4, 1), dtype=mx.bool_)})
+    cap = glm5._FUSED_KDA_MAX_BATCH
+    assert layer._fused_kda_eligible(
+        B=cap,
+        S=1,
+        mask=mx.ones((cap, 1), dtype=mx.bool_),
+        cache=_cache(config, batch=cap),
+        gdn_sink=None,
+        ref=mx.zeros((cap, 1, config.hidden_size), mx.bfloat16),
+    )
     over = glm5._FUSED_KDA_MAX_BATCH + 1
     assert not layer._fused_kda_eligible(
         B=over,
@@ -539,7 +557,7 @@ def test_fused_kda_batch_gate():
     )
 
 
-@pytest.mark.parametrize("batch", [2, 8])
+@pytest.mark.parametrize("batch", [2, 8, 16])
 def test_fused_kda_batched_capture_matches_eager_gdn_sink(batch):
     """The speculative sink must be exact at B > 1 too (rollback replays it)."""
     if not mx.metal.is_available():
@@ -599,3 +617,132 @@ def test_fused_kda_batched_capture_matches_eager_gdn_sink(batch):
         for r, g in pairs:
             worst = max(worst, _max_abs_rel(r, g))
     assert worst == (0.0, 0.0), f"expected bit-identical sink, got {worst}"
+
+
+# --------------------------------------------------------------------------
+# Why the batch cap is a policy number and not a kernel limit.
+#
+# _FUSED_KDA_MAX_BATCH says how wide a batch parity has been run to.  That is
+# only an honest thing to say if widening the batch really does leave the
+# compiled pipeline alone -- otherwise the number would be hiding a threadgroup
+# budget or a register cliff, and raising it would be shipping a degraded
+# kernel.  The two tests below check that structurally, on the CPU, so the claim
+# survives a future edit to the kernel rather than resting on a code comment.
+_TG_LIMIT_BYTES = 32768  # Apple GPU threadgroup memory budget (Apple7 onward)
+
+
+def _kernel_sources():
+    from mlx_vlm.models.glm5_next import fused_kda as fk
+
+    return {
+        "base": fk._SOURCE,
+        "capture": fk._SOURCE + fk._SINK_SOURCE,
+        "qproj": fk._qproj_source(fk._SOURCE),
+    }
+
+
+def _strip_comments(src):
+    # The kernel sources contain no string or character literals, so removing
+    # /* */ and // spans is exact here.
+    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)
+    return "\n".join(re.sub(r"//.*$", "", line) for line in src.splitlines())
+
+
+def test_fused_kda_kernel_source_is_batch_agnostic():
+    """No variant's *code* may mention B; only grid.z and the buffer extents may.
+
+    This is the whole basis for one threadgroup probe covering every batch size
+    and for the cap being raisable by measurement alone.  ``B`` appears in the
+    sources five times, every one of them inside a comment describing a buffer
+    shape -- if a future edit makes a real expression depend on B, the compiled
+    pipeline stops being batch-invariant and this fails.
+    """
+    ident_b = re.compile(r"(?<![A-Za-z0-9_])B(?![A-Za-z0-9_])")
+    for name, src in _kernel_sources().items():
+        offending = [
+            line.strip()
+            for line in _strip_comments(src).splitlines()
+            if ident_b.search(line)
+        ]
+        assert not offending, f"{name} kernel reads B in code: {offending}"
+        # ... and it is genuinely mentioned in the prose, so the check above is
+        # not passing because the regex is broken.
+        assert ident_b.search(src), f"{name}: regex found no B at all"
+
+
+def test_fused_kda_threadgroup_footprint_is_b_independent_and_fits():
+    """Every threadgroup allocation is sized by the head dim, never by the batch.
+
+    One threadgroup serves one (batch row, head) pair, so a wider batch buys more
+    threadgroups and not bigger ones.  At the live GLM-5.3-Flash dims that is
+    3084 B for the base and capture pipelines and 3596 B with the projection
+    fold, against a 32 KiB budget -- the same at B=1 and at B=16.
+    """
+    D = _CFG["linear_attn_config"]["head_dim"]
+    decl = re.compile(r"threadgroup\s+float\s+(\w+)\s*\[([^\]]+)\]")
+    expected = {"base": 3084, "capture": 3084, "qproj": 3596}
+    for name, src in _kernel_sources().items():
+        total = 0
+        for var, extent in decl.findall(_strip_comments(src)):
+            extent = extent.strip()
+            assert extent == "D" or extent.isdigit(), (
+                f"{name}: threadgroup array {var}[{extent}] is not sized by the "
+                "head dim or a constant -- a batch-sized one would break the "
+                "one-threadgroup-per-(row, head) mapping"
+            )
+            total += (D if extent == "D" else int(extent)) * 4
+        assert total == expected[name], f"{name}: {total} B, expected {expected[name]}"
+        assert total <= _TG_LIMIT_BYTES
+
+
+def test_fused_kda_batch_cap_is_env_tunable():
+    """The cap can be moved without editing the model (and is the A/B lever).
+
+    Read at import, like the gather-gate constants next to it, so this needs a
+    fresh interpreter rather than a reload -- reloading would swap the layer
+    class out from under the rest of the session.
+    """
+    import subprocess
+    import sys
+
+    prog = (
+        "import mlx_vlm.models.glm5_next.language as g\nprint(g._FUSED_KDA_MAX_BATCH)"
+    )
+    for env_value, expect in ((None, "8"), ("16", "16"), ("32", "32")):
+        env = dict(os.environ)
+        env.pop("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", None)
+        if env_value is not None:
+            env["MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH"] = env_value
+        out = subprocess.run(
+            [sys.executable, "-c", prog],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        assert out.stdout.strip() == expect, out.stderr
+
+
+def test_fused_kda_qproj_fold_still_declines_a_wide_batch():
+    """Raising the base cap must not drag the projection fold along with it.
+
+    The fold inverts as the batch grows (it re-reads the weights per (row, head)
+    threadgroup while mx.quantized_matmul reads them once for all rows), so it
+    keeps its own, much lower cap.  Nothing about the B=16 extension changes it.
+    """
+    assert glm5._FUSED_KDA_QPROJ_MAX_BATCH == 2
+    assert glm5._FUSED_KDA_QPROJ_MAX_BATCH < glm5._FUSED_KDA_MAX_BATCH
+
+
+def test_fused_kda_batch_cap_is_covered_by_parity():
+    """The shipped cap may only be a width this file actually compares.
+
+    The cap is a claim about evidence -- "eager and fused agree this far" -- so
+    it is worth making it impossible to raise the number without adding the
+    evidence.  Widening _PARITY_BATCHES costs one line and 32 carried decode
+    steps per mask regime; that is the price of moving the default.
+    """
+    assert glm5._FUSED_KDA_MAX_BATCH in (1,) + _PARITY_BATCHES, (
+        f"cap is {glm5._FUSED_KDA_MAX_BATCH} but parity only runs at "
+        f"{_PARITY_BATCHES}"
+    )
