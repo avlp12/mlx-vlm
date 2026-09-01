@@ -176,7 +176,7 @@ def _require_device(config, kind, layer=None):
 # Every batch width the eager-vs-fused parity suite is run at.  _FUSED_KDA_MAX_BATCH
 # is required to be one of these (test_fused_kda_batch_cap_is_covered_by_parity), so
 # the cap cannot be raised to a width nothing has ever been compared at.
-_PARITY_BATCHES = (2, 4, 8, 16)
+_PARITY_BATCHES = (2, 4, 8, 16, 32)
 
 
 def _masks(kind, batch, steps, seed=99):
@@ -568,7 +568,7 @@ def test_fused_kda_batch_gate():
     )
 
 
-@pytest.mark.parametrize("batch", [2, 8, 16])
+@pytest.mark.parametrize("batch", [2, 8, 16, 32])
 def test_fused_kda_batched_capture_matches_eager_gdn_sink(batch):
     """The speculative sink must be exact at B > 1 too (rollback replays it)."""
     if not mx.metal.is_available():
@@ -720,7 +720,7 @@ def test_fused_kda_batch_cap_is_env_tunable():
     prog = (
         "import mlx_vlm.models.glm5_next.language as g\nprint(g._FUSED_KDA_MAX_BATCH)"
     )
-    for env_value, expect in ((None, "8"), ("16", "16"), ("32", "32")):
+    for env_value, expect in ((None, "8"), ("16", "16"), ("32", "32"), ("2", "2")):
         env = dict(os.environ)
         env.pop("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", None)
         if env_value is not None:
