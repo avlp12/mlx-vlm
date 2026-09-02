@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, CacheList, KVCache
+from ....models.glm5_next.language import trim_sparse_cache
 from ....models.glm5_next.mtp import Glm5NextMTP, load_mtp_weights
 from .config import Glm5NextMTPConfig
 
@@ -156,6 +157,20 @@ class Glm5NextMTPDraftModel(nn.Module):
         h = self._forward_tokens(shifted, hidden[:, : shifted.shape[1], :], token_dtype)
         self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
 
+    def _trim_cache(self, trim: int) -> None:
+        # Rolling the drafter's own sparse cache back on a partial accept is the
+        # same operation the target does in rollback_speculative_cache, so it goes
+        # through the same helper: trim the two KV caches AND move the indexer's
+        # pooled-key caches with them.  The raw ``cache.trim(trim)`` this replaces
+        # left ``_pool`` describing the pre-trim length, which the indexer's
+        # incremental guard then rejects -- correct, but it pays a full O(T)
+        # repool on the next step instead of the O(index_kpool) one.
+        if trim <= 0:
+            return
+        kpool = self.mtp.self_attn.indexer.index_kpool
+        for cache in self._cache:
+            trim_sparse_cache(cache, trim, kpool)
+
     def accept_verified_tokens(
         self,
         verify_hidden: mx.array,
@@ -168,9 +183,7 @@ class Glm5NextMTPDraftModel(nn.Module):
     ) -> None:
         keep_appended = min(int(accepted), self._round_appended)
         trim = self._round_appended - keep_appended
-        if trim > 0:
-            for cache in self._cache:
-                cache.trim(trim)
+        self._trim_cache(trim)
 
         token_chunks = []
         hidden_chunks = []
@@ -205,9 +218,7 @@ class Glm5NextMTPDraftModel(nn.Module):
         a = int(accepted[0])
         keep = min(a, self._round_appended)
         trim = self._round_appended - keep
-        if trim > 0:
-            for cache in self._cache:
-                cache.trim(trim)
+        self._trim_cache(trim)
 
         token_chunks = []
         hidden_chunks = []

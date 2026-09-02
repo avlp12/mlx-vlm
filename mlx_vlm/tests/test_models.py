@@ -2930,6 +2930,62 @@ class TestModels(unittest.TestCase):
             glm5_lang._GATHER_MIN_CONTEXT = old_min
         self.assertTrue(mx.all(mx.isfinite(out2)).item())
 
+    def test_glm5_next_video_pixels_reach_vision_tower(self):
+        from mlx_vlm.models import glm5_next
+
+        vision = glm5_next.VisionConfig(
+            model_type="glm_ocr_vision",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=128,
+            projection_intermediate_size=128,
+            image_size=28,
+            spatial_merge_size=1,
+            temporal_patch_size=2,
+        )
+        config = glm5_next.ModelConfig(
+            text_config=self._glm5_next_mtp_text_config(),
+            vision_config=vision,
+            model_type="glm5_next",
+            image_token_id=7,
+            video_token_id=8,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        model = glm5_next.Model(config)
+
+        class _Reached(Exception):
+            pass
+
+        seen = {}
+
+        class _VisionSpy:
+            def __init__(self, real):
+                self.patch_embed = real.patch_embed
+
+            def __call__(self, pixel_values, grid_thw):
+                seen["grid"] = grid_thw
+                raise _Reached
+
+        model.vision_model = _VisionSpy(model.vision_model)
+
+        with self.assertRaises(_Reached):
+            model.get_input_embeddings(
+                mx.array([[1, 8, 8, 2]]),
+                pixel_values=None,
+                pixel_values_videos=mx.zeros((4, 8)),
+                video_grid_thw=mx.array([[2, 1, 1]]),
+            )
+        self.assertIsNotNone(seen.get("grid"))
+
+        feats = model.get_input_embeddings(mx.array([[1, 2, 3]]), pixel_values=None)
+        self.assertEqual(
+            feats.inputs_embeds.shape, (1, 3, config.text_config.hidden_size)
+        )
+
     def test_glm5_next_kda_matches_recurrent(self):
         # The shared gated-delta path must match glm5_next's reference recurrence
         # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).
@@ -3799,6 +3855,227 @@ class TestModels(unittest.TestCase):
             sampler,
             greedy=True,
         )
+
+    def _glm5_next_mtp_primed_drafter(self):
+        """A bound glm5_next_mtp drafter whose own sparse cache is past index_topk."""
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+        from mlx_vlm.speculative.drafters.glm5_next_mtp import Model, ModelConfig
+
+        mx.random.seed(0)
+        tcfg = self._glm5_next_mtp_text_config()
+        lm = LanguageModel(tcfg)
+        lm.eval()
+        mx.eval(lm.parameters())
+        drafter = Model(ModelConfig(text_config=tcfg, block_size=3))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        drafter.reset(lm)
+
+        sampler = lambda logits: mx.argmax(logits, axis=-1)
+        prompt = mx.array([[2, 4, 6, 8, 10, 12, 14, 16]])
+        out = lm(
+            prompt,
+            cache=lm.make_cache(),
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        hidden = out.hidden_states[-1]
+        bonus = int(mx.argmax(out.logits[:, -1, :]).item())
+        drafter.prefill_from_target_hidden(prompt, hidden, bonus, sampler, greedy=True)
+        return drafter, lm, hidden, bonus, sampler
+
+    def _glm5_next_mtp_reject_without_append(self, drafter, hidden, bonus, sampler):
+        """Two full-accept rounds, then a rejected round that trims and appends nothing.
+
+        The trim-with-no-append round is the one that leaves the indexer pools
+        observable: ``accept_verified_tokens`` only re-enters the indexer when it has
+        something to append, so with ``accepted == 0`` and no new token the pools stay
+        exactly as the trim left them.
+        """
+        verify_hidden = mx.broadcast_to(hidden[:, -1:, :], (1, 3, hidden.shape[-1]))
+        for _ in range(2):
+            draft = drafter.draft_block(
+                bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+            )
+            drafter.accept_verified_tokens(
+                verify_hidden,
+                draft,
+                2,
+                [int(draft[0, -1].item())],
+                sampler,
+                greedy=True,
+            )
+        draft = drafter.draft_block(
+            bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+        )
+        self.assertGreater(drafter._round_appended, 0)  # there is something to trim
+        drafter.accept_verified_tokens(
+            verify_hidden, draft, 0, [], sampler, greedy=True
+        )
+
+    def test_glm5_next_mtp_drafter_trim_rolls_back_indexer_pool(self):
+        # A partial accept trims the drafter's own sparse cache. The indexer's pooled
+        # -key cache must move with it, exactly as the target does in
+        # rollback_speculative_cache -- both now go through trim_sparse_cache. Leaving
+        # `_pool` describing the pre-trim length is not a wrong answer (the incremental
+        # guard `_pool[3] == T - S` rejects it) but it costs a full O(T) repool on the
+        # next step instead of the O(index_kpool) one.
+        drafter, _lm, hidden, bonus, sampler = self._glm5_next_mtp_primed_drafter()
+        cache = drafter._cache[0]
+        self._glm5_next_mtp_reject_without_append(drafter, hidden, bonus, sampler)
+
+        pool = getattr(cache[1], "_pool", None)
+        self.assertIsNotNone(pool)  # the eager path owns the pool when IDX_FAST is off
+        self.assertEqual(pool[3], cache[0].offset)
+        kpool = drafter.mtp.self_attn.indexer.index_kpool
+        self.assertEqual(pool[0].shape[1], pool[3] // kpool)
+
+    def test_glm5_next_mtp_drafter_trim_drops_fast_indexer_pool(self):
+        # Same trim, with the fast indexer decode path live. `_fpool` is the
+        # preallocated append-only pool store; it is keyed on a length, so it must not
+        # survive a trim. The flag is read once into a module global, so the module
+        # global is what the test moves -- setting the env var here would be a no-op.
+        from mlx_vlm.models.glm5_next import language as glm5_lang
+
+        saved = glm5_lang._IDX_FAST_ENV
+        glm5_lang._IDX_FAST_ENV = True
+        try:
+            drafter, _lm, hidden, bonus, sampler = self._glm5_next_mtp_primed_drafter()
+            cache = drafter._cache[0]
+            # A full-accept round appends one token (S == 1), which is what lets
+            # _decode_fast run and build `_fpool` in the first place.
+            verify_hidden = mx.broadcast_to(hidden[:, -1:, :], (1, 3, hidden.shape[-1]))
+            for _ in range(2):
+                draft = drafter.draft_block(
+                    bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+                )
+                drafter.accept_verified_tokens(
+                    verify_hidden,
+                    draft,
+                    2,
+                    [int(draft[0, -1].item())],
+                    sampler,
+                    greedy=True,
+                )
+            draft = drafter.draft_block(
+                bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+            )
+            self.assertIsNotNone(getattr(cache[1], "_fpool", None))  # precondition
+            self.assertGreater(drafter._round_appended, 0)
+            drafter.accept_verified_tokens(
+                verify_hidden, draft, 0, [], sampler, greedy=True
+            )
+            self.assertIsNone(getattr(cache[1], "_fpool", None))
+        finally:
+            glm5_lang._IDX_FAST_ENV = saved
+
+    def test_glm5_next_indexer_fast_pool_guard_rejects_after_trim(self):
+        # Receipt for a claim that had to be walked back: a STALE `_fpool` surviving a
+        # trim cannot actually be consumed, so the drafter's old untracked trim was a
+        # cost bug and not silent corruption.
+        #
+        # The fast-decode guard is `_fpool[3] == T - 1` AND `S == 1`. After a trim of
+        # k tokens followed by an append of n tokens in one call, T == T0 - k + n and
+        # S == n, so the guard needs n == 1 (from S) and then T0 == T0 - k, i.e. k == 0.
+        # The "trim k then append n == k + 1" shape is therefore only expressible with
+        # S == n > 1, which the guard rejects on S alone. And the eager path it falls
+        # to nulls `_fpool`, so a stale one cannot survive to a later step either.
+        from mlx_vlm.models.glm5_next import language as glm5_lang
+
+        saved = glm5_lang._IDX_FAST_ENV
+        original = glm5_lang.Glm5NextIndexer._decode_fast
+        calls = []
+
+        def _spy(self, *args, **kwargs):
+            calls.append(1)
+            return original(self, *args, **kwargs)
+
+        glm5_lang._IDX_FAST_ENV = True
+        glm5_lang.Glm5NextIndexer._decode_fast = _spy
+        try:
+            drafter, _lm, hidden, bonus, sampler = self._glm5_next_mtp_primed_drafter()
+            cache = drafter._cache[0]
+            step_hidden = hidden[:, -1:, :]
+            # Warm the fast path: two single-token steps, the second of which must
+            # take it (positive control -- without this the negative one proves nothing).
+            drafter._forward_tokens(mx.array([[5]]), step_hidden, mx.int32)
+            calls.clear()
+            drafter._forward_tokens(mx.array([[7]]), step_hidden, mx.int32)
+            self.assertEqual(len(calls), 1)
+            self.assertIsNotNone(getattr(cache[1], "_fpool", None))
+
+            # Now the hazardous shape, built by hand: trim WITHOUT invalidating (the
+            # pre-fix behaviour), so `_fpool` is stale by exactly k == 1.
+            stale = cache[1]._fpool
+            cache.trim(1)
+            cache[1]._fpool = stale
+            self.assertEqual(stale[3], cache[0].offset + 1)  # stale by k == 1
+            calls.clear()
+            drafter._forward_tokens(mx.array([[9]]), step_hidden, mx.int32)
+            self.assertEqual(len(calls), 0)  # guard rejected the stale prefix
+            self.assertIsNone(getattr(cache[1], "_fpool", None))  # eager path cleared it
+        finally:
+            glm5_lang.Glm5NextIndexer._decode_fast = original
+            glm5_lang._IDX_FAST_ENV = saved
+
+    def test_glm5_next_mtp_ffn_compile_is_bit_identical(self):
+        # The nextn FFN half is compiled by default (B == 1, S <= 8). Default-on is
+        # justified by bit-identity, not by a speed claim: compiled and eager must be
+        # mx.array_equal, so the switch cannot move an output bit. If this ever fails,
+        # flip the default in _mtp_ffn_compile_enabled to off.
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.mtp import Glm5NextMTP
+
+        cfg = self._glm5_next_mtp_text_config()
+        for seed in (0, 1):
+            mx.random.seed(seed)
+            mtp = Glm5NextMTP(cfg)
+            mtp.eval()
+            mx.eval(mtp.parameters())
+            for S in (1, 4, 8):
+                hidden = mx.random.normal((1, S, cfg.hidden_size))
+                embed = mx.random.normal((1, S, cfg.hidden_size))
+                outputs = {}
+                for enabled in (False, True):
+                    mtp.compile_ffn = enabled
+                    mtp._ffn_c = None
+                    outputs[enabled] = mtp(
+                        hidden, embed, cache=CacheList(KVCache(), KVCache())
+                    )
+                    # The compiled arm must actually have compiled, or this test
+                    # would be comparing eager against eager and prove nothing.
+                    self.assertEqual(mtp._ffn_c is not None, enabled)
+                mx.eval(list(outputs.values()))
+                self.assertTrue(
+                    mx.array_equal(outputs[True], outputs[False]).item(),
+                    f"compiled nextn FFN is not bit-identical at seed={seed} S={S}",
+                )
+
+    def test_glm5_next_mtp_ffn_compile_gate(self):
+        # The compile gate must refuse B > 1 and S > 8 -- compiling the MoE at
+        # batched or prefill shapes spikes memory (the target carries the same bound).
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.mtp import Glm5NextMTP, _mtp_ffn_compile_enabled
+
+        cfg = self._glm5_next_mtp_text_config()
+        mx.random.seed(0)
+        for shape in ((2, 2), (1, 9)):
+            mtp = Glm5NextMTP(cfg)
+            mtp.eval()
+            mx.eval(mtp.parameters())
+            mtp.compile_ffn = True
+            mtp._ffn_c = None
+            B, S = shape
+            mtp(
+                mx.random.normal((B, S, cfg.hidden_size)),
+                mx.random.normal((B, S, cfg.hidden_size)),
+                cache=CacheList(KVCache(), KVCache()),
+            )
+            self.assertIsNone(mtp._ffn_c, f"compiled the FFN at B={B} S={S}")
+
+        mtp = Glm5NextMTP(cfg)
+        self.assertEqual(mtp.compile_ffn, _mtp_ffn_compile_enabled())
 
     def test_glm5_next_mtp_never_lose_gate(self):
         # The never-lose gate has two parts: (1) the drafter yields an empty block at
