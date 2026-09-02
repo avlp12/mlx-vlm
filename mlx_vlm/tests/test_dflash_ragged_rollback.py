@@ -132,10 +132,10 @@ class _RollbackDone(Exception):
     """
 
 
-def _run_one_ragged_round(model, accepted=RAGGED):
-    """One real ``_dflash_rounds_batch`` round with ragged per-row acceptance.
+def _run_one_ragged_round(model, accepted=RAGGED, rounds_to_run=1):
+    """``rounds_to_run`` real ``_dflash_rounds_batch`` rounds, ragged accepts.
 
-    Returns (drafter, emitted_tokens_per_row, accepted_seen_by_rollback).
+    Returns (drafter, emitted_tokens_per_row, cache, rollbacks_seen).
     """
     target = SimpleNamespace(language_model=model)
     cache = model.make_cache()
@@ -157,14 +157,19 @@ def _run_one_ragged_round(model, accepted=RAGGED):
     original_walk = dflash_utils._speculative_walk_batch
     dflash_utils._speculative_walk_batch = ragged_walk
 
-    seen = {}
+    seen = []
     original_rollback = model.rollback_speculative_cache
 
     def spy(caches, gdn_states, accepted_arg, block_size):
-        seen["accepted"] = [int(v) for v in accepted_arg.reshape(-1).tolist()]
-        seen["block_size"] = int(block_size)
+        seen.append(
+            (
+                [int(v) for v in accepted_arg.reshape(-1).tolist()],
+                int(block_size),
+            )
+        )
         original_rollback(caches, gdn_states, accepted_arg, block_size)
-        raise _RollbackDone
+        if len(seen) >= rounds_to_run:
+            raise _RollbackDone
 
     model.rollback_speculative_cache = spy
     drafter = _StubDrafter()
@@ -192,16 +197,17 @@ def _run_one_ragged_round(model, accepted=RAGGED):
     finally:
         model.rollback_speculative_cache = original_rollback
         dflash_utils._speculative_walk_batch = original_walk
-    assert "accepted" in seen, "rollback was never called"
+    assert len(seen) == rounds_to_run, f"expected {rounds_to_run} rollbacks, got {seen}"
     return drafter, emitted, cache, seen
 
 
 def _reference_cache(model, row, emitted_row):
-    """A fresh forward over exactly what this row committed this round.
+    """A fresh forward over exactly what this row has committed so far.
 
-    ``emitted_row`` is [accepted drafts..., target's own token]; the tokens the
-    cache must hold are the row's previous bonus plus those accepted drafts,
-    i.e. ``[bonus] + emitted_row[:-1]``.
+    Each round emits [accepted drafts..., the target's own token], and that
+    last token is the bonus the NEXT round feeds back in. So across any number
+    of rounds the tokens the cache must hold are the row's first bonus plus
+    every emitted token except the last: ``[bonus] + emitted_row[:-1]``.
     """
     cache = model.make_cache()
     model(mx.array([PROMPT], dtype=mx.int32), cache=cache)
@@ -276,12 +282,47 @@ def test_dflash_batch_clamps_ragged_accepts_so_cache_matches_emitted_tokens():
 
     # And the two things that made it true: the rollback saw a uniform count,
     # and every row emitted exactly (uniform accepted + 1) tokens.
-    assert seen["accepted"] == [min(RAGGED)] * 2, (
-        "rollback_speculative_cache received ragged accepts "
-        f"{seen['accepted']}; glm5_next trims by max(), so the short row keeps "
-        "the KV of tokens it rejected"
+    assert [a for a, _ in seen] == [[min(RAGGED)] * 2], (
+        f"rollback_speculative_cache received ragged accepts {seen}; glm5_next "
+        "trims by max(), so the short row keeps the KV of tokens it rejected"
     )
     assert [len(e) for e in emitted] == [min(RAGGED) + 1] * 2, emitted
+
+
+def test_dflash_batch_clamp_composes_over_two_ragged_rounds():
+    """One clamped round can be right by luck; two in a row cannot.
+
+    Round 2 drafts from round 1's bonus and verifies into round 1's rolled-back
+    cache, so an off-by-one between the token a row emitted and the state it
+    was left in only shows up on the second pass.
+    """
+    mx.random.seed(3)
+    model = _tiny_glm5_next_target()
+    mx.eval(model.parameters())
+
+    drafter, emitted, cache, seen = _run_one_ragged_round(model, rounds_to_run=2)
+
+    assert [a for a, _ in seen] == [[min(RAGGED)] * 2] * 2, seen
+    assert [len(e) for e in emitted] == [2 * (min(RAGGED) + 1)] * 2, emitted
+
+    for row in range(2):
+        ref_cache, committed = _reference_cache(model, row, emitted[row])
+        for layer, (got_entry, ref_entry) in enumerate(zip(cache, ref_cache)):
+            for (name, got_off, got_arr), (_, ref_off, ref_arr) in zip(
+                _row_signature(got_entry.extract(row)), _row_signature(ref_entry)
+            ):
+                assert got_off == ref_off, (
+                    f"round 2, row {row} layer {layer} {name}: offset {got_off} "
+                    f"but a forward over {committed} lands at {ref_off}"
+                )
+                worst = _worst_diff(got_arr, ref_arr)
+                assert worst <= _ROW_TOL, (
+                    f"round 2, row {row} layer {layer} {name}: max abs diff "
+                    f"{worst:.3e} against a fresh forward over {committed}"
+                )
+
+    # Two rounds, two give-backs.
+    assert drafter.clamped_tokens == 2 * sum(a - min(RAGGED) for a in RAGGED)
 
 
 def test_dflash_batch_clamp_is_counted_in_the_receipts():
