@@ -23,8 +23,13 @@ def _fake_step(n=64):
     return step
 
 
-def _driver(k=2, n_ch=2, dev=mx.cpu):
-    chans = [Channel(name=f"c{i}", step=_fake_step()) for i in range(n_ch)]
+def _driver(k=2, n_ch=2, dev=mx.cpu, sequential=False):
+    """sequential=False by default: these are synthetic fixed-shape probes whose
+    next input does not depend on the previous output, so they may legally run
+    ahead. A REAL decode channel is sequential=True and is pinned at lag=1 --
+    see test_sequential_channel_refuses_lag_above_one."""
+    chans = [Channel(name=f"c{i}", step=_fake_step(), sequential=sequential)
+             for i in range(n_ch)]
     return MultiStreamDriver(chans, lag=k, device=dev)
 
 
@@ -113,3 +118,45 @@ def test_memo_scope_is_entered_per_channel():
     d.tick()
     assert set(seen) == {"k0", "k1"}, seen
     assert glm5.stream_memo_key() == "default", "scope leaked past the driver"
+
+
+# ----------------------------------------------- autoregressive channels (I10xx)
+def test_sequential_channel_refuses_lag_above_one():
+    """An autoregressive channel cannot run ahead: step N+1 needs step N's token,
+    which does not exist until collection. Running ahead is SILENTLY WRONG, not an
+    error -- measured, a lag=2 AR channel was fed [0,0,1,1] where correct is
+    [0,1,2]. The driver must refuse rather than let that happen."""
+    chans = [Channel(name="ar", step=_fake_step())]      # sequential=True default
+    with pytest.raises(ValueError, match="cannot run ahead"):
+        MultiStreamDriver(chans, lag=2, device=mx.cpu)
+
+
+def test_sequential_channel_allows_lag_one():
+    d = MultiStreamDriver([Channel(name="ar", step=_fake_step())],
+                          lag=1, device=mx.cpu)
+    d.run(rounds=3)
+    assert d.channels[0].completed == 3
+
+
+def test_non_sequential_channel_may_run_ahead():
+    chans = [Channel(name="probe", step=_fake_step(), sequential=False)]
+    d = MultiStreamDriver(chans, lag=4, device=mx.cpu)
+    for ch in d.channels:
+        while len(ch.pending) < d.lag:
+            d._submit(ch)
+    assert len(d.channels[0].pending) == 4
+    d.drain()
+
+
+def test_concurrency_for_real_serving_comes_from_channels_not_lag():
+    """The shippable configuration: N channels at lag=1. Channel 1's forward is
+    outstanding while channel 0 is being collected -- that is the mechanism, and
+    it needs no lookahead."""
+    d = MultiStreamDriver([Channel(name=f"u{i}", step=_fake_step()) for i in range(3)],
+                          lag=1, device=mx.cpu)
+    submitted = []
+    orig = d._submit
+    d._submit = lambda ch: (submitted.append(ch.name), orig(ch))[1]
+    d.tick()
+    assert submitted == ["u0", "u1", "u2"], submitted
+    assert all(ch.completed == 1 for ch in d.channels)

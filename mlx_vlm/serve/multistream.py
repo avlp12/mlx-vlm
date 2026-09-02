@@ -40,6 +40,14 @@ lag>=2 leaves work in flight on every channel while one is being collected.
 lag is not free: it is added latency to first token on each channel, so the k it
 takes to win is part of the result, not an implementation detail.
 
+AND FOR REAL DECODE, lag IS PINNED AT 1.  An autoregressive channel cannot run
+ahead -- step N+1 needs step N's token, which does not exist until step N is
+collected.  Submitting ahead does not fail loudly; it silently reuses a stale
+token.  So concurrency for real serving comes from CHANNELS (users), not from
+lag: N=2 at lag=1 already leaves channel 1's forward outstanding while channel 0
+is being collected, which is the whole mechanism.  lag>1 exists only to
+characterise non-autoregressive work and is not a serving configuration.
+
 MEMO KEYING
 ===========
 Three per-module memos are keyed by SHAPE, not stream -- the compiled FFN, the
@@ -74,13 +82,29 @@ def _memo_scope(key: str):
 class Channel:
     """One request. ``step`` CONSTRUCTS the next forward and returns the array to
     evaluate -- it must not call mx.eval itself, or the driver's lag is defeated
-    and the streams serialise (law 18)."""
+    and the streams serialise (law 18).
+
+    ``sequential`` (default True) means step N+1 depends on step N's RESULT, which
+    is what autoregressive decode is: the next token does not exist until the
+    previous forward has been COLLECTED. Such a channel CANNOT run ahead, and
+    letting it try produces SILENTLY WRONG RESULTS rather than an error -- measured
+    on this driver, a lag=2 autoregressive channel was fed tokens [0, 0, 1, 1]
+    where the correct sequence is [0, 1, 2]. The driver refuses it.
+
+    Set sequential=False only for work whose next input is genuinely independent
+    of the previous output (a fixed-shape probe, a replayed trace). Real decode
+    and real speculative verify are both sequential."""
     name: str
     step: Callable[[], mx.array]
+    sequential: bool = True
     stream: Optional[object] = None
     pending: Deque[Tuple[mx.array, float]] = field(default_factory=deque)
     latencies: List[float] = field(default_factory=list)
     completed: int = 0
+    #: the most recently COLLECTED (evaluated) output. A sequential channel's
+    #: next step reads this -- it is the whole reason such a channel cannot run
+    #: ahead, and it is only valid after the collect that produced it.
+    last: Optional[mx.array] = None
 
 
 class MultiStreamDriver:
@@ -92,6 +116,16 @@ class MultiStreamDriver:
     def __init__(self, channels: List[Channel], lag: int = 2, device=None):
         if lag < 1:
             raise ValueError("lag must be >= 1")
+        bad = [c.name for c in channels if c.sequential and lag > 1]
+        if bad:
+            raise ValueError(
+                f"lag={lag} with sequential channel(s) {bad}: an autoregressive "
+                f"channel cannot run ahead -- step N+1 needs step N's RESULT, which "
+                f"only exists after collection. Running ahead does not error, it "
+                f"silently reuses a stale input (measured: tokens [0,0,1,1] instead "
+                f"of [0,1,2]). Use lag=1 and add CHANNELS for concurrency, or mark "
+                f"the channel sequential=False if its input really is independent."
+            )
         self.lag = int(lag)
         self.channels = channels
         dev = device if device is not None else mx.gpu
@@ -112,6 +146,7 @@ class MultiStreamDriver:
         out, t0 = ch.pending.popleft()
         mx.eval(out)                       # completes this one
         ch.latencies.append((time.perf_counter() - t0) * 1e3)
+        ch.last = out
         ch.completed += 1
 
     def tick(self) -> None:
