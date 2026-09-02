@@ -359,3 +359,20 @@ def test_glm5_next_rollback_still_accepts_a_uniform_batch_and_a_scalar():
         assert model.rollback_speculative_cache(
             kv_only, [], accepted, BLOCK_TOTAL
         ) == 1
+
+
+def test_the_clamp_shows_up_in_the_speculative_receipt():
+    """The give-back has to be readable off a run, not inferred from it."""
+    from mlx_vlm.speculative.common import _format_speculative_stats
+
+    lens = dict(accept_lens=[1, 0, 2], draft_lens=[2, 1, 2])
+    assert _format_speculative_stats(SimpleNamespace(**lens)) == (
+        "Speculative decoding: 2.00 accepted tokens/round "
+        "(1.00 accepted drafts/round, 60.0% of drafted, "
+        "avg draft 1.67) over 3 rounds"
+    )
+    assert _format_speculative_stats(SimpleNamespace(clamped_tokens=4, **lens)) == (
+        "Speculative decoding: 2.00 accepted tokens/round "
+        "(1.00 accepted drafts/round, 60.0% of drafted, "
+        "avg draft 1.67, clamped 4 tok) over 3 rounds"
+    )
