@@ -763,6 +763,13 @@ class GenerationArguments:
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
+    # Conversation identity for the vault's session tier. NEVER derived from the
+    # prompt: in production the first tokens are the shared system prompt, so a
+    # derived id collapses every conversation into one eviction group. Supplied
+    # by the server -- the Responses API mints it at the root of the
+    # previous_response_id chain, Chat Completions requires an X-Session-Id
+    # header. None means "do not capture", which is the safe default.
+    session_id: Optional[str] = None
 
     def diffusion_kwargs(self) -> dict:
         """Diffusion-only generation kwargs explicitly supplied by a request."""

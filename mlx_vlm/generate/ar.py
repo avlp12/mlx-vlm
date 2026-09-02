@@ -2395,6 +2395,10 @@ class BatchGenerator:
         # ArraysCache KDA state is CHECKPOINT-only -- so a model that cannot
         # offer it does not get a vault rather than getting a broken one.
         self.vault = vault
+        # uid -> prompt ids + everything emitted for it so far.  Only populated
+        # while the session-capture flag is on; empty dict otherwise, so the
+        # feature costs one attribute when off.
+        self._session_tokens: Dict[Any, List[int]] = {}
         if self.vault is not None:
             if self.apc_mode is None:
                 self.apc_mode = _apc.model_apc_mode(model)
@@ -2859,6 +2863,11 @@ class BatchGenerator:
             thinking_budget_criteria,
         ):
             self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc))
+            if _context_vault.session_capture_enabled():
+                # Seed the session key with the EXACT prompt ids the model will
+                # see. Re-deriving them at completion from the request would
+                # re-tokenise and could disagree by a token; these are the ones.
+                self._session_tokens[self.uid_count] = list(p)
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -2867,10 +2876,36 @@ class BatchGenerator:
         )
         return uids
 
+    def note_generated(self, uid, tokens: Sequence[int]) -> None:
+        """Append emitted tokens to ``uid``'s session key.  Never raises.
+
+        Must be called EXACTLY once per emitted token, in order.  The session
+        rung is keyed by the full token sequence, so a dropped or duplicated
+        token does not make the rung wrong -- it makes it unreachable, which is
+        a silent loss of the feature rather than a wrong answer.  Still: the
+        caller owns that contract, and under speculative decoding a single
+        emitted chunk can cover several tokens while naming only the last one.
+        See ``docs/vault_session_restore.md``.
+        """
+        if not _context_vault.session_capture_enabled():
+            return
+        acc = self._session_tokens.get(uid)
+        if acc is None:
+            return
+        try:
+            acc.extend(int(t) for t in tokens)
+        except Exception:  # noqa: BLE001 - bookkeeping must never fail a response
+            self._session_tokens.pop(uid, None)
+
+    def forget_session(self, uid) -> None:
+        """Drop ``uid``'s accumulator.  Called on removal so a cancelled or
+        completed request cannot leak its token list for the process lifetime."""
+        self._session_tokens.pop(uid, None)
+
     def capture_session(
         self,
         uid,
-        tokens: Sequence[int],
+        tokens: Optional[Sequence[int]] = None,
         *,
         session_id: str,
         ttl_s: Optional[float] = None,
@@ -2910,9 +2945,12 @@ class BatchGenerator:
             row_cache = _apc.snapshot_prompt_cache_row(gb.prompt_cache, row)
             if not row_cache:
                 return False
+            key = list(tokens) if tokens is not None else self._session_tokens.get(uid)
+            if not key:
+                return False
             return _context_vault.record_session_turn(
                 self.vault,
-                tokens,
+                key,
                 row_cache,
                 completed=True,
                 session_id=session_id,
@@ -2926,6 +2964,7 @@ class BatchGenerator:
 
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
+        self.forget_session(uid)
         with mx.stream(self._stream):
             # Waiting in the queue.
             for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):

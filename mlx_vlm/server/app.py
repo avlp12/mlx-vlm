@@ -2,13 +2,14 @@ import asyncio
 import gc
 import logging
 import os
+import uuid
 import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
 from threading import Lock
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
@@ -193,6 +194,74 @@ def _read_tenant_id(http_request) -> Optional[str]:
         return default
     h = http_request.headers
     return h.get("x-apc-tenant") or h.get("x-tenant-id") or default
+
+
+# --------------------------------------------------------------------------
+# Conversation identity for the vault's session tier (coordinator ruling I981)
+# --------------------------------------------------------------------------
+
+_SESSION_ID_MAX = 128
+# response id -> conversation root id. Written when a response is stored, so
+# resolving a follow-up is an O(1) lookup and never a chain walk on the hot path.
+_CONVERSATION_ROOTS: Dict[str, str] = {}
+
+
+def _valid_session_id(value) -> Optional[str]:
+    """An opaque client-supplied id, or None.
+
+    Length-capped and restricted to printable ASCII without whitespace: it ends
+    up in log lines and as a dict key, and an unbounded or newline-bearing value
+    is a log-injection and memory-growth hazard, not a correctness one.
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v or len(v) > _SESSION_ID_MAX:
+        return None
+    if any(c < "!" or c > "~" for c in v):
+        return None
+    return v
+
+
+def _read_session_id(http_request) -> Optional[str]:
+    """Chat Completions: capture ONLY with an explicit ``X-Session-Id`` header.
+
+    No header means no capture. There is deliberately no fallback: keying on
+    tenant plus prompt prefix was rejected because it merges or fragments
+    eviction groups silently, which is the exact failure the required-id rule
+    exists to prevent.
+    """
+    if http_request is None or not hasattr(http_request, "headers"):
+        return None
+    return _valid_session_id(http_request.headers.get("x-session-id"))
+
+
+def note_response_root(response_id: str, root_id: str) -> None:
+    """Record which conversation a stored response belongs to."""
+    rid, root = _valid_session_id(response_id), _valid_session_id(root_id)
+    if rid and root:
+        _CONVERSATION_ROOTS[rid] = root
+
+
+def resolve_conversation_id(previous_response_id, http_request=None) -> Optional[str]:
+    """Responses API: the conversation root, minting one for a new root.
+
+    A request carrying ``previous_response_id`` resolves to the root recorded for
+    it; a request without one IS a new root and gets a fresh id. An unknown
+    previous id (server restart, evicted map) is treated as a new root rather
+    than guessed at -- the cost is one cold prefill, and the alternative is
+    silently merging two conversations.
+    """
+    prev = _valid_session_id(previous_response_id)
+    if prev is not None:
+        root = _CONVERSATION_ROOTS.get(prev)
+        if root is not None:
+            return root
+    if prev is None and http_request is not None:
+        explicit = _read_session_id(http_request)
+        if explicit:
+            return explicit
+    return f"conv-{uuid.uuid4().hex[:24]}"
 
 
 async def _preflight_stream_context_budget(

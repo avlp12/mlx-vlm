@@ -49,10 +49,11 @@ class _Batch:
 
 
 class _Gen:
-    """Only the attributes capture_session touches."""
+    """Only the attributes capture_session / note_generated touch."""
     def __init__(self, vault, uids, cache):
         self.vault = vault
         self._generation_batch = _Batch(uids, cache)
+        self._session_tokens = {}
 
 
 def capture(gen, uid, tokens, session_id, ttl_s=None):
@@ -170,3 +171,67 @@ class TestBatchGeneratorEntryPoint(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAccumulator(unittest.TestCase):
+    def setUp(self):
+        for k in (V._ENV_SESSION, V._ENV_SESSION_DERIVED_ID):
+            os.environ.pop(k, None)
+
+    def _gen(self, seed=None):
+        v = V.ContextVault("acc", budget_bytes=1 << 30)
+        g = _Gen(v, ["u1"], row_cache(8))
+        if seed is not None:
+            g._session_tokens["u1"] = list(seed)
+        return v, g
+
+    def note(self, g, uid, toks):
+        return BatchGenerator.note_generated(g, uid, toks)
+
+    def test_note_is_a_no_op_while_the_flag_is_off(self):
+        _, g = self._gen(seed=[1, 2, 3])
+        self.note(g, "u1", [4, 5])
+        self.assertEqual(g._session_tokens["u1"], [1, 2, 3])
+
+    def test_note_appends_in_order_when_enabled(self):
+        os.environ[V._ENV_SESSION] = "1"
+        _, g = self._gen(seed=[1, 2, 3])
+        self.note(g, "u1", [4])
+        self.note(g, "u1", [5, 6])
+        self.assertEqual(g._session_tokens["u1"], [1, 2, 3, 4, 5, 6])
+
+    def test_note_for_an_untracked_uid_does_not_create_one(self):
+        """A uid with no seeded prompt has no key to build; refuse to invent one."""
+        os.environ[V._ENV_SESSION] = "1"
+        _, g = self._gen()
+        self.note(g, "u1", [4, 5])
+        self.assertNotIn("u1", g._session_tokens)
+
+    def test_a_bad_token_drops_the_accumulator_rather_than_corrupting_it(self):
+        os.environ[V._ENV_SESSION] = "1"
+        _, g = self._gen(seed=[1, 2])
+        self.note(g, "u1", [object()])
+        self.assertNotIn("u1", g._session_tokens,
+                         "a partially-extended key would be silently unreachable")
+
+    def test_capture_sources_the_key_from_the_accumulator(self):
+        os.environ[V._ENV_SESSION] = "1"
+        v, g = self._gen(seed=list(range(1, 9)))
+        self.note(g, "u1", [9])
+        self.assertTrue(BatchGenerator.capture_session(g, "u1", session_id="conv-1"))
+        cp = V.lookup_session(v, list(range(1, 10)))
+        self.assertIsNotNone(cp)
+        self.assertEqual(cp.prefix_len, 8)
+
+    def test_capture_with_no_accumulated_key_stores_nothing(self):
+        os.environ[V._ENV_SESSION] = "1"
+        v, g = self._gen()
+        self.assertFalse(BatchGenerator.capture_session(g, "u1", session_id="conv-1"))
+        self.assertEqual(v.rungs, 0)
+
+    def test_forget_session_clears_the_key(self):
+        os.environ[V._ENV_SESSION] = "1"
+        _, g = self._gen(seed=[1, 2])
+        BatchGenerator.forget_session(g, "u1")
+        self.assertNotIn("u1", g._session_tokens)
+        BatchGenerator.forget_session(g, "gone")   # must not raise
