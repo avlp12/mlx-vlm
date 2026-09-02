@@ -199,6 +199,159 @@ def _mla_absorb_multi_enabled() -> bool:
     return _MLA_ABSORB_MULTI_ENV
 
 
+_MQA_FOLD_ENV = None
+_FUSED_MLA_ENV = None
+
+# Threadgroup floor for the fused MLA kernel (see _mqa_sdpa).  80 GPU cores; one threadgroup per
+# 32 query rows per row-group, so 64 is one tile-wave with room for tail imbalance.
+_FUSED_MLA_MIN_TG = int(os.environ.get("MLX_VLM_GLM5_FUSED_MLA_MIN_TG", "64"))
+
+
+def _mqa_fold_enabled() -> bool:
+    """Fold the head axis into the query axis when the KV has exactly one head.
+
+    Absorbed MLA is MQA-shaped: q is [B, 64, L, 512] against a SINGLE latent KV head
+    [B, 1, Kv, 512], so gqa_factor is 64.  MLX cannot fuse that (head dim 512 is in
+    neither supported set, and the vector path additionally caps L*gqa_factor at 32), so
+    it takes the composite fallback in mlx/fast.cpp.  That fallback expands the query
+    heads into the BATCH dimension --
+
+        q = unflatten(q, 1, {n_kv_heads, n_repeats});  k = expand_dims(k, 2)
+
+    -- which at L == 1 turns one GEMM into ``n_repeats`` broadcast matmuls of M = 1, i.e.
+    64 GEMVs that each re-walk the same K.  Measured on the gathered prefill chunk
+    (B*lc = 256, Kv = 2051, D = 512): 3.95 TFLOP/s.
+
+    When n_kv_heads == 1 and L == 1 the head axis and the query axis are interchangeable
+    -- scores[b, h, 0, j] = sum_d q[b, h, 0, d] * k[b, 0, j, d] does not couple h to j --
+    so viewing q as [B, 1, H, D] makes n_repeats 1 and the same call becomes ONE GEMM with
+    K read once: 15.10 TFLOP/s, a 3.82x speedup on that cell, max |delta| 2.0e-3 against
+    the unfolded result on an output whose bf16 ulp is 7.8e-3 (sub-ulp; the op sequence is
+    identical, only MLX's matmul dispatch changes).
+
+    Numbers are M3 Ultra (applegpu_g15d) on the SERVING runtime -- mlx 0.32.1, python 3.11,
+    the ane-spike venv -- on a box gated clean before and after (receipt
+    logs/sweep6/lane5_SERVING_RUNTIME_revalidation.md).  They are an ISOLATED MICROBENCH at
+    the model's shapes, not an in-model measurement; the e2e adoption gate is separate.
+
+    This is a pure shape rewrite: no custom kernel, and it stays correct -- and starts
+    being genuinely fused rather than merely well-shaped -- the day MLX supports head
+    dim 512 in the full path.
+
+    DEFAULT ON.  Set MLX_VLM_GLM5_MQA_FOLD=0 to restore MLX's own dispatch.
+
+    Adopted on the e2e gate (receipt logs/sweep6/lane5_VERDICT_fold_e2e.md; harness
+    prep/sweep6/fold_e2e.py on epsilon, mlx 0.32.1, real text, B=1, stride 2048, 3 paired
+    cycles plus a discarded warm-up).  Paired per chunk, then medianed over cycles:
+
+        prefill chunks where this CANNOT fire (depth < gate)   1.0059   range 1.0054-1.0063
+        prefill chunks where it fires                          1.2064   range 1.2000-1.2594
+        whole 131k prefill wall                                1.185, 1.214, 1.185
+        decode B=1, 32 tokens at depth 131072                  0.9907   (pre-registered null)
+        batch B=8 / B=16 at T=1024 (indexer bypasses)          1.0003 / 1.0017
+
+    Identity, I912: 48-token greedy off a 16384-token real-text prime gives the IDENTICAL token
+    stream and identical text, on a determinism control that is exactly 100% (max |dlogit| 0),
+    while a single bfloat16 ulp flipped in one embedding element diverges at token 30.  Logits are
+    not bit-identical (max 1.016 on a scale of 27.38) and that is not claimed.
+    """
+    global _MQA_FOLD_ENV
+    if _MQA_FOLD_ENV is None:
+        v = os.environ.get("MLX_VLM_GLM5_MQA_FOLD")
+        _MQA_FOLD_ENV = True if v is None else v.lower() not in ("0", "", "false", "no", "off")
+    return _MQA_FOLD_ENV
+
+
+def _fused_mla_enabled() -> bool:
+    """Use the custom mx.fast.metal_kernel flash attention for absorbed MLA (head dim 512).
+
+    Default OFF.  MLX_VLM_GLM5_FUSED_MLA=1 to enable.  See fused_mla_attn.py.
+    """
+    global _FUSED_MLA_ENV
+    if _FUSED_MLA_ENV is None:
+        _FUSED_MLA_ENV = _env_flag("MLX_VLM_GLM5_FUSED_MLA")
+    return _FUSED_MLA_ENV
+
+
+def _mqa_sdpa(q, kv, scale, mask):
+    """SDPA for [B, H, L, D] queries against a single-KV-head [B, 1, N, D] latent.
+
+    Dispatches, in order of preference:
+      1. the fused metal kernel (head dim 512/256, no score tensor)      -- MLX_VLM_GLM5_FUSED_MLA
+      2. the MQA fold at L == 1 (one GEMM instead of H broadcast GEMVs)  -- MLX_VLM_GLM5_MQA_FOLD
+      3. MLX's own call, unchanged.
+
+    CONTRACT ON ``mask``: None, or an ARRAY broadcastable to [B, H, L, N] (bool or additive
+    float).  MLX's SDPA API also accepts the string sentinel "causal", which
+    ``create_attention_mask`` returns when ``return_array`` is false (base.py) -- and both fast
+    paths below index ``mask.ndim`` / ``mask.dtype``, which a string does not have.  Neither
+    rewrite is expressed for the sentinel, so it is handed straight back to MLX rather than
+    crashed on.  The glm5_next call sites pass ``return_array=True`` today, so this is a contract
+    fix and not a live bug -- but the contract is now enforced here instead of assumed.
+    """
+    B, H, L, D = q.shape
+    N = kv.shape[2]
+
+    if mask is not None and not isinstance(mask, mx.array):
+        return scaled_dot_product_attention(q, kv, kv, cache=None, scale=scale, mask=mask)
+
+    # The fused kernel is tiled with no split-K, so it launches G * ceil(R/32) threadgroups.
+    # Below that floor it cannot fill the GPU and loses badly to the composite -- measured
+    # 1.42 ms against 0.31 ms at single-stream decode (G=1, R=64 -> two threadgroups).
+    # Guard here rather than in the kernel so the kernel stays a plain primitive.
+    n_tg = (B * ((H + 31) // 32)) if L == 1 else (B * H * ((L + 31) // 32))
+    if _fused_mla_enabled() and n_tg >= _FUSED_MLA_MIN_TG and kv.shape[1] == 1 \
+            and q.dtype == mx.bfloat16:
+        m3 = None
+        if mask is not None:
+            if mask.dtype != mx.bool_:
+                m3 = None
+            else:
+                m = mask
+                while m.ndim < 4:
+                    m = m[None]
+                # [B?, H?, L?, N] -> the kernel's [G, R, N] with G = B*H (dense) or B (fold)
+                if m.shape[1] == 1:
+                    m3 = mx.broadcast_to(m[:, 0], (m.shape[0], m.shape[2], N))
+                else:
+                    m3 = None
+        if mask is None or m3 is not None:
+            from .fused_mla_attn import mla_flash_attention
+
+            if L == 1:
+                # fold: rows are the heads, one group per batch row
+                o = mla_flash_attention(
+                    mx.reshape(q, (B, H, D)), mx.reshape(kv, (B, N, D)), scale, m3
+                )
+                return mx.reshape(o, (B, H, 1, D))
+            if B == 1:
+                # dense: rows are the query positions, one group per (batch, head)
+                m3d = None if m3 is None else mx.reshape(m3, (m3.shape[0], L, N))
+                o = mla_flash_attention(
+                    mx.reshape(q, (B * H, L, D)), mx.reshape(kv, (B, N, D)), scale, m3d
+                )
+                return mx.reshape(o, (B, H, L, D))
+
+    if _mqa_fold_enabled() and L == 1 and kv.shape[1] == 1:
+        qf = mx.reshape(q, (B, 1, H, D))
+        mf = mask
+        if mf is not None:
+            while mf.ndim < 4:
+                mf = mf[None]
+            # the query axis of the folded view is H; a mask that is per-key only
+            # ([B,1,1,N]) broadcasts unchanged, anything head-dependent cannot fold.
+            if mf.shape[1] != 1 or mf.shape[2] != 1:
+                mf = None
+                qf = None
+        if qf is not None:
+            o = scaled_dot_product_attention(
+                qf, kv, kv, cache=None, scale=scale, mask=mf
+            )
+            return mx.reshape(o, (B, H, 1, D))
+
+    return scaled_dot_product_attention(q, kv, kv, cache=None, scale=scale, mask=mask)
+
+
 def _fused_kda_enabled() -> bool:
     # Opt-in: the fused decode kernel replaces ~30 dispatches per KDA layer with
     # one, but it is decode-only and only the "safe gate" variant is transcribed,
@@ -315,7 +468,41 @@ def _gather_q_chunk_for(kv_len: int, dim: int) -> int:
 # unaffected by this line -- but that value was fitted against the same
 # pre-formula gather cost and is stale for the same reason.  It needs its own
 # re-sweep on two boxes.
-_GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "12288"))
+# RE-SWEPT AFTER THE MQA FOLD (2026-09-02). The gate is a crossover between the dense masked path
+# and the gathered path, and MLX_VLM_GLM5_MQA_FOLD moved the gathered side: the per-chunk attention
+# went from 3.95 to 15.10 TFLOP/s, so gathering now pays much earlier. Re-swept e2e on one load,
+# real text, stride 2048, target 16384, 3 paired cycles plus a discarded warm-up, gates
+# {4096, 6144, 8192, 12288} x fold {OFF, ON} (receipt logs/sweep6/lane5_VERDICT_gate_resweep.md,
+# harness prep/sweep6/gate_resweep.py). Drift-corrected wall, ms:
+#
+#      gate    fold OFF   fold ON
+#      4096     58096.4   49232.1
+#      6144     56580.0   49052.6   <- new default
+#      8192     55552.8   49298.0   (tied with 6144, 0.5%)
+#     12288     54709.2   50935.4   <- old default; with the fold it is the WORST of the four
+#
+# The fold INVERTS the ordering. Without it, 12288 wins every cycle -- which reproduces both the
+# shipped default and R8's original finding, and is the best available check that this harness
+# measures what R8's did. That inversion also disposes of the ordering hazard: arms run gates
+# ascending and the box heats through a cycle, biasing toward low gates, yet the fold-OFF arms
+# under identical ordering favour the HIGH gate.
+#
+# Per chunk, the crossover is visible directly: gathering LOSES at depth 2048 (Kv 4096) and wins
+# from depth 4096 (Kv 6144), so the crossover is between Kv 4096 and 6144. The arithmetic estimate
+# registered before the sweep was Kv ~= 5729, inside that interval.
+#
+# WHAT IT IS WORTH, stated so it cannot be over-quoted: the gate only changes chunks at depths
+# 4096-8192 (everything deeper is gathered under either value), so the saving is a FIXED
+# ~2073 ms per prefill -- 4.1% of a 16k-token prompt, 0.5% of a 131k one. An order of magnitude
+# smaller than the fold itself.
+#
+# Identity: token-identical to gate 12288 at this prime with the fold on (max |dlogit| 1.328 on a
+# scale of 27), on a determinism control that is exactly 100%. Gate changes are chaos-limited in
+# general, so that is a favourable observation, not a guarantee.
+#
+# With MLX_VLM_GLM5_MQA_FOLD=0 the old crossover applies and 12288 is the right value; this default
+# is correct for the shipped configuration, which has the fold on.
+_GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "6144"))
 
 
 # --------------------------------------------------------------- indexer memo
@@ -1857,9 +2044,15 @@ class Glm5NextSparseAttention(nn.Module):
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
 
-        output = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=attn_mask
-        )
+        if absorb and isinstance(k, mx.array) and k.shape[1] == 1:
+            # k is v is the latent here, so the MQA-shaped dispatch in _mqa_sdpa applies.
+            # Non-absorbed (k != v, 64 KV heads) and quantized latent caches (k is a
+            # dequant tuple, not an array) keep MLX's own call untouched.
+            output = _mqa_sdpa(q, k, self.scale, attn_mask)
+        else:
+            output = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=attn_mask
+            )
         if absorb:
             output = self.unembed_out(output)
 
@@ -1903,9 +2096,7 @@ class Glm5NextSparseAttention(nn.Module):
             q_bl = q_e[:, :, a0:a1].transpose(0, 2, 1, 3).reshape(B * lc, H, 1, dim)
             kv_bl = kv_g.reshape(B * lc, 1, topk, dim)
             valid = sel_valid[:, a0:a1].reshape(B * lc, 1, 1, topk)
-            o = scaled_dot_product_attention(
-                q_bl, kv_bl, kv_bl, cache=None, scale=self.scale, mask=valid
-            )  # [B*lc, H, 1, dim]
+            o = _mqa_sdpa(q_bl, kv_bl, self.scale, valid)  # [B*lc, H, 1, dim]
             outs.append(o.reshape(B, lc, H, dim).transpose(0, 2, 1, 3))
         attn = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
         attn = attn * row_has_keys.astype(attn.dtype)[:, None, :, 0, None]
