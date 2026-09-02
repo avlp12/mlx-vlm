@@ -54,16 +54,18 @@ The kernel works on a 3-D view so one kernel serves both call sites:
 
 MEASUREMENT STATUS (read before quoting any number for this kernel)
 ------------------------------------------------------------------
-Everything below is ISOLATED MICROBENCH at the model's shapes on one M3 Ultra.  It is not an
-in-model measurement; no end-to-end number is claimed, and the adoption decision is pending a
-coordinator-granted box window.  Receipt: lane5_probe1_CLEAN_and_contamination.md.
+Everything below is ISOLATED MICROBENCH at the model's shapes on one M3 Ultra, taken on the
+SERVING runtime (mlx 0.32.1, python 3.11, the ane-spike venv) on a box gated clean before and
+after.  It is not an in-model measurement; no end-to-end number is claimed, and the adoption
+decision is pending the e2e gate.  Receipt:
+logs/sweep6/lane5_SERVING_RUNTIME_revalidation.md.
 
 Paired ratios against MLX's composite fallback, current tiling (BQ=32, BK=128):
 
-    dense prefill, depth 8192, Kv 10240, top-k mask   2.04x   <- the kernel's real win
-    dense prefill, depth 0,    Kv 2048,  causal       0.85x   <- still a LOSS
-    gathered chunk, batch 256, Kv 2051                2.25x   <- but the plain MQA reshape
-                                                                gets 4.07x on the same cell,
+    dense prefill, depth 8192, Kv 10240, top-k mask   2.22x   <- the kernel's real win
+    dense prefill, depth 0,    Kv 2048,  causal       0.88x   <- still a LOSS
+    gathered chunk, batch 256, Kv 2051                2.04x   <- but the plain MQA reshape
+                                                                gets 3.82x on the same cell,
                                                                 so the reshape wins there
 
 The kernel runs at roughly 70% of the rate MLX's own GEMM achieves on the same contraction.

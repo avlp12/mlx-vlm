@@ -204,14 +204,19 @@ def _mqa_fold_enabled() -> bool:
 
     -- which at L == 1 turns one GEMM into ``n_repeats`` broadcast matmuls of M = 1, i.e.
     64 GEMVs that each re-walk the same K.  Measured on the gathered prefill chunk
-    (B*lc = 256, Kv = 2051, D = 512, M3 Ultra, mlx 0.32.0): 4.14 TFLOP/s.
+    (B*lc = 256, Kv = 2051, D = 512): 3.95 TFLOP/s.
 
     When n_kv_heads == 1 and L == 1 the head axis and the query axis are interchangeable
     -- scores[b, h, 0, j] = sum_d q[b, h, 0, d] * k[b, 0, j, d] does not couple h to j --
     so viewing q as [B, 1, H, D] makes n_repeats 1 and the same call becomes ONE GEMM with
-    K read once: 16.56 TFLOP/s, a 4.00x speedup on that cell, max |delta| 2.0e-3 against
+    K read once: 15.10 TFLOP/s, a 3.82x speedup on that cell, max |delta| 2.0e-3 against
     the unfolded result on an output whose bf16 ulp is 7.8e-3 (sub-ulp; the op sequence is
     identical, only MLX's matmul dispatch changes).
+
+    Numbers are M3 Ultra (applegpu_g15d) on the SERVING runtime -- mlx 0.32.1, python 3.11,
+    the ane-spike venv -- on a box gated clean before and after (receipt
+    logs/sweep6/lane5_SERVING_RUNTIME_revalidation.md).  They are an ISOLATED MICROBENCH at
+    the model's shapes, not an in-model measurement; the e2e adoption gate is separate.
 
     This is a pure shape rewrite: no custom kernel, and it stays correct -- and starts
     being genuinely fused rather than merely well-shaped -- the day MLX supports head
