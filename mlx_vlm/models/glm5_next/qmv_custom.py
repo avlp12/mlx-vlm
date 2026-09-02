@@ -413,3 +413,67 @@ def gather_qmv4(
         w, scales, biases, x.reshape(-1), idx, K, N, B,
         group_size, pt, rs, nsg, loadv, x.dtype, bits,
     )
+
+
+# --------------------------------------------------------------------------
+# Serving-path adapter.
+#
+# The dispatch condition is a FUNCTION, not an inline `if`, so the integration
+# tests can assert on it directly (PA788: "the dispatch condition is asserted,
+# not assumed").  It returns a reason string on refusal so a test can prove
+# WHY a shape was declined rather than only that it was.
+# --------------------------------------------------------------------------
+
+DEFAULT_GEOMETRY = {"pt": 2, "rs": 1, "nsg": 1, "loadv": False}
+
+
+def qmv_applicable(layer, x, pt=2, rs=1, nsg=1):
+    """(ok, reason) for routing ``layer(x)`` through the custom kernel.
+
+    ``layer`` is an ``nn.QuantizedLinear``.  M=1 only: prefill and batched
+    decode must fall through to MLX.
+    """
+    if not hasattr(layer, "scales"):
+        return False, "not a quantized layer"
+    if getattr(layer, "bias", None) is not None:
+        return False, "additive bias not implemented"
+    # MLX's own qmv_fast_impl types x, scales, biases and y with the SAME T, and
+    # so does this kernel.  A module quantized while its weights were still fp32
+    # gets fp32 scales, which will not compile against a bf16 x.  Refuse rather
+    # than emit a kernel that fails to build.  (Found by the integration test:
+    # nn.quantize on an fp32 nn.Linear produced fp32 scales.)
+    if layer.scales.dtype != x.dtype or layer.biases.dtype != x.dtype:
+        return False, (
+            f"scales/biases dtype {layer.scales.dtype}/{layer.biases.dtype} "
+            f"!= x dtype {x.dtype}"
+        )
+    mode = getattr(layer, "mode", "affine")
+    if mode != "affine":
+        return False, f"quantization mode {mode!r} is not affine"
+    bits = int(layer.bits)
+    if bits not in (4, 6):
+        return False, f"bits {bits} not implemented"
+    M = x.size // x.shape[-1]
+    if M != 1:
+        return False, f"M={M}, kernel is M=1 only (prefill/batch stay on MLX)"
+    if x.dtype != mx.bfloat16:
+        return False, f"dtype {x.dtype} != bfloat16"
+    N, K = layer.weight.shape[0], x.shape[-1]
+    why = supported(K, N, int(layer.group_size), pt, rs, nsg, bits)
+    if why is not None:
+        return False, why
+    return True, "ok"
+
+
+def maybe_qmv(layer, x, pt=2, rs=1, nsg=1, loadv=False):
+    """``layer(x)`` via the custom kernel, or ``None`` if the shape is declined."""
+    ok, _ = qmv_applicable(layer, x, pt, rs, nsg)
+    if not ok:
+        return None
+    N = layer.weight.shape[0]
+    y = qmv4(
+        x.reshape(1, -1), layer.weight, layer.scales, layer.biases,
+        group_size=int(layer.group_size), pt=pt, rs=rs, nsg=nsg,
+        loadv=loadv, bits=int(layer.bits),
+    )
+    return y.reshape(tuple(x.shape[:-1]) + (N,))
