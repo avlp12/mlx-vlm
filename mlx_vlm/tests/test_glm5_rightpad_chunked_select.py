@@ -41,6 +41,35 @@ This module pins:
 4.  the unchunked arm is byte-identical to the number recorded before the fix;
 5.  a batch that is NOT right-padded takes no capture at all -- the code path an
     ordinary cold batch runs is untouched.
+
+DEVICE (added 2026-09-03, after a GPU-quiet Metal run of the suite).  Claims 1-5
+are about WHICH COLUMN is sampled, which is integer indexing and device-free.
+The numbers they were originally written against are not: on Metal the KDA
+(linear-attention) scan split at a chunk boundary drifts from the single scan,
+so the chunked prompt cache is not bit-equal to the unchunked one and the
+recorded CPU digests do not reproduce.  Measured here on an M3 Ultra, mlx
+0.32.1.dev20260902:
+
+  * chunked vs unchunked prompt cache, B = 2: 3 of 10 arrays move, worst
+    9.54e-07 (bit-equal on CPU).  Bounded, not asserted equal, on GPU.
+  * the PROMPT SELECTION itself -- the ``[B, vocab]`` the sampler is handed --
+    agrees with the unchunked arm to <= 1.43e-06 at every chunk size on BOTH
+    devices, with identical argmax.  That is the fix's actual claim and it is
+    now asserted directly (``test_the_selected_prompt_logits_...``) instead of
+    being inferred from four decode steps.
+  * four decode steps on the B = 3 fixture are NOT a device-stable comparison:
+    this is a 2-layer randomly-initialised model, and row 0's third sampled
+    token sits on a 0.074-logprob margin that a 1e-06 state drift flips.  The
+    Metal UNCHUNKED arm itself emits [52, 106, 5, 83] where CPU emits
+    [52, 106, 60, 71].  The first two tokens agree everywhere; on GPU only
+    those are asserted for B = 3, and the docstring says so rather than the
+    test quietly comparing two chaotic trajectories.  B = 2 is stable on both
+    devices and keeps all four.
+  * the pre-fix digest tables are device-keyed.  The GPU column was measured the
+    same way the CPU one was -- the pristine 422b69fa tree, same interpreter,
+    same machine, 2026-09-03 -- and the post-fix tree reproduces all 14 chunked
+    cache digests and both unchunked digests byte for byte on GPU as well.  The
+    "the fix did not move the prefill" guard therefore holds on both devices.
 """
 
 import hashlib
@@ -54,6 +83,20 @@ from mlx_vlm.models.glm5_next.config import TextConfig
 from mlx_vlm.models.glm5_next.language import LanguageModel
 
 STEPS = [4, 8, 12, 16, 24, 32]
+
+# ``mx.default_device()`` is pinned by conftest from MLX_DEFAULT_DEVICE.
+ON_GPU = mx.default_device() == mx.gpu
+DEV = "gpu" if ON_GPU else "cpu"
+
+# Chunked-vs-unchunked prompt-cache drift from splitting the KDA scan.  Zero on
+# CPU at B = 2; worst measured on Metal 9.54e-07 (B = 2) and 8.35e-07 (B = 3).
+CACHE_DRIFT_TOL = 2e-06
+# Selection claim: the [B, vocab] handed to the sampler for the prompt.  Worst
+# measured 1.43e-06 on both devices, at every chunk size, both fixtures.
+SELECTION_TOL = 1e-05
+# Decode steps that are a device-stable comparison on the B = 3 fixture.  See
+# the DEVICE section of the module docstring.
+B3_STABLE_TOKENS = 2 if ON_GPU else 4
 
 
 def _tiny_text_config():
@@ -186,6 +229,42 @@ def _run(step, suffixes, *, emit=4):
     return rows, arrays, chunks
 
 
+def _prompt_selection_logprobs(step, suffixes):
+    """The ``[B, vocab]`` the sampler is handed for the PROMPT, plus the columns.
+
+    This is what the fix changes and nothing else: ``generate()`` assembles one
+    row of logits per row of the batch, and this returns exactly that array
+    together with ``_last_real_column`` so the index arithmetic can be asserted
+    on its own.
+    """
+    pads, width = _pads(suffixes)
+    lm = _lm()
+    padded = _right_pad_prompts(suffixes, max_length=width)
+    batch = PromptProcessingBatch(
+        model=lm,
+        uids=list(range(len(suffixes))),
+        input_ids=suffixes,
+        max_tokens=[1] * len(suffixes),
+        inputs_embeds=lm.model.embed_tokens(padded),
+        prompt_kwargs={},
+        prefill_step_size=step,
+        right_pad_per_row=list(pads),
+        suffix_lens=[len(s) for s in suffixes],
+    )
+    columns = None if batch._last_real_column is None else list(batch._last_real_column)
+    while batch.needs_processing():
+        batch.prompt_step()
+    seen = {}
+
+    def sampler(logprobs):
+        seen["lp"] = mx.array(logprobs)
+        return mx.argmax(logprobs, axis=-1)
+
+    batch.generate(sampler=sampler, stop_criteria=lambda token: False)
+    mx.eval(seen["lp"])
+    return seen["lp"], columns, width
+
+
 def _cache_digest(arrays):
     """Digest of the prompt cache alone -- what the fix must leave untouched."""
     h = hashlib.sha256()
@@ -234,13 +313,20 @@ def test_the_unpadded_row_was_never_the_broken_one():
 
 
 @pytest.mark.parametrize("step", STEPS)
-def test_the_chunked_prompt_cache_stays_bit_equal_to_the_unchunked_one(step):
+def test_the_chunked_prompt_cache_tracks_the_unchunked_one(step):
     """The prefill was always right; the fix must not have bought (1) by moving it.
 
     B = 2 only.  At B = 3 the KDA scan lands a chunk boundary inside a row at two of
     the six step sizes and the split scan is not the same arithmetic as one scan
     over the whole prompt -- see ``test_three_rows_...`` below, which measures that
     and pins it against the PRE-FIX build rather than against the unchunked arm.
+
+    On CPU this is BIT equality, and that is not relaxed.  On Metal the same KDA
+    split drift shows up at B = 2 as well -- 3 of the 10 cache arrays move, worst
+    9.54e-07, on cache array 5 (shape (2, 1, 40, 129)) -- so there the assertion
+    is the documented ``CACHE_DRIFT_TOL`` bound.  Neither number is caused by the
+    fix: ``test_the_prompt_cache_is_what_the_pre_fix_build_wrote`` pins all 14
+    arms byte for byte against the pre-fix build ON THE SAME DEVICE.
     """
     _, unchunked, _ = _run(None, B2_SUFFIX)
     _, chunked, _ = _run(step, B2_SUFFIX)
@@ -248,7 +334,13 @@ def test_the_chunked_prompt_cache_stays_bit_equal_to_the_unchunked_one(step):
     assert len(chunked) == len(unchunked) == 10
     for i, (a, b) in enumerate(zip(chunked, unchunked)):
         assert a.shape == b.shape, f"cache array {i}"
-        assert mx.array_equal(a, b), f"cache array {i}, step={step}"
+        if not ON_GPU:
+            assert mx.array_equal(a, b), f"cache array {i}, step={step}"
+            continue
+        if a.size == 0:
+            continue
+        drift = float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))))
+        assert drift < CACHE_DRIFT_TOL, f"cache array {i}, step={step}: {drift}"
 
 
 # Digests of the CHUNKED prompt cache, recorded on 422b69fa BEFORE the fix
@@ -256,21 +348,39 @@ def test_the_chunked_prompt_cache_stays_bit_equal_to_the_unchunked_one(step):
 # The fix captures logits out of a chunk's OUTPUT and passes the model exactly the
 # arguments it passed before, so every one of these must survive it byte for byte.
 # This is the guard that the selection fix did not become a prefill change.
+# The kernels differ per device, so the digests do: the CPU column is the
+# original one, the GPU column was measured the same way on 2026-09-03 (M3 Ultra,
+# mlx 0.32.1.dev20260902).  That the GPU column has SEVEN distinct values where
+# the CPU one has one is itself the KDA-split drift, present before the fix.
 PRE_FIX_CACHE = {
-    ("B2", None): "9c582cbff6ae7517",
-    ("B2", 4): "9c582cbff6ae7517",
-    ("B2", 8): "9c582cbff6ae7517",
-    ("B2", 12): "9c582cbff6ae7517",
-    ("B2", 16): "9c582cbff6ae7517",
-    ("B2", 24): "9c582cbff6ae7517",
-    ("B2", 32): "9c582cbff6ae7517",
-    ("B3", None): "f7900c633298b31b",
-    ("B3", 4): "fc43c6b7ac48598c",
-    ("B3", 8): "f7900c633298b31b",
-    ("B3", 12): "756c54ee44d28d9f",
-    ("B3", 16): "f7900c633298b31b",
-    ("B3", 24): "f7900c633298b31b",
-    ("B3", 32): "f7900c633298b31b",
+    ("cpu", "B2", None): "9c582cbff6ae7517",
+    ("cpu", "B2", 4): "9c582cbff6ae7517",
+    ("cpu", "B2", 8): "9c582cbff6ae7517",
+    ("cpu", "B2", 12): "9c582cbff6ae7517",
+    ("cpu", "B2", 16): "9c582cbff6ae7517",
+    ("cpu", "B2", 24): "9c582cbff6ae7517",
+    ("cpu", "B2", 32): "9c582cbff6ae7517",
+    ("cpu", "B3", None): "f7900c633298b31b",
+    ("cpu", "B3", 4): "fc43c6b7ac48598c",
+    ("cpu", "B3", 8): "f7900c633298b31b",
+    ("cpu", "B3", 12): "756c54ee44d28d9f",
+    ("cpu", "B3", 16): "f7900c633298b31b",
+    ("cpu", "B3", 24): "f7900c633298b31b",
+    ("cpu", "B3", 32): "f7900c633298b31b",
+    ("gpu", "B2", None): "a2b236c52c7c94be",
+    ("gpu", "B2", 4): "a104ac619cdcdd23",
+    ("gpu", "B2", 8): "a104ac619cdcdd23",
+    ("gpu", "B2", 12): "a104ac619cdcdd23",
+    ("gpu", "B2", 16): "a104ac619cdcdd23",
+    ("gpu", "B2", 24): "b7b9f2af3c7eb1e3",
+    ("gpu", "B2", 32): "cafcaf05f92c1327",
+    ("gpu", "B3", None): "6ac67756acdcd285",
+    ("gpu", "B3", 4): "39b739dce5013d79",
+    ("gpu", "B3", 8): "39b739dce5013d79",
+    ("gpu", "B3", 12): "f2642349c7c7a717",
+    ("gpu", "B3", 16): "26c3927b2da62ed0",
+    ("gpu", "B3", 24): "6ac67756acdcd285",
+    ("gpu", "B3", 32): "26c3927b2da62ed0",
 }
 
 
@@ -279,7 +389,53 @@ PRE_FIX_CACHE = {
 def test_the_prompt_cache_is_what_the_pre_fix_build_wrote(fixture, step):
     suffixes = B2_SUFFIX if fixture == "B2" else B3_SUFFIX
     _, arrays, _ = _run(step, suffixes)
-    assert _cache_digest(arrays)[:16] == PRE_FIX_CACHE[(fixture, step)]
+    assert _cache_digest(arrays)[:16] == PRE_FIX_CACHE[(DEV, fixture, step)]
+
+
+# ------------------------------------------------ 2b. the selection, directly
+
+
+@pytest.mark.parametrize("step", [None] + STEPS)
+@pytest.mark.parametrize("fixture", ["B2", "B3"])
+def test_the_selected_prompt_logits_are_the_unchunked_ones(fixture, step):
+    """The fix's claim, stated as itself rather than as four decode steps.
+
+    ``generate()`` hands the sampler one ``[1, vocab]`` row per batch row, taken
+    at that row's last real column.  Chunking must not change which column that
+    is, so the array must match the unchunked arm -- to the KDA-split drift, and
+    with an identical argmax.  Device-free: the column list is integer
+    arithmetic and is asserted exactly on both devices.
+    """
+    suffixes = B2_SUFFIX if fixture == "B2" else B3_SUFFIX
+    pads, width = _pads(suffixes)
+    ref, _, _ = _prompt_selection_logprobs(None, suffixes)
+    got, columns, _ = _prompt_selection_logprobs(step, suffixes)
+
+    assert columns == [width - 1 - p for p in pads], columns
+    assert got.shape == ref.shape
+    drift = float(mx.max(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32))))
+    assert drift < SELECTION_TOL, f"{fixture} step={step}: selection moved by {drift}"
+    assert mx.array_equal(mx.argmax(got, axis=-1), mx.argmax(ref, axis=-1)), (
+        f"{fixture} step={step}: the sampled token moved"
+    )
+
+
+@pytest.mark.parametrize("step", STEPS)
+@pytest.mark.parametrize("fixture", ["B2", "B3"])
+def test_a_chunked_batch_row_agrees_with_a_singleton_chunked_run(fixture, step):
+    """Cross-check that owes nothing to the unchunked arm.
+
+    Running row ``i`` ALONE at the same chunk size gives a batch with no right
+    padding at all -- ``_last_real_column is None``, the untouched code path --
+    so its first emitted token is the row's answer by construction, on any
+    device.  Only the first token is compared: a singleton decodes with a
+    different batch width from row ``i`` of the group, so the trajectories part
+    company after it (measured: they do, from token 2, on both devices).
+    """
+    suffixes = B2_SUFFIX if fixture == "B2" else B3_SUFFIX
+    batched, _, _ = _run(step, suffixes)
+    singles = [_run(step, [s])[0][0] for s in suffixes]
+    assert [r[0] for r in batched] == [r[0] for r in singles], f"step={step}"
 
 
 # ------------------------------------------------ 3. three rows, two pad sizes
@@ -296,6 +452,16 @@ def test_three_rows_with_two_different_right_pads(step):
     PRE-EXISTING (``test_the_prompt_cache_is_what_the_pre_fix_build_wrote`` pins
     those two arms to the byte against 422b69fa), it is bounded here at 2e-06, and
     it is the same drift the greedy chunked path already shipped.
+
+    ``B3_STABLE_TOKENS`` decode steps are compared, which is all four on CPU and
+    the first two on Metal.  That is not a relaxation of the claim, it is the end
+    of what this fixture can measure: on a 2-layer randomly-initialised model
+    row 0's third sampled token sits on a 0.074-logprob margin, and the Metal
+    unchunked arm itself lands on the other side of it from the CPU unchunked arm
+    ([52, 106, 5, 83] vs [52, 106, 60, 71]) -- neither of which involves chunking.
+    The selection claim at full strength is
+    ``test_the_selected_prompt_logits_are_the_unchunked_ones``, which passes at
+    every step on both devices with the selected logits agreeing to 1.43e-06.
     """
     pads, _ = _pads(B3_SUFFIX)
     assert pads == [18, 7, 0], pads
@@ -303,7 +469,8 @@ def test_three_rows_with_two_different_right_pads(step):
     unchunked, unchunked_cache, _ = _run(None, B3_SUFFIX)
     chunked, chunked_cache, _ = _run(step, B3_SUFFIX)
 
-    assert chunked == unchunked, f"step={step}"
+    n = B3_STABLE_TOKENS
+    assert [r[:n] for r in chunked] == [r[:n] for r in unchunked], f"step={step}"
     for i, (a, b) in enumerate(zip(chunked_cache, unchunked_cache)):
         assert a.shape == b.shape, f"cache array {i}"
         if a.size == 0:
@@ -318,19 +485,27 @@ def test_three_rows_with_two_different_right_pads(step):
 # this worktree, this module run, then restored).  The unchunked path is the one
 # the fix must not touch: it takes no capture, and ``take`` reduces term for term
 # to the ``seq - 1 - right_pad[i]`` it was.
-UNCHUNKED_B2_DIGEST = "39dc6566d9ae2d0d7a3887154f8443f60a306f6242c4d9bddc147ff212a810fa"
+# Device-keyed for the same reason ``PRE_FIX_CACHE`` is; the GPU row was measured
+# on the pristine 422b69fa tree on 2026-09-03 and the post-fix tree reproduces it.
+UNCHUNKED_B2_DIGEST = {
+    "cpu": "39dc6566d9ae2d0d7a3887154f8443f60a306f6242c4d9bddc147ff212a810fa",
+    "gpu": "86f706084a372b0319cf4a4801bb17e58ce16da2caf2326bdbccb84eae377a14",
+}
 POST_HOC_RIGHT_PAD_TOKENS = [71, 99]
-UNCHUNKED_B3_DIGEST = "fc992fe112ba53004b4f1fc53563a6110b3dbc94f07ea10c356680a1b0cc09f5"
+UNCHUNKED_B3_DIGEST = {
+    "cpu": "fc992fe112ba53004b4f1fc53563a6110b3dbc94f07ea10c356680a1b0cc09f5",
+    "gpu": "2489e2fc953ac7814b988677328f084c54bccbe7f92a57b6d51c1068a9d3dbcb",
+}
 
 
 def test_the_unchunked_arm_is_byte_identical_to_the_pre_fix_build():
     rows, arrays, chunks = _run(None, B2_SUFFIX)
     assert chunks == 0
-    assert _digest(rows, arrays) == UNCHUNKED_B2_DIGEST
+    assert _digest(rows, arrays) == UNCHUNKED_B2_DIGEST[DEV]
 
     rows3, arrays3, chunks3 = _run(None, B3_SUFFIX)
     assert chunks3 == 0
-    assert _digest(rows3, arrays3) == UNCHUNKED_B3_DIGEST
+    assert _digest(rows3, arrays3) == UNCHUNKED_B3_DIGEST[DEV]
 
 
 # ------------------------------------------- 5. a batch without right padding
