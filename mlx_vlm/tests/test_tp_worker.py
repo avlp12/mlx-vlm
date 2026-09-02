@@ -446,7 +446,13 @@ class _ScriptedBatchPair:
 
     requires_uniform_batch_acceptance = True
 
-    def __init__(self, rounds=1, batch=2, hidden=4, vocab=64):
+    def __init__(self, rounds=1, batch=2, hidden=4, vocab=64, per_row=False):
+        # ``per_row`` stands in for glm5_next handed BATCHED caches, which can
+        # represent a per-row length and would keep the ragged accepts if it
+        # were driven directly. Under the mirror it must not: see
+        # MirroredLanguageModel.supports_per_row_speculative_rollback.
+        if per_row:
+            self.supports_per_row_speculative_rollback = lambda caches: True
         self.rounds, self.batch = rounds, batch
         self.hidden, self.vocab = hidden, vocab
         self.round = 0
@@ -477,7 +483,7 @@ class _ScriptedBatchPair:
         return mx.array([[10 + i for i in range(bs - 1)]], dtype=token_dtype)
 
 
-def _drive_batch_round(monkeypatch, accepted, block_size=4, batch=2):
+def _drive_batch_round(monkeypatch, accepted, block_size=4, batch=2, per_row=False):
     """One batched DFlash2 round with dictated per-row acceptance, mirrored."""
     from mlx_vlm.server import tp_mode as T
     from mlx_vlm.speculative import dflash as _dflash
@@ -504,7 +510,7 @@ def _drive_batch_round(monkeypatch, accepted, block_size=4, batch=2):
 
     monkeypatch.setattr(_dflash, "_speculative_walk_batch", _ragged_walk)
 
-    pair = _ScriptedBatchPair(batch=batch)
+    pair = _ScriptedBatchPair(batch=batch, per_row=per_row)
     mirror = T.MirroredLanguageModel(pair)
     model = SimpleNamespace(language_model=mirror)
     drafter = SimpleNamespace(
@@ -575,3 +581,49 @@ def test_batched_uniform_accept_is_mirrored_unclamped(monkeypatch):
     assert [len(e) for e in emitted] == [2, 2], emitted
     assert not getattr(drafter, "speculative_total_clamped", 0)
     assert drafter.clamped_tokens == 0
+
+
+def test_per_row_rollback_is_declined_under_tp_even_when_the_target_can(monkeypatch):
+    """The gate: rank 1 has no cache that can hold a per-row length.
+
+    ``tp/worker.py`` builds ``self.lm.make_cache()`` and nothing else -- the
+    scalar-offset cache, one offset for the batch. A ragged accept list would
+    cross the wire intact (the next test) and then raise on the peer, mid-round,
+    after rank 0 had already rolled back. So the mirror answers False for the
+    pair no matter what the wrapped target can do, and the loop clamps.
+    """
+    from mlx_vlm.server import tp_mode as T
+
+    pair, drafter, sent, emitted = _drive_batch_round(
+        monkeypatch, accepted=[2, 0], per_row=True
+    )
+    # The wrapped target says it could; the mirror says the PAIR cannot.
+    assert pair.supports_per_row_speculative_rollback(None) is True
+    assert T.MirroredLanguageModel.supports_per_row_speculative_rollback(
+        object(), None
+    ) is False
+
+    assert pair.rollbacks == [([0, 0], 4)], "rank 0 rolled back the clamped count"
+    twin, _ = _replay(sent)
+    assert twin.rollbacks == [([0, 0], 4, ["gdn"])], "rank 1 rolled back the same"
+    assert [list(m.ids) for m in sent if m.op == W.OP_ROLLBACK] == [[0, 0]]
+    assert [len(e) for e in emitted] == [1, 1], emitted
+    assert drafter.clamped_tokens == 2
+    assert getattr(drafter, "per_row_kept_tokens", 0) == 0
+
+
+def test_the_rollback_wire_already_carries_a_per_row_vector():
+    """Not the blocker: the payload is a list, and rank 1 replays it verbatim.
+
+    Pinned so that when rank 1 learns to build batched caches, the protocol side
+    is known to be a no-op rather than an assumption.
+    """
+    lm = _TwinLM()
+    st = W._WorkerState(lm)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2, 3, 4], flags=W.FLAG_CAPTURE))
+    st.handle(_msg(W.OP_ROLLBACK, 1, ids=[3, 1, 2], arg0=5))
+    assert lm.rollbacks == [([3, 1, 2], 5, ["gdn"])], (
+        "a ragged per-row vector must survive encode/decode and reach rank 1's "
+        "rollback unchanged"
+    )

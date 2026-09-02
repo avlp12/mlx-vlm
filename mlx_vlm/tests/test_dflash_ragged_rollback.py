@@ -1,12 +1,19 @@
-"""Ragged batched DFlash2 acceptance must be clamped before the rollback.
+"""Ragged batched DFlash2 acceptance must be clamped before a RECTANGULAR
+rollback.
 
 The batched DFlash2 loop walks each row independently, so rows routinely accept
-different numbers of drafted tokens. ``glm5_next``'s
-``rollback_speculative_cache`` cannot represent that: it trims ONE shared KV
-length (``max_a``), replays ONE shared KDA prefix and rolls the indexer pool to
-ONE shared length. Handing it a ragged ``accepted`` therefore leaves every row
-that accepted fewer tokens than the batch maximum holding the LIVE KV of tokens
-it rejected, while the tokens that row emitted say otherwise.
+different numbers of drafted tokens. A rectangular rollback cannot represent
+that: it trims ONE shared KV length (``max_a``), replays ONE shared KDA prefix
+and rolls the indexer pool to ONE shared length. Handing it a ragged
+``accepted`` therefore leaves every row that accepted fewer tokens than the
+batch maximum holding the LIVE KV of tokens it rejected, while the tokens that
+row emitted say otherwise.
+
+Every cache in this file is the scalar-offset one ``model.make_cache()``
+returns, which has nowhere to put a per-row length -- so the clamp is still the
+answer here, and these tests still pin it. On the BATCHED caches a served
+request actually gets, glm5_next now rolls back per row and no clamp runs; that
+is ``test_dflash_perrow_rollback.py``.
 
 These tests drive the real ``_dflash_rounds_batch`` loop over a real (tiny)
 same-architecture Glm5Next target with a stub drafter, and check the only thing
@@ -35,6 +42,8 @@ BONUS = [5, 7]
 PROMPT = [2, 4, 6, 8]
 # The ragged round under test: row 0 accepts 3 of its 4 drafts, row 1 accepts 1.
 RAGGED = [3, 1]
+# The token the "target" emits at the rejection point, per row. Below vocab_size.
+SENTINEL = 28
 
 
 def _tiny_glm5_next_target():
@@ -145,9 +154,14 @@ def _run_one_ragged_round(model, accepted=RAGGED, rounds_to_run=1):
     def ragged_walk(draft_tokens, target_tokens, budgets):
         rows = draft_tokens.tolist()
         # Same shape the real walk produces: the accepted draft prefix plus the
-        # target's own token at the rejection point.
+        # target's own token at the rejection point.  The sentinel must be IN
+        # VOCABULARY (32 here): a bonus token is fed back as the next round's
+        # input, and mx gather does not bounds-check, so an out-of-range id
+        # reads whatever memory follows the embedding table -- which made the
+        # two-round case agree with its reference only by luck.
         return list(accepted), [
-            (rows[i][:a] + [90 + i])[: budgets[i]] for i, a in enumerate(accepted)
+            (rows[i][:a] + [SENTINEL + i])[: budgets[i]]
+            for i, a in enumerate(accepted)
         ]
 
     # The acceptance pattern is the thing under test, so it is dictated rather
@@ -353,6 +367,9 @@ def test_uniform_requirement_is_honored_on_either_side():
 
 
 def test_glm5_next_language_model_declares_the_requirement():
+    """The static declaration stays True: it is the answer for the caches that
+    cannot carry a per-row length. The cache-aware override is
+    ``supports_per_row_speculative_rollback`` (test_dflash_perrow_rollback.py)."""
     from mlx_vlm.models.glm5_next.language import LanguageModel
 
     assert LanguageModel.requires_uniform_batch_acceptance is True
@@ -373,14 +390,18 @@ def test_uniform_clamp_counter_is_per_request_and_lifetime():
 
 
 def test_glm5_next_rollback_refuses_a_ragged_batch():
-    """A wrong precondition must fail loudly, not trim by the batch maximum."""
+    """A wrong precondition must fail loudly, not trim by the batch maximum.
+
+    ``model.make_cache()`` is scalar-offset, so per-row rollback is not
+    available and the clamp is mandatory; skipping it has to crash.
+    """
     mx.random.seed(3)
     model = _tiny_glm5_next_target()
     mx.eval(model.parameters())
     cache = model.make_cache()
     model(mx.array([PROMPT, PROMPT], dtype=mx.int32), cache=cache)
 
-    with pytest.raises(RuntimeError, match="uniform per-row acceptance"):
+    with pytest.raises(RuntimeError, match="per-row rollback needs a batched"):
         model.rollback_speculative_cache(
             cache, [], mx.array(RAGGED, dtype=mx.int32), BLOCK_TOTAL
         )
