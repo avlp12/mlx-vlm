@@ -342,3 +342,66 @@ class TestStepDrivesTheRealCaptureSession(unittest.TestCase):
         self.assertEqual(self.vault.stats.session_inserts, 0)
         self.assertEqual(
             self.V.session_skip_counts().get("no_session_id_on_request"), 1)
+
+
+class TestFinishedRowIsStillFindable(unittest.TestCase):
+    """The bug the live diagnostic named: uid_gone_from_batch.
+
+    SpeculativeGenerationBatch._refresh_uids rebuilds .uids from ._finished, so
+    a uid leaves .uids at the instant finish_reason is set -- which is precisely
+    when capture_session runs. Looking the row up in .uids therefore always
+    missed, and the feature stored nothing while reporting nothing.
+
+    My earlier fake gave the batch a permanent uids=["u1"], which is why every
+    unit test passed against an inert feature.
+    """
+
+    def setUp(self):
+        from mlx_vlm import context_vault as V
+        self.V = V
+        V.reset_session_skips()
+        saved = os.environ.get(V._ENV_SESSION)
+
+        def restore():
+            if saved is None:
+                os.environ.pop(V._ENV_SESSION, None)
+            else:
+                os.environ[V._ENV_SESSION] = saved
+        self.addCleanup(restore)
+        os.environ[V._ENV_SESSION] = "1"
+
+    def _batch(self, uids, all_uids):
+        """A batch shaped like the real one after a row finished."""
+        ns = types.SimpleNamespace(uids=list(uids), prompt_cache=[])
+        if all_uids is not None:
+            ns._all_uids = list(all_uids)
+        return ns
+
+    def test_a_finished_uid_is_still_found_via_all_uids(self):
+        from mlx_vlm.generate.ar import BatchGenerator
+        g = types.SimpleNamespace(
+            vault=object(), _session_tokens={"u1": [1, 2]},
+            _generation_batch=self._batch(uids=[], all_uids=["u1"]))
+        BatchGenerator.capture_session(g, "u1", session_id="s")
+        counts = self.V.session_skip_counts()
+        self.assertIsNone(counts.get("uid_gone_from_batch"),
+                          "a finished row must still be locatable")
+        self.assertEqual(counts.get("row_cache_unavailable"), 1,
+                         "it should get past the uid gate and stop on the cache")
+
+    def test_a_genuinely_absent_uid_still_reports_gone(self):
+        from mlx_vlm.generate.ar import BatchGenerator
+        g = types.SimpleNamespace(
+            vault=object(), _session_tokens={"u1": [1, 2]},
+            _generation_batch=self._batch(uids=[], all_uids=["other"]))
+        BatchGenerator.capture_session(g, "u1", session_id="s")
+        self.assertEqual(self.V.session_skip_counts().get("uid_gone_from_batch"), 1)
+
+    def test_plain_batch_without_all_uids_still_works(self):
+        """GenerationBatch has no _all_uids and never prunes on finish."""
+        from mlx_vlm.generate.ar import BatchGenerator
+        g = types.SimpleNamespace(
+            vault=object(), _session_tokens={"u1": [1, 2]},
+            _generation_batch=self._batch(uids=["u1"], all_uids=None))
+        BatchGenerator.capture_session(g, "u1", session_id="s")
+        self.assertIsNone(self.V.session_skip_counts().get("uid_gone_from_batch"))
