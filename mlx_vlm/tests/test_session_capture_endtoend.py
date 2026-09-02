@@ -266,3 +266,79 @@ class TestSkipReasonsAreNamed(unittest.TestCase):
         self.V.record_session_turn(None, [1], [], completed=True, session_id="s")
         self.assertIn("no_vault",
                       _app._vault_stats_snapshot().get("session_skips", {}))
+
+
+class TestStepDrivesTheRealCaptureSession(unittest.TestCase):
+    """_step -> the REAL BatchGenerator.capture_session, against a real vault.
+
+    The gap that let ff9a3045 ship inert: TestStepCapture fakes capture_session
+    entirely, so it proves _step CALLS something and nothing about whether that
+    something stores a rung. This drives the real method with real state and
+    asserts the vault actually gains a rung.
+    """
+
+    def setUp(self):
+        import mlx.core as mx
+        from mlx_vlm import context_vault as V
+        from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+        self.V, self.mx = V, mx
+        self._prev = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        self.addCleanup(lambda: mx.set_default_device(self._prev))
+        V.reset_session_skips()
+        saved = os.environ.get(V._ENV_SESSION)
+
+        def restore():
+            if saved is None:
+                os.environ.pop(V._ENV_SESSION, None)
+            else:
+                os.environ[V._ENV_SESSION] = saved
+        self.addCleanup(restore)
+        os.environ[V._ENV_SESSION] = "1"
+
+        H, D, N = 2, 8, 6
+        c = [ArraysCache(size=2), CacheList(KVCache(), KVCache())]
+        c[0][0] = mx.zeros((1, H, D, 4), mx.float32)
+        c[0][1] = mx.zeros((1, H, D, D), mx.float32)
+        lat = mx.zeros((1, H, N, D), mx.bfloat16)
+        c[1].caches[0].update_and_fetch(lat, lat)
+        idx = mx.zeros((1, 1, N, 2 * D + 1), mx.bfloat16)
+        c[1].caches[1].update_and_fetch(idx, mx.zeros((1, 1, N, 0), mx.bfloat16))
+        mx.eval([e.state for e in c])
+        self.cache = c
+        self.vault = V.ContextVault("real-step", budget_bytes=1 << 30)
+
+    def _generator(self):
+        from mlx_vlm.generate.ar import BatchGenerator
+        gb = types.SimpleNamespace(uids=["u1"], prompt_cache=self.cache)
+        g = types.SimpleNamespace(vault=self.vault, _generation_batch=gb,
+                                  _session_tokens={"u1": [1, 2, 3, 4, 5]})
+        g.capture_session = lambda uid, tokens=None, *, session_id, ttl_s=None: \
+            BatchGenerator.capture_session(g, uid, tokens,
+                                           session_id=session_id, ttl_s=ttl_s)
+        g.note_generated = lambda uid, toks: \
+            BatchGenerator.note_generated(g, uid, toks)
+        return g
+
+    def test_a_finished_turn_actually_stores_a_rung(self):
+        g = self._generator()
+        bg = _BatchGen([[_Resp("u1", 9, finish_reason="stop")]])
+        bg.capture_session = g.capture_session
+        bg.note_generated = g.note_generated
+        ResponseGenerator._step(_stub_self(), bg, _active("conv-A"))
+        self.assertEqual(
+            self.vault.stats.session_inserts, 1,
+            f"no rung stored; skips={self.V.session_skip_counts()}")
+        cp = self.V.lookup_session(self.vault, [1, 2, 3, 4, 5, 9])
+        self.assertIsNotNone(cp, "the stored rung must be reachable by its key")
+        self.assertEqual(cp.prefix_len, 6, "prefix_len must be the cache offset")
+
+    def test_no_session_id_names_itself_rather_than_storing_nothing_silently(self):
+        g = self._generator()
+        bg = _BatchGen([[_Resp("u1", 9, finish_reason="stop")]])
+        bg.capture_session = g.capture_session
+        bg.note_generated = g.note_generated
+        ResponseGenerator._step(_stub_self(), bg, _active(None))
+        self.assertEqual(self.vault.stats.session_inserts, 0)
+        self.assertEqual(
+            self.V.session_skip_counts().get("no_session_id_on_request"), 1)
