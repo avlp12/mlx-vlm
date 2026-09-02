@@ -432,3 +432,146 @@ def test_verify_width_varies_with_acceptance_and_is_announced(monkeypatch):
     assert len(set(widths)) > 1, f"expected varying verify widths, got {widths}"
     twin, _ = _replay(sent)
     assert [s for _, s, _ in twin.forwards] == widths
+
+
+# ------------------------------------------- batched rounds: the uniform clamp
+class _ScriptedBatchPair:
+    """A B=2 target/drafter pair that declares the uniform-acceptance rule.
+
+    Stands in for glm5_next in TP mode: its ``rollback_speculative_cache``
+    reduces the batch to one trim length, so the batched DFlash2 loop must clamp
+    ragged per-row accepts BEFORE announcing the rollback -- otherwise the two
+    ranks would agree on a count that is wrong for every short row.
+    """
+
+    requires_uniform_batch_acceptance = True
+
+    def __init__(self, rounds=1, batch=2, hidden=4, vocab=64):
+        self.rounds, self.batch = rounds, batch
+        self.hidden, self.vocab = hidden, vocab
+        self.round = 0
+        self.forwards = []
+        self.rollbacks = []
+        self.aborted = False
+
+    def __call__(self, ids, cache=None, **kw):
+        if self.round >= self.rounds:
+            self.aborted = True
+            raise _PlanExhausted
+        B, S = ids.shape
+        self.forwards.append((B, S, kw.get("capture_layer_ids") is not None))
+        self.round += 1
+        return SimpleNamespace(
+            logits=mx.zeros((B, S, self.vocab)),
+            hidden_states=[mx.zeros((B, S, self.hidden))],
+            gdn_states=["gdn"],
+        )
+
+    def rollback_speculative_cache(self, caches, gdn, accepted, bs):
+        self.rollbacks.append(
+            ([int(v) for v in accepted.reshape(-1).tolist()], int(bs))
+        )
+        return 0
+
+    def draft_block(self, b, hidden, draft_cache, bs, sampler, token_dtype, **kw):
+        return mx.array([[10 + i for i in range(bs - 1)]], dtype=token_dtype)
+
+
+def _drive_batch_round(monkeypatch, accepted, block_size=4, batch=2):
+    """One batched DFlash2 round with dictated per-row acceptance, mirrored."""
+    from mlx_vlm.server import tp_mode as T
+    from mlx_vlm.speculative import dflash as _dflash
+
+    sent = []
+
+    def _send(op, ep, ids, *, flags=0, arg0=0, name=""):
+        shape = flat = None
+        if ids is not None:
+            if hasattr(ids, "reshape"):
+                shape, flat = (ids.shape[0], ids.shape[1]), ids.reshape(-1).tolist()
+            else:
+                shape, flat = (1, len(ids)), [int(v) for v in ids]
+        sent.append(W.decode(W.encode(op, ep, shape, flat, n=256,
+                                      flags=flags, arg0=arg0, name=name)))
+
+    monkeypatch.setattr(T, "_ctrl_send", _send)
+
+    def _ragged_walk(draft_tokens, target_tokens, budgets):
+        rows = draft_tokens.tolist()
+        return list(accepted), [
+            (rows[i][:a] + [90 + i])[: budgets[i]] for i, a in enumerate(accepted)
+        ]
+
+    monkeypatch.setattr(_dflash, "_speculative_walk_batch", _ragged_walk)
+
+    pair = _ScriptedBatchPair(batch=batch)
+    mirror = T.MirroredLanguageModel(pair)
+    model = SimpleNamespace(language_model=mirror)
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[0], block_size=block_size,
+                               runtime_block_size=block_size),
+        accept_lens=[], draft_lens=[],
+        dflash_deferred_walk=False,
+        requires_uniform_batch_acceptance=False,
+        reset=lambda m: None,
+        make_cache=lambda: [],
+        draft_block=pair.draft_block,
+    )
+    cache = [SimpleNamespace(offset=0)]
+    rounds = _dflash._dflash_rounds_batch(
+        model, drafter, cache, mx.zeros((batch, 1, pair.hidden)),
+        first_bonus=mx.array([7] * batch, dtype=mx.int32),
+        max_tokens=64,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        draft_block_size=block_size,
+        greedy_sampling=True,
+    )
+    emitted = [[] for _ in range(batch)]
+    try:
+        for tokens_out, _ in rounds:
+            for i, token in enumerate(tokens_out):
+                if token is not None:
+                    emitted[i].append(int(token))
+    except _PlanExhausted:
+        pass
+    finally:
+        rounds.close()
+    if pair.aborted:
+        last = max(i for i, m in enumerate(sent) if m.op == W.OP_FORWARD)
+        sent = sent[:last]
+    return pair, drafter, sent, emitted
+
+
+def test_batched_ragged_accept_is_clamped_before_both_ranks_see_it(monkeypatch):
+    """B>1 with ragged accepts: both ranks must roll back the CLAMPED count.
+
+    The mirror is faithful either way -- it announces whatever rank 0 was
+    handed -- so a ragged list would desync nothing and corrupt both ranks
+    identically. The fix has to happen upstream of the announcement, which is
+    what this pins: rank 0's rollback, the announced ids, and rank 1's rollback
+    are one uniform count, and the emitted tokens match it.
+    """
+    pair, drafter, sent, emitted = _drive_batch_round(monkeypatch, accepted=[2, 0])
+
+    assert pair.rollbacks == [([0, 0], 4)], "rank 0 rolled back the clamped count"
+    twin, _ = _replay(sent)
+    assert twin.rollbacks == [([0, 0], 4, ["gdn"])], "rank 1 rolled back the same"
+    announced = [list(m.ids) for m in sent if m.op == W.OP_ROLLBACK]
+    assert announced == [[0, 0]], "the wire carried the clamped, uniform count"
+    # Row 0 gave back the two tokens it had accepted; both rows emit one token.
+    assert [len(e) for e in emitted] == [1, 1], emitted
+    assert drafter.clamped_tokens == 2
+    assert drafter.speculative_total_clamped == 2
+    assert drafter.accept_lens == [0, 0]
+
+
+def test_batched_uniform_accept_is_mirrored_unclamped(monkeypatch):
+    """Already-uniform accepts must travel untouched -- no clamp, no give-back."""
+    pair, drafter, sent, emitted = _drive_batch_round(monkeypatch, accepted=[1, 1])
+
+    assert pair.rollbacks == [([1, 1], 4)]
+    twin, _ = _replay(sent)
+    assert twin.rollbacks == [([1, 1], 4, ["gdn"])]
+    assert [len(e) for e in emitted] == [2, 2], emitted
+    assert not getattr(drafter, "speculative_total_clamped", 0)
+    assert drafter.clamped_tokens == 0
