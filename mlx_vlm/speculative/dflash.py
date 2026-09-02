@@ -474,9 +474,13 @@ def _dflash_next_block_size(
     accept_rate = accepted / drafted
     mean_accept = accepted / len(recent)
 
-    # mean_accept is bounded by the drafted length (current-1), so a constant
-    # 2.0 floor pins small blocks at min forever (at current=3 the bound IS
-    # 2.0). Scale the floor below 2.0 for small blocks (2026-08-30).
+    # mean_accept is bounded by the drafted length (current-1), so at
+    # current=3 the bound IS 2.0 and a constant 2.0 floor is satisfied by
+    # anything short of a perfect recent window.  That is a downward ratchet
+    # BIAS, not a permanent pin: escape upward still happens once accept_rate
+    # and the full-hit rate clear their thresholds (simulated 2026-09-02,
+    # logs/upstream/UPSTREAM_2074_MERGE_RECONCILE_2026-09-02.md section 4c).
+    # Scale the floor below 2.0 for small blocks (2026-08-30).
     if accept_rate < 0.30 or mean_accept < min(2.0, 0.5 * (current - 1)):
         if current >= 8:
             return max(min_total, min(block_total, current // 2))
