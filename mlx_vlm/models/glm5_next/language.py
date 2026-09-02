@@ -446,6 +446,8 @@ def _assert_same(what, cached, fresh):
 # ---------------------------------------------------------------------------
 PACK_SHARED_ENV = "MLX_VLM_GLM5_PACK_SHARED"
 SHARED_QMV_ENV = "MLX_VLM_GLM5_SHARED_QMV"
+# R3: hold the MoE router weight in fp32 instead of re-casting it every call.
+ROUTER_FP32_ENV = "MLX_VLM_GLM5_ROUTER_FP32"
 
 _SHARED_EXPERTS = "shared_experts."
 _SHARED_GATE_MARKER = _SHARED_EXPERTS + "gate_proj."
@@ -465,6 +467,26 @@ def pack_shared_enabled(config: Any = None) -> bool:
 def shared_qmv_enabled(config: Any = None) -> bool:
     flag = getattr(config, "shared_qmv", None) if config is not None else None
     return bool(flag) if flag is not None else _env_flag(SHARED_QMV_ENV)
+
+
+def router_fp32_enabled(config: Any = None) -> bool:
+    """R3: keep ``mlp.gate.weight`` in fp32 at load so the router GEMV stops
+    materialising a [288, 4096] fp32 copy on every layer of every token.
+
+    The checkpoint stores the router weight as BF16 [288, 4096] and
+    ``Glm5NextMoEGate.__call__`` does ``self.weight.astype(mx.float32)``, so
+    today each of the 42 routers reads 2.36 MB bf16, writes 4.72 MB fp32 and
+    then reads that 4.72 MB back for the matmul -- 11.80 MB per layer, 495.6 MB
+    per token.  Holding fp32 makes it a single 4.72 MB read, 198.2 MB per token.
+
+    Memory: the fp32 copies total 198.2 MB, but 99.1 MB of that was already
+    resident as bf16, so the INCREMENTAL cost is +99.1 MB.
+
+    Bit-exact: bf16 -> fp32 is lossless, so the pre-cast tensor is byte-identical
+    to what astype produces today and the matmul receives identical inputs.
+    """
+    flag = getattr(config, "router_weight_fp32", None) if config is not None else None
+    return bool(flag) if flag is not None else _env_flag(ROUTER_FP32_ENV)
 
 
 def fuse_shared_gate_up(weights: dict) -> dict:
@@ -1741,7 +1763,14 @@ class Glm5NextMoEGate(MoEGate):
     # Router logits in fp32 (reference uses moe_router_dtype=float32) so near-tie top-k
     # membership matches the reference rather than flipping under bf16 rounding.
     def __call__(self, x: mx.array):
-        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        # NOTE: mx.array.astype(dtype) does not short-circuit when the dtype
+        # already matches (checked on mlx 0.32.1 -- it returns a distinct array),
+        # so this guard is load-bearing, not cosmetic.  With R3 enabled the
+        # weight arrives fp32 and no cast kernel is emitted at all.
+        w = self.weight
+        if w.dtype != mx.float32:
+            w = w.astype(mx.float32)
+        logits = x.astype(mx.float32) @ w.T
         return group_expert_select(
             logits,
             self.e_score_correction_bias,
@@ -2212,6 +2241,13 @@ class LanguageModel(nn.Module):
                 weights[k] = v.astype(mx.float32)
         if pack_shared_enabled(getattr(self, "config", None)):
             weights = fuse_shared_gate_up(weights)
+        if router_fp32_enabled(getattr(self, "config", None)):
+            for k, v in list(weights.items()):
+                if k.endswith("mlp.gate.weight") and mx.issubdtype(
+                    v.dtype, mx.floating
+                ):
+                    if v.dtype != mx.float32:
+                        weights[k] = v.astype(mx.float32)
         return weights
 
     @property

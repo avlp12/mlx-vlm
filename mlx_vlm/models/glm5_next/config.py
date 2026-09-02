@@ -59,6 +59,8 @@ class TextConfig(BaseModelConfig):
     # pack_shared_gate_up -> MLX_VLM_GLM5_PACK_SHARED ; shared_qmv -> MLX_VLM_GLM5_SHARED_QMV
     pack_shared_gate_up: Optional[bool] = None
     shared_qmv: Optional[bool] = None
+    # R3 -> MLX_VLM_GLM5_ROUTER_FP32: hold mlp.gate.weight in fp32 (+99.1 MB net)
+    router_weight_fp32: Optional[bool] = None
     hc_mult: int = 4
     hc_eps: float = 1e-06
     hc_sinkhorn_iters: int = 20

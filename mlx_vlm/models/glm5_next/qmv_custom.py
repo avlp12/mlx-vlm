@@ -330,10 +330,103 @@ def _source6(K, N, gs, pt, rs, nsg):
         ROWLOOP=row_loop, WSTEP=BLOCK * BPP // PACK, GPB=GPB, BLOCK=BLOCK,
     )
 
+
+# --------------------------------------------------------------------------
+# 8-bit affine variant (R2 ladder rank 2: KDA self_attn.o_proj, 34 layers,
+# N=4096 K=8192 -> only 512 threadgroups under MLX's bn=8).
+#
+# 8-bit differs from 4/6-bit in TWO ways that matter for bit-exactness, both
+# read from quantized.h v0.32.1:
+#   * load_vector<...,8> (lines 97-102) accumulates `sum += x[i]` ONE VALUE AT A
+#     TIME into the fp32 U, not four-at-a-time in T.  So unlike 4-bit and 6-bit
+#     there is no bf16-rounded partial sum to reproduce here -- getting this
+#     wrong the other way (summing in T) would break the control cell.
+#   * there is no pre-divide: x_thread[i] = x[i] verbatim, and qdot<...,8>
+#     (lines 283-287) is simply `accum += x_thread[i] * w[i]` over uint8 weights.
+# --------------------------------------------------------------------------
+
+
+def _source8(K, N, gs, pt, rs, nsg):
+    PACK = 4          # values per uint32
+    VPT = PACK * pt
+    BLOCK = VPT * 32
+    NBLK = K // BLOCK
+    WROW_B = K        # one byte per value
+    GROW = K // gs
+    SPT = gs // VPT
+    GPB = BLOCK // gs
+
+    x_body = "".join(
+        "      xsum += (float)xp[{i}];\n      xt[{i}] = (float)xp[{i}];\n".format(i=i)
+        for i in range(VPT)
+    )
+    dot_body = "".join(
+        "        a += xt[{i}] * (float)wl[{i}];\n".format(i=i) for i in range(VPT)
+    )
+
+    row_loop = (
+        "    #pragma clang loop unroll(full)\n"
+        "    for (int r = 0; r < {RS}; ++r) {{\n"
+        "      const device uchar* wl = wp + r * {WROW_B};\n"
+        "      float s = (float)sp[r * {GROW}];\n"
+        "      float bb = (float)bp[r * {GROW}];\n"
+        "      float a = 0.0f;\n"
+        "{DOT}"
+        "      acc[r] += s * a + xsum * bb;\n"
+        "    }}\n"
+    ).format(RS=rs, WROW_B=WROW_B, GROW=GROW, DOT=dot_body)
+
+    return """
+  const uint simd_lid = thread_index_in_simdgroup;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint tgy = threadgroup_position_in_grid.y;
+  const uint bz  = threadgroup_position_in_grid.z;
+
+  const uint e = eidx[bz];
+  const int out_row = (int)(tgy * {ROWS_PER_TG} + simd_gid * {RS});
+
+  const device uchar* wp = ((const device uchar*)w)
+        + (ulong)e * {N} * {WROW_B} + (ulong)out_row * {WROW_B}
+        + simd_lid * {BPT};
+  const device T* sp = scales + (ulong)e * {N} * {GROW}
+                              + (ulong)out_row * {GROW} + simd_lid / {SPT};
+  const device T* bp = biases + (ulong)e * {N} * {GROW}
+                              + (ulong)out_row * {GROW} + simd_lid / {SPT};
+  const device T* xp = x + simd_lid * {VPT};
+
+  float xt[{VPT}];
+  float acc[{RS}];
+  #pragma clang loop unroll(full)
+  for (int r = 0; r < {RS}; ++r) {{ acc[r] = 0.0f; }}
+
+  for (int kb = 0; kb < {NBLK}; ++kb) {{
+    float xsum = 0.0f;
+{XBODY}
+{ROWLOOP}
+    wp += {WSTEP};
+    sp += {GPB};
+    bp += {GPB};
+    xp += {BLOCK};
+  }}
+
+  #pragma clang loop unroll(full)
+  for (int r = 0; r < {RS}; ++r) {{
+    float v = simd_sum(acc[r]);
+    if (simd_lid == 0) {{
+      y[(ulong)bz * {N} + out_row + r] = (T)v;
+    }}
+  }}
+""".format(
+        ROWS_PER_TG=nsg * rs, RS=rs, N=N, WROW_B=WROW_B, BPT=VPT,
+        GROW=GROW, SPT=SPT, VPT=VPT, NBLK=NBLK, XBODY=x_body,
+        ROWLOOP=row_loop, WSTEP=BLOCK, GPB=GPB, BLOCK=BLOCK,
+    )
+
+
 def supported(K: int, N: int, gs: int, pt: int, rs: int, nsg: int,
               bits: int = 4) -> Optional[str]:
     """Return None if the configuration is dispatchable, else the reason."""
-    if bits not in (4, 6):
+    if bits not in (4, 6, 8):
         return f"bits {bits} not implemented"
     PACK = 8 if bits == 4 else 4
     VPT = PACK * pt
@@ -357,6 +450,9 @@ def build_kernel(K, N, gs=64, pt=4, rs=4, nsg=2, loadv=True, bits=4):
     if bits == 6:
         loadv = False
         src = _source6(K, N, gs, pt, rs, nsg)
+    elif bits == 8:
+        loadv = False
+        src = _source8(K, N, gs, pt, rs, nsg)
     else:
         src = _source(K, N, gs, pt, rs, nsg, bool(loadv))
     name = f"qmvB_b{bits}_k{K}_n{N}_g{gs}_p{pt}_r{rs}_s{nsg}_v{int(loadv)}"
@@ -451,7 +547,7 @@ def qmv_applicable(layer, x, pt=2, rs=1, nsg=1):
     if mode != "affine":
         return False, f"quantization mode {mode!r} is not affine"
     bits = int(layer.bits)
-    if bits not in (4, 6):
+    if bits not in (4, 6, 8):
         return False, f"bits {bits} not implemented"
     M = x.size // x.shape[-1]
     if M != 1:
