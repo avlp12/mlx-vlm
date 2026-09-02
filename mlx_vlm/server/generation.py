@@ -1411,6 +1411,17 @@ class ResponseGenerator:
                 _vault_mod.vault_budget_bytes() / 1e9,
                 _vault_mod.default_boundary_stride(),
             )
+            # Cold tier, off unless MLX_VLM_VAULT_DISK_DIR is set.  Attached
+            # here rather than inside get_vault so a vault that already exists
+            # for this identity keeps the tier it was given, and so a disk fault
+            # is contained to the same try/except that already protects the load.
+            from .. import vault_disk as _disk_mod
+
+            if _disk_mod.disk_vault_enabled():
+                cfg = getattr(model, "config", None)
+                model_path = (getattr(cfg, "_name_or_path", None)
+                              or getattr(model, "model_path", None))
+                _disk_mod.attach_disk_vault(vault, model_path=model_path)
             return vault
         except Exception:  # noqa: BLE001 - a vault fault must never fail a load
             logger.warning("vault: could not be created; continuing without it",

@@ -2425,6 +2425,42 @@ class PromptProcessingBatch:
         return rope_deltas
 
 
+def _vault_disk_deepen(vault, ids_list, hit, hit_tier, tiers):
+    """Promote a deeper cold entry off disk, then let the RAM tier serve it.
+
+    Module-level on purpose.  ``_vault_pick_for`` is called unbound against
+    duck-typed generators (``test_session_restore._Gen`` is "only what
+    _vault_pick_for touches"), so reaching for a new attribute on ``self`` would
+    make every such caller fail on a feature that is off by default.
+
+    The disk tier does NOT participate in the longest-strict-prefix contest in
+    the caller.  It restores into the RAM vault through the ordinary ``insert``
+    (ordinary byte accounting, ordinary eviction) and the ordinary lookup then
+    serves the result, so every downstream path -- the trim, the suffix
+    prefill, the identity refusals -- is byte-for-byte what it was.
+
+    The cost of that two-step is that the FIRST request needing an entry pays
+    the read: ~0.55-0.7 s for a 131k rung on the internal NVMe
+    (sweep11/P2_VERDICT.md: 6.6-6.7 GB/s at >= 4 MiB reads) against the ~444 s
+    of prefill it replaces.  Later requests pay nothing extra.
+    """
+    disk = getattr(vault, "disk", None)
+    if disk is None:
+        return hit, hit_tier
+    have = int(hit.prefix_len) if hit is not None else 0
+    for tier in tiers:
+        try:
+            cand = disk.restore_into_vault(vault, list(ids_list), tier, min_depth=have)
+        except Exception:  # noqa: BLE001 - a disk fault costs a cold prefill, no more
+            continue
+        if cand is None:
+            continue
+        if have < int(cand.prefix_len) < len(ids_list):
+            hit, hit_tier = cand, tier
+            have = int(cand.prefix_len)
+    return hit, hit_tier
+
+
 class BatchGenerator:
     """
     Continuous batching with separate prompt processing and generation phases.
@@ -2705,6 +2741,7 @@ class BatchGenerator:
                 continue
             if hit is None or int(cand.prefix_len) > int(hit.prefix_len):
                 hit, hit_tier = cand, tier
+        hit, hit_tier = _vault_disk_deepen(vault, ids_list, hit, hit_tier, tiers)
         if hit is None:
             return pick
         if not self._vault_prefix_trim_is_safe():
