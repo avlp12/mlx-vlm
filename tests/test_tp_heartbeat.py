@@ -396,3 +396,32 @@ def test_wedge_inside_a_collective_is_caught():
     verdict, reason = rx.poll()
     assert verdict == hb.PEER_STALLED
     assert "fwd_idx=57" in reason and "driving thread" in reason
+
+
+# ------------------------------------------------- default path (10GbE, I97x)
+def test_default_hosts_are_the_dedicated_10gbe_pair(monkeypatch):
+    """The default must be the path with PHYSICAL independence from the
+    Thunderbolt cable jaccl runs on, not merely the lowest-latency one.
+
+    Measured 64 B TCP RTT p50: tbnet 65 us, 10GbE 215 us, tunnelled 180 us.
+    tbnet is 3x faster and is still the WRONG choice -- it is the link whose
+    failure the beat has to be able to report.  At 4 Hz all three are ~1000x
+    faster than needed, so independence decides and latency does not.
+    """
+    monkeypatch.delenv("MLX_VLM_TP_HB_HOSTS", raising=False)
+    monkeypatch.delenv("MLX_VLM_TP_HB_LOCAL", raising=False)
+    monkeypatch.delenv("MLX_VLM_TP_HB_PEER", raising=False)
+    monkeypatch.setenv("MLX_VLM_TP_HB_PORT", "39600")
+    assert hb.DEFAULT_HOSTS == ("10.0.1.1", "10.0.1.2")
+    local, peer = hb.resolve_addrs(0)
+    assert local == ("10.0.1.1", 39600) and peer == ("10.0.1.2", 39600)
+    local, peer = hb.resolve_addrs(1)
+    assert local == ("10.0.1.2", 39600) and peer == ("10.0.1.1", 39600)
+
+
+def test_fallback_hosts_still_declared():
+    """If en0 is unplugged the tunnelled pair still catches the dominant
+    (software) hang class, so it stays a documented fallback rather than being
+    deleted."""
+    assert hb.FALLBACK_HOSTS == ("169.254.30.147", "169.254.240.246")
+    assert hb.FALLBACK_HOSTS != hb.DEFAULT_HOSTS
