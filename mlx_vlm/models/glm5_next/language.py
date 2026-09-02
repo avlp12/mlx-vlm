@@ -183,6 +183,118 @@ def _mla_absorb_multi_enabled() -> bool:
     return _MLA_ABSORB_MULTI_ENV
 
 
+_MQA_FOLD_ENV = None
+_FUSED_MLA_ENV = None
+
+
+def _mqa_fold_enabled() -> bool:
+    """Fold the head axis into the query axis when the KV has exactly one head.
+
+    Absorbed MLA is MQA-shaped: q is [B, 64, L, 512] against a SINGLE latent KV head
+    [B, 1, Kv, 512], so gqa_factor is 64.  MLX cannot fuse that (head dim 512 is in
+    neither supported set, and the vector path additionally caps L*gqa_factor at 32), so
+    it takes the composite fallback in mlx/fast.cpp.  That fallback expands the query
+    heads into the BATCH dimension --
+
+        q = unflatten(q, 1, {n_kv_heads, n_repeats});  k = expand_dims(k, 2)
+
+    -- which at L == 1 turns one GEMM into ``n_repeats`` broadcast matmuls of M = 1, i.e.
+    64 GEMVs that each re-walk the same K.  Measured on the gathered prefill chunk
+    (B*lc = 256, Kv = 2051, D = 512, M3 Ultra, mlx 0.32.0): 4.14 TFLOP/s.
+
+    When n_kv_heads == 1 and L == 1 the head axis and the query axis are interchangeable
+    -- scores[b, h, 0, j] = sum_d q[b, h, 0, d] * k[b, 0, j, d] does not couple h to j --
+    so viewing q as [B, 1, H, D] makes n_repeats 1 and the same call becomes ONE GEMM with
+    K read once: 16.56 TFLOP/s, a 4.00x speedup on that cell, max |delta| 2.0e-3 against
+    the unfolded result on an output whose bf16 ulp is 7.8e-3 (sub-ulp; the op sequence is
+    identical, only MLX's matmul dispatch changes).
+
+    This is a pure shape rewrite: no custom kernel, and it stays correct -- and starts
+    being genuinely fused rather than merely well-shaped -- the day MLX supports head
+    dim 512 in the full path.
+
+    Default OFF pending the paired e2e gate.  MLX_VLM_GLM5_MQA_FOLD=1 to enable.
+    """
+    global _MQA_FOLD_ENV
+    if _MQA_FOLD_ENV is None:
+        _MQA_FOLD_ENV = _env_flag("MLX_VLM_GLM5_MQA_FOLD")
+    return _MQA_FOLD_ENV
+
+
+def _fused_mla_enabled() -> bool:
+    """Use the custom mx.fast.metal_kernel flash attention for absorbed MLA (head dim 512).
+
+    Default OFF.  MLX_VLM_GLM5_FUSED_MLA=1 to enable.  See fused_mla_attn.py.
+    """
+    global _FUSED_MLA_ENV
+    if _FUSED_MLA_ENV is None:
+        _FUSED_MLA_ENV = _env_flag("MLX_VLM_GLM5_FUSED_MLA")
+    return _FUSED_MLA_ENV
+
+
+def _mqa_sdpa(q, kv, scale, mask):
+    """SDPA for [B, H, L, D] queries against a single-KV-head [B, 1, N, D] latent.
+
+    Dispatches, in order of preference:
+      1. the fused metal kernel (head dim 512/256, no score tensor)      -- MLX_VLM_GLM5_FUSED_MLA
+      2. the MQA fold at L == 1 (one GEMM instead of H broadcast GEMVs)  -- MLX_VLM_GLM5_MQA_FOLD
+      3. MLX's own call, unchanged.
+    ``mask`` is None or a bool array broadcastable to [B, H, L, N].
+    """
+    B, H, L, D = q.shape
+    N = kv.shape[2]
+
+    if _fused_mla_enabled() and kv.shape[1] == 1 and q.dtype == mx.bfloat16:
+        m3 = None
+        if mask is not None:
+            if mask.dtype != mx.bool_:
+                m3 = None
+            else:
+                m = mask
+                while m.ndim < 4:
+                    m = m[None]
+                # [B?, H?, L?, N] -> the kernel's [G, R, N] with G = B*H (dense) or B (fold)
+                if m.shape[1] == 1:
+                    m3 = mx.broadcast_to(m[:, 0], (m.shape[0], m.shape[2], N))
+                else:
+                    m3 = None
+        if mask is None or m3 is not None:
+            from .fused_mla_attn import mla_flash_attention
+
+            if L == 1:
+                # fold: rows are the heads, one group per batch row
+                o = mla_flash_attention(
+                    mx.reshape(q, (B, H, D)), mx.reshape(kv, (B, N, D)), scale, m3
+                )
+                return mx.reshape(o, (B, H, 1, D))
+            if B == 1:
+                # dense: rows are the query positions, one group per (batch, head)
+                m3d = None if m3 is None else mx.reshape(m3, (m3.shape[0], L, N))
+                o = mla_flash_attention(
+                    mx.reshape(q, (B * H, L, D)), mx.reshape(kv, (B, N, D)), scale, m3d
+                )
+                return mx.reshape(o, (B, H, L, D))
+
+    if _mqa_fold_enabled() and L == 1 and kv.shape[1] == 1:
+        qf = mx.reshape(q, (B, 1, H, D))
+        mf = mask
+        if mf is not None:
+            while mf.ndim < 4:
+                mf = mf[None]
+            # the query axis of the folded view is H; a mask that is per-key only
+            # ([B,1,1,N]) broadcasts unchanged, anything head-dependent cannot fold.
+            if mf.shape[1] != 1 or mf.shape[2] != 1:
+                mf = None
+                qf = None
+        if qf is not None:
+            o = scaled_dot_product_attention(
+                qf, kv, kv, cache=None, scale=scale, mask=mf
+            )
+            return mx.reshape(o, (B, H, 1, D))
+
+    return scaled_dot_product_attention(q, kv, kv, cache=None, scale=scale, mask=mask)
+
+
 def _fused_kda_enabled() -> bool:
     # Opt-in: the fused decode kernel replaces ~30 dispatches per KDA layer with
     # one, but it is decode-only and only the "safe gate" variant is transcribed,
@@ -1503,9 +1615,15 @@ class Glm5NextSparseAttention(nn.Module):
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
 
-        output = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=attn_mask
-        )
+        if absorb and isinstance(k, mx.array) and k.shape[1] == 1:
+            # k is v is the latent here, so the MQA-shaped dispatch in _mqa_sdpa applies.
+            # Non-absorbed (k != v, 64 KV heads) and quantized latent caches (k is a
+            # dequant tuple, not an array) keep MLX's own call untouched.
+            output = _mqa_sdpa(q, k, self.scale, attn_mask)
+        else:
+            output = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=attn_mask
+            )
         if absorb:
             output = self.unembed_out(output)
 
@@ -1549,9 +1667,7 @@ class Glm5NextSparseAttention(nn.Module):
             q_bl = q_e[:, :, a0:a1].transpose(0, 2, 1, 3).reshape(B * lc, H, 1, dim)
             kv_bl = kv_g.reshape(B * lc, 1, topk, dim)
             valid = sel_valid[:, a0:a1].reshape(B * lc, 1, 1, topk)
-            o = scaled_dot_product_attention(
-                q_bl, kv_bl, kv_bl, cache=None, scale=self.scale, mask=valid
-            )  # [B*lc, H, 1, dim]
+            o = _mqa_sdpa(q_bl, kv_bl, self.scale, valid)  # [B*lc, H, 1, dim]
             outs.append(o.reshape(B, lc, H, dim).transpose(0, 2, 1, 3))
         attn = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
         attn = attn * row_has_keys.astype(attn.dtype)[:, None, :, 0, None]
