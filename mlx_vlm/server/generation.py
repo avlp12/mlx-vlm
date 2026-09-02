@@ -2137,6 +2137,10 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
+                        # Conversation id for the vault's session tier. None
+                        # means "do not capture" -- Chat Completions without an
+                        # X-Session-Id header, or the session tier switched off.
+                        "session_id": getattr(args, "session_id", None),
                         "spec_snapshot": (
                             speculative_stats_snapshot(self.draft_model)
                             if self.draft_model is not None
@@ -2683,6 +2687,15 @@ class ResponseGenerator:
                 finish_reason=r.finish_reason,
                 token_count=token_count,
             )
+
+            # End-of-turn session capture. Here and not later: the row is still
+            # in the generation batch, which is the window capture_session needs
+            # (after remove() it finds no row and stores nothing rather than
+            # storing something wrong). Best-effort by contract -- capture_session
+            # never raises, and losing a rung only costs the next turn a cold
+            # prefill, which is the status quo.
+            if r.finish_reason is not None and info.get("session_id"):
+                batch_gen.capture_session(r.uid, session_id=info["session_id"])
 
             draft_rounds = draft_accepted = draft_total = None
             request_draft_kind = None

@@ -138,6 +138,7 @@ def _build_gen_args(
     request,
     processor=None,
     tenant_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     structured_logits_processor_builder=_build_structured_logits_processors,
 ) -> GenerationArguments:
     """Build generation arguments from a compatible API request."""
@@ -246,6 +247,7 @@ def _build_gen_args(
             config=config,
         ),
         tenant_id=tenant_id,
+        session_id=session_id,
     )
     if processor is not None:
         args.logits_processors = structured_logits_processor_builder(request, processor)
