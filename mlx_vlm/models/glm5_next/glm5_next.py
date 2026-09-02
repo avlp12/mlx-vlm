@@ -1,11 +1,11 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
-from .language import LanguageModel
+from .language import LanguageModel, shared_mlp_quantization_aliases
 from .vision import VisionModel
 
 
@@ -143,6 +143,13 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.model.layers
+
+    @staticmethod
+    def quantization_path_aliases(path: str) -> Tuple[str, ...]:
+        """The packed shared-expert FFN has no ``gate_up_proj`` entry in the
+        checkpoint's per-module quantization map; point it at the ``gate_proj``
+        entry it was built from."""
+        return shared_mlp_quantization_aliases(path)
 
     @property
     def quant_predicate(self):

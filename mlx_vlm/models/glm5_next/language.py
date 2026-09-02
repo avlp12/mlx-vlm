@@ -26,6 +26,7 @@ from .fused_kda import (
     fused_kda_supported,
     fused_kda_verify_block,
 )
+from .qmv_custom import DEFAULT_GEOMETRY, maybe_qmv, qmv_applicable
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
 _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
@@ -425,6 +426,124 @@ def _assert_same(what, cached, fresh):
             )
         if not bool(mx.all(a == b)):
             raise AssertionError(f"{what}[{i}]: value mismatch")
+
+
+
+# ---------------------------------------------------------------------------
+# Shared-expert decode levers (both opt-in, both DEFAULT OFF, both bit-exact).
+#
+# The shared expert is the worst-occupied significant op in this checkpoint at
+# B=1: MLX's affine qmv puts 8 output rows in one 64-thread threadgroup, so
+# gate_proj/up_proj (N=2048) launch only 256 threadgroups and down_proj (N=4096)
+# only 512, against the 2048-4096 the routed experts get for free from the
+# gather's batch dimension.
+#
+#   R1  MLX_VLM_GLM5_PACK_SHARED   concatenate the shared expert's gate_proj and
+#       up_proj on the OUTPUT axis, so one quantized_matmul replaces two.  Affine
+#       groups run along the INPUT axis within each output row, so stacking rows
+#       is bit-identical by construction -- no tensor is dequantized.  (Measured:
+#       max_ulp 0 over 4096 outputs at 6-bit.)  This is the shared-expert analogue
+#       of the routed-expert packing on branch glm5-pack-gate-up, which
+#       deliberately excludes shared_experts.
+#
+#   R2  MLX_VLM_GLM5_SHARED_QMV    route the shared expert's M=1 projections
+#       through qmv_custom, whose rows-per-threadgroup is tunable.  At rows=1,
+#       simdgroups=1 the same work launches 2048-4096 threadgroups instead of
+#       256-512.  Bit-identical by construction: changing which thread owns an
+#       output row does not change that row's fp32 accumulation order or its
+#       simd_sum.  (Measured: max_ulp 0 on all 36 cells.)
+#
+# NOTE: these are unproven on wall-clock until the epsilon slope run lands.  They
+# ship OFF.  The R2 dispatch condition lives in qmv_custom.qmv_applicable() so
+# tests can assert on it directly rather than re-deriving it.
+# ---------------------------------------------------------------------------
+PACK_SHARED_ENV = "MLX_VLM_GLM5_PACK_SHARED"
+SHARED_QMV_ENV = "MLX_VLM_GLM5_SHARED_QMV"
+# R3: hold the MoE router weight in fp32 instead of re-casting it every call.
+ROUTER_FP32_ENV = "MLX_VLM_GLM5_ROUTER_FP32"
+
+_SHARED_EXPERTS = "shared_experts."
+_SHARED_GATE_MARKER = _SHARED_EXPERTS + "gate_proj."
+_LINEAR_PARAMS = ("weight", "scales", "biases", "bias")
+
+
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name)
+    return raw is not None and raw.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def pack_shared_enabled(config: Any = None) -> bool:
+    flag = getattr(config, "pack_shared_gate_up", None) if config is not None else None
+    return bool(flag) if flag is not None else _env_flag(PACK_SHARED_ENV)
+
+
+def shared_qmv_enabled(config: Any = None) -> bool:
+    flag = getattr(config, "shared_qmv", None) if config is not None else None
+    return bool(flag) if flag is not None else _env_flag(SHARED_QMV_ENV)
+
+
+def router_fp32_enabled(config: Any = None) -> bool:
+    """R3: keep ``mlp.gate.weight`` in fp32 at load so the router GEMV stops
+    materialising a [288, 4096] fp32 copy on every layer of every token.
+
+    The checkpoint stores the router weight as BF16 [288, 4096] and
+    ``Glm5NextMoEGate.__call__`` does ``self.weight.astype(mx.float32)``, so
+    today each of the 42 routers reads 2.36 MB bf16, writes 4.72 MB fp32 and
+    then reads that 4.72 MB back for the matmul -- 11.80 MB per layer, 495.6 MB
+    per token.  Holding fp32 makes it a single 4.72 MB read, 198.2 MB per token.
+
+    Memory: the fp32 copies total 198.2 MB, but 99.1 MB of that was already
+    resident as bf16, so the INCREMENTAL cost is +99.1 MB.
+
+    Bit-exact: bf16 -> fp32 is lossless, so the pre-cast tensor is byte-identical
+    to what astype produces today and the matmul receives identical inputs.
+    """
+    flag = getattr(config, "router_weight_fp32", None) if config is not None else None
+    return bool(flag) if flag is not None else _env_flag(ROUTER_FP32_ENV)
+
+
+def fuse_shared_gate_up(weights: dict) -> dict:
+    """Concatenate ``shared_experts.gate_proj`` and ``up_proj`` on the output axis.
+
+    Only ``shared_experts.`` as a whole path component matches, so the routed
+    ``switch_mlp.gate_proj`` and the three dense ``mlp.gate_proj`` layers are
+    untouched.
+    """
+    prefixes = set()
+    for key in weights:
+        offset = key.rfind(_SHARED_GATE_MARKER)
+        if offset < 0 or (offset > 0 and key[offset - 1] != "."):
+            continue
+        if key[offset + len(_SHARED_GATE_MARKER) :] in _LINEAR_PARAMS:
+            prefixes.add(key[: offset + len(_SHARED_EXPERTS)])
+
+    for prefix in prefixes:
+        for name in _LINEAR_PARAMS:
+            gate_key = f"{prefix}gate_proj.{name}"
+            up_key = f"{prefix}up_proj.{name}"
+            fused_key = f"{prefix}gate_up_proj.{name}"
+            if fused_key in weights:
+                weights.pop(gate_key, None)
+                weights.pop(up_key, None)
+            elif gate_key in weights and up_key in weights:
+                weights[fused_key] = mx.concatenate(
+                    [weights.pop(gate_key), weights.pop(up_key)], axis=0
+                )
+    return weights
+
+
+def shared_mlp_quantization_aliases(path: str) -> tuple:
+    """Point a packed ``shared_experts.gate_up_proj`` at the checkpoint's
+    per-module quantization entries (gate and up are always quantized alike)."""
+    marker = ".shared_experts.gate_up_proj"
+    if not path.endswith(marker):
+        return ()
+    base = path[: -len(marker)] + ".shared_experts"
+    aliases = [f"{base}.gate_proj", f"{base}.up_proj"]
+    stripped = base.removeprefix("language_model.")
+    if stripped != base:
+        aliases.extend([f"{stripped}.gate_proj", f"{stripped}.up_proj"])
+    return tuple(aliases)
 
 
 class Glm5NextRMSNormGated(nn.Module):
@@ -1720,6 +1839,44 @@ class Glm5NextClampedSwiGLU(nn.Module):
         return nn.silu(x_gate) * x_up
 
 
+class Glm5NextPackedSharedMLP(nn.Module):
+    """Shared-expert MLP whose gate and up projections live in one Linear.
+
+    ``gate_up_proj`` holds ``[2 * intermediate, hidden]`` with gate stacked above
+    up.  The clamp/silu/mul and the down projection are byte-for-byte the ones in
+    ``Glm5NextMLP``; only the number of dispatches changes.
+    """
+
+    def __init__(self, config, hidden_size=None, intermediate_size=None):
+        super().__init__()
+        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
+        self.intermediate_size = (
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
+        self.gate_up_proj = nn.Linear(
+            self.hidden_size, 2 * self.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.limit = config.swiglu_limit
+        self.use_qmv = shared_qmv_enabled(config)
+
+    def _proj(self, layer, x):
+        if self.use_qmv:
+            y = maybe_qmv(layer, x, **DEFAULT_GEOMETRY)
+            if y is not None:
+                return y
+        return layer(x)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gate_up = self._proj(self.gate_up_proj, x)
+        gate = gate_up[..., : self.intermediate_size]
+        up = gate_up[..., self.intermediate_size :]
+        if self.limit is not None:
+            gate = mx.clip(gate, a_min=None, a_max=self.limit)
+            up = mx.clip(up, a_min=-self.limit, a_max=self.limit)
+        return self._proj(self.down_proj, nn.silu(gate) * up)
+
+
 class Glm5NextMLP(DeepseekMLP):
     # Dense / shared-expert MLP with the clamped SwiGLU (matches the reference text MLP).
     def __init__(self, config, hidden_size=None, intermediate_size=None):
@@ -1727,21 +1884,39 @@ class Glm5NextMLP(DeepseekMLP):
             config, hidden_size=hidden_size, intermediate_size=intermediate_size
         )
         self.limit = config.swiglu_limit
+        # Default OFF. Only Glm5NextMoE turns this on, and only for its
+        # shared_experts instance -- the three dense MLP layers share this class
+        # and are NOT part of the shared-expert item.
+        self.use_qmv = False
+
+    def _proj(self, layer, x):
+        if getattr(self, "use_qmv", False):
+            y = maybe_qmv(layer, x, **DEFAULT_GEOMETRY)
+            if y is not None:
+                return y
+        return layer(x)
 
     def __call__(self, x: mx.array) -> mx.array:
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
+        gate = self._proj(self.gate_proj, x)
+        up = self._proj(self.up_proj, x)
         if self.limit is not None:
             gate = mx.clip(gate, a_min=None, a_max=self.limit)
             up = mx.clip(up, a_min=-self.limit, a_max=self.limit)
-        return self.down_proj(nn.silu(gate) * up)
+        return self._proj(self.down_proj, nn.silu(gate) * up)
 
 
 class Glm5NextMoEGate(MoEGate):
     # Router logits in fp32 (reference uses moe_router_dtype=float32) so near-tie top-k
     # membership matches the reference rather than flipping under bf16 rounding.
     def __call__(self, x: mx.array):
-        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        # NOTE: mx.array.astype(dtype) does not short-circuit when the dtype
+        # already matches (checked on mlx 0.32.1 -- it returns a distinct array),
+        # so this guard is load-bearing, not cosmetic.  With R3 enabled the
+        # weight arrives fp32 and no cast kernel is emitted at all.
+        w = self.weight
+        if w.dtype != mx.float32:
+            w = w.astype(mx.float32)
+        logits = x.astype(mx.float32) @ w.T
         return group_expert_select(
             logits,
             self.e_score_correction_bias,
@@ -1762,7 +1937,15 @@ class Glm5NextMoE(DeepseekV32MoE):
         self.gate = Glm5NextMoEGate(config)
         if config.n_shared_experts is not None:
             inter = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = Glm5NextMLP(config, intermediate_size=inter)
+            cls = (
+                Glm5NextPackedSharedMLP
+                if pack_shared_enabled(config)
+                else Glm5NextMLP
+            )
+            self.shared_experts = cls(config, intermediate_size=inter)
+            # R2 applies to the SHARED expert only. The dense MLP layers use the
+            # same class and stay on MLX.
+            self.shared_experts.use_qmv = shared_qmv_enabled(config)
 
 
 class Glm5NextDecoderLayer(nn.Module):
@@ -2239,6 +2422,15 @@ class LanguageModel(nn.Module):
             )
             if keep and mx.issubdtype(v.dtype, mx.floating) and v.dtype != mx.float32:
                 weights[k] = v.astype(mx.float32)
+        if pack_shared_enabled(getattr(self, "config", None)):
+            weights = fuse_shared_gate_up(weights)
+        if router_fp32_enabled(getattr(self, "config", None)):
+            for k, v in list(weights.items()):
+                if k.endswith("mlp.gate.weight") and mx.issubdtype(
+                    v.dtype, mx.floating
+                ):
+                    if v.dtype != mx.float32:
+                        weights[k] = v.astype(mx.float32)
         return weights
 
     @property
