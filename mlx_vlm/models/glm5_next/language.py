@@ -2677,6 +2677,30 @@ class LanguageModel(nn.Module):
             return bool(prefill_kwargs.get("return_hidden", False)) and bool(
                 prefill_kwargs.get("return_shared_kv", False)
             )
+        if draft_kind == "dflash":
+            # The dflash drafter's ONLY need from the prefill is the per-layer
+            # hidden capture, and all THREE prefill drivers now carry the capture
+            # kwargs on every chunk and stitch the pieces back along the time
+            # axis (``speculative/utils.py::PrefillHiddenAccumulator``, used by
+            # ``server/generation.py::_run_chunked_speculative_prefill``, by
+            # ``generate/ar.py::generate_step`` and by
+            # ``generate/ar.py::PromptProcessingBatch`` -- the batched/continuous
+            # batching driver, which was fixed last).  Nothing reads a prefill's
+            # ``gdn_states``, so the stash stays off on every chunk as well.
+            #
+            # Gated on the capture actually being requested: a prefill_kwargs
+            # without ``capture_layer_ids`` gives the accumulator nothing to
+            # collect, and the drafter would be handed the final forward's single
+            # row instead of the prompt.  Same shape of guard as the mtp branch
+            # above -- the policy asks whether the contract this chunking relies
+            # on is present, not merely which drafter is attached.
+            #
+            # eagle3 is NOT admitted here.  Its capture is structurally the same
+            # per-layer list and the accumulator would stitch it identically, but
+            # its round loop takes ``prompt_tokens`` and its drafter publishes no
+            # trailing-context contract, so the equivalent claim is untested; the
+            # honest state is "not yet", not "yes".
+            return prefill_kwargs.get("capture_layer_ids") is not None
         return draft_kind is None
 
     def rollback_speculative_cache(

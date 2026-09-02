@@ -22,8 +22,10 @@ from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
+    PrefillHiddenAccumulator,
     make_speculative_prompt_cache,
     prefill_capture_kwargs,
+    prefill_context_keep,
     run_speculative_rounds,
     run_speculative_server_rounds,
     speculative_hidden_state,
@@ -344,6 +346,34 @@ def generate_step(
         if hasattr(lm, "_rope_deltas"):
             lm._rope_deltas = None
 
+    # The chunk loop below must carry the SAME capture as the final forward, or
+    # the drafter is handed a one-row context (issue #2096: ``chunk_kwargs`` was
+    # built from ``kwargs`` only, so turning chunking on for a capturing drafter
+    # silently dropped the prompt).  Only a per-layer capture stitches back
+    # together -- see ``_run_chunked_speculative_prefill`` in server/generation.py
+    # for why MTP's ``return_hidden`` is deliberately excluded.
+    _prefill_capture_kwargs = (
+        prefill_capture_kwargs(
+            model.language_model if hasattr(model, "language_model") else model,
+            speculative_prefill_capture_kwargs,
+        )
+        if speculative_prefill_capture_kwargs
+        else {}
+    )
+    _chunk_capture_kwargs = (
+        _prefill_capture_kwargs
+        if _prefill_capture_kwargs.get("capture_layer_ids")
+        else {}
+    )
+    target_hidden_offset = 0
+    _prefill_hidden = PrefillHiddenAccumulator(
+        keep=(
+            prefill_context_keep(draft_kind, draft_model)
+            if _chunk_capture_kwargs
+            else None
+        )
+    )
+
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
 
@@ -352,12 +382,7 @@ def generate_step(
             # Prefill only -- with a drafter attached the loop below is unreachable
             # (the speculative branch returns first), so every _step that carries
             # these kwargs is a prefill forward.  Drop the rollback stash there.
-            step_kwargs = {
-                **kwargs,
-                **prefill_capture_kwargs(
-                    model.language_model, speculative_prefill_capture_kwargs
-                ),
-            }
+            step_kwargs = {**kwargs, **_prefill_capture_kwargs}
         if getattr(model.language_model, "supports_logits_to_keep", False):
             step_kwargs = {**step_kwargs, "logits_to_keep": 1}
 
@@ -485,7 +510,10 @@ def generate_step(
             # (vault merge fix: the old single ``checkpoint_len`` became the
             # boundary ladder -- pipeline stays disabled whenever any
             # checkpoint boundary is requested.)
-            if not ladder:
+            # ``_chunk_capture_kwargs`` disables it too: ``pipeline.prefill_chunk``
+            # returns no output object, so a pipelined chunk's hidden capture
+            # cannot be accumulated and the drafter would lose the prompt.
+            if not ladder and not _chunk_capture_kwargs:
                 from ..pipeline_runtime import maybe_open_pipeline
 
                 pipeline = maybe_open_pipeline(model, total_tokens, verbose=verbose)
@@ -506,6 +534,8 @@ def generate_step(
                     chunk_kwargs = kwargs
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**kwargs, "logits_to_keep": 1}
+                    if _chunk_capture_kwargs:
+                        chunk_kwargs = {**chunk_kwargs, **_chunk_capture_kwargs}
                     if pipeline is not None:
                         pipeline.prefill_chunk(
                             model,
@@ -516,15 +546,22 @@ def generate_step(
                         # only stage A's caches exist on this box until finalize
                         mx.eval([c.state for c in pipeline.local_caches(prompt_cache)])
                     else:
-                        model.language_model(
+                        chunk_out = model.language_model(
                             inputs=input_ids[:, :n_to_process],
                             inputs_embeds=inputs_embeds[:, :n_to_process],
                             cache=prompt_cache,
                             n_to_process=n_to_process,
                             **chunk_kwargs,
                         )
+                        _prefill_hidden.append(chunk_out)
+                        # Drop the chunk's logits (and any gdn stash) BEFORE the
+                        # eval, so the vocab-wide projection is never materialised
+                        # for a chunk nobody samples from.
+                        chunk_out = None
                         quantize_cache_fn(prompt_cache)
-                        mx.eval([c.state for c in prompt_cache])
+                        mx.eval(
+                            [c.state for c in prompt_cache] + _prefill_hidden.pending()
+                        )
                     processed_tokens += n_to_process
                     for reached in ladder.reached(processed_tokens):
                         prompt_cache_checkpoint(reached, prompt_cache)
@@ -543,6 +580,11 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+        if _chunk_capture_kwargs and last_outputs is not None:
+            _prefill_hidden.append(last_outputs)
+            stitched, target_hidden_offset = _prefill_hidden.finish()
+            if stitched is not None:
+                last_outputs.hidden_states = stitched
 
     mx.async_eval(y, logprobs)
 
@@ -562,6 +604,7 @@ def generate_step(
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
             prompt_tokens=full_prompt_ids,
+            target_hidden_offset=target_hidden_offset,
         )
         return
 
@@ -1486,6 +1529,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        target_hidden_offset: int = 0,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1503,6 +1547,13 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        # Rows the prefill trimmed off the front of the drafter's context.  The
+        # drafter discards that prefix itself when it is handed the whole prompt,
+        # and adds its width to every draft cache offset; when the prefill
+        # discarded it first the offset has to be supplied here or the drafter's
+        # absolute RoPE positions move.  Same contract the single-stream path
+        # carries as ``target_hidden_offset`` (``generate_step``).
+        self.target_hidden_offset = int(target_hidden_offset or 0)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1589,6 +1640,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            target_hidden_offset=self.target_hidden_offset,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1728,6 +1780,17 @@ class PromptProcessingBatch:
                 ]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
+        # ``prompt_step`` consumes ``_input_ids`` one chunk at a time, so anything
+        # that needs the WHOLE prompt -- ``prompt_tokens`` on the speculative round
+        # loop, which is the prompt-lookup drafter's n-gram corpus -- must be handed
+        # a snapshot taken before the loop starts.  Passing ``self._input_ids`` at
+        # the round-loop call site instead hands over only the tail that survived
+        # chunking.  ``generate_step`` keeps the same snapshot as ``full_prompt_ids``.
+        #
+        # This is only the PREFILL input, though: on a warm row it is the suffix, and
+        # the prefix came from a cache.  Refined below once ``_apc_meta`` is known --
+        # see ``_whole_prompt_ids_rows``.
+        self._speculative_prompt_ids = self._input_ids
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
 
@@ -1866,6 +1929,143 @@ class PromptProcessingBatch:
                 prefill_kwargs=policy_kwargs,
             ):
                 self.prefill_step_size = None
+
+        # This is the THIRD chunked-prefill driver in the tree, and it had the same
+        # defect the other two were fixed for: ``prompt_step`` built its kwargs from
+        # ``self._prompt_kwargs`` alone, so a batched request with a hidden-reading
+        # drafter chunked its prompt and then handed the drafter only the final
+        # forward -- a one-chunk context -- while ``chunked_prefill_policy`` had
+        # already admitted the chunking on the strength of the capture being asked
+        # for.  Carry the same capture on every chunk and stitch the pieces back;
+        # see ``generate_step`` and ``server/generation.py::
+        # _run_chunked_speculative_prefill`` for the identical shape.
+        self._prefill_capture_kwargs: dict = {}
+        self._chunk_capture_kwargs: dict = {}
+        self.target_hidden_offset = 0
+        if draft_model is not None and draft_kind is not None:
+            # Prefill leg: hidden captures yes, KDA rollback stash no.
+            self._prefill_capture_kwargs = prefill_capture_kwargs(
+                self.model,
+                speculative_prefill_kwargs(draft_kind, draft_model),
+            )
+            # Only a per-layer capture (``capture_layer_ids``) survives being split
+            # across chunks and stitched back on the time axis.  MTP's
+            # ``return_hidden`` capture is a single pre-final-norm hidden whose
+            # consumer wants the LAST token only, so it stays off the chunks.
+            if self._prefill_capture_kwargs.get("capture_layer_ids"):
+                self._chunk_capture_kwargs = self._prefill_capture_kwargs
+
+        # ``prompt_tokens`` must be the WHOLE prompt, and on a warm row the prefill
+        # input is only the suffix.  ``_build_mixed_prompt_batch`` records the whole
+        # thing per row as ``apc_meta[i]["full_input_ids"]``; recover it from there.
+        whole_rows = self._whole_prompt_ids_rows(input_ids, self._apc_meta)
+        if whole_rows is not None:
+            self._speculative_prompt_ids = _left_pad_prompts(whole_rows)
+
+        # Two refusals, both of them policy rather than mechanism, and both of them
+        # costing memory rather than correctness.  Each names the TRIM it refuses;
+        # only the second one also refuses the CHUNKING.
+        #
+        # 1.  A RIGHT-PADDED batch (the mixed warm/cold driver,
+        #     ``_build_mixed_prompt_batch``) is refused the TRIM ONLY.  The drafter's
+        #     window is the TRAILING rows of the capture, and for a short right-padded
+        #     row those rows are padding, so a trimmed context would hand that row a
+        #     window of zeros.  That objection is about the trim and nothing else.
+        #
+        #     NARROWED 2026-09-03, on this merge.  The blanket version of this refusal
+        #     also declined the chunking, for two reasons that no longer hold:
+        #       * "a chunk boundary is not the same column of real content in every
+        #         row, so the stitched pieces do not line up".  They do line up when
+        #         ``keep is None``: ``PrefillHiddenAccumulator._prune`` is then a
+        #         no-op and ``finish()`` concatenates every chunk on the time axis,
+        #         which reproduces the full padded width column for column, exactly
+        #         as an unchunked capture does.  Misalignment is a property of the
+        #         trim (which counts back from a prompt end that differs per row),
+        #         not of the stitch.  Measured on the section-9 fixture at chunk
+        #         4/8/12/16/24/32: capture ``[2, 40, 256]``, offset 0, agreeing with
+        #         the unchunked capture to <= 4.2e-07 -- the same KDA scan-split drift
+        #         class this file already records for the left-padded batch path --
+        #         and the prompt cache BIT-EQUAL to the unchunked arm in every one of
+        #         those arms.
+        #       * "chunking walks into the negative last-real-token index".  That
+        #         defect is FIXED on this branch: ``_last_real_column`` /
+        #         ``_capture_last_real_logits`` above capture each row's ``[1, vocab]``
+        #         slice in whatever chunk its last real token lands in, so chunked
+        #         greedy selection on a right-padded batch is exact (measured: the
+        #         same tokens as the unchunked arm at every chunk size).
+        # 2.  A warm row whose prefix cannot be named (no ``full_input_ids``) means
+        #     the drafter cannot be handed the whole prompt, so it does not get a
+        #     trimmed one either -- and this one KEEPS the blanket form (chunking
+        #     declined as well).  Nothing was measured about that case here, and a
+        #     refusal is not narrowed on an argument alone.
+        #
+        # In both cases the capture stays FULL WIDTH and untrimmed, and
+        # ``capture_gdn_states=False`` still rides on every forward, so the
+        # sequence-shaped KDA rollback stash is still never built.
+        self._capture_refusal: Optional[str] = None
+        self._capture_refusal_declines_chunking = False
+        if self._chunk_capture_kwargs:
+            if right_pad_per_row is not None:
+                self._capture_refusal = (
+                    "right-padded batch (mixed warm/cold prefill): the drafter's "
+                    "window is the trailing rows, which are padding for a short row"
+                )
+            elif whole_rows is None:
+                self._capture_refusal = (
+                    "a warm row's prefix is not recoverable (apc_meta carries no "
+                    "full_input_ids), so the drafter cannot be handed the whole "
+                    "prompt"
+                )
+                self._capture_refusal_declines_chunking = True
+        if self._capture_refusal is not None:
+            logger.info(
+                "speculative prefill: declining the trailing-context trim%s for "
+                "this batch -- %s. The capture stays full width and %s; "
+                "capture_gdn_states is still off.",
+                (
+                    " and the chunked prefill"
+                    if self._capture_refusal_declines_chunking
+                    else ""
+                ),
+                self._capture_refusal,
+                (
+                    "the prefill runs in one forward"
+                    if self._capture_refusal_declines_chunking
+                    else "the prefill still chunks"
+                ),
+            )
+            if self._capture_refusal_declines_chunking:
+                self.prefill_step_size = None
+        self._prefill_hidden = PrefillHiddenAccumulator(
+            keep=(
+                prefill_context_keep(draft_kind, draft_model)
+                if self._chunk_capture_kwargs and self._capture_refusal is None
+                else None
+            )
+        )
+
+    @staticmethod
+    def _whole_prompt_ids_rows(input_ids, apc_meta):
+        """The whole prompt per row, or ``None`` if a warm row's prefix is unnameable.
+
+        A cold row's prefill input IS its whole prompt.  A warm row's is the suffix;
+        its whole prompt is ``apc_meta[i]["full_input_ids"]``.  Returning ``None``
+        rather than a best effort is deliberate: a caller that silently used the
+        suffix would hand the prompt-lookup drafter an n-gram corpus missing
+        everything the cache already held.
+        """
+        rows = []
+        for i, ids in enumerate(input_ids):
+            meta = apc_meta[i] if i < len(apc_meta) else None
+            full = (meta or {}).get("full_input_ids")
+            prefix_len = int((meta or {}).get("prefix_len", 0) or 0)
+            if full is not None and len(full) >= len(ids):
+                rows.append(list(full))
+            elif prefix_len > 0:
+                return None
+            else:
+                rows.append(list(ids))
+        return rows
 
     def __len__(self):
         return len(self.uids)
@@ -2098,10 +2298,18 @@ class PromptProcessingBatch:
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
-        capture_rows = self._rows_ending_in_chunk(n)
-        # The forward's arguments are exactly what they were before this fix --
-        # nothing about the capture reaches the model -- so the prompt cache
+        # Which rows END in this chunk (right-padded batches only).  Reading it
+        # off the recorded absolute column adds NOTHING to the forward's
+        # arguments, so on a batch with no hidden-reading drafter the model
+        # still sees byte-for-byte the call it saw before and the prompt cache
         # this chunk writes cannot move.
+        capture_rows = self._rows_ending_in_chunk(n)
+        # The speculative capture, on the other hand, IS an argument, and it has
+        # to ride on every chunk or the drafter is handed a one-chunk context.
+        # The two are independent: this dict is empty without a hidden-reading
+        # drafter, and ``capture_rows`` is empty without right padding.
+        if self._chunk_capture_kwargs:
+            prompt_kwargs = {**prompt_kwargs, **self._chunk_capture_kwargs}
         chunk_out = self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
@@ -2109,13 +2317,35 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
-        pending: List[mx.array] = []
+        # BOTH readers take what they need out of the ONE bound output, in this
+        # order, before it is released:
+        #   1. the last-real-token logits of every row that ends in this chunk,
+        #      kept as a ``[1, vocab]`` slice per row (right-padded batches only);
+        #   2. this chunk's per-layer hidden, appended to the accumulator that
+        #      stitches the whole-prompt context for a hidden-reading drafter.
+        # Neither reader is aware of the other; both are no-ops when their own
+        # precondition is absent.
+        last_real_pending: List[mx.array] = []
         if capture_rows:
-            pending = self._capture_last_real_logits(chunk_out, capture_rows)
-        # Drop the chunk's full projection before the eval, so only the kept
-        # per-row slices are materialised beyond this statement.
+            last_real_pending = self._capture_last_real_logits(chunk_out, capture_rows)
+        if self._chunk_capture_kwargs:
+            self._prefill_hidden.append(chunk_out)
+        # Only now drop the chunk's logits (and any gdn stash) -- BEFORE the eval
+        # below, so neither the vocab-wide projection of a chunk nobody samples
+        # from nor a sequence-shaped KDA rollback stash is ever materialised.
+        # Without either reader this is exactly the old statement-expression call.
         chunk_out = None
-        mx.async_eval([c.state for c in self.prompt_cache] + pending)
+        # Both pendings are empty unless their reader is active, so the plain
+        # greedy no-drafter path schedules the same single argument it always did.
+        # Scheduling them is not optional: an unevaluated capture is a graph node
+        # that pins every intermediate behind it
+        # (``PrefillHiddenAccumulator.pending``), and an unevaluated ``[1, vocab]``
+        # slice would pin the chunk projection this statement just dropped.
+        mx.async_eval(
+            [c.state for c in self.prompt_cache]
+            + last_real_pending
+            + self._prefill_hidden.pending()
+        )
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._store_vault_checkpoints()
@@ -2154,14 +2384,10 @@ class PromptProcessingBatch:
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
         call_kwargs = dict(self._prompt_kwargs)
-        if self.draft_model is not None and self.draft_kind is not None:
-            # Prefill leg: hidden captures yes, KDA rollback stash no.
-            call_kwargs.update(
-                prefill_capture_kwargs(
-                    self.model,
-                    speculative_prefill_kwargs(self.draft_kind, self.draft_model),
-                )
-            )
+        # Prefill leg: hidden captures yes, KDA rollback stash no.  Computed once in
+        # ``__init__`` so this forward and every chunk before it carry byte-identical
+        # capture kwargs -- the accumulator raises if the capture width moves.
+        call_kwargs.update(self._prefill_capture_kwargs)
 
         output = self.model(
             self._input_ids,
@@ -2169,6 +2395,14 @@ class PromptProcessingBatch:
             inputs_embeds=self._inputs_embeds,
             **call_kwargs,
         )
+        if self._chunk_capture_kwargs:
+            # Stitch this forward's capture onto the chunks' and hand the drafter one
+            # whole-prompt context.  ``finish()`` also reports the rows it trimmed off
+            # the front, which the drafter is owed as a RoPE offset.
+            self._prefill_hidden.append(output)
+            stitched, self.target_hidden_offset = self._prefill_hidden.finish()
+            if stitched is not None:
+                output.hidden_states = stitched
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             # Per-row last *real* token sits at absolute column
@@ -2268,10 +2502,11 @@ class PromptProcessingBatch:
                 shared_kv_states=(
                     output.shared_kv_states if self.draft_kind == "mtp" else None
                 ),
-                prompt_tokens=self._input_ids,
+                prompt_tokens=self._speculative_prompt_ids,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                target_hidden_offset=self.target_hidden_offset,
             )
             compute_logprobs = False
         else:

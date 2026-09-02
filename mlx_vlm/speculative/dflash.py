@@ -722,6 +722,30 @@ def _speculative_walk_batch_deferred_greedy(
     return accepted_list, new_tokens_list
 
 
+def _adopt_pretruncated_context(draft_model, draft_caches, target_hidden_offset: int):
+    """Give a drafter back the offset a caller's context trim took from it.
+
+    A chunked prefill may hand round 1 only the trailing window of the prompt
+    (``speculative/utils.py::PrefillHiddenAccumulator``).  The drafter would
+    normally discard that prefix itself and add its width to every layer cache's
+    offset; when the caller discarded it first, the offset has to be supplied or
+    the drafter's absolute RoPE positions move.  Loud rather than silent: a
+    non-zero offset a drafter cannot accept is a wiring bug.
+    """
+    if not target_hidden_offset:
+        return
+    adopt = getattr(draft_model, "adopt_pretruncated_context", None)
+    if not callable(adopt):
+        raise RuntimeError(
+            f"{type(draft_model).__name__} was handed a pre-truncated target "
+            f"hidden (offset {target_hidden_offset}) but does not implement "
+            "adopt_pretruncated_context; its context RoPE positions would be "
+            "wrong. Set MLX_VLM_SPEC_PREFILL_CTX_TRIM=0 or teach the drafter."
+        )
+    for cache in draft_caches:
+        adopt(cache, int(target_hidden_offset))
+
+
 def _dflash_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -735,6 +759,7 @@ def _dflash_rounds(
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
     greedy_sampling: bool = True,
+    target_hidden_offset: int = 0,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -754,6 +779,7 @@ def _dflash_rounds(
         draft_model, draft_block_size, ignore_runtime=_fixed_width() > 0
     )
     draft_cache = draft_model.reset(model)
+    _adopt_pretruncated_context(draft_model, [draft_cache], target_hidden_offset)
     _reset_uniform_clamp(draft_model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     sampler_rng = _SpeculativeSamplerRNG(
@@ -894,6 +920,7 @@ def _dflash_rounds_batch(
     stop_check: Optional[Callable[[int, int], bool]] = None,
     greedy_sampling: bool = True,
     row_ids: Optional[List[int]] = None,
+    target_hidden_offset: int = 0,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -933,6 +960,7 @@ def _dflash_rounds_batch(
         draft_model, greedy_sampling=greedy_sampling
     )
     draft_caches = [draft_model.make_cache() for _ in range(B)]
+    _adopt_pretruncated_context(draft_model, draft_caches, target_hidden_offset)
 
     # Per-sequence state tracked by ORIGINAL index so the caller sees
     # stable indices in the yielded token lists.
