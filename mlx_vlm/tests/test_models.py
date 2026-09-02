@@ -3380,6 +3380,13 @@ class TestModels(unittest.TestCase):
                 steps.append(lm(mx.array([[tok]]), cache=c).logits)
             mx.eval(steps)
             outs[on] = steps
+            # Assert the path, never assume it. A comparison whose "compiled"
+            # arm silently stayed eager passes for the wrong reason -- the same
+            # failure shape as nn.Module's training=True default routing both
+            # arms of an HC comparison down the ops path.
+            built = [L._attn_pre_c is not None for L in lm.model.layers]
+            self.assertEqual(all(built), on,
+                             f"compile_attn={on} but compiled prologues={built}")
         for i, (a, b) in enumerate(zip(outs[True], outs[False])):
             self.assertLess(float(mx.max(mx.abs(a - b))), 1e-3,
                             f"attention prologue compile diverged at step {i}")
