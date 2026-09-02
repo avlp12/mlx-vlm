@@ -406,13 +406,22 @@ def test_spec_round_loop_mixed_sequence_is_mirrored_step_for_step(monkeypatch):
 
 
 def test_verify_width_varies_with_acceptance_and_is_announced(monkeypatch):
-    """Width-W verify: W is decided by rank 0's cost model and changes between
-    rounds, so it has to travel rather than be assumed."""
-    # Seven rounds, not three.  Adaptive-K is now the shipped default and it
+    """Width-W verify: W is decided by rank 0's width policy and can change
+    between rounds, so it has to travel rather than be assumed."""
+    # The shipped default is the FIXED policy (block total 8, R24), under which
+    # W never moves and this test would be vacuous -- it held [6]*7 and failed
+    # once the default flipped.  The invariant under test is the wire, not the
+    # policy, so SELECT the one policy that moves W instead of reaching it by
+    # omission (the same rule test_dflash_adaptive_k.py follows).  Adaptive-K
     # needs MINROUNDS (4) of acceptance history before it has a hazard to act
-    # on, so a three-round plan holds W constant and a test that cannot move W
-    # is not testing the invariant.  This plan establishes a hazard and then
-    # breaks it, and W really does move: [6, 6, 6, 6, 5, 4, 5].
+    # on, so a three-round plan holds W constant; this seven-round plan
+    # establishes a hazard and then breaks it: [6, 6, 6, 6, 5, 4, 5].
+    from mlx_vlm.speculative import dflash as _dflash
+    monkeypatch.setenv("MLX_VLM_DFLASH_ADAPTIVE_K", "1")
+    monkeypatch.delenv("MLX_VLM_DFLASH_FIXED_WIDTH", raising=False)
+    for name in ("_ADAPTIVE_K_ENV", "_FIXED_WIDTH_ENV"):
+        monkeypatch.setattr(_dflash, name, None)
+    assert _dflash._adaptive_k_enabled(), "test must run under the adaptive policy"
     pair, sent, _ = _drive_spec_rounds(
         monkeypatch, plan=[4, 4, 4, 4, 0, None, 2], block_size=6
     )
