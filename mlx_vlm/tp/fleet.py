@@ -96,6 +96,95 @@ MIN_FREE_GB = float(os.environ.get("MLX_VLM_TP_MIN_FREE_GB", "100"))
 # Typical resident sizes on this fleet, so a caller can say what it is about to
 # load instead of guessing a floor.
 SHARD_GB = {"tp": 86.0, "single": 183.0}
+# ^ RETAINED FOR CALLERS THAT PASS AN EXPLICIT LOAD. For sizing a single-box
+# load, prefer single_box_required_gib(): 183.0 is one operating point (the
+# B-curve at B=8.1, 512-token prompts, decode) and lane 5 measured 190.52 GiB at
+# B=1 with a 16k prefill -- the same failure I891 named, a gate sized below what
+# the workload reaches.
+
+
+class UnmeasuredConfiguration(RuntimeError):
+    """No cited receipt covers this configuration, so no size can be claimed."""
+
+
+# Measured single-box peaks, each carrying the receipt it came from. Nothing
+# here is typed from memory: test_fleet_peaks_are_cited re-reads every receipt
+# and fails if a number drifts from its source.
+#
+# Key: (batch, prompt_tokens, chunk, segment_align, speculative) -> GiB.
+# ``chunk=None`` means the receipt did not vary it.
+SINGLE_BOX_PEAKS = {
+    # Decode arm, 512-token prompts, fused KDA (logs/tp2/kda_bench_*_202609011436)
+    (1, 512, None, False, False): (173.9, "tp2/kda_bench_x1_cap32_202609011436.json",
+                                   ("preflight", "fit", "anchors", 0, 1)),
+    (2, 512, None, False, False): (175.3, "tp2/kda_bench_x1_cap32_202609011436.json",
+                                   ("preflight", "fit", "anchors", 1, 1)),
+    (4, 512, None, False, False): (177.7, "tp2/kda_bench_x1_cap32_202609011436.json",
+                                   ("preflight", "fit", "anchors", 2, 1)),
+    (8, 512, None, False, False): (183.2, "tp2/kda_bench_x1_cap32_202609011436.json",
+                                   ("preflight", "fit", "anchors", 3, 1)),
+    # 16k real-text prefill, epsilon (logs/sweep6/SWEEP6_L2_e2e_E1.json)
+    (1, 16384, 512, False, False): (190.52, "sweep6/SWEEP6_L2_e2e_E1.json",
+                                    ("arms", 0, "peak_gb")),
+    (1, 16384, 512, True, False): (196.10, "sweep6/SWEEP6_L2_e2e_E1.json",
+                                   ("arms", 1, "peak_gb")),
+}
+# Configurations the gate CANNOT size yet, listed so their absence is a decision
+# rather than an oversight. Until each lands, a request needing it is refused.
+PEAKS_PENDING = (
+    "(1, 16384, 2048, OFF/ON) -- 198.11 / 210.01 GiB are in the same lane 5 "
+    "receipt but under a stride the arm records as 2048; add once the locator "
+    "is confirmed against the file rather than assumed",
+    "B=8 and B=16 prefill, align OFF -- lane 3 X3 T2",
+    "B=1 speculative peaks -- lane 2 X3/R24",
+    "align ON at batch > 1 -- lane 5, tomorrow",
+)
+_LOG_ROOT = os.environ.get("MLX_VLM_FLEET_RECEIPT_ROOT",
+                           os.path.expanduser("~/glm53flash/logs"))
+
+
+def single_box_required_gib(*, batch: int, prompt_tokens: int,
+                            chunk: Optional[int] = None,
+                            segment_align: bool = False,
+                            speculative: bool = False) -> tuple:
+    """Peak GiB to request, and the receipt that justifies it.
+
+    THE RULE, pre-registered. A configuration is sized only by a measured point
+    that DOMINATES it -- one whose batch, prompt length and chunk are all >= the
+    request, whose segment_align is on if the request's is, and likewise
+    speculative. Among dominating points the SMALLEST is returned, so the gate is
+    tight without ever being under.
+
+    Nothing is interpolated and nothing is extrapolated. The old linear fit
+    (173.0 + 1.23*B) is kept as documentation of the batch slope, not as a
+    sizing rule: it was drawn from 512-token decode arms, and lane 5 measured
+    +16.6 GiB at the SAME batch simply by prefilling 16k. A line fitted in one
+    dimension cannot be trusted in another, and using it that way is how 183.0
+    came to be quoted for workloads that reach 210.
+
+    Uncovered configurations RAISE. Refusing costs a load that has to be
+    measured first; guessing costs a frozen box, and only one of those is
+    recoverable (I891, and the 2026-09-01 freeze).
+    """
+    want = (batch, prompt_tokens, chunk or 0, segment_align, speculative)
+    best = None
+    for (b, p, c, a, sp), (gib, receipt, loc) in SINGLE_BOX_PEAKS.items():
+        if b < want[0] or p < want[1] or (c or 0) < want[2]:
+            continue
+        if want[3] and not a:
+            continue
+        if want[4] and not sp:
+            continue
+        if best is None or gib < best[0]:
+            best = (gib, receipt, loc)
+    if best is None:
+        raise UnmeasuredConfiguration(
+            f"no cited peak dominates batch={batch} prompt={prompt_tokens} "
+            f"chunk={chunk} align={segment_align} spec={speculative}. "
+            f"Measure it; do not extrapolate. Pending: {PEAKS_PENDING}")
+    return best[0], f"{best[1]}::{'.'.join(str(x) for x in best[2])}"
+
+
 
 # How require_headroom_box() counts headroom.
 #
@@ -534,7 +623,15 @@ class _RUsageInfoV2(ctypes.Structure):
 
 
 def phys_footprint_gb(pid: Optional[int] = None) -> float:
-    """This (or another) process's physical footprint in GB, 0.0 if gone.
+    """This (or another) process's physical footprint in GiB, 0.0 if gone.
+
+    UNIT, stated because it cost an audit: the divisor is ``_GB = 1024**3``, so
+    this and every ``*_gb`` field in this module are GiB. The suffix is a
+    historical mislabel kept for compatibility. Lane 5's peak receipts come from
+    HERE, so they are GiB and compare directly against ``SHARD_GB`` -- a
+    conclusion worth checking before refitting a gate on them, because lane 5's
+    own pre-registration wrote "173.0 + 1.23*B GiB ... predicts 192.7 GB" in one
+    sentence and the two readings differ by 7%.
 
     The number a shutdown has to move.  ``resident_size`` does not: MLX's Metal
     buffers are simply not in it, so a teardown that logs "unloaded" while RSS
