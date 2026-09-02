@@ -2964,20 +2964,35 @@ class BatchGenerator:
         buffers are not ours to take.  Adoption is only for a cache nobody will
         touch again.
         """
+        # Every early return NAMES ITSELF. Live on ff9a3045 this method returned
+        # False five different ways in silence, and the seven checks could only
+        # report "nothing happened" -- which is indistinguishable from the
+        # feature being switched off.
         if not _context_vault.session_capture_enabled():
+            _context_vault.record_session_skip("flag_off")
             return False
-        if getattr(self, "vault", None) is None or not session_id:
+        if getattr(self, "vault", None) is None:
+            _context_vault.record_session_skip("generator_has_no_vault")
+            return False
+        if not session_id:
+            _context_vault.record_session_skip("no_session_id_at_generator")
             return False
         try:
             gb = self._generation_batch
-            if gb is None or uid not in gb.uids:
+            if gb is None:
+                _context_vault.record_session_skip("no_generation_batch")
+                return False
+            if uid not in gb.uids:
+                _context_vault.record_session_skip("uid_gone_from_batch")
                 return False
             row = gb.uids.index(uid)
             row_cache = _apc.snapshot_prompt_cache_row(gb.prompt_cache, row)
             if not row_cache:
+                _context_vault.record_session_skip("row_cache_unavailable")
                 return False
             key = list(tokens) if tokens is not None else self._session_tokens.get(uid)
             if not key:
+                _context_vault.record_session_skip("empty_token_key")
                 return False
             return _context_vault.record_session_turn(
                 self.vault,
@@ -2989,6 +3004,7 @@ class BatchGenerator:
                 adopt=False,
             )
         except Exception:  # noqa: BLE001 - never fail a response over a rung
+            _context_vault.record_session_skip("exception_in_capture_session")
             logger.warning("vault: session capture failed for uid=%s; the next "
                            "turn falls back to a cold prefill", uid, exc_info=True)
             return False

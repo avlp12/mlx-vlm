@@ -122,12 +122,17 @@ def _vault_stats_snapshot() -> dict:
     """
     gen = getattr(runtime, "response_generator", None)
     vault = getattr(gen, "vault", None) if gen is not None else None
+    from .. import context_vault as _vault_mod
+    # Skip counts are reported whether or not a vault exists: two of the reasons
+    # are "there is no vault" and "the flag is off", and those are exactly the
+    # cases a caller most needs named.
+    skips = _vault_mod.session_skip_counts()
     if vault is None:
-        return {"enabled": False}
+        return {"enabled": False, "session_skips": skips}
     try:
-        return {"enabled": True, **vault.stats_dict()}
+        return {"enabled": True, "session_skips": skips, **vault.stats_dict()}
     except Exception:  # noqa: BLE001 - observability must not break the endpoint
-        return {"enabled": True, "stats_error": True}
+        return {"enabled": True, "session_skips": skips, "stats_error": True}
 
 
 def _server_runtime_snapshot() -> dict:

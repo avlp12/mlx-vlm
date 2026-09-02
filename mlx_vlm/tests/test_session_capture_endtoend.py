@@ -8,6 +8,7 @@ capture_session call at finish_reason -- and none without an id.
 
 import argparse
 import importlib
+import os
 import types
 import unittest
 
@@ -149,7 +150,9 @@ class TestVaultObservability(unittest.TestCase):
         old = getattr(_app.runtime, "response_generator", None)
         try:
             _app.runtime.response_generator = None
-            self.assertEqual(_app._vault_stats_snapshot(), {"enabled": False})
+            snap = _app._vault_stats_snapshot()
+            self.assertFalse(snap["enabled"])
+            self.assertIn("session_skips", snap)
         finally:
             _app.runtime.response_generator = old
 
@@ -157,7 +160,9 @@ class TestVaultObservability(unittest.TestCase):
         old = getattr(_app.runtime, "response_generator", None)
         try:
             _app.runtime.response_generator = types.SimpleNamespace(vault=None)
-            self.assertEqual(_app._vault_stats_snapshot(), {"enabled": False})
+            snap = _app._vault_stats_snapshot()
+            self.assertFalse(snap["enabled"])
+            self.assertIn("session_skips", snap)
         finally:
             _app.runtime.response_generator = old
 
@@ -182,7 +187,82 @@ class TestVaultObservability(unittest.TestCase):
         old = getattr(_app.runtime, "response_generator", None)
         try:
             _app.runtime.response_generator = types.SimpleNamespace(vault=Boom())
-            self.assertEqual(_app._vault_stats_snapshot(),
-                             {"enabled": True, "stats_error": True})
+            snap = _app._vault_stats_snapshot()
+            self.assertTrue(snap["enabled"])
+            self.assertTrue(snap["stats_error"])
         finally:
             _app.runtime.response_generator = old
+
+
+class TestSkipReasonsAreNamed(unittest.TestCase):
+    """The feature was inert live and said nothing. Now it says which gate.
+
+    On unified ff9a3045 the seven live checks found session_inserts stuck at 0
+    with an empty server log, because capture_session had five early returns and
+    none of them spoke. A disabled feature and a broken one produced the same
+    picture, which is the failure the APC default had -- rebuilt, by me, in my
+    own code, while fixing theirs.
+    """
+
+    def setUp(self):
+        from mlx_vlm import context_vault as V
+        self.V = V
+        V.reset_session_skips()
+        saved = {k: os.environ.get(k) for k in (V._ENV_SESSION,)}
+
+        def restore():
+            for k, val in saved.items():
+                if val is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = val
+        self.addCleanup(restore)
+        os.environ.pop(V._ENV_SESSION, None)
+
+    def test_no_vault_is_named(self):
+        self.V.record_session_turn(None, [1, 2], [], completed=True, session_id="s")
+        self.assertEqual(self.V.session_skip_counts().get("no_vault"), 1)
+
+    def test_cancel_is_named_rather_than_silent(self):
+        self.V.record_session_turn(object(), [1, 2], [], completed=False,
+                                   session_id="s")
+        self.assertEqual(self.V.session_skip_counts().get("not_completed"), 1)
+
+    def test_missing_session_id_is_named(self):
+        v = self.V.ContextVault("skips", budget_bytes=1 << 20)
+        self.V.record_session_turn(v, [1, 2], [], completed=True, session_id="")
+        self.assertEqual(self.V.session_skip_counts().get("no_session_id"), 1)
+
+    def test_flag_off_is_named_at_the_generator(self):
+        from mlx_vlm.generate.ar import BatchGenerator
+        g = types.SimpleNamespace(vault=object(), _generation_batch=None,
+                                  _session_tokens={})
+        BatchGenerator.capture_session(g, "u1", session_id="s")
+        self.assertEqual(self.V.session_skip_counts().get("flag_off"), 1)
+
+    def test_uid_gone_is_distinguishable_from_flag_off(self):
+        from mlx_vlm.generate.ar import BatchGenerator
+        os.environ[self.V._ENV_SESSION] = "1"
+        g = types.SimpleNamespace(
+            vault=object(), _session_tokens={},
+            _generation_batch=types.SimpleNamespace(uids=["other"]))
+        BatchGenerator.capture_session(g, "u1", session_id="s")
+        counts = self.V.session_skip_counts()
+        self.assertEqual(counts.get("uid_gone_from_batch"), 1)
+        self.assertIsNone(counts.get("flag_off"),
+                          "the two must not collapse into one reason")
+
+    def test_every_reason_is_a_distinct_string(self):
+        """A counter that reuses a name cannot separate two causes."""
+        import inspect
+        from mlx_vlm.generate import ar
+        src = inspect.getsource(ar.BatchGenerator.capture_session)
+        names = [ln.split('record_session_skip("')[1].split('"')[0]
+                 for ln in src.splitlines() if 'record_session_skip("' in ln]
+        self.assertEqual(len(names), len(set(names)), f"duplicate reasons: {names}")
+        self.assertGreaterEqual(len(names), 6)
+
+    def test_the_skips_reach_the_stats_endpoint(self):
+        self.V.record_session_turn(None, [1], [], completed=True, session_id="s")
+        self.assertIn("no_vault",
+                      _app._vault_stats_snapshot().get("session_skips", {}))
