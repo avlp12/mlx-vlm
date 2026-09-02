@@ -32,6 +32,7 @@ Usable from a shell driver too::
 """
 from __future__ import annotations
 
+import _thread
 import ctypes
 import json
 import logging
@@ -39,6 +40,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -93,6 +95,52 @@ MIN_FREE_GB = float(os.environ.get("MLX_VLM_TP_MIN_FREE_GB", "100"))
 # Typical resident sizes on this fleet, so a caller can say what it is about to
 # load instead of guessing a floor.
 SHARD_GB = {"tp": 86.0, "single": 183.0}
+
+# How require_headroom_box() counts headroom.
+#
+#   free_only    -- vm_stat "Pages free" alone.  The original rule.  Safe, and
+#                   wrong often enough to matter: after a box has read a 171 GB
+#                   model once, the page cache holds nearly all of RAM as
+#                   INACTIVE file-backed pages, "free" reads ~40 GB, and the
+#                   gate refuses a load the box can trivially serve by evicting
+#                   clean cache.
+#   reclaimable  -- free + min(inactive, file-backed).  Clean file-backed pages
+#                   are evictable without swapping, so they are headroom.
+#
+# The default stays free_only.  Switching a box to reclaimable is a fleet rule
+# change and is recorded as one; the WATCHED-LOAD clause below is mandatory
+# under it, because "reclaimable" is a claim about the future that has to be
+# checked while the load happens rather than asserted before it.
+GATE_ACCOUNTING = os.environ.get("MLX_VLM_FLEET_GATE_ACCOUNTING", "free_only")
+# Abort floor for a watched load.
+#
+# DEVIATION, FLAGGED FOR RATIFICATION: the floor was specified as "free < 20 GB".
+# On a box that has read a 171 GB model, "Pages free" is STRUCTURALLY near zero
+# -- macOS holds the page cache at whatever size fits and reclaims on demand.
+# Measured on gesicht immediately before the validation run: free 2.7 GB,
+# inactive 479.7 GB, swap 0.  A literal free-based floor fires instantly on a
+# perfectly healthy box, so it cannot be the trigger.
+#
+# The floor therefore reads the SAME quantity the gate now counts -- free plus
+# reclaimable clean file-backed pages.  That is the faithful translation of the
+# intent ("the load is losing the race"), because when a load really is losing,
+# the reclaimable pool is what collapses.  swap > 0 remains the primary trigger
+# and is unchanged.
+WATCH_FLOOR_GB = float(os.environ.get("MLX_VLM_FLEET_WATCH_FLOOR_GB", "20"))
+WATCH_FREE_FLOOR_GB = WATCH_FLOOR_GB  # back-compat alias
+WATCH_POLL_S = float(os.environ.get("MLX_VLM_FLEET_WATCH_POLL_S", "5"))
+
+
+def gate_accountings(mem: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
+    """Both headroom numbers for one box, so a receipt can show what each rule
+    would have said.  Returns None for an accounting the probe cannot support
+    (an older peer sends no inactive/file-backed fields)."""
+    free = mem.get("free_gb")
+    inact, fileb = mem.get("inactive_gb"), mem.get("file_backed_gb")
+    recl = None
+    if free is not None and inact is not None and fileb is not None:
+        recl = round(free + min(inact, fileb), 1)
+    return {"free_only": free, "reclaimable": recl}
 
 # ``single`` is one operating point, not a constant, and treating it as a
 # constant is a way to under-request.  A single-box decode arm's peak grows with
@@ -149,8 +197,112 @@ _PROBE = ("/usr/bin/top -l 1 -o mem -n 40 -stats pid,mem; "
           # Free and wired in GB.  vm_stat is the only place the *absolute*
           # headroom is visible, and absolute headroom is what a load needs.
           "/usr/bin/vm_stat | /usr/bin/awk '/Pages free/{f=$3} "
-          "/Pages wired down/{w=$4} END{gsub(/[.]/,\"\",f);gsub(/[.]/,\"\",w);"
-          "printf \"VMFREEGB %.1f %.1f\\n\", f*16384/2^30, w*16384/2^30}'")
+          "/Pages wired down/{w=$4} /Pages inactive/{i=$3} "
+          "/File-backed pages/{fb=$3} END{gsub(/[.]/,\"\",f);gsub(/[.]/,\"\",w);"
+          "gsub(/[.]/,\"\",i);gsub(/[.]/,\"\",fb);"
+          "printf \"VMFREEGB %.1f %.1f %.1f %.1f\\n\", f*16384/2^30, "
+          "w*16384/2^30, i*16384/2^30, fb*16384/2^30}'")
+
+
+class LoadAborted(RuntimeError):
+    """A watched load was stopped because the box started losing headroom."""
+
+
+class WatchedLoad:
+    """Poll local memory during a load and abort if the box starts to lose.
+
+    Mandatory under GATE_ACCOUNTING == "reclaimable".  The reclaimable rule
+    promises that clean file-backed pages will be evicted rather than swapped;
+    this is what checks that the promise is being kept, while it is being kept
+    or broken, instead of asserting it beforehand.
+
+    Abort is by ``interrupt_main()``, which raises KeyboardInterrupt in the main
+    thread and unwinds through every context manager on the way out -- so the
+    wired_limit exits and the streams are cleared.  A bare SIGTERM to a process
+    holding a shard leaks wired memory that only a reboot returns, so it is
+    never used here.
+    """
+
+    def __init__(self, label: str = "", floor_gb: float = None,
+                 poll_s: float = None, expect: Optional[dict] = None):
+        self.label = label
+        self.floor_gb = WATCH_FLOOR_GB if floor_gb is None else floor_gb
+        self.poll_s = WATCH_POLL_S if poll_s is None else poll_s
+        self.expect = expect
+        self.trajectory: List[dict] = []
+        self.fired: Optional[str] = None
+        self._stop = threading.Event()
+        self._t: Optional[threading.Thread] = None
+
+    @staticmethod
+    def sample() -> dict:
+        out = {"t": round(time.time(), 2)}
+        try:
+            vm = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
+                                text=True, timeout=10).stdout
+            g = 16384 / _GB
+            for line, key in (("Pages free", "free_gb"),
+                              ("Pages wired down", "wired_gb"),
+                              ("Pages inactive", "inactive_gb"),
+                              ("File-backed pages", "file_backed_gb")):
+                for ln in vm.splitlines():
+                    if ln.startswith(line):
+                        n = float(ln.rsplit(":", 1)[1].strip().rstrip("."))
+                        out[key] = round(n * g, 1)
+                        break
+            sw = subprocess.run(["/usr/sbin/sysctl", "-n", "vm.swapusage"],
+                                capture_output=True, text=True, timeout=10).stdout
+            used = sw.split("used =")[1].split()[0]
+            mult = _UNITS.get(used[-1].upper(), 1.0)
+            out["swap_used_gb"] = round(float(used[:-1]) * mult / _GB, 2)
+        except Exception as exc:                       # a probe failure is not
+            out["probe_error"] = str(exc)[:120]        # a reason to kill a load
+        return out
+
+    def _run(self):
+        while not self._stop.wait(self.poll_s):
+            s = self.sample()
+            self.trajectory.append(s)
+            swap = s.get("swap_used_gb")
+            free, inact = s.get("free_gb"), s.get("inactive_gb")
+            fileb = s.get("file_backed_gb")
+            avail = None
+            if free is not None and inact is not None and fileb is not None:
+                avail = free + min(inact, fileb)
+                s["available_gb"] = round(avail, 1)
+            why = None
+            if swap is not None and swap > 0:
+                why = f"swap appeared ({swap:.2f}GB)"
+            elif avail is not None and avail < self.floor_gb:
+                why = (f"available (free {free:.1f} + reclaimable "
+                       f"{min(inact, fileb):.1f}) fell to {avail:.1f}GB, "
+                       f"below the {self.floor_gb:.0f}GB floor")
+            if why:
+                self.fired = why
+                logging.error("[watched-load] ABORTING %s: %s", self.label, why)
+                _thread.interrupt_main()
+                return
+
+    def __enter__(self):
+        self.trajectory.append(dict(self.sample(), phase="before"))
+        self._t = threading.Thread(target=self._run, daemon=True,
+                                   name="watched-load")
+        self._t.start()
+        return self
+
+    def __exit__(self, et, ev, tb):
+        self._stop.set()
+        if self._t is not None:
+            self._t.join(timeout=self.poll_s + 5)
+        self.trajectory.append(dict(self.sample(), phase="after"))
+        if self.fired and et is KeyboardInterrupt:
+            raise LoadAborted(f"{self.label}: {self.fired}") from ev
+        return False
+
+    def receipt(self) -> dict:
+        return {"label": self.label, "floor_gb": self.floor_gb,
+                "poll_s": self.poll_s, "expected": self.expect,
+                "fired": self.fired, "trajectory": self.trajectory}
 
 
 class HeavyRunActive(RuntimeError):
@@ -260,7 +412,9 @@ def _parse_ps(text: str, threshold_gb: float, ignore_pids: Sequence[int] = ()) \
 def _parse_memory(text: str) -> Dict[str, Optional[float]]:
     """swap used (GB) and system-wide free percentage from the probe tail."""
     out: Dict[str, Optional[float]] = {"swap_used_gb": None, "free_pct": None,
-                                       "free_gb": None, "wired_gb": None}
+                                       "free_gb": None, "wired_gb": None,
+                                       "inactive_gb": None,
+                                       "file_backed_gb": None}
     out["free_gb"] = None
     _, _, mem = text.partition(_MEM_SEP)
     for line in mem.splitlines():
@@ -276,9 +430,18 @@ def _parse_memory(text: str) -> Dict[str, Optional[float]]:
             except (IndexError, ValueError):
                 pass
         elif line.strip().startswith("VMFREEGB"):
+            f = line.split()
             try:
-                out["free_gb"] = round(float(line.split()[1]), 1)
-                out["wired_gb"] = round(float(line.split()[2]), 1)
+                out["free_gb"] = round(float(f[1]), 1)
+                out["wired_gb"] = round(float(f[2]), 1)
+            except (IndexError, ValueError):
+                pass
+            # Fields 3 and 4 are newer than fields 1 and 2; a peer running an
+            # older build sends only two, so these stay None and the reclaimable
+            # accounting refuses to apply rather than guessing.
+            try:
+                out["inactive_gb"] = round(float(f[3]), 1)
+                out["file_backed_gb"] = round(float(f[4]), 1)
             except (IndexError, ValueError):
                 pass
         elif "free percentage" in low:
@@ -484,7 +647,8 @@ def require_headroom(load_gb: float, hosts: Sequence[str] = (),
 def require_headroom_box(host: Optional[str], load_gb: float,
                          margin_gb: float = 60.0, label: str = "",
                          ps_runner: Optional[Callable[[Optional[str]], str]] = None,
-                         threshold_gb: float = HEAVY_FOOTPRINT_GB) -> dict:
+                         threshold_gb: float = HEAVY_FOOTPRINT_GB,
+                         accounting: Optional[str] = None) -> dict:
     """Headroom + quiet check scoped to ONE box, ignoring every other machine.
 
     require_headroom() folds in localhost because a TP load needs both boxes.
@@ -498,23 +662,53 @@ def require_headroom_box(host: Optional[str], load_gb: float,
     procs = _parse_ps(text, threshold_gb)
     mem = _parse_memory(text)
     need = load_gb + margin_gb
+    acct = accounting or GATE_ACCOUNTING
+    avail = gate_accountings(mem)
+    # Record what BOTH rules would have said, always, whichever one decides.
+    verdicts = {k: (None if v is None else bool(v >= need))
+                for k, v in avail.items()}
     receipt = {"box": who, "label": label, "when": time.strftime("%FT%T%z"),
                "load_gb": load_gb, "margin_gb": margin_gb, "pressure": mem,
-               "busy": procs, "quiet": not procs}
+               "busy": procs, "quiet": not procs, "accounting": acct,
+               "available_gb": avail, "would_pass": verdicts,
+               "need_gb": need}
+    # One model load per box.  Unchanged, and still a hard requirement.
     if procs:
         detail = ", ".join(f"pid {p['pid']} {p['footprint_gb']}GB {p['cmd']}"
                            for p in procs)
         raise HeavyRunActive(
             f"refusing {label or 'this load'} on {who}: something heavy is "
             f"already resident there ({detail}).")
-    free = mem.get("free_gb")
-    if free is not None and free < need:
+    # Swap must be zero.  free_only never needed this check because it never
+    # spent the page cache; reclaimable does, so a box that is ALREADY swapping
+    # has no clean pages to promise and must be refused outright.
+    swap = mem.get("swap_used_gb")
+    if swap is not None and swap > 0:
         receipt["quiet"] = False
         raise HeavyRunActive(
-            f"refusing {label or 'this load'} on {who}: {free:.1f}GB free, "
-            f"needs {need:.0f}GB ({load_gb:.0f} load + {margin_gb:.0f} margin"
+            f"refusing {label or 'this load'} on {who}: swap is in use "
+            f"({swap:.2f}GB). Headroom accounting assumes swap == 0.")
+    if acct not in avail:
+        raise ValueError(f"unknown gate accounting {acct!r}; "
+                         f"expected one of {sorted(avail)}")
+    have = avail[acct]
+    if have is None:
+        raise HeavyRunActive(
+            f"refusing {label or 'this load'} on {who}: accounting {acct!r} "
+            "needs inactive/file-backed page counts and this box's probe did "
+            "not report them (older build on the peer?).")
+    if have < need:
+        receipt["quiet"] = False
+        extra = ""
+        if acct == "reclaimable":
+            extra = (f" [free {mem.get('free_gb')}GB + reclaimable "
+                     f"{have - (mem.get('free_gb') or 0):.1f}GB]")
+        raise HeavyRunActive(
+            f"refusing {label or 'this load'} on {who}: {have:.1f}GB available "
+            f"under {acct}, needs {need:.0f}GB ({load_gb:.0f} load + "
+            f"{margin_gb:.0f} margin"
             + (f", {mem['wired_gb']:.0f} already wired)" if mem.get("wired_gb")
-               else ")"))
+               else ")") + extra)
     receipt["headroom_ok"] = True
     return receipt
 
