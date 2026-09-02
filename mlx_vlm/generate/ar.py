@@ -2867,6 +2867,63 @@ class BatchGenerator:
         )
         return uids
 
+    def capture_session(
+        self,
+        uid,
+        tokens: Sequence[int],
+        *,
+        session_id: str,
+        ttl_s: Optional[float] = None,
+    ) -> bool:
+        """Store an end-of-turn session rung for ``uid``.  Never raises.
+
+        Called BY THE SERVER when a response completes, not from inside the
+        decode loop.  Two reasons, and they are the design:
+
+        * the server is the layer that knows what a conversation is.  This
+          object knows about rows and caches and has no idea which requests
+          belong together, and ``session_id`` must be the server's conversation
+          id -- never the token-derived fallback, which in production hashes the
+          shared system prompt and collapses every conversation into one
+          eviction group (see ``context_vault.derived_session_id_allowed``).
+
+        * the row's cache is only meaningful while the row is still in the
+          generation batch, i.e. in the window between ``finish_reason`` being
+          emitted and ``remove()``.  Calling it from the server's completion
+          handler lands inside that window; calling it later finds no row and
+          returns False rather than storing something wrong.
+
+        ``adopt=False`` deliberately: the row cache is extracted from a
+        batch-shaped cache the other rows are still decoding against, so the
+        buffers are not ours to take.  Adoption is only for a cache nobody will
+        touch again.
+        """
+        if not _context_vault.session_capture_enabled():
+            return False
+        if getattr(self, "vault", None) is None or not session_id:
+            return False
+        try:
+            gb = self._generation_batch
+            if gb is None or uid not in gb.uids:
+                return False
+            row = gb.uids.index(uid)
+            row_cache = _apc.snapshot_prompt_cache_row(gb.prompt_cache, row)
+            if not row_cache:
+                return False
+            return _context_vault.record_session_turn(
+                self.vault,
+                tokens,
+                row_cache,
+                completed=True,
+                session_id=session_id,
+                ttl_s=ttl_s,
+                adopt=False,
+            )
+        except Exception:  # noqa: BLE001 - never fail a response over a rung
+            logger.warning("vault: session capture failed for uid=%s; the next "
+                           "turn falls back to a cold prefill", uid, exc_info=True)
+            return False
+
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):

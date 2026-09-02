@@ -83,6 +83,8 @@ _ENV_ENABLE = "MLX_VLM_GLM5_VAULT"
 _ENV_BUDGET_GB = "MLX_VLM_GLM5_VAULT_BUDGET_GB"
 _ENV_STRIDE = "MLX_VLM_GLM5_VAULT_STRIDE"
 _ENV_MAX_LADDER = "MLX_VLM_GLM5_VAULT_MAX_LADDER"
+_ENV_SESSION = "MLX_VLM_GLM5_VAULT_SESSION"
+_ENV_SESSION_DERIVED_ID = "MLX_VLM_GLM5_VAULT_SESSION_DERIVED_ID"
 
 _DEFAULT_BUDGET_GB = 256.0
 _DEFAULT_STRIDE = 8192
@@ -105,6 +107,33 @@ def vault_budget_bytes() -> int:
     except (TypeError, ValueError):
         gb = _DEFAULT_BUDGET_GB
     return int(max(0.0, gb) * (1024**3))
+
+
+def session_capture_enabled() -> bool:
+    """End-of-turn capture, ``MLX_VLM_GLM5_VAULT_SESSION``.  Default OFF.
+
+    Off until it has been validated on a live server: it fires on the RESPONSE
+    path, which is the one place in this stack where a mistake reaches the
+    client rather than the log.
+    """
+    return _env_truthy(_ENV_SESSION)
+
+
+def derived_session_id_allowed() -> bool:
+    """Whether a missing session id may be derived from the tokens.  Default OFF.
+
+    ``session_id_for`` hashes the first 64 tokens.  In production those are
+    almost always the SYSTEM PROMPT, so every conversation on a server would
+    hash to one id, collapse into one eviction group, and deep-first eviction
+    would start shedding the deepest rung of unrelated conversations.  Nothing
+    becomes incorrect -- the trie still keys on the full prefix -- but the
+    graceful-degradation property that justifies deep-first eviction is gone.
+
+    So the id is REQUIRED from the caller in production, and the derivation is
+    available only behind this flag, for tests and single-tenant experiments
+    where the collapse is harmless and understood.
+    """
+    return _env_truthy(_ENV_SESSION_DERIVED_ID)
 
 
 def default_boundary_stride() -> int:
@@ -906,6 +935,35 @@ def session_id_for(tokens: Sequence[int], turns: int = 0) -> str:
     return h.hexdigest()[:16]
 
 
+def prefix_len_from_cache(caches: Sequence[Any]) -> Optional[int]:
+    """How many tokens this cache actually holds, asked of the cache itself.
+
+    Not computed from the prompt length plus a token count.  At end of turn the
+    last sampled token has NOT been fed back through the model, and the exact
+    bookkeeping differs between the padded and unpadded batch paths
+    (``_row_real_tokens_processed`` counts prompt columns only and knows nothing
+    about decode).  The offset the attention caches carry is the one number that
+    is true by construction.
+
+    Returns None -- meaning "do not store" -- when the offsets DISAGREE.  A cache
+    whose halves think they hold different numbers of tokens is silently wrong
+    rather than slow, and the campaign's rule for that is to refuse.  Components
+    that are flat in sequence length (the KDA ``ArraysCache``) carry no offset
+    and are ignored.
+    """
+    offsets = set()
+    for entry in caches or ():
+        subs = getattr(entry, "caches", None)
+        for sub in (subs if subs is not None else [entry]):
+            off = getattr(sub, "offset", None)
+            if off is not None:
+                offsets.add(int(off))
+    if len(offsets) != 1:
+        return None
+    n = offsets.pop()
+    return n if n > 0 else None
+
+
 def record_session_turn(
     vault: Optional[ContextVault],
     tokens: Sequence[int],
@@ -915,6 +973,7 @@ def record_session_turn(
     session_id: str = "",
     ttl_s: Optional[float] = None,
     adopt: bool = True,
+    prefix_len: Optional[int] = None,
 ) -> bool:
     """Store the cache as of the end of a finished turn.  Never raises.
 
@@ -942,15 +1001,34 @@ def record_session_turn(
         toks = list(tokens)
         if not toks:
             return False
-        frags = capture_fragments(caches, len(toks), adopt=adopt)
+        sid = session_id
+        if not sid:
+            if not derived_session_id_allowed():
+                logger.warning(
+                    "vault: refusing a session capture with no session_id; the "
+                    "caller must pass its conversation id (see "
+                    "derived_session_id_allowed for why the token-derived "
+                    "fallback is not safe in production)")
+                return False
+            sid = session_id_for(toks)
+        n = prefix_len if prefix_len is not None else prefix_len_from_cache(caches)
+        if n is None or n <= 0:
+            return False
+        if n > len(toks):
+            # The cache holds more than the key describes; the key would not
+            # identify the state. Refuse rather than store a mislabelled rung.
+            logger.warning("vault: session capture skipped, cache holds %d tokens "
+                           "but the key has %d", n, len(toks))
+            return False
+        frags = capture_fragments(caches, n, adopt=adopt)
         if frags is None:
             return False
         return vault.insert(
             toks,
-            len(toks),
+            n,
             frags,
             tier=VaultTier.SESSION,
-            session_id=session_id or session_id_for(toks),
+            session_id=sid,
             ttl_s=ttl_s,
         )
     except Exception:  # noqa: BLE001 - a vault fault must never fail a response
@@ -989,4 +1067,5 @@ def restore_session(
         return False
 
 
-__all__ += ["session_id_for", "restore_session"]
+__all__ += ["session_id_for", "restore_session", "prefix_len_from_cache",
+            "session_capture_enabled", "derived_session_id_allowed"]
