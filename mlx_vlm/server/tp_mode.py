@@ -297,6 +297,28 @@ class MirroredLanguageModel:
     def __getattr__(self, name):
         return getattr(self._lm, name)
 
+    def supports_per_row_speculative_rollback(self, caches) -> bool:
+        """No: rank 1 cannot represent a per-row length, so nobody may use one.
+
+        Per-row rollback needs a batched (left-paddable) KV cache on BOTH sides.
+        The wire is not the obstacle -- ``OP_ROLLBACK`` already carries the whole
+        per-row list (``_accepted_list`` -> ``ids``, decoded back into a list by
+        ``tp/worker.py``), so a ragged vector would cross intact.  Rank 1's
+        CACHES are: the worker builds ``self.lm.make_cache()`` and nothing else
+        (``tp/worker.py`` cache_for / new_cache / _vault_restore), i.e. the
+        scalar-offset ``KVCache`` with one offset for the batch.  Handed a ragged
+        list it would raise inside ``rollback_speculative_cache`` -- mid-round,
+        on the peer, after rank 0 had already rolled back and moved on.
+
+        So the mirror declines for the pair, and the batched loop clamps under
+        TP exactly as it did before.  Lifting this is a rank-1 change (build the
+        batch caches there), not a protocol one; the two ranks must answer this
+        question identically, and the only way to be sure of that today is for
+        rank 0 to answer for both.
+        """
+        del caches
+        return False
+
     # ------------------------------------------------------------ discipline
     def _embeds_are_just_the_ids(self, inputs, embeds) -> bool:
         """Is ``inputs_embeds`` exactly what rank 1 gets by embedding the ids?
