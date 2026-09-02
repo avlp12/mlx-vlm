@@ -248,10 +248,20 @@ def _mqa_sdpa(q, kv, scale, mask):
       1. the fused metal kernel (head dim 512/256, no score tensor)      -- MLX_VLM_GLM5_FUSED_MLA
       2. the MQA fold at L == 1 (one GEMM instead of H broadcast GEMVs)  -- MLX_VLM_GLM5_MQA_FOLD
       3. MLX's own call, unchanged.
-    ``mask`` is None or a bool array broadcastable to [B, H, L, N].
+
+    CONTRACT ON ``mask``: None, or an ARRAY broadcastable to [B, H, L, N] (bool or additive
+    float).  MLX's SDPA API also accepts the string sentinel "causal", which
+    ``create_attention_mask`` returns when ``return_array`` is false (base.py) -- and both fast
+    paths below index ``mask.ndim`` / ``mask.dtype``, which a string does not have.  Neither
+    rewrite is expressed for the sentinel, so it is handed straight back to MLX rather than
+    crashed on.  The glm5_next call sites pass ``return_array=True`` today, so this is a contract
+    fix and not a live bug -- but the contract is now enforced here instead of assumed.
     """
     B, H, L, D = q.shape
     N = kv.shape[2]
+
+    if mask is not None and not isinstance(mask, mx.array):
+        return scaled_dot_product_attention(q, kv, kv, cache=None, scale=scale, mask=mask)
 
     # The fused kernel is tiled with no split-K, so it launches G * ceil(R/32) threadgroups.
     # Below that floor it cannot fill the GPU and loses badly to the composite -- measured

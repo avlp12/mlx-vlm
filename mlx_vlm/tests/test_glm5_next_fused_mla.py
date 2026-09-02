@@ -225,6 +225,121 @@ class TestFusedMLA(unittest.TestCase):
         self.assertEqual(n_k, 0, "the launch-size guard did not decline a 1-threadgroup call")
         self.assertEqual(sh, [(1, 8, 1, 512)])
 
+    # ------------------------------------------------------- the fold under a REAL mask
+    # Adversarial review (Codex, relayed 2026-09-02) found that nothing exercised the fold with a
+    # mask: the module tests run mask=None and the kernel tests take the Gk==G path. These call
+    # _mqa_sdpa directly at the exact shapes the model produces, with the exact mask ranks.
+    def _fold_vs_composite(self, L_mod, q, kv, mask, tol_ulps=4):
+        """Assert fold == composite AND that the fold was actually entered.
+
+        The shape assertion is the whole point: without it a silent decline makes the tolerance
+        check vacuously true, which is exactly how the first version of the module test in this
+        file passed while executing none of the new code.
+        """
+        from mlx_vlm.models.base import scaled_dot_product_attention as sdpa
+
+        scale = 256 ** -0.5
+        B, H = q.shape[0], q.shape[1]
+        ref = sdpa(q, kv, kv, cache=None, scale=scale, mask=mask)
+        mx.eval(ref)
+
+        seen = []
+        orig = L_mod.scaled_dot_product_attention
+
+        def wrap(a, b, c, cache=None, scale=None, mask=None, **kw):
+            seen.append(tuple(a.shape))
+            return orig(a, b, c, cache=cache, scale=scale, mask=mask, **kw)
+
+        L_mod.scaled_dot_product_attention = wrap
+        L_mod._MQA_FOLD_ENV = True
+        L_mod._FUSED_MLA_ENV = False
+        try:
+            got = L_mod._mqa_sdpa(q, kv, scale, mask)
+            mx.eval(got)
+        finally:
+            L_mod.scaled_dot_product_attention = orig
+
+        self.assertEqual(seen[:1], [(B, 1, H, q.shape[3])],
+                         f"fold was NOT entered: inner query shape {seen[:1]}")
+        self.assertEqual(got.shape, ref.shape)
+        err = float(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max())
+        u = _ulp_bf16(ref.astype(mx.float32))
+        self.assertLess(err, tol_ulps * u, f"fold err={err} ulp={u}")
+        self.assertGreater(err, 0.0,
+                           "bit-identical to the composite means the fold silently declined")
+        return err, u
+
+    def test_fold_declines_a_head_dependent_mask(self):
+        """A [B, H, 1, N] mask cannot ride the fold unchanged, so it must fall through."""
+        L = _reload(MLX_VLM_GLM5_MQA_FOLD="1", MLX_VLM_GLM5_FUSED_MLA=None)
+        from mlx_vlm.models.base import scaled_dot_product_attention as sdpa
+
+        mx.random.seed(11)
+        q = mx.random.normal((2, 64, 1, 512)).astype(mx.bfloat16)
+        kv = mx.random.normal((2, 1, 2048, 512)).astype(mx.bfloat16)
+        m = mx.random.uniform(shape=(2, 64, 1, 2048)) > 0.3
+        mx.eval(q, kv, m)
+        L._MQA_FOLD_ENV = True
+        L._FUSED_MLA_ENV = False
+        got = L._mqa_sdpa(q, kv, 256 ** -0.5, m)
+        ref = sdpa(q, kv, kv, cache=None, scale=256 ** -0.5, mask=m)
+        mx.eval(got, ref)
+        self.assertEqual(float(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max()), 0.0,
+                         "a head-dependent mask must be handed back to MLX bit-identically")
+
+    def test_fold_with_bool_mask(self):
+        L = _reload(MLX_VLM_GLM5_MQA_FOLD="1", MLX_VLM_GLM5_FUSED_MLA=None)
+        mx.random.seed(7)
+        q = mx.random.normal((2, 64, 1, 512)).astype(mx.bfloat16)
+        kv = mx.random.normal((2, 1, 2048, 512)).astype(mx.bfloat16)
+        m = mx.random.uniform(shape=(2, 1, 1, 2048)) > 0.3
+        mx.eval(q, kv, m)
+        self._fold_vs_composite(L, q, kv, m)
+
+    def test_fold_with_additive_float_mask(self):
+        L = _reload(MLX_VLM_GLM5_MQA_FOLD="1", MLX_VLM_GLM5_FUSED_MLA=None)
+        mx.random.seed(8)
+        q = mx.random.normal((2, 64, 1, 512)).astype(mx.bfloat16)
+        kv = mx.random.normal((2, 1, 2048, 512)).astype(mx.bfloat16)
+        # additive mask: 0 where visible, a large negative where not -- the shape
+        # create_attention_mask produces for a float mask
+        blocked = mx.random.uniform(shape=(2, 1, 1, 2048)) > 0.7
+        m = mx.where(blocked, mx.array(-1e4, mx.bfloat16), mx.array(0.0, mx.bfloat16))
+        mx.eval(q, kv, m)
+        self._fold_vs_composite(L, q, kv, m)
+
+    def test_fold_on_the_gathered_path_shape(self):
+        """The per-chunk shape _gathered_attention actually builds: B*lc rows, one KV head."""
+        L = _reload(MLX_VLM_GLM5_MQA_FOLD="1", MLX_VLM_GLM5_FUSED_MLA=None)
+        mx.random.seed(9)
+        q = mx.random.normal((256, 64, 1, 512)).astype(mx.bfloat16)
+        kv = mx.random.normal((256, 1, 64, 512)).astype(mx.bfloat16)
+        valid = mx.random.uniform(shape=(256, 1, 1, 64)) > 0.2
+        valid = valid | (mx.arange(64)[None, None, None, :] == 0)   # never a fully-masked row
+        mx.eval(q, kv, valid)
+        self._fold_vs_composite(L, q, kv, valid)
+
+    def test_fold_declines_the_causal_string_sentinel(self):
+        """MLX accepts mask="causal"; the fold branch indexes mask.ndim, which a str lacks.
+
+        create_attention_mask returns the sentinel whenever return_array is false. The glm5_next
+        call sites pass return_array=True, so this is a contract fix rather than a live bug -- but
+        it must hand back to MLX instead of raising AttributeError.
+        """
+        L = _reload(MLX_VLM_GLM5_MQA_FOLD="1", MLX_VLM_GLM5_FUSED_MLA="1",
+                    MLX_VLM_GLM5_FUSED_MLA_MIN_TG="1")
+        mx.random.seed(10)
+        q = mx.random.normal((1, 64, 16, 512)).astype(mx.bfloat16)
+        kv = mx.random.normal((1, 1, 64, 512)).astype(mx.bfloat16)
+        mx.eval(q, kv)
+        out = L._mqa_sdpa(q, kv, 256 ** -0.5, "causal")     # must not raise
+        mx.eval(out)
+        ref = mx.fast.scaled_dot_product_attention(q, kv, kv, scale=256 ** -0.5, mask="causal")
+        mx.eval(ref)
+        self.assertEqual(
+            float(mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max()), 0.0,
+            "the sentinel must be handed back to MLX unchanged, not rewritten")
+
 
 if __name__ == "__main__":
     unittest.main()
