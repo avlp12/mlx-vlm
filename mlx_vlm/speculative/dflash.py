@@ -49,8 +49,23 @@ def _fixed_width() -> int:
 
 def _adaptive_k_enabled() -> bool:
     """Pick the block width that maximises measured throughput instead of
-    ratcheting on thresholds.  ON by default; ``MLX_VLM_DFLASH_ADAPTIVE_K=0``
-    is the kill switch back to the ladder.
+    ratcheting on thresholds.  OPT-IN since R24: set
+    ``MLX_VLM_DFLASH_ADAPTIVE_K=1``.
+
+    THERE ARE THREE WIDTH POLICIES, and "adaptive off" no longer means "ladder":
+
+        fixed (DEFAULT)  block total ``MLX_VLM_DFLASH_FIXED_WIDTH``, default 8 --
+                         the drafter's own trained ``dflash_config.block_size``.
+                         See ``_fixed_width``.
+        adaptive-K       this function, ``MLX_VLM_DFLASH_ADAPTIVE_K=1``.
+        ladder (legacy)  reachable only with ``MLX_VLM_DFLASH_FIXED_WIDTH=0``
+                         and adaptive off.
+
+    R24 measured fixed 8 against adaptive-K on four workloads, n=3 paired ABAB,
+    and fixed won every one on worst-pair: code 1.0663, prose 1.0820, chat
+    1.0798, prose@16,394 1.0832 (logs/sweep3/CARD_spec_row_r24_p1024.json,
+    _r24_p16k.json).  Adaptive-K is kept as the documented alternative that lost
+    R20 and R24, not as a fallback anyone should reach for by default.
 
     It deliberately takes precedence over ``prefer_requested_block_size`` (the
     harness's --fixed-block): pinning the width is exactly what this replaces,
@@ -79,17 +94,33 @@ def _adaptive_k_enabled() -> bool:
     nothing measurable; on prose it settles at a mean width of 3.03 and takes 118
     rounds for 256 tokens, where the cost model takes 106.
 
-    THE COST MODEL IS AHEAD OF THE LADDER, NOT AT THE OPTIMUM.  Fixed W=5 still
-    beats it on prose, 42.33 against 38.83 tok/s.  That gap was investigated
+    THE COST MODEL IS AHEAD OF THE LADDER, NOT AT THE OPTIMUM -- and R24 closed
+    that question against it.  Fixed W=5 already beat it on prose, 42.33 against
+    38.83 tok/s, and fixed 8 went on to beat it on all four R24 workloads.  That gap was investigated
     under PA780 and it does NOT close: see _empirical_enabled for the three
     independent reasons and logs/sweep3/R12_RESULT.json for the receipts.  It is
     the drafter's cost of workload-blindness and it is structural, not a tuning
     miss.
 
-    No identity question attached: in the same session all seven width policies
-    produced identical decoded text for a given workload and all returned 256
-    tokens, which is what speculative decoding's exactness guarantee predicts.
-    Width selection moves wall clock and nothing else.
+    ON IDENTITY, AND THIS PARAGRAPH USED TO BE WRONG.  It previously claimed
+    that all width policies produced identical decoded text, "which is what
+    speculative decoding's exactness guarantee predicts".  R18 measured the
+    opposite: every policy decoded DIFFERENT text, including greedy against
+    every speculative policy (logs/sweep3/CARD_spec_row_r18.json).  Speculative
+    decoding is exact in exact arithmetic, but verifying S tokens in one forward
+    is not bit-identical to S sequential forwards in floating point -- a
+    near-tie argmax flips once and everything after it diverges.
+
+    What IS true, and what the receipts show: each policy is internally
+    reproducible (one sha1 per policy per workload across three cycles), every
+    arm returns the same token count, and the round accounting closes.  That is
+    the identity standard; bit-identical text across widths is not an
+    fp-achievable one, and a check asserting it was retired after firing nine
+    times in R20 as pure noise.
+
+    So width selection moves wall clock AND the exact token stream, though not
+    the distribution it is drawn from.  A user toggling the policy sees
+    different text.
     """
     global _ADAPTIVE_K_ENV
     if _ADAPTIVE_K_ENV is None:
