@@ -262,6 +262,43 @@ class DFlashDraftModel(nn.Module):
         draft_logits = self._logits(draft_hidden[:, 1:])
         return sampler(draft_logits)
 
+    # ---------------------------------------------------------- prefill trim
+    # The two methods below are the public half of the pre-truncation contract,
+    # so a PREFILL can hand this drafter the trailing window instead of the whole
+    # prompt.  They exist because the hoist inside ``_hidden`` only saves FLOPs:
+    # the caller still had to build and retain a [B, S, 5*4096] context, which on
+    # a 16k prompt is 0.67 GB held for the life of the request.
+    #
+    # Splitting the discard across the seam is bit-identical ONLY if the offset
+    # bookkeeping crosses with it.  ``_pretruncate_ctx`` does two things -- drop
+    # ``skip`` rows AND add ``skip`` to every layer cache's offset -- and the
+    # second is what fixes the absolute RoPE positions of the surviving context
+    # (``rope(ctx_keys, offset=cache.offset)`` and ``rope(queries,
+    # offset=cache.offset + S)`` below).  A caller that trims without calling
+    # :meth:`adopt_pretruncated_context` shifts every draft position by ``skip``.
+    # RoPE is relative, so the attention scores are mathematically the same and
+    # the emitted tokens cannot change (acceptance is resolved against the
+    # target's argmax) -- but the arithmetic is not the same arithmetic, and the
+    # acceptance rate is free to move.  Do both or neither.
+
+    def prefill_context_keep(self) -> Optional[int]:
+        """Trailing context rows a round-1 forward keeps, or ``None`` for all of them."""
+        return self._uniform_ctx_keep()
+
+    def adopt_pretruncated_context(self, cache: List[KVCache], skip: int) -> None:
+        """Account for ``skip`` context rows a caller already dropped.
+
+        Exactly the offset half of :meth:`_pretruncate_ctx`, applied to a fresh
+        cache before the first draft round -- the same ``+= skip`` on the same
+        caches, just earlier.  ``_pretruncate_ctx`` then finds nothing left to
+        drop and is a no-op, so the round-1 computation is unchanged.
+        """
+        if skip <= 0:
+            return
+        # zip against self.layers: never touch a cache entry no layer owns.
+        for _, c in zip(self.layers, cache):
+            c.offset += skip
+
     def _uniform_ctx_keep(self) -> Optional[int]:
         """Context positions every layer will keep, or ``None`` if they differ.
 

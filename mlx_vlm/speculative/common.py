@@ -231,6 +231,63 @@ def _requires_uniform_batch_acceptance(
     return bool(getattr(target_model, "requires_uniform_batch_acceptance", False))
 
 
+def _supports_per_row_rollback(target_model: Optional[nn.Module], caches) -> bool:
+    """Whether the target can roll THESE caches back per row.
+
+    The uniform-acceptance requirement is a property of the target's cache, not
+    of the target: the same model can represent per-row accept counts in a
+    batched (left-paddable) cache and cannot in a scalar-offset one. A model
+    opts in by implementing ``supports_per_row_speculative_rollback(caches)``;
+    everything that does not answers False and keeps the clamp, which is every
+    model in the tree except glm5_next.
+    """
+    if target_model is None or caches is None:
+        return False
+    hook = getattr(target_model, "supports_per_row_speculative_rollback", None)
+    if not callable(hook):
+        return False
+    return bool(hook(caches))
+
+
+def _batch_acceptance_must_be_uniform(
+    draft_model: nn.Module, target_model: Optional[nn.Module], caches
+) -> bool:
+    """``_requires_uniform_batch_acceptance``, minus the cases now covered.
+
+    Keeps the either-side flag as the default answer and lets a target that CAN
+    roll the caches in hand back per row keep the ragged accepts. The clamp
+    costs tokens (every row above the batch minimum re-drafts the difference
+    next round); per-row rollback costs one right-shift of the KV buffers.
+    """
+    if not _requires_uniform_batch_acceptance(draft_model, target_model):
+        return False
+    return not _supports_per_row_rollback(target_model, caches)
+
+
+def _record_per_row_rollback(draft_model: nn.Module, kept_tokens: int) -> None:
+    """Record tokens a ragged round KEPT that the clamp would have given back.
+
+    The mirror image of ``_record_uniform_clamp``, and the direct measurement of
+    what per-row rollback buys: ``sum(a_i) - B * min(a_i)`` over ragged rounds.
+    Reported next to ``clamped``, which reads 0 on the per-row path -- the two
+    together say both what was paid and what was saved.
+    """
+    kept_tokens = int(kept_tokens)
+    if kept_tokens <= 0:
+        return
+    draft_model.per_row_kept_tokens = (
+        getattr(draft_model, "per_row_kept_tokens", 0) + kept_tokens
+    )
+    draft_model.speculative_total_per_row_kept = (
+        getattr(draft_model, "speculative_total_per_row_kept", 0) + kept_tokens
+    )
+
+
+def _reset_per_row_rollback(draft_model: nn.Module) -> None:
+    """Zero the per-request per-row counter, alongside ``clamped_tokens``."""
+    draft_model.per_row_kept_tokens = 0
+
+
 def _record_uniform_clamp(draft_model: nn.Module, clamped_tokens: int) -> None:
     """Record speculative tokens thrown away by the uniform-acceptance clamp.
 
@@ -363,7 +420,15 @@ def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     # throughput cost is visible in the receipt rather than only in a lower
     # mean accept.
     clamped = int(getattr(draft_model, "clamped_tokens", 0) or 0)
-    clamp_note = f", clamped {clamped} tok" if clamped else ""
+    # Tokens a ragged round kept because the target rolled back per row -- the
+    # give-back that did NOT happen. When it is present the clamp count is
+    # printed even at zero, because "clamped 0 tok" is the receipt a per-row
+    # build is read for.
+    kept = int(getattr(draft_model, "per_row_kept_tokens", 0) or 0)
+    if kept:
+        clamp_note = f", clamped {clamped} tok, per-row kept {kept} tok"
+    else:
+        clamp_note = f", clamped {clamped} tok" if clamped else ""
     if len(draft_lens) == rounds and sum(draft_lens) > 0:
         accept_rate = 100 * accepted_drafts / sum(draft_lens)
         mean_draft = sum(draft_lens) / rounds

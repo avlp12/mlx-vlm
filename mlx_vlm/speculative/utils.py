@@ -1,3 +1,4 @@
+import os
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -37,6 +38,7 @@ from .mtp import (
 )
 
 __all__ = [
+    "PrefillHiddenAccumulator",
     "_MTPVerifyResult",
     "_dflash_block_total",
     "_dflash_committed_hidden_segments",
@@ -62,6 +64,10 @@ __all__ = [
     "format_speculative_stats",
     "get_speculative_rounds_batch",
     "make_speculative_prompt_cache",
+    "prefill_capture_kwargs",
+    "prefill_context_keep",
+    "prefill_context_offset",
+    "prefill_context_trim_enabled",
     "run_speculative_rounds",
     "run_speculative_server_rounds",
     "speculative_hidden_state",
@@ -143,6 +149,157 @@ def prefill_capture_kwargs(lm, capture_kwargs: dict) -> dict:
     return {**capture_kwargs, "capture_gdn_states": False}
 
 
+def prefill_context_trim_enabled() -> bool:
+    """Kill switch for the trailing-context trim (see :class:`PrefillHiddenAccumulator`).
+
+    Deliberately not memoized, for the reason recorded in
+    ``drafters/qwen3_dflash/dflash.py``: a first-call memo is a test hazard and one
+    ``os.environ`` lookup per *request* is free.
+    """
+    return os.environ.get("MLX_VLM_SPEC_PREFILL_CTX_TRIM", "1") not in (
+        "0",
+        "false",
+        "False",
+    )
+
+
+def prefill_context_keep(draft_kind: str, drafter) -> Optional[int]:
+    """Trailing context rows the drafter keeps from a round-1 hidden, or ``None``.
+
+    ``None`` means "do not trim": either the drafter does not publish the
+    contract, or its layers do not all discard the same prefix (a full-attention
+    draft layer reads the whole context, so nothing may be hoisted in front of
+    it).  The drafter is the only thing that knows this -- see
+    ``DFlashDraftModel.prefill_context_keep``.
+    """
+    if draft_kind != "dflash" or drafter is None:
+        return None
+    if not prefill_context_trim_enabled():
+        return None
+    fn = getattr(drafter, "prefill_context_keep", None)
+    if not callable(fn):
+        return None
+    keep = fn()
+    return None if keep is None else int(keep)
+
+
+def prefill_context_offset(outputs) -> int:
+    """Rows a chunked prefill trimmed off the front of the drafter's context.
+
+    Zero unless the prefill applied :func:`prefill_context_keep`.  It has to reach
+    the round loop as ``target_hidden_offset`` -- see
+    ``DFlashDraftModel.adopt_pretruncated_context``.
+    """
+    return int(getattr(outputs, "speculative_context_offset", 0) or 0)
+
+
+class PrefillHiddenAccumulator:
+    """Stitch a chunked prefill's per-layer hidden captures back into one list.
+
+    An unchunked prefill hands the drafter ``out.hidden_states`` -- one
+    ``[B, S, D]`` array per captured target layer.  A chunked prefill produces
+    one such list per chunk, so the accumulator keeps a per-layer list of chunk
+    pieces and concatenates them along the TIME axis at the end.
+
+    Two things it deliberately does NOT do:
+
+    * It never slices a chunk to its own trailing ``keep`` rows.  A chunk
+      boundary is not the prompt end: the drafter's window is the last ``keep``
+      rows of the WHOLE prompt, so trimming per chunk would keep the tail of
+      every chunk and drop rows that belong in the window.  The trim is applied
+      once, to the concatenation, at :meth:`finish`.
+    * It never hands back a bare MLX slice.  ``mx`` slices are views that pin
+      their parent buffer (measured: holding a 0.5 MB slice of a 204 MB parent
+      keeps 204 MB live), so a bare ``h[:, -keep:]`` would retain the very
+      full-prompt array this class exists to drop.  :meth:`finish` copies.
+
+    Whole leading chunks *are* dropped as they age out (:meth:`_prune`), which is
+    not the same operation: a chunk is only released once the pieces after it
+    already cover ``keep`` rows, so no row of the final window is ever in it.
+    """
+
+    def __init__(self, keep: Optional[int] = None):
+        self.keep = None if keep is None or int(keep) <= 0 else int(keep)
+        self._layers: Optional[List[List[mx.array]]] = None
+        self._widths: List[int] = []
+        self.total_rows = 0
+        self.dropped_rows = 0
+
+    @property
+    def active(self) -> bool:
+        return self._layers is not None
+
+    def append(self, outputs) -> None:
+        """Collect one forward's captures.  A forward without captures is a no-op."""
+        captured = getattr(outputs, "hidden_states", None)
+        if not captured:
+            return
+        if self._layers is None:
+            self._layers = [[] for _ in captured]
+        if len(captured) != len(self._layers):
+            raise RuntimeError(
+                "chunked speculative prefill: capture width changed mid-prompt "
+                f"({len(self._layers)} layers, then {len(captured)}). The capture "
+                "kwargs must be identical on every chunk."
+            )
+        width = int(captured[0].shape[1])
+        for slot, h in zip(self._layers, captured):
+            if int(h.shape[1]) != width:
+                raise RuntimeError(
+                    "chunked speculative prefill: captured layers disagree on "
+                    f"length ({width} vs {int(h.shape[1])})."
+                )
+            slot.append(h)
+        self._widths.append(width)
+        self.total_rows += width
+        self._prune()
+
+    def _prune(self) -> None:
+        if self.keep is None or self._layers is None:
+            return
+        # Release the oldest chunk while what remains after it still covers the
+        # window.  ``resident`` is the row count currently held.
+        resident = self.total_rows - self.dropped_rows
+        while len(self._widths) > 1 and resident - self._widths[0] >= self.keep:
+            head = self._widths.pop(0)
+            for slot in self._layers:
+                slot.pop(0)
+            self.dropped_rows += head
+            resident -= head
+
+    def pending(self) -> List[mx.array]:
+        """The captures of the most recent chunk, for ``mx.eval``.
+
+        Evaluating them is not optional: an unevaluated capture is a graph node
+        that pins every intermediate behind it, so an accumulator of lazy chunk
+        captures would hold the whole prefill's activations instead of 5 arrays.
+        """
+        if self._layers is None:
+            return []
+        return [slot[-1] for slot in self._layers if slot]
+
+    def finish(self) -> Tuple[Optional[List[mx.array]], int]:
+        """``(per-layer hidden, rows dropped off the front)``.
+
+        The second element is what the drafter's own truncation would have added
+        to each of its cache offsets had it been handed the untrimmed context --
+        the caller must apply it (``target_hidden_offset``) or the drafter's RoPE
+        positions move by that amount.
+        """
+        if self._layers is None:
+            return None, 0
+        keep = self.keep
+        skip = 0
+        out: List[mx.array] = []
+        for slot in self._layers:
+            h = slot[0] if len(slot) == 1 else mx.concatenate(slot, axis=1)
+            if keep is not None and keep < int(h.shape[1]):
+                skip = int(h.shape[1]) - keep
+                h = mx.contiguous(h[:, -keep:])
+            out.append(h)
+        return out, self.dropped_rows + skip
+
+
 def speculative_hidden_state(draft_kind: str, outputs):
     if draft_kind == "lookup":
         return None
@@ -186,6 +343,7 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    target_hidden_offset: int = 0,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
@@ -279,6 +437,7 @@ def run_speculative_server_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=token_dtype,
                 greedy_sampling=greedy_sampling,
+                target_hidden_offset=target_hidden_offset,
             ):
                 yield [tok], state
                 if stop_check is not None and stop_check(0, tok):
@@ -298,6 +457,7 @@ def run_speculative_server_rounds(
             stop_check=stop_check,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            target_hidden_offset=target_hidden_offset,
         )
         return
 
@@ -321,6 +481,7 @@ def run_speculative_rounds(
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
     prompt_tokens: Optional[mx.array] = None,
+    target_hidden_offset: int = 0,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
@@ -466,6 +627,7 @@ def run_speculative_rounds(
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
             greedy_sampling=sampler_is_greedy,
+            target_hidden_offset=target_hidden_offset,
         )
     else:
         mx.eval(first_token)
@@ -482,4 +644,5 @@ def run_speculative_rounds(
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
             greedy_sampling=sampler_is_greedy,
+            target_hidden_offset=target_hidden_offset,
         )
