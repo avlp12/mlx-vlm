@@ -50,6 +50,7 @@ __all__ = [
     "HeavyRunActive",
     "HEAVY_FOOTPRINT_GB",
     "MAX_SWAP_GB",
+    "SWAP_CEIL_GB",
     "MIN_FREE_GB",
     "MIN_FREE_PCT",
     "GpuWedged",
@@ -127,12 +128,32 @@ GATE_ACCOUNTING = os.environ.get("MLX_VLM_FLEET_GATE_ACCOUNTING", "reclaimable")
 # The floor therefore reads the SAME quantity the gate now counts -- free plus
 # reclaimable clean file-backed pages.  That is the faithful translation of the
 # intent ("the load is losing the race"), because when a load really is losing,
-# the reclaimable pool is what collapses.  swap > 0 remains the primary trigger
-# and is unchanged.  RATIFIED 2026-09-02; the DEVIATION note above is kept
-# because the reasoning is the justification, not just history.
+# the reclaimable pool is what collapses.  Swap GROWTH during the load is the
+# other primary trigger; a static swap residue is not (see SWAP_CEIL_GB).
+# RATIFIED 2026-09-02; the DEVIATION note above is kept because the reasoning is
+# the justification, not just history.
 WATCH_FLOOR_GB = float(os.environ.get("MLX_VLM_FLEET_WATCH_FLOOR_GB", "20"))
 WATCH_FREE_FLOOR_GB = WATCH_FLOOR_GB  # back-compat alias
 WATCH_POLL_S = float(os.environ.get("MLX_VLM_FLEET_WATCH_POLL_S", "5"))
+# Static swap the gate tolerates.
+#
+# The ratified rule said swap == 0.  That was stricter than the campaign's own
+# standard -- playbook §3.2 says "swap <= threshold" and the harnesses have used
+# SWAP_CEIL_GB=4 throughout -- and it bit: after ten sequential 183 GB server
+# loads gesicht held 0.20 GB of STALE swap while sitting on ~476 GB of headroom
+# (free 82.5 + inactive 393.5), stable over 60 s with no pressure, and the gate
+# refused every lane behind it.
+#
+# A static residue is not a pressure signal.  macOS leaves pages in the swapfile
+# after the pressure that wrote them is long gone and never proactively faults
+# them back.  The signal that actually predicted the I876/I877 freezes was swap
+# GROWING during a load, which WatchedLoad now watches for directly -- so the
+# static ceiling can be generous without giving anything up.
+SWAP_CEIL_GB = float(os.environ.get("MLX_VLM_FLEET_SWAP_CEIL_GB", "1.0"))
+# Growth during a watched load that means the box is losing.  Small, because
+# this is a derivative: any sustained growth at all is the failure mode.
+SWAP_GROWTH_ABORT_GB = float(
+    os.environ.get("MLX_VLM_FLEET_SWAP_GROWTH_GB", "0.05"))
 
 
 def gate_accountings(mem: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
@@ -234,6 +255,7 @@ class WatchedLoad:
         self.poll_s = WATCH_POLL_S if poll_s is None else poll_s
         self.expect = expect
         self.trajectory: List[dict] = []
+        self.swap_base: Optional[float] = None   # set at __enter__
         self.fired: Optional[str] = None
         self._stop = threading.Event()
         self._t: Optional[threading.Thread] = None
@@ -275,8 +297,17 @@ class WatchedLoad:
                 avail = free + min(inact, fileb)
                 s["available_gb"] = round(avail, 1)
             why = None
-            if swap is not None and swap > 0:
-                why = f"swap appeared ({swap:.2f}GB)"
+            growth = None
+            if swap is not None and self.swap_base is not None:
+                growth = swap - self.swap_base
+                s["swap_growth_gb"] = round(growth, 3)
+            if growth is not None and growth > SWAP_GROWTH_ABORT_GB:
+                # THE signal. A static residue is tolerated by the gate; swap
+                # that GROWS while we load is the box losing the race, and it is
+                # what the I876/I877 freezes actually looked like.
+                why = (f"swap grew {growth:.2f}GB during the load "
+                       f"({self.swap_base:.2f} -> {swap:.2f}GB), over the "
+                       f"{SWAP_GROWTH_ABORT_GB:.2f}GB abort threshold")
             elif avail is not None and avail < self.floor_gb:
                 why = (f"available (free {free:.1f} + reclaimable "
                        f"{min(inact, fileb):.1f}) fell to {avail:.1f}GB, "
@@ -288,7 +319,11 @@ class WatchedLoad:
                 return
 
     def __enter__(self):
-        self.trajectory.append(dict(self.sample(), phase="before"))
+        before = self.sample()
+        # Baseline for the growth clause. Whatever is already in the swapfile is
+        # not this load's doing; only what we add counts against us.
+        self.swap_base = before.get("swap_used_gb")
+        self.trajectory.append(dict(before, phase="before"))
         self._t = threading.Thread(target=self._run, daemon=True,
                                    name="watched-load")
         self._t.start()
@@ -306,6 +341,8 @@ class WatchedLoad:
     def receipt(self) -> dict:
         return {"label": self.label, "floor_gb": self.floor_gb,
                 "poll_s": self.poll_s, "expected": self.expect,
+                "swap_base_gb": self.swap_base,
+                "swap_growth_abort_gb": SWAP_GROWTH_ABORT_GB,
                 "fired": self.fired, "trajectory": self.trajectory}
 
 
@@ -683,15 +720,19 @@ def require_headroom_box(host: Optional[str], load_gb: float,
         raise HeavyRunActive(
             f"refusing {label or 'this load'} on {who}: something heavy is "
             f"already resident there ({detail}).")
-    # Swap must be zero.  free_only never needed this check because it never
-    # spent the page cache; reclaimable does, so a box that is ALREADY swapping
-    # has no clean pages to promise and must be refused outright.
+    # Swap must be under the ceiling.  reclaimable promises clean pages, so a box
+    # under real memory pressure has none to promise -- but a STATIC residue left
+    # by an earlier load is not pressure, and refusing on it strands a box with
+    # hundreds of GB free.  Growth during the load is the pressure signal, and
+    # WatchedLoad owns that.
     swap = mem.get("swap_used_gb")
-    if swap is not None and swap > 0:
+    receipt["swap_ceil_gb"] = SWAP_CEIL_GB
+    if swap is not None and swap > SWAP_CEIL_GB:
         receipt["quiet"] = False
         raise HeavyRunActive(
-            f"refusing {label or 'this load'} on {who}: swap is in use "
-            f"({swap:.2f}GB). Headroom accounting assumes swap == 0.")
+            f"refusing {label or 'this load'} on {who}: swap in use is "
+            f"{swap:.2f}GB, over the {SWAP_CEIL_GB:.2f}GB ceiling. That is "
+            "enough to mean real pressure rather than a stale residue.")
     if acct not in avail:
         raise ValueError(f"unknown gate accounting {acct!r}; "
                          f"expected one of {sorted(avail)}")

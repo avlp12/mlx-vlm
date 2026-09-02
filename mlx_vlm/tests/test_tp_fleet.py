@@ -9,6 +9,8 @@ distinguishable from "nobody called the guard", and that it covers the peer box
 rather than only the one running it.
 """
 
+import time
+
 import pytest
 
 from mlx_vlm.tp import fleet
@@ -262,6 +264,102 @@ def test_a_missing_memory_section_does_not_block(monkeypatch):
     pressure = r["pressure"]["localhost"]
     assert set(pressure) >= {"swap_used_gb", "free_pct", "free_gb", "wired_gb"}
     assert all(v is None for v in pressure.values()), pressure
+
+
+def _mem_swap(swap_mb, free_gb=400.0, wired_gb=6.0, inactive_gb=80.0,
+              filebacked_gb=90.0):
+    """A memory probe tail with a chosen swap residue and headroom.
+
+    NOT named _mem: this module already defines a _mem(free_gb, wired_gb, pct)
+    further down, and the later definition silently wins. Two same-named
+    helpers in one module is a trap -- if the signatures had happened to be
+    compatible these tests would have run against the wrong fixture and passed.
+    """
+    return _QUIET_HEAD + (
+        "===MEM===\n"
+        f"total = 1024.00M  used = {swap_mb:.2f}M  free = 100.00M\n"
+        "System-wide memory free percentage: 90%\n"
+        f"VMFREEGB {free_gb} {wired_gb} {inactive_gb} {filebacked_gb}\n"
+    )
+
+
+def test_static_swap_residue_under_ceiling_passes():
+    """A stale residue is not pressure.
+
+    Measured on gesicht after ten sequential 183 GB server loads: 0.20 GB of
+    swap sitting stable over 60 s with ~476 GB of headroom free. The strict
+    swap==0 rule refused every lane behind it, which is stricter than the
+    campaign's own standard (playbook 3.2 says "swap <= threshold", and the
+    harnesses have used 4 GB).
+    """
+    r = fleet.require_headroom_box(None, 183.0, label="stale residue",
+                                   ps_runner=lambda host: _mem_swap(204.69),
+                                   accounting="reclaimable")
+    assert r["headroom_ok"] is True
+    assert r["pressure"]["swap_used_gb"] == 0.2
+    assert r["swap_ceil_gb"] == fleet.SWAP_CEIL_GB
+
+
+def test_static_swap_over_ceiling_refuses():
+    """1.5 GB is past the ceiling and means real pressure, not a residue."""
+    with pytest.raises(fleet.HeavyRunActive, match="over the"):
+        fleet.require_headroom_box(None, 183.0, label="real pressure",
+                                   ps_runner=lambda host: _mem_swap(1536.0),
+                                   accounting="reclaimable")
+
+
+def test_watched_load_aborts_when_swap_GROWS(monkeypatch):
+    """Growth during the load is the signal the static ceiling gives up.
+
+    The I876/I877 freezes were swap GROWTH events, never a static residue, so
+    the watchdog watches the derivative and the gate watches the level.
+    """
+    samples = iter([
+        {"swap_used_gb": 0.20, "free_gb": 400.0, "inactive_gb": 80.0,
+         "file_backed_gb": 90.0},                      # baseline at __enter__
+        {"swap_used_gb": 0.22, "free_gb": 380.0, "inactive_gb": 70.0,
+         "file_backed_gb": 80.0},                      # +0.02, under threshold
+        {"swap_used_gb": 0.40, "free_gb": 300.0, "inactive_gb": 40.0,
+         "file_backed_gb": 50.0},                      # +0.20, ABORT
+    ])
+    last = {"v": {"swap_used_gb": 0.40, "free_gb": 300.0,
+                  "inactive_gb": 40.0, "file_backed_gb": 50.0}}
+
+    def fake_sample():
+        try:
+            last["v"] = next(samples)
+        except StopIteration:
+            pass
+        return dict(last["v"])
+
+    monkeypatch.setattr(fleet.WatchedLoad, "sample", staticmethod(fake_sample))
+    fired = {}
+    monkeypatch.setattr(fleet._thread, "interrupt_main",
+                        lambda: fired.setdefault("hit", True))
+    w = fleet.WatchedLoad(label="growth", poll_s=0.01)
+    with w:
+        for _ in range(200):
+            if w.fired:
+                break
+            time.sleep(0.01)
+    assert w.fired is not None, "swap growth must abort the load"
+    assert "grew" in w.fired
+    assert fired.get("hit") is True, "abort must go through interrupt_main"
+    assert w.swap_base == 0.20, "baseline is what was already there, not ours"
+
+
+def test_watched_load_tolerates_a_flat_swap_residue(monkeypatch):
+    """The same residue, not growing, must NOT abort."""
+    flat = {"swap_used_gb": 0.20, "free_gb": 400.0, "inactive_gb": 80.0,
+            "file_backed_gb": 90.0}
+    monkeypatch.setattr(fleet.WatchedLoad, "sample",
+                        staticmethod(lambda: dict(flat)))
+    monkeypatch.setattr(fleet._thread, "interrupt_main",
+                        lambda: pytest.fail("flat swap must not abort"))
+    w = fleet.WatchedLoad(label="flat", poll_s=0.01)
+    with w:
+        time.sleep(0.1)
+    assert w.fired is None
 
 
 def test_peer_without_page_counts_downgrades_to_free_only(caplog):
