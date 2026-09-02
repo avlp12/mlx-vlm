@@ -4019,6 +4019,64 @@ class TestModels(unittest.TestCase):
             glm5_lang.Glm5NextIndexer._decode_fast = original
             glm5_lang._IDX_FAST_ENV = saved
 
+    def test_glm5_next_mtp_ffn_compile_is_bit_identical(self):
+        # The nextn FFN half is compiled by default (B == 1, S <= 8). Default-on is
+        # justified by bit-identity, not by a speed claim: compiled and eager must be
+        # mx.array_equal, so the switch cannot move an output bit. If this ever fails,
+        # flip the default in _mtp_ffn_compile_enabled to off.
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.mtp import Glm5NextMTP
+
+        cfg = self._glm5_next_mtp_text_config()
+        for seed in (0, 1):
+            mx.random.seed(seed)
+            mtp = Glm5NextMTP(cfg)
+            mtp.eval()
+            mx.eval(mtp.parameters())
+            for S in (1, 4, 8):
+                hidden = mx.random.normal((1, S, cfg.hidden_size))
+                embed = mx.random.normal((1, S, cfg.hidden_size))
+                outputs = {}
+                for enabled in (False, True):
+                    mtp.compile_ffn = enabled
+                    mtp._ffn_c = None
+                    outputs[enabled] = mtp(
+                        hidden, embed, cache=CacheList(KVCache(), KVCache())
+                    )
+                    # The compiled arm must actually have compiled, or this test
+                    # would be comparing eager against eager and prove nothing.
+                    self.assertEqual(mtp._ffn_c is not None, enabled)
+                mx.eval(list(outputs.values()))
+                self.assertTrue(
+                    mx.array_equal(outputs[True], outputs[False]).item(),
+                    f"compiled nextn FFN is not bit-identical at seed={seed} S={S}",
+                )
+
+    def test_glm5_next_mtp_ffn_compile_gate(self):
+        # The compile gate must refuse B > 1 and S > 8 -- compiling the MoE at
+        # batched or prefill shapes spikes memory (the target carries the same bound).
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.mtp import Glm5NextMTP, _mtp_ffn_compile_enabled
+
+        cfg = self._glm5_next_mtp_text_config()
+        mx.random.seed(0)
+        for shape in ((2, 2), (1, 9)):
+            mtp = Glm5NextMTP(cfg)
+            mtp.eval()
+            mx.eval(mtp.parameters())
+            mtp.compile_ffn = True
+            mtp._ffn_c = None
+            B, S = shape
+            mtp(
+                mx.random.normal((B, S, cfg.hidden_size)),
+                mx.random.normal((B, S, cfg.hidden_size)),
+                cache=CacheList(KVCache(), KVCache()),
+            )
+            self.assertIsNone(mtp._ffn_c, f"compiled the FFN at B={B} S={S}")
+
+        mtp = Glm5NextMTP(cfg)
+        self.assertEqual(mtp.compile_ffn, _mtp_ffn_compile_enabled())
+
     def test_glm5_next_mtp_never_lose_gate(self):
         # The never-lose gate has two parts: (1) the drafter yields an empty block at
         # block_size<=1 so the orchestrator can run a plain decode step, and (2) the
