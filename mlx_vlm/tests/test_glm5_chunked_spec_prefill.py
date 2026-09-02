@@ -65,6 +65,18 @@ from mlx_vlm.speculative.utils import (
 CAPTURE_IDS = [0, 1]
 STREAM = mx.default_stream(mx.default_device())
 
+# ``mx.default_device()`` is pinned by conftest from MLX_DEFAULT_DEVICE.
+ON_GPU = mx.default_device() == mx.gpu
+# Splitting the KDA (linear-attention) running scan at a chunk boundary is not
+# the same arithmetic as one scan over the whole prompt.  On CPU the two agree
+# bitwise at these shapes; on Metal they do not.  Worst measured 2026-09-03 on an
+# M3 Ultra (mlx 0.32.1.dev20260902): 9.54e-07, on the same three cache arrays the
+# sibling test file sees it on -- array 5 (2, 1, 40, 129) at 9.54e-07 and arrays
+# 8 and 9 (2, 1, 40, 64) at 7.15e-07.  It is PRE-EXISTING drift in the chunked
+# greedy path, not something the speculative arm introduces, and it is bounded
+# rather than asserted away.
+CACHE_DRIFT_TOL = 2e-06
+
 
 # ------------------------------------------------------------------ tiny target
 
@@ -504,16 +516,57 @@ def test_a_drafter_that_cannot_adopt_an_offset_is_a_loud_error():
 # ---------------------------------------------------- 4. the retention, in bytes
 
 
-def _held_bytes(lm, prompt, *, step, capture, keep=None):
-    """Live bytes still referenced once the prefill's result is in hand."""
+def _held_once(lm, prompt, *, step, capture, keep=None):
+    """Live bytes still referenced once the prefill's result is in hand.
+
+    Four things make this a measurement rather than a reading of the allocator,
+    the same four ``test_gdn_sink_prefill._held_once`` needs:
+
+    * ``mx.synchronize()`` on both sides.  Metal's command buffer is
+      asynchronous, so without it ``get_active_memory`` samples a moving target.
+    * force eval of exactly the retained object -- ``_prefill`` already evals the
+      logits, the hidden states and the cache, so what is left is to make sure
+      the sample happens after that and not during it.
+    * ``mx.clear_cache()`` on both sides, so the allocator's free pool is never
+      counted as live.
+    * the delta is taken across DROPPING the result, not against a baseline
+      sampled before the prefill.  A residue from a previous arm can survive one
+      ``clear_cache`` and inflate such a baseline; that is how the pre-fix helper
+      returned NEGATIVE "held" values on Metal (unchunked
+      [-3030474, 428138, 428130, 428134, 428138], chunked
+      [-274980, 381828, 66436, 381828, 381828] over six repetitions) and made
+      ``freed`` come out at -2,755,494 B.  Sampling on both sides of
+      ``del out, prompt_cache`` cancels whatever was already resident and answers
+      the question the tests ask: how many bytes does holding this prefill's
+      result cost.
+
+    With all four the number is bit-stable across repetitions on CPU and on Metal
+    alike (five repetitions each, 2026-09-03).
+    """
+    mx.synchronize()
     mx.clear_cache()
-    base = mx.get_active_memory()
     out, prompt_cache, _ = _prefill(lm, prompt, step=step, capture=capture, keep=keep)
+    mx.eval(out.logits)
+    if out.hidden_states:
+        mx.eval(out.hidden_states)
+    mx.eval(_cache_arrays(prompt_cache))
+    mx.synchronize()
     mx.clear_cache()
-    held = mx.get_active_memory() - base
+    with_result = mx.get_active_memory()
     del out, prompt_cache
+    mx.synchronize()
     mx.clear_cache()
-    return held
+    without_result = mx.get_active_memory()
+    return with_result - without_result
+
+
+def _held_bytes(lm, prompt, *, step, capture, keep=None, reps=3):
+    """The floor of a few repetitions: residue from a previous arm can only make
+    a sample bigger, never smaller."""
+    return min(
+        _held_once(lm, prompt, step=step, capture=capture, keep=keep)
+        for _ in range(reps)
+    )
 
 
 def test_the_chunked_prefill_stops_holding_the_full_prompt_logits():
@@ -537,6 +590,12 @@ def test_the_chunked_prefill_stops_holding_the_full_prompt_logits():
     chunked = _held_bytes(lm, prompt, step=CHUNK, capture=True, keep=KEEP)
 
     logits_bytes = (S - 1) * vocab * itemsize
+    # Measured 2026-09-03, five repetitions each (all five identical on GPU,
+    # min-of-three on CPU where a 2,048 B step appears on some samples):
+    #   CPU  unchunked 676,438 B  chunked 371,286 B  freed 305,152 B
+    #   GPU  unchunked 675,430 B  chunked 381,568 B  freed 293,862 B
+    # against logits_bytes = 130,560.  The pre-fix helper gave, on Metal,
+    # unchunked min -3,030,474 B and chunked min -274,980 B: freed -2,755,494.
     assert chunked < unchunked
     assert unchunked - chunked >= logits_bytes, (
         f"freed {unchunked - chunked} B but the discarded logits alone are "
@@ -555,6 +614,11 @@ def test_the_retained_capture_stops_growing_with_the_prompt():
     small = _held_bytes(lm, _prompt(128), step=CHUNK, capture=True, keep=KEEP)
     large = _held_bytes(lm, _prompt(256), step=CHUNK, capture=True, keep=KEEP)
     growth = (large - small) / 128.0
+    # Measured 2026-09-03, against hidden_per_token = 1,024:
+    #   CPU  small 349,248 B  large 371,286 B  growth 172.17 B/token
+    #   GPU  small 348,472 B  large 381,568 B  growth 258.56 B/token
+    # The pre-fix helper reported 1,029.72 B/token on Metal -- over the bound --
+    # purely because its "small" arm picked up a -98,196 B baseline artefact.
 
     hidden_per_token = (
         len(CAPTURE_IDS)
@@ -1261,13 +1325,41 @@ def test_a_right_padded_batch_hands_the_drafter_the_whole_prompt_per_row():
     )
 
 
+def _assert_row_matches(a, b, what):
+    """Bit-equal on CPU; within the documented KDA-split bound on Metal.
+
+    The CPU arm is the strict one and is not relaxed.  On Metal the same three
+    cache arrays move by <= 9.54e-07 whether or not a drafter is attached, so
+    demanding bit equality there measures the backend rather than this change.
+    The load-bearing equality of this file --
+    ``test_chunked_spec_prefill_is_bit_identical_to_chunked_greedy``, spec vs
+    greedy in the SAME process on the SAME device with the same decomposition --
+    stays exact on both devices and is untouched.
+    """
+    if not ON_GPU:
+        assert mx.array_equal(a, b), what
+        return
+    if a.size == 0:
+        assert mx.array_equal(a, b), what
+        return
+    drift = float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))))
+    assert drift < CACHE_DRIFT_TOL, f"{what}: {drift}"
+
+
 def test_a_right_padded_spec_prefill_matches_the_greedy_arm_it_now_shares():
     """Refusing the chunking puts the spec arm on the unchunked decomposition.
 
-    So it must be bit-identical to unchunked greedy -- per row, in the sampled token
-    and in every prompt-cache array.  (Against CHUNKED greedy it is not, and must not
+    So it must match unchunked greedy -- per row, in the sampled token and in
+    every prompt-cache array.  (Against CHUNKED greedy it is not, and must not
     be expected to be: chunked greedy still walks into the negative-index defect
     pinned by the next test.)
+
+    The sampled token is asserted EXACTLY on both devices; the cache arrays are
+    bit-equal on CPU and within ``CACHE_DRIFT_TOL`` on Metal -- see
+    ``_assert_row_matches``.  Worth recording that on Metal this test was not
+    even stable at bit equality: over four consecutive runs of the unmodified
+    file it failed three times and passed once, because the drift sits right on
+    the boundary.
     """
     spec, _, _ = _right_padded_batch(step=BATCH_STEP, drafter=_StubDrafter())
     greedy_unchunked, _, _ = _right_padded_batch(step=None, drafter=None)
@@ -1281,11 +1373,11 @@ def test_a_right_padded_spec_prefill_matches_the_greedy_arm_it_now_shares():
         assert a.shape == b.shape, f"cache array {i}"
         if a.ndim and a.shape[0] == 2:
             for row in range(2):
-                assert mx.array_equal(
-                    a[row : row + 1], b[row : row + 1]
-                ), f"cache array {i}, row {row}"
+                _assert_row_matches(
+                    a[row : row + 1], b[row : row + 1], f"cache array {i}, row {row}"
+                )
         else:
-            assert mx.array_equal(a, b), f"cache array {i}"
+            _assert_row_matches(a, b, f"cache array {i}")
 
 
 def test_right_padded_chunked_prefill_indexes_a_negative_row_position():
