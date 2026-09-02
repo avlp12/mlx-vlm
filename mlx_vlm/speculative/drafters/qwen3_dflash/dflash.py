@@ -1,4 +1,5 @@
-from typing import List
+import os
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -7,6 +8,23 @@ from ....models.activations import swiglu
 from ....models.cache import BufferedRotatingKVCache, KVCache, RotatingKVCache
 from ....models.rope_utils import initialize_rope
 from .config import DFlashConfig
+
+
+# Hoist the sliding-window context discard in front of ``fc``/``hidden_norm``.
+#
+# Every sliding layer throws away all but the last ``sliding_window - 1`` context
+# positions inside DFlashAttention (see :meth:`DFlashAttention.__call__` below).
+# ``fc`` and ``hidden_norm`` are position-wise, so running them on the whole
+# prompt and then discarding 87% of the rows is pure waste: at a 16,384-token
+# prompt with the shipped GLM-5.3-Flash DFlash2 geometry (5 target layers x 4096
+# -> 4096) that is 2.75 TFLOP of which 2.41 TFLOP is thrown away.
+#
+# Deliberately NOT memoized: the adaptive-K knob is memoized on first call and
+# every test that touches it has to reach into a module global to undo that.  One
+# ``os.environ`` lookup happens once per draft round, next to a multi-GFLOP
+# matmul, so the memo buys nothing and costs test ergonomics.
+def _fc_pretrunc_enabled() -> bool:
+    return os.environ.get("MLX_VLM_DFLASH_FC_PRETRUNC", "1") not in ("0", "false", "False")
 
 
 def _build_rope(config: DFlashConfig):
@@ -224,6 +242,45 @@ class DFlashDraftModel(nn.Module):
         draft_logits = self._logits(draft_hidden[:, 1:])
         return sampler(draft_logits)
 
+    def _uniform_ctx_keep(self) -> Optional[int]:
+        """Context positions every layer will keep, or ``None`` if they differ.
+
+        Only meaningful when EVERY layer is a sliding layer with the same
+        window: a full-attention layer keeps the whole context, so a hoisted
+        truncation would change what it sees.
+        """
+        types = self.config.layer_types or []
+        if not types or any(t != "sliding_attention" for t in types):
+            return None
+        window = getattr(self.config, "sliding_window", None)
+        if window is None or int(window) <= 1:
+            return None
+        return int(window) - 1
+
+    def _pretruncate_ctx(
+        self, target_hidden: mx.array, cache: List[KVCache]
+    ) -> mx.array:
+        """Drop the context rows every layer is about to drop anyway.
+
+        Bit-identical to the per-layer discard for the rows that survive:
+        ``fc`` is a matmul over the feature axis and ``hidden_norm`` an RMSNorm
+        over the feature axis, so both are position-wise and row ``i`` of the
+        result does not depend on how many other rows were handed in.  The
+        offset bookkeeping is the same arithmetic the layer does -- it adds
+        ``skip`` to its own cache before the two rope calls -- moved out one
+        level so each cache is advanced exactly once.
+        """
+        keep = self._uniform_ctx_keep()
+        if keep is None or not _fc_pretrunc_enabled():
+            return target_hidden
+        skip = target_hidden.shape[1] - keep
+        if skip <= 0:
+            return target_hidden
+        # zip against self.layers: never touch a cache entry no layer owns.
+        for _, c in zip(self.layers, cache):
+            c.offset += skip
+        return target_hidden[:, skip:]
+
     def _hidden(
         self,
         inputs: mx.array,
@@ -231,6 +288,7 @@ class DFlashDraftModel(nn.Module):
         cache: List[KVCache],
     ) -> mx.array:
         h = self._embed_input_tokens(inputs)
+        target_hidden = self._pretruncate_ctx(target_hidden, cache)
         h_ctx = self.hidden_norm(self.fc(target_hidden))
         for layer, c in zip(self.layers, cache):
             h = layer(h, h_ctx, self.rope, c)
