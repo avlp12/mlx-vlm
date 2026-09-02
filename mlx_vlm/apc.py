@@ -4468,6 +4468,13 @@ def from_env(
     if overrides is not None and "enabled" in overrides:
         enabled = bool(overrides["enabled"])
     else:
+        # NOTE: this library-level default is "0" while the SERVER's default
+        # (RuntimeConfig.apc_enabled) is True since I1024. That divergence is
+        # deliberate, not an oversight -- do not "fix" it by flipping this one.
+        # The server always passes an explicit override built from its config
+        # (app.get_cached_model), so the server default governs serving; this
+        # branch only serves direct library callers, who have not been measured
+        # and should keep opting in.
         enabled = os.environ.get("APC_ENABLED", "0").lower() in (
             "1",
             "true",

@@ -72,7 +72,7 @@ KNOBS: Tuple[
         None,
         "Quantized KV start layer.",
     ),
-    ("apc_enabled", "bool", False, TEXT_KINDS, None, "Prefix caching on/off."),
+    ("apc_enabled", "bool", True, TEXT_KINDS, None, "Prefix caching on/off."),
     (
         "apc_disk_path",
         "str_or_none",
@@ -188,7 +188,12 @@ class RuntimeConfig:
     kv_key_scheme: Optional[str] = None
     kv_value_scheme: Optional[str] = None
     quantized_kv_start: Optional[int] = None
-    apc_enabled: bool = False
+    # ON by default since I1024. Measured on the live server: an identical 32k
+    # prompt resubmitted cost 79.2 s cold and 2.64 s warm (30x), 2k went 6.73 ->
+    # 2.45 s (2.7x), and exact mode added ~2 GB at the default 2 entries against
+    # a 169 GB model. It had been fully plumbed and off the whole campaign
+    # because nothing announced it. APC_ENABLED=0 or --no-apc turns it off.
+    apc_enabled: bool = True
     apc_disk_path: Optional[str] = None
     apc_block_size: int = 16
     apc_num_blocks: int = 2048
@@ -217,7 +222,7 @@ class RuntimeConfig:
             kv_key_scheme=os.environ.get("KV_KEY_SCHEME") or None,
             kv_value_scheme=os.environ.get("KV_VALUE_SCHEME") or None,
             quantized_kv_start=_env_int("QUANTIZED_KV_START", None),
-            apc_enabled=os.environ.get("APC_ENABLED", "0").lower()
+            apc_enabled=os.environ.get("APC_ENABLED", "1").lower()
             in ("1", "true", "yes"),
             apc_disk_path=os.environ.get("APC_DISK_PATH") or None,
             apc_block_size=int(os.environ.get("APC_BLOCK_SIZE", "16")),

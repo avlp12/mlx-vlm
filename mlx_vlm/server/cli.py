@@ -35,8 +35,9 @@ def _apply_apc_env(args, env) -> None:
     when it was actually passed, so an operator setting APC_ENABLED in the
     environment is not silently overridden by the flag's default.
     """
-    if getattr(args, "apc", False):
-        env["APC_ENABLED"] = "1"
+    apc = getattr(args, "apc", None)
+    if apc is not None:
+        env["APC_ENABLED"] = "1" if apc else "0"
     entries = getattr(args, "apc_exact_entries", None)
     if entries is not None:
         env["APC_EXACT_CACHE_ENTRIES"] = str(int(entries))
@@ -170,11 +171,13 @@ def main():
     )
     parser.add_argument(
         "--apc",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable automatic prefix caching (APC). Default off. This is the "
-            "same switch as APC_ENABLED=1; the flag exists because a whole "
-            "campaign ran without prefix caching and nobody could see it."
+            "Automatic prefix caching (APC). ON by default since I1024; pass "
+            "--no-apc to disable. Same switch as APC_ENABLED. Default None "
+            "means 'not specified', so an operator's APC_ENABLED export is not "
+            "overridden by a flag nobody passed."
         ),
     )
     parser.add_argument(
