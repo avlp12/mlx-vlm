@@ -174,5 +174,46 @@ class TestMoESegmentAlign(unittest.TestCase):
         self.assertEqual(xs.shape[0], R)
 
 
+    def test_bit_exact_with_a_batch_axis(self):
+        """indices arrive as [B, T, topk] under batched prefill, not [T, topk].
+
+        _gather_sort flattens before sorting so the padding is shape-agnostic, but "should be"
+        is not a test: batched serving is where this flag is most likely to be turned on and
+        least likely to be noticed if it is subtly wrong.
+        """
+        for B in (2, 8):
+            T, R = 64, None
+            rng = np.random.default_rng(100 + B)
+            idx_np = rng.integers(0, self.E, size=(B, T, self.TOPK)).astype(np.uint32)
+            indices = mx.array(idx_np)
+            R = int(indices.size)
+            x = mx.random.normal((B, T, self.K)).astype(mx.bfloat16)
+            wq = mx.random.normal((self.E, self.N, self.K)).astype(mx.bfloat16)
+            w, scales, biases = mx.quantize(wq, group_size=64, bits=4)
+            mx.eval(x, indices, w, scales, biases)
+
+            rows = {}
+
+            def run(S, tag):
+                xx = mx.expand_dims(x, (-2, -3))
+                xs, ids, inv = S._gather_sort(xx, indices, num_experts=self.E)
+                rows[tag] = xs.shape[0]
+                o = mx.gather_qmm(xs, w, scales=scales, biases=biases, rhs_indices=ids,
+                                  transpose=True, group_size=64, bits=4, sorted_indices=True)
+                return S._scatter_unsort(o, inv, indices.shape).squeeze(-2)
+
+            base = run(_reload(MLX_VLM_MOE_SEGMENT_ALIGN="0"), "off")
+            pad = run(_reload(MLX_VLM_MOE_SEGMENT_ALIGN="16"), "on")
+            mx.eval(base, pad)
+            counts = np.bincount(idx_np.reshape(-1), minlength=self.E)
+            self.assertEqual(rows["off"], R)
+            self.assertEqual(rows["on"], int((((counts + 15) // 16) * 16).sum()))
+            self.assertGreater(rows["on"], rows["off"], f"padding did not fire at B={B}")
+            self.assertEqual(base.shape, pad.shape)
+            self.assertEqual(base.shape[:2], (B, T), "batch/sequence axes were not restored")
+            self.assertTrue(bool(mx.all(base == pad).item()),
+                            f"not bit-identical at B={B}")
+
+
 if __name__ == "__main__":
     unittest.main()
