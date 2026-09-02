@@ -467,11 +467,6 @@ _SHARED_GATE_MARKER = _SHARED_EXPERTS + "gate_proj."
 _LINEAR_PARAMS = ("weight", "scales", "biases", "bias")
 
 
-def _env_flag(name: str) -> bool:
-    raw = os.environ.get(name)
-    return raw is not None and raw.strip().lower() not in ("", "0", "false", "no", "off")
-
-
 def pack_shared_enabled(config: Any = None) -> bool:
     flag = getattr(config, "pack_shared_gate_up", None) if config is not None else None
     return bool(flag) if flag is not None else _env_flag(PACK_SHARED_ENV)
