@@ -329,3 +329,33 @@ def test_uniform_clamp_counter_is_per_request_and_lifetime():
     _reset_uniform_clamp(drafter)
     assert drafter.clamped_tokens == 0
     assert drafter.speculative_total_clamped == 5
+
+
+def test_glm5_next_rollback_refuses_a_ragged_batch():
+    """A wrong precondition must fail loudly, not trim by the batch maximum."""
+    mx.random.seed(3)
+    model = _tiny_glm5_next_target()
+    mx.eval(model.parameters())
+    cache = model.make_cache()
+    model(mx.array([PROMPT, PROMPT], dtype=mx.int32), cache=cache)
+
+    with pytest.raises(RuntimeError, match="uniform per-row acceptance"):
+        model.rollback_speculative_cache(
+            cache, [], mx.array(RAGGED, dtype=mx.int32), BLOCK_TOTAL
+        )
+
+def test_glm5_next_rollback_still_accepts_a_uniform_batch_and_a_scalar():
+    """The guard must not fire on the shapes the fixed path actually sends."""
+    mx.random.seed(3)
+    model = _tiny_glm5_next_target()
+    mx.eval(model.parameters())
+    for accepted in (1, [1, 1], mx.array([1, 1], dtype=mx.int32)):
+        cache = model.make_cache()
+        batch = 1 if isinstance(accepted, int) else 2
+        model(mx.array([PROMPT] * batch, dtype=mx.int32), cache=cache)
+        # No gdn_states are needed: with a single non-KDA layer touched the
+        # guard is the only thing under test here, so drive the KV half only.
+        kv_only = [None if i == 0 else c for i, c in enumerate(cache)]
+        assert model.rollback_speculative_cache(
+            kv_only, [], accepted, BLOCK_TOTAL
+        ) == 1
