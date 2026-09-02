@@ -2566,17 +2566,47 @@ class BatchGenerator:
         """
         vault = getattr(self, "vault", None)
         have = int(pick.get("prefix_len", 0)) if pick else 0
-        try:
-            hit = vault.lookup(list(ids_list))
-        except Exception:  # noqa: BLE001 - a vault fault must never fail a request
-            return pick
-        if hit is None or not (have < int(hit.prefix_len) < len(ids_list)):
+        # Tiers compete under one rule: strictly deeper than what we already
+        # have, and a strict prefix of the new prompt. That right-hand term is
+        # the returning-turn condition -- the stored rung covers turn N, the new
+        # prompt is that plus turn N+1's user message -- so the session tier
+        # needs no separate guard. The SESSION tier is consulted only when the
+        # flag is on, so with it off this reduces term for term to the prefill
+        # lookup it replaces.
+        _PREFILL_TIER = _context_vault.VaultTier.PREFILL
+        tiers = [_PREFILL_TIER]
+        if _context_vault.session_capture_enabled():
+            tiers.append(_context_vault.VaultTier.SESSION)
+        hit = None
+        hit_tier = _PREFILL_TIER
+        for tier in tiers:
+            try:
+                # PREFILL uses the two-argument call the vault has always had,
+                # so a duck-typed vault (the server tests use one) keeps working
+                # and this path stays byte-for-byte what it replaced. The tier
+                # kwarg is only used where it is load-bearing.
+                cand = (vault.lookup(list(ids_list)) if tier is _PREFILL_TIER
+                        else vault.lookup(list(ids_list), tier=tier))
+            except Exception:  # noqa: BLE001 - a vault fault must never fail a request
+                return pick
+            if cand is None:
+                continue
+            if not (have < int(cand.prefix_len) < len(ids_list)):
+                continue
+            if hit is None or int(cand.prefix_len) > int(hit.prefix_len):
+                hit, hit_tier = cand, tier
+        if hit is None:
             return pick
         if not self._vault_prefix_trim_is_safe():
             return pick
         fresh = cache.make_prompt_cache(self.model)
         try:
-            restored = bool(vault.restore_into(fresh, hit))
+            # The tier is mandatory: restore_into refuses a mismatch by design,
+            # so a session rung restored as PREFILL returns False and falls
+            # through to a cold prefill rather than serving a wrong guarantee.
+            restored = bool(
+                vault.restore_into(fresh, hit) if hit_tier is _PREFILL_TIER
+                else vault.restore_into(fresh, hit, tier=hit_tier))
         except Exception:  # noqa: BLE001
             restored = False
         if not restored:
@@ -2589,7 +2619,8 @@ class BatchGenerator:
             "prefix_len": int(hit.prefix_len),
             "extra_hash": self._apc_extra_hash(prompt_kwargs or {}),
             "full_input_ids": list(ids_list),
-            "source": "vault",
+            "source": ("vault-session"
+                       if hit_tier is _context_vault.VaultTier.SESSION else "vault"),
         }
 
     def _vault_rungs_for(self, ids_list, prefix_len: int) -> List[int]:

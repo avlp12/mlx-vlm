@@ -2569,6 +2569,20 @@ class ResponseGenerator:
 
             tok = r.token
             token_count = 0 if tok is None else 1
+            # Session key accumulation. One Response is exactly one token here
+            # (token_count is derived on the line above and is only ever 0 or 1),
+            # so a single append per response is the whole contract. The other
+            # _log_decode_progress sites are deliberately NOT wired: 2506 is a
+            # synthetic length-stop carrying no token, and the diffusion emitter
+            # collapses a block into one chunk while discarding the individual
+            # ids (it keeps only ``last_token``). _run_speculative and
+            # _run_diffusion are separate run modes with no BatchGenerator, so
+            # there is no capture_session for them to feed.
+            if tok is not None:
+                try:
+                    batch_gen.note_generated(r.uid, [int(tok)])
+                except Exception:  # noqa: BLE001 - bookkeeping never fails a response
+                    pass
             if tok is None:
                 text = info["streamer"].finalize()
                 tok = 0

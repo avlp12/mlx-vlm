@@ -56,6 +56,27 @@ class _Gen:
         self._session_tokens = {}
 
 
+def _isolate_session_env(testcase):
+    """Restore the session flags after the test.
+
+    Leaking MLX_VLM_GLM5_VAULT_SESSION=1 out of a module makes a LATER module's
+    duck-typed vault see a tier kwarg it has no parameter for -- which is how it
+    was found: test_vault_server_wiring passed alone and failed in the full run.
+    """
+    saved = {k: os.environ.get(k)
+             for k in (V._ENV_SESSION, V._ENV_SESSION_DERIVED_ID)}
+
+    def restore():
+        for k, val in saved.items():
+            if val is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = val
+    testcase.addCleanup(restore)
+    for k in saved:
+        os.environ.pop(k, None)
+
+
 def capture(gen, uid, tokens, session_id, ttl_s=None):
     return BatchGenerator.capture_session(
         gen, uid, tokens, session_id=session_id, ttl_s=ttl_s)
@@ -63,8 +84,7 @@ def capture(gen, uid, tokens, session_id, ttl_s=None):
 
 class TestFlagDefaults(unittest.TestCase):
     def setUp(self):
-        for k in (V._ENV_SESSION, V._ENV_SESSION_DERIVED_ID):
-            os.environ.pop(k, None)
+        _isolate_session_env(self)
 
     def test_capture_is_off_by_default(self):
         """It fires on the response path, so it stays off until validated."""
@@ -122,8 +142,7 @@ class TestPrefixLenFromCache(unittest.TestCase):
 
 class TestBatchGeneratorEntryPoint(unittest.TestCase):
     def setUp(self):
-        for k in (V._ENV_SESSION, V._ENV_SESSION_DERIVED_ID):
-            os.environ.pop(k, None)
+        _isolate_session_env(self)
 
     def _gen(self):
         v = V.ContextVault("wire", budget_bytes=1 << 30)
@@ -175,8 +194,7 @@ if __name__ == "__main__":
 
 class TestAccumulator(unittest.TestCase):
     def setUp(self):
-        for k in (V._ENV_SESSION, V._ENV_SESSION_DERIVED_ID):
-            os.environ.pop(k, None)
+        _isolate_session_env(self)
 
     def _gen(self, seed=None):
         v = V.ContextVault("acc", budget_bytes=1 << 30)
@@ -235,3 +253,58 @@ class TestAccumulator(unittest.TestCase):
         BatchGenerator.forget_session(g, "u1")
         self.assertNotIn("u1", g._session_tokens)
         BatchGenerator.forget_session(g, "gone")   # must not raise
+
+
+class TestSpecRoundAccumulation(unittest.TestCase):
+    """A speculative round that accepts several tokens must land all of them.
+
+    FINDING that shaped these tests: no call site collapses an accepted round
+    into one call. `_step`'s token_count is `0 if tok is None else 1`, computed
+    two lines above the call, and one Response is one token; the speculative
+    run mode already appends per token to its own `token_lists`. The only site
+    that can report token_count > 1 is the diffusion emitter, which keeps just
+    `last_token` and belongs to a run mode with no BatchGenerator at all.
+
+    So a 4-token round arrives as 4 appends, and that is what is pinned here --
+    plus the guard for the day somebody wires a collapsing site anyway.
+    """
+
+    def setUp(self):
+        _isolate_session_env(self)
+        os.environ[V._ENV_SESSION] = "1"
+
+    def _gen(self, prompt, n_cached):
+        v = V.ContextVault("spec", budget_bytes=1 << 30)
+        g = _Gen(v, ["u1"], row_cache(n_cached))
+        g._session_tokens["u1"] = list(prompt)
+        return v, g
+
+    def test_a_four_token_round_lands_all_four_in_order(self):
+        v, g = self._gen(range(1, 5), 8)
+        for tok in (10, 11, 12, 13):                 # one Response per token
+            BatchGenerator.note_generated(g, "u1", [tok])
+        self.assertEqual(g._session_tokens["u1"], [1, 2, 3, 4, 10, 11, 12, 13])
+        self.assertTrue(BatchGenerator.capture_session(g, "u1", session_id="c1"))
+        cp = V.lookup_session(v, [1, 2, 3, 4, 10, 11, 12, 13])
+        self.assertIsNotNone(cp, "the rung must be reachable by its own key")
+        self.assertEqual(cp.prefix_len, 8)
+
+    def test_a_collapsed_round_is_detected_not_silently_stored(self):
+        """If a caller ever reports 4 accepted tokens as 1, the key is short.
+
+        A short key is not a wrong answer -- it is a rung nobody can reach. The
+        cache offset is the independent witness, and record_session_turn refuses
+        when the cache holds more tokens than the key describes.
+        """
+        v, g = self._gen(range(1, 5), 8)
+        BatchGenerator.note_generated(g, "u1", [13])   # 4 accepted, 1 recorded
+        self.assertEqual(len(g._session_tokens["u1"]), 5)
+        self.assertFalse(BatchGenerator.capture_session(g, "u1", session_id="c1"),
+                         "cache offset 8 > key length 5 must refuse")
+        self.assertEqual(v.rungs, 0)
+
+    def test_a_malformed_id_drops_the_round(self):
+        v, g = self._gen(range(1, 5), 8)
+        BatchGenerator.note_generated(g, "u1", [10, object(), 12])
+        self.assertNotIn("u1", g._session_tokens)
+        self.assertFalse(BatchGenerator.capture_session(g, "u1", session_id="c1"))
