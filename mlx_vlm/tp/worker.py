@@ -279,13 +279,21 @@ def _ctrl_send(op: int, epoch: int, ids, *, flags: int = 0, arg0: int = 0,
     """Rank 0: publish a control message through the data collective."""
     import mlx.core as mx
 
-    from ..tp.transport import all_sum
-
     shape, flat = _flatten(ids)
+    # Publish the epoch to the side-channel BEFORE the collective that carries
+    # the verb.  If this all_sum is the one that wedges, the beat already names
+    # the epoch rank 0 was trying to announce.
+    from ..tp.transport import all_sum, driving, set_epoch
+
+    set_epoch(epoch)
     msg = mx.array([encode(op, epoch, shape, flat, flags=flags, arg0=arg0,
                            name=name, echo=_LAST_SHAPE)], dtype=mx.int32)
     out = all_sum(msg)
-    mx.eval(out)
+    # The eval is where the collective actually runs, so it is where "a
+    # collective is outstanding" is true.  If rank 0 wedges here, its beat says
+    # DRIVING with frozen counters and rank 1 can name the reduce.
+    with driving():
+        mx.eval(out)
     drift = _shape_disagreement(out[0].tolist())
     if drift is not None:
         raise TPDesync(
@@ -344,6 +352,24 @@ def _release_and_exit(reason: str) -> None:
     matters.
     """
     logger.error("tp worker: %s -- releasing wired limit and exiting", reason)
+    # Name the divergent reduce before leaving.  transport keeps _FWD_IDX exactly
+    # so "rank 0 reached #57 and rank 1 reached #58" can be said out loud; the
+    # side-channel is the first place it can actually be said, because the
+    # collective that would otherwise carry it is the thing that is stuck.
+    try:
+        from ..tp import heartbeat as _hb
+        from ..tp.transport import forward_index
+
+        b = _hb.beacon()
+        if b is not None:
+            where = b.divergence(forward_index())
+            if where:
+                logger.error("tp worker: %s", where)
+            # Announce EXITING so the peer releases promptly instead of waiting
+            # out its own dead_s bound.
+            _hb.shutdown_beacon(announce_exit=True)
+    except Exception:
+        logger.debug("tp worker: heartbeat teardown failed", exc_info=True)
     try:
         import mlx.core as mx
 
@@ -364,23 +390,60 @@ def _ctrl_recv() -> Ctrl:
     """
     import mlx.core as mx
 
-    from ..tp.transport import Deadman, all_sum
+    from ..tp.transport import Deadman, all_sum, driving
 
     n = _max_tok()
+    # BUGFIX: this contribution was referenced as an undefined name `contrib` on
+    # the bounded path.  The bound ships disabled, so the branch was dead code and
+    # the NameError had never fired -- but it would have fired on the first run
+    # that set MLX_VLM_GLM5_TP_CTRL_IDLE_S, i.e. exactly the vault-hang
+    # reproduction this bound exists for.
+    contrib = mx.zeros((1, HEADER + n), dtype=mx.int32)
     bound = _ctrl_idle_bound()
-    if bound <= 0:
-        out = all_sum(mx.zeros((1, HEADER + n), dtype=mx.int32))
-        mx.eval(out)
+
+    # THE UNLOCK.  _ctrl_idle_bound ships at 0 because a TIME-ONLY bound cannot
+    # tell "idle" from "orphaned".  A progress-carrying beat can: the peer says
+    # IDLE when it is legitimately parked and DRIVING when it owes us progress,
+    # so protection no longer requires a deadline.  With a beacon up we arm a
+    # Deadman with NO time bound at all and let the probe be the only trigger.
+    probe = _hb_stall_probe()
+    if bound <= 0 and probe is None:
+        out = all_sum(contrib)          # unchanged legacy behaviour
+        with driving():
+            mx.eval(out)
         return decode(out[0].tolist())
+
     # on_fire runs in the watcher thread, which is the only thread that can act:
     # this one is about to be stuck inside the collective with no way back.
-    # harm_probe is disabled -- there is no valid host-side liveness signal here
-    # (see the note above), so the bound is purely time.
-    with Deadman(bound, "tp control wait", on_timeout="none",
-                 harm_probe=lambda _w: None, on_fire=_release_and_exit):
+    with Deadman(bound if bound > 0 else float("inf"), "tp control wait",
+                 on_timeout="none",
+                 harm_probe=probe if probe is not None else (lambda _w: None),
+                 on_fire=_release_and_exit):
         out = all_sum(contrib)
-        mx.eval(out)
-    return _decode_checked(out[0].tolist(), n)
+        with driving():
+            mx.eval(out)
+    # Decode strictly only where it was already strict.  Turning the shape-drift
+    # check on for the previously-unbounded path would be a behaviour change
+    # smuggled inside a liveness patch; the asymmetry between decode() here and
+    # _decode_checked() on the bounded path is real and is raised separately.
+    row = out[0].tolist()
+    return _decode_checked(row, n) if bound > 0 else decode(row)
+
+
+def _hb_stall_probe():
+    """The heartbeat's harm probe, or None when no beacon is running.
+
+    Unlike the Deadman's default probe (_display_stalled, which shells out to
+    /usr/bin/log for ~0.75 s and reads the display compositor as a PROXY for
+    harm) this is a non-blocking read of already-received state and a DIRECT
+    signal about the peer.  Detection latency is stall_s (default 30 s) plus at
+    most Deadman.HARM_POLL_S (8 s), because the Deadman's poll cadence is tuned
+    for the expensive probe."""
+    try:
+        from ..tp import heartbeat as _hb
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return _hb.stall_probe if _hb.beacon() is not None else None
 
 
 def _decode_checked(row, n):
@@ -596,6 +659,12 @@ def worker_loop(model_path: str, hosts: List[str], rank: int) -> None:
 
     info = preflight(hosts, rank)
     logger.info("tp worker: joined %s", info)
+    # Up AFTER formation: before it, a missing peer is expected, and the beacon's
+    # UNKNOWN verdict already refuses to treat startup silence as a kill.
+    from ..tp import heartbeat as _hb
+
+    _hb.init_beacon(rank, len(hosts))
+    _hb.beacon() and _hb.beacon().note(_hb.STATE_IDLE)
     model, report = load_sharded(model_path, _r(), tp_size())
     peak = materialize(model)
     logger.info("tp worker: sharded %s peak %.1f GiB", report, peak)
@@ -611,6 +680,12 @@ def worker_loop(model_path: str, hosts: List[str], rank: int) -> None:
             if not state.handle(_ctrl_recv()):
                 return
     finally:
+        # Announce departure first: it is a datagram, it cannot block, and it
+        # saves the peer from waiting out its own dead_s bound.
+        try:
+            _hb.shutdown_beacon(announce_exit=True)
+        except Exception:
+            logger.debug("tp worker: heartbeat shutdown failed", exc_info=True)
         # Order matters: leave wired_limit FIRST (it synchronises the stream and
         # puts the wired budget back), then drop the shard, then clear.  Skipping
         # this is what leaks 85.5 GiB of wired pages that survive the process.
