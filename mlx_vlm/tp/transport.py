@@ -21,6 +21,7 @@ IPv4-mapped GID against the local address, and falls back to the ring backend
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
@@ -294,6 +295,13 @@ def collective_count() -> int:
     return _ALL_SUM_CALLS
 
 
+def forward_index() -> int:
+    """Position within the current forward.  Published so the heartbeat beacon
+    can carry it to the peer -- which is what finally makes the position-by-
+    position comparison described above possible from OUTSIDE the collective."""
+    return _FWD_IDX
+
+
 def reset_forward_counter() -> None:
     global _FWD_IDX
     _FWD_IDX = 0
@@ -308,7 +316,63 @@ def all_sum(x: mx.array) -> mx.array:
     _FWD_IDX += 1
     if _deep_trace():
         logger.info("all_sum #%d shape=%s", _FWD_IDX, tuple(x.shape))
+    # Progress note for the side-channel.  THIS CALL SITE IS THE WHOLE POINT: it
+    # runs on the thread that drives, immediately before the call that can wedge,
+    # so a frozen counter on the wire means "the driving thread stopped here" and
+    # not merely "the process is busy".  Cost is one lock and a tuple build
+    # against ~101 reduces per step -- under 0.02% of a decode step -- and it is
+    # skipped entirely when the beacon is disabled or absent.
+    # COUNTERS ONLY.  This call only BUILDS the reduce -- mlx is lazy and the
+    # collective cannot block until mx.eval -- so this must not claim a
+    # collective is outstanding.  That claim is made by driving() around the eval.
+    _hb = _heartbeat()
+    if _hb is not None:
+        b = _hb.beacon()
+        if b is not None:
+            b.note_progress(epoch=_EPOCH, fwd_idx=_FWD_IDX,
+                            verb_seq=_ALL_SUM_CALLS)
     return mx.distributed.all_sum(x, group=_GROUP)
+
+
+def driving():
+    """Bracket the ``mx.eval`` that actually forces a collective.
+
+    Returns a no-op context when no beacon is running, so call sites stay
+    unconditional.  See heartbeat.Beacon.driving for why the bracket belongs
+    here and not around all_sum."""
+    _hb = _heartbeat()
+    b = _hb.beacon() if _hb is not None else None
+    return b.driving() if b is not None else contextlib.nullcontext()
+
+
+# The epoch rank 0 is currently driving, mirrored into the beat so a desync is
+# visible on the side-channel and not only inside the control vector.
+_EPOCH = -1
+
+
+def set_epoch(epoch: int) -> None:
+    global _EPOCH
+    _EPOCH = int(epoch)
+
+
+_HB_MOD = None
+_HB_TRIED = False
+
+
+def _heartbeat():
+    """Lazily import the beacon module.  Imported late and defensively: the
+    heartbeat is an OPTIONAL diagnostic, and a failure to load it must never be
+    able to stop a forward."""
+    global _HB_MOD, _HB_TRIED
+    if not _HB_TRIED:
+        _HB_TRIED = True
+        try:
+            from . import heartbeat as _m
+            _HB_MOD = _m
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("[tp] heartbeat module unavailable", exc_info=True)
+            _HB_MOD = None
+    return _HB_MOD
 
 
 # ---------------------------------------------------------------- deadman
