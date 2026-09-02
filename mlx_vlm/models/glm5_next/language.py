@@ -761,8 +761,10 @@ class Glm5NextLinearAttention(nn.Module):
         the hand-rolled gated RMSNorm -- is roughly 33 small dependent launches
         per layer, and at 34 KDA layers that is what this collapses to 34.
 
-        The state is loaded and stored once for the block rather than once per
-        token, so a width-W verify pays one [H, D, D] round trip instead of W.
+        It does NOT save state round trips -- gated_delta_kernel already loaded
+        the state before its own `for t` loop and stored it after, so the eager
+        path paid one per block too.  The win is dispatch count, measured flat at
+        ~3.2 ms per verify forward against a 3.03 ms ceiling.
         """
         fg = self.forget_gate
         H, D = self.num_heads, self.head_dim

@@ -846,10 +846,21 @@ def fused_kda_decode_step(
 # ~17.5% of a 94 ms W=8 verify.  UPPER BOUND, per the fusion ledger's R1: kernel
 # count x dispatch cost bounds the prize, it does not predict it.
 #
-# TWO THINGS THIS BUYS THAT THE S=1 KERNEL DID NOT:
-#   * the state is loaded and stored ONCE for the whole block instead of once per
-#     token -- W round trips of [H, D, D] fp32 (4 MB/layer) collapse to one;
-#   * q/k/v/g never reach device memory between the conv and the recurrence.
+# WHAT THIS BUYS, and one thing it does NOT:
+#   * the ~33 dependent launches per layer collapse to one -- measured at a flat
+#     ~3.2 ms per verify forward against a 3.03 ms dispatch-elimination ceiling,
+#     i.e. essentially all of it, because these are serial launches with nothing
+#     in flight to hide them (GAP2_RESULT_ACD.json);
+#   * q/k/v/g never reach device memory between the conv and the recurrence;
+#   * it does NOT save state round trips. An earlier version of this note claimed
+#     W round trips collapse to one. That was wrong: gated_delta_kernel already
+#     loads the state before its `for t` loop and stores it after, so the eager
+#     path was already paying one per block. The saving is dispatch count only,
+#     which is exactly why the measurement lands on a pure dispatch ceiling.
+#
+# The saving is FLAT in W -- 34 layers x ~33 launches does not depend on the block
+# width -- so the PERCENTAGE shrinks as W grows: +7.3% at W=2, +4.1% at W=8, about
+# +4.7% at adaptive-K's measured mean width of 4.6.
 #
 # S is a RUNTIME scalar, not a template parameter.  Adaptive-K varies the width
 # every round (measured mean 4.6 on code), and a templated S would compile a new
