@@ -7671,9 +7671,20 @@ class TestRuntimeConfig:
         cfg2 = RuntimeConfig.from_env()
         assert cfg2.fingerprint() == fp
 
-        # toggling a dead APC knob while APC is off must not invalidate
+        # toggling a dead APC knob while APC is off must not invalidate.
+        # The "while APC is off" precondition used to ride on the default; APC
+        # is ON by default since I1024, so state it rather than inherit it.
+        cfg2.apc_enabled = False
+        fp_off = cfg2.fingerprint()
         cfg2.apc_block_size = 64
-        assert cfg2.fingerprint() == fp
+        assert cfg2.fingerprint() == fp_off
+
+        # ...and the converse, which the old default hid: once APC is on, the
+        # block size is part of cache identity and MUST invalidate.
+        cfg2.apc_enabled = True
+        fp_on = cfg2.fingerprint()
+        cfg2.apc_block_size = 128
+        assert cfg2.fingerprint() != fp_on
 
         # toggling an effective knob must invalidate
         cfg2.vision_cache_size = 40
@@ -7847,6 +7858,10 @@ class TestRuntimeConfigAdditions:
         assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
 
     def test_settings_patch_replace_semantics(self, client, monkeypatch):
+        # This test is about PATCH replace semantics, not about the default, so
+        # pin the starting state explicitly. APC defaults ON since I1024 and a
+        # patch to True from True would prove nothing.
+        monkeypatch.setenv("APC_ENABLED", "0")
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         cfg = server.runtime.config
         assert cfg.apc_enabled is False

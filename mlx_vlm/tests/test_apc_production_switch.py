@@ -20,6 +20,7 @@ import unittest
 
 from mlx_vlm import apc as _apc
 from mlx_vlm.server import cli as _cli
+from mlx_vlm.server import runtime_config as _rc
 from mlx_vlm.server.runtime_config import RuntimeConfig
 
 _app = importlib.import_module("mlx_vlm.server.app")
@@ -45,14 +46,39 @@ class TestSwitchExists(unittest.TestCase):
     def setUp(self):
         _isolate(self)
 
-    def test_default_is_off(self):
-        self.assertIsNone(_apc.from_env(), "APC must stay opt-in")
+    def test_server_default_is_ON(self):
+        """I1024: prefix caching is the server default.
+
+        Measured before flipping it: identical 32k prompt 79.2 s cold -> 2.64 s
+        warm (30x), 2k 6.73 -> 2.45 s (2.7x), ~2 GB added at the default 2
+        entries against a 169 GB model, swap flat.
+        """
+        self.assertTrue(RuntimeConfig.from_env().apc_enabled)
+
+    def test_APC_ENABLED_0_still_disables(self):
+        os.environ["APC_ENABLED"] = "0"
         self.assertFalse(RuntimeConfig.from_env().apc_enabled)
+        self.assertIsNone(_apc.from_env(overrides={"enabled": False}))
+
+    def test_library_default_stays_OFF_and_that_is_deliberate(self):
+        """from_env() without overrides is for direct library callers.
+
+        The server never reaches this branch -- it always passes an override
+        built from its config -- so the two defaults are allowed to differ, and
+        a future reader should not unify them without measuring the library
+        path. Pinned so the divergence is a decision, not a drift.
+        """
+        self.assertIsNone(_apc.from_env(), "library callers keep opting in")
 
     def test_env_turns_it_on(self):
         os.environ["APC_ENABLED"] = "1"
         self.assertTrue(RuntimeConfig.from_env().apc_enabled)
         self.assertIsNotNone(_apc.from_env(), "APC_ENABLED=1 must build a manager")
+
+    def test_settings_table_agrees_with_the_dataclass(self):
+        """Two declarations of the same default is how they drift apart."""
+        row = [r for r in _rc.KNOBS if r[0] == "apc_enabled"][0]
+        self.assertEqual(row[2], RuntimeConfig.apc_enabled)
 
     def test_override_beats_env(self):
         """get_cached_model passes cfg through as an override, so live settings
@@ -75,15 +101,20 @@ class TestFlagDoesNotForkTheSwitch(unittest.TestCase):
         _isolate(self)
 
     def _args(self, **kw):
-        base = {"apc": False, "apc_exact_entries": None}
+        base = {"apc": None, "apc_exact_entries": None}
         base.update(kw)
         return argparse.Namespace(**base)
 
     def test_flag_absent_leaves_the_environment_alone(self):
         """An operator exporting APC_ENABLED must not be overridden by a default."""
-        env = {"APC_ENABLED": "1"}
+        env = {"APC_ENABLED": "0"}
         _cli._apply_apc_env(self._args(), env)
-        self.assertEqual(env["APC_ENABLED"], "1")
+        self.assertEqual(env["APC_ENABLED"], "0", "unpassed flag must not write")
+
+    def test_no_apc_turns_it_off(self):
+        env = {}
+        _cli._apply_apc_env(self._args(apc=False), env)
+        self.assertEqual(env["APC_ENABLED"], "0")
 
     def test_flag_writes_the_existing_variable(self):
         env = {}
