@@ -38,7 +38,9 @@ This module pins:
     bought (1) by changing the prefill);
 3.  the same at B = 3 with two different right pads, so the loop is not accidentally
     right only for one boundary per prefill;
-4.  the unchunked arm is byte-identical to the number recorded before the fix;
+4.  the unchunked arm's PROMPT CACHE is byte-identical to the one recorded before
+    the fix (see RIGHT PADDING IS DECLINED below for why the decode tokens are no
+    longer part of that pin);
 5.  a batch that is NOT right-padded takes no capture at all -- the code path an
     ordinary cold batch runs is untouched.
 
@@ -70,6 +72,37 @@ recorded CPU digests do not reproduce.  Measured here on an M3 Ultra, mlx
     same machine, 2026-09-03 -- and the post-fix tree reproduces all 14 chunked
     cache digests and both unchunked digests byte for byte on GPU as well.  The
     "the fix did not move the prefill" guard therefore holds on both devices.
+
+RIGHT PADDING IS DECLINED (added 2026-09-03).  This module measures WHICH COLUMN
+a right-padded batch samples, and that is all it ever measured.  The batch itself
+is now known to be wrong for a different reason, one that no column arithmetic
+can reach: the KDA (linear-attention) layers fold the padding into a recurrent
+state and a conv window taken AT the padded column, and a recurrent state cannot
+be rolled back the way ``BatchKVCache.finalize()`` rolls a K/V buffer.  A
+right-padded row's PROMPT logits are right to 9.5e-07 and its DECODE trajectory
+parts company from a singleton run at the first step, by 0.09 to 1.6 on a 6.3
+logit scale depending on the pad.  ``BatchGenerator`` no longer builds such a
+batch for this model (``generate/ar.py::_apply_right_pad_policy``); the fixtures
+here build one directly, which is still the right thing for a module about
+column selection, but it means the DECODE TOKENS of a padded row are not a
+correct answer and must not be pinned as if they were.
+
+So two pins moved:
+
+  * ``test_the_unchunked_arm_...`` pinned ``_digest(rows, arrays)`` -- the
+    emitted tokens AND the cache.  The cache half is unchanged and is now pinned
+    on its own (``UNCHUNKED_CACHE_DIGEST``, verified byte-identical to the
+    pre-fix build); the token half is replaced by the claim that actually holds,
+    namely that the row carrying NO right padding decodes exactly like the same
+    row run alone, and that every row's FIRST token does.
+  * ``test_right_padding_attached_after_construction_...`` pinned two token ids
+    recorded at 422b69fa.  That fixture attaches ``_right_pad_per_row`` AFTER
+    construction, so the cache is never told about the padding -- its arithmetic
+    is nobody's served arithmetic, and the pin duly went stale at 47b503a3
+    ([71, 99] -> [95, 99], a live failure in this file before this commit).  It
+    now asserts the arithmetic it was always about: no capture was taken, and the
+    sampler is handed exactly ``logits[i, width - 1 - right_pad[i]]`` of the
+    final forward.
 """
 
 import hashlib
@@ -274,13 +307,9 @@ def _cache_digest(arrays):
     return h.hexdigest()
 
 
-def _digest(rows, arrays):
-    h = hashlib.sha256(repr(rows).encode())
-    for a in arrays:
-        h.update(repr(tuple(a.shape)).encode())
-        h.update(repr(a.dtype).encode())
-        h.update(memoryview(np.asarray(a.astype(mx.float32))).tobytes())
-    return h.hexdigest()
+# ``_digest(rows, arrays)`` -- tokens AND cache -- used to live here.  It was the
+# only caller of a token pin on a right-padded row's decode, which is a wrong
+# answer (module docstring, RIGHT PADDING IS DECLINED), so it went with the pin.
 
 
 # ------------------------------------------------------- 1. the emitted tokens
@@ -481,31 +510,68 @@ def test_three_rows_with_two_different_right_pads(step):
 
 # ------------------------------------------------- 4. the unchunked arm is pinned
 #
-# Recorded on 422b69fa BEFORE the fix (pristine ``generate/ar.py`` restored into
-# this worktree, this module run, then restored).  The unchunked path is the one
-# the fix must not touch: it takes no capture, and ``take`` reduces term for term
-# to the ``seq - 1 - right_pad[i]`` it was.
-# Device-keyed for the same reason ``PRE_FIX_CACHE`` is; the GPU row was measured
-# on the pristine 422b69fa tree on 2026-09-03 and the post-fix tree reproduces it.
-UNCHUNKED_B2_DIGEST = {
-    "cpu": "39dc6566d9ae2d0d7a3887154f8443f60a306f6242c4d9bddc147ff212a810fa",
-    "gpu": "86f706084a372b0319cf4a4801bb17e58ce16da2caf2326bdbccb84eae377a14",
-}
-POST_HOC_RIGHT_PAD_TOKENS = [71, 99]
-UNCHUNKED_B3_DIGEST = {
-    "cpu": "fc992fe112ba53004b4f1fc53563a6110b3dbc94f07ea10c356680a1b0cc09f5",
-    "gpu": "2489e2fc953ac7814b988677328f084c54bccbe7f92a57b6d51c1068a9d3dbcb",
+# The unchunked path is the one the selection fix must not touch: it takes no
+# capture, and ``take`` reduces term for term to the ``seq - 1 - right_pad[i]``
+# it was.  What is pinned is the PROMPT CACHE alone.
+#
+# It used to be ``_digest(rows, arrays)`` -- the emitted tokens and the cache
+# together, recorded on 422b69fa.  The token half was a pin on a WRONG answer:
+# a right-padded row's decode is corrupted by the KDA state (see RIGHT PADDING IS
+# DECLINED in the module docstring), so those ids were never the row's answer and they
+# moved the moment either defect was touched.  The cache half is the part that
+# carries the claim, and it is unchanged: measured on the pristine 47b503a3 tree
+# and on this one, CPU, the two digests below are byte-identical.
+#
+# Device-keyed for the same reason ``PRE_FIX_CACHE`` is.  The GPU values are the
+# ``PRE_FIX_CACHE`` entries at ``step=None`` extended to full length; they are
+# marked ``None`` here rather than guessed, and the GPU arm falls back to the
+# 16-hex prefix pin that ``PRE_FIX_CACHE`` already carries.
+UNCHUNKED_CACHE_DIGEST = {
+    ("cpu", "B2"): (
+        "9c582cbff6ae7517ad070827c637489444bf9c6c0d0324a4db9dbb470f5bb1a3"
+    ),
+    ("cpu", "B3"): (
+        "f7900c633298b31bc1770168b0a8610df5b86de551a36735862bf6d1cfa2a316"
+    ),
+    ("gpu", "B2"): None,
+    ("gpu", "B3"): None,
 }
 
 
-def test_the_unchunked_arm_is_byte_identical_to_the_pre_fix_build():
-    rows, arrays, chunks = _run(None, B2_SUFFIX)
+@pytest.mark.parametrize("fixture", ["B2", "B3"])
+def test_the_unchunked_prompt_cache_is_byte_identical_to_the_pre_fix_build(fixture):
+    suffixes = B2_SUFFIX if fixture == "B2" else B3_SUFFIX
+    _, arrays, chunks = _run(None, suffixes)
     assert chunks == 0
-    assert _digest(rows, arrays) == UNCHUNKED_B2_DIGEST[DEV]
+    expected = UNCHUNKED_CACHE_DIGEST[(DEV, fixture)]
+    digest = _cache_digest(arrays)
+    if expected is None:
+        assert digest[:16] == PRE_FIX_CACHE[(DEV, fixture, None)]
+    else:
+        assert digest == expected
 
-    rows3, arrays3, chunks3 = _run(None, B3_SUFFIX)
-    assert chunks3 == 0
-    assert _digest(rows3, arrays3) == UNCHUNKED_B3_DIGEST[DEV]
+
+@pytest.mark.parametrize("fixture", ["B2", "B3"])
+def test_the_unchunked_arm_decodes_like_the_singletons_where_it_can(fixture):
+    """What replaces the token pin: the claims that are actually true.
+
+    * every row's FIRST token is the token that row emits when run alone -- the
+      prompt selection is right, which is this module's subject;
+    * the row that carries NO right padding matches its singleton for all four
+      steps, so the batching itself is sound;
+    * a PADDED row's later tokens are not asserted, and must not be: its KDA
+      state absorbed the padding.  ``test_glm5_rightpad_decline`` measures that
+      residual and is where the claim about it lives.
+    """
+    suffixes = B2_SUFFIX if fixture == "B2" else B3_SUFFIX
+    pads, _ = _pads(suffixes)
+    batched, _, _ = _run(None, suffixes)
+    singles = [_run(None, [s])[0][0] for s in suffixes]
+
+    assert [r[0] for r in batched] == [r[0] for r in singles]
+    for i, pad in enumerate(pads):
+        if pad == 0:
+            assert batched[i] == singles[i], f"row {i} carries no padding"
 
 
 # ------------------------------------------- 5. a batch without right padding
@@ -545,6 +611,16 @@ def test_right_padding_attached_after_construction_still_selects_the_last_real_t
     No chunk could have captured anything in that case -- the whole prompt is in
     the final forward -- so ``generate()`` falls back to the exact formula it used
     before this fix rather than dereferencing a column list it never built.
+
+    Asserted as ARITHMETIC, not as a token pin.  This fixture constructs the
+    batch WITHOUT ``right_pad_per_row`` and attaches it afterwards, so the cache
+    is never told there is padding: no ``prepare()``, no roll in ``finalize()``,
+    and the row's own K/V still counts the padded columns.  Nothing about that
+    is the served arithmetic, and the two token ids this used to pin (recorded
+    at 422b69fa) had already gone stale by 47b503a3 -- [71, 99] -> [95, 99], a
+    live failure in this file.  What the test is actually about is the fallback
+    index, so that is what it now checks: the sampler is handed exactly
+    ``logits[i, width - 1 - right_pad[i]]`` of the final forward, bit for bit.
     """
     lm = _lm()
     suffixes = B2_SUFFIX
@@ -559,15 +635,43 @@ def test_right_padding_attached_after_construction_still_selects_the_last_real_t
         prompt_kwargs={},
         prefill_step_size=None,
     )
+    # The construction-time bookkeeping never happened: no column list, no
+    # capture slots, so ``generate()`` must rebuild the index from the forward.
     assert batch._last_real_column is None
+    assert batch._captured_last_logits == []
     batch._right_pad_per_row = list(pads)
-    gen_batch = batch.generate(
-        sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-        stop_criteria=lambda token: False,
+
+    # The model's own output for the final (and only) forward, so the selected
+    # row can be compared against the column it is supposed to come from.
+    seen = {}
+    model = batch.model
+
+    class _Spy:
+        def __call__(self, *args, **kwargs):
+            output = model(*args, **kwargs)
+            seen["logits"] = output.logits if hasattr(output, "logits") else output
+            return output
+
+        def __getattr__(self, name):
+            return getattr(model, name)
+
+    batch.model = _Spy()
+    sampled = {}
+
+    def sampler(logprobs):
+        sampled["logprobs"] = mx.array(logprobs)
+        return mx.argmax(logprobs, axis=-1)
+
+    batch.generate(sampler=sampler, stop_criteria=lambda token: False)
+
+    full = seen["logits"]
+    assert full.shape[1] == width
+    assert batch._captured_last_logits == []
+    # ``generate`` hands the sampler log-probs, so undo the normalisation the
+    # same way it was applied and compare against the raw column.
+    expected = mx.stack(
+        [full[i, width - 1 - int(pad)] for i, pad in enumerate(pads)], axis=0
     )
-    tokens, _, _, _ = gen_batch._step()
-    # Recorded on 422b69fa BEFORE the fix.  (Not [125, 99]: constructing without
-    # ``right_pad_per_row`` skips the cache ``prepare()`` this batch would
-    # normally get, so the arithmetic is not the served one -- the point of the
-    # test is that the SELECTION arithmetic is unchanged.)
-    assert [int(t) for t in tokens] == POST_HOC_RIGHT_PAD_TOKENS
+    expected = expected - mx.logsumexp(expected, axis=-1, keepdims=True)
+    mx.eval(expected, sampled["logprobs"])
+    assert mx.array_equal(sampled["logprobs"], expected)
