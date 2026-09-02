@@ -25,6 +25,23 @@ DEFAULT_SERVER_PORT = 8080
 logger = logging.getLogger("mlx_vlm.server")
 
 
+def _apply_apc_env(args, env) -> None:
+    """Map the APC flags onto the environment the runtime already reads.
+
+    Deliberately NOT a new switch. ``RuntimeConfig.from_env`` already reads
+    ``APC_ENABLED`` and ``app.get_cached_model`` already passes it to
+    ``apc.from_env``; adding a second source of truth is how two switches end up
+    disagreeing. The flag only writes the variable that already exists, and only
+    when it was actually passed, so an operator setting APC_ENABLED in the
+    environment is not silently overridden by the flag's default.
+    """
+    if getattr(args, "apc", False):
+        env["APC_ENABLED"] = "1"
+    entries = getattr(args, "apc_exact_entries", None)
+    if entries is not None:
+        env["APC_EXACT_CACHE_ENTRIES"] = str(int(entries))
+
+
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
@@ -149,6 +166,26 @@ def main():
         help=(
             "Default token that closes a thinking block. Requests can override "
             "this with thinking_end_token."
+        ),
+    )
+    parser.add_argument(
+        "--apc",
+        action="store_true",
+        help=(
+            "Enable automatic prefix caching (APC). Default off. This is the "
+            "same switch as APC_ENABLED=1; the flag exists because a whole "
+            "campaign ran without prefix caching and nobody could see it."
+        ),
+    )
+    parser.add_argument(
+        "--apc-exact-entries",
+        type=int,
+        default=None,
+        help=(
+            "How many whole-prefix snapshots exact mode keeps (APC_EXACT_CACHE_"
+            "ENTRIES, default 2). NOTE: this bounds a COUNT, not bytes -- each "
+            "entry is a full prompt-cache clone, ~1.0 GiB at 32k and ~3.6 GiB "
+            "at 131k for GLM-5.3-Flash."
         ),
     )
     parser.add_argument(
@@ -329,6 +366,7 @@ def main():
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:
         os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
+    _apply_apc_env(args, os.environ)
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(

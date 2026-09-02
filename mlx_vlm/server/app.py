@@ -995,6 +995,24 @@ def get_cached_model(
         },
     )
 
+    # Say it out loud, once per load. APC ships fully plumbed and defaults OFF,
+    # and the whole X3 finding was that nobody could tell: an identical 32k
+    # prompt re-prefilled three times at ~92 s each with cached_tokens 0, and
+    # the cause was a default, not a missing feature. A server that does not
+    # announce whether prefix caching is on invites that measurement again.
+    if runtime.apc_manager is None:
+        logger.info(
+            "APC: disabled (prefix caching off). Enable with --apc or "
+            "APC_ENABLED=1; every prompt will be prefilled from scratch."
+        )
+    else:
+        logger.info(
+            "APC: enabled, block_size=%s exact_entries=%s. Exact mode keeps "
+            "whole-prefix snapshots bounded by COUNT, not bytes.",
+            getattr(runtime.apc_manager, "block_size", "?"),
+            getattr(runtime.apc_manager, "_exact_cache_max", "?"),
+        )
+
     response_generator = ResponseGenerator(
         model_path=model_path,
         adapter_path=adapter_path,
