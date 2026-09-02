@@ -209,6 +209,61 @@ def _speculative_walk_batch_uniform_acceptance(
     return [accepted] * len(accepted_list), new_tokens_list
 
 
+def _requires_uniform_batch_acceptance(
+    draft_model: nn.Module, target_model: Optional[nn.Module] = None
+) -> bool:
+    """Whether ragged per-row acceptance must be clamped to a uniform count.
+
+    The flag is honored on either the drafter or the target model. A target's
+    dedicated drafter (e.g. glm5_next -> glm5_next_dflash2) may not advertise
+    it, yet the target's own ``rollback_speculative_cache`` may be unable to
+    represent ragged accepts: glm5_next trims one shared KV length and replays
+    one shared KDA prefix, so a row that accepted fewer tokens than the batch
+    maximum keeps the real KV of tokens it rejected (issue #1962 upstream, and
+    our own variant of it). The target therefore may require uniformity
+    independently of the drafter.
+
+    Named after upstream Blaizzy/mlx-vlm 3b8f727d so a later rebase is a
+    no-conflict fast-forward.
+    """
+    if getattr(draft_model, "requires_uniform_batch_acceptance", False):
+        return True
+    return bool(getattr(target_model, "requires_uniform_batch_acceptance", False))
+
+
+def _record_uniform_clamp(draft_model: nn.Module, clamped_tokens: int) -> None:
+    """Record speculative tokens thrown away by the uniform-acceptance clamp.
+
+    The clamp buys correctness with throughput: every row that accepted more
+    than the batch minimum re-drafts the difference next round. ``accept_lens``
+    already shows the *post*-clamp acceptance (``_record_speculative_round``
+    runs after the clamp), so the mean-accept receipt reflects the cost; this
+    counter makes the cost attributable rather than merely implied.
+    """
+    clamped_tokens = int(clamped_tokens)
+    if clamped_tokens <= 0:
+        return
+    # Per-request (zeroed alongside ``accept_lens`` by _reset_uniform_clamp)
+    # and monotonic lifetime, matching the two scopes the other speculative
+    # counters already keep.
+    draft_model.clamped_tokens = (
+        getattr(draft_model, "clamped_tokens", 0) + clamped_tokens
+    )
+    draft_model.speculative_total_clamped = (
+        getattr(draft_model, "speculative_total_clamped", 0) + clamped_tokens
+    )
+
+
+def _reset_uniform_clamp(draft_model: nn.Module) -> None:
+    """Zero the per-request clamp counter.
+
+    Called next to ``draft_model.reset()``, which is where ``accept_lens``
+    restarts; without it the receipt would divide a lifetime give-back by one
+    request's rounds.
+    """
+    draft_model.clamped_tokens = 0
+
+
 def _record_speculative_round(
     draft_model: nn.Module, accepted: float, draft_count: int
 ) -> None:
@@ -303,6 +358,12 @@ def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     mean_accept = accepted_drafts / rounds
     mean_accepted_tokens = (accepted_drafts + rounds) / rounds
     draft_lens = getattr(draft_model, "draft_lens", None) or []
+    # Tokens a row had already accepted but gave back so the whole batch could
+    # roll back to one uniform length. Reported so the correctness clamp's
+    # throughput cost is visible in the receipt rather than only in a lower
+    # mean accept.
+    clamped = int(getattr(draft_model, "clamped_tokens", 0) or 0)
+    clamp_note = f", clamped {clamped} tok" if clamped else ""
     if len(draft_lens) == rounds and sum(draft_lens) > 0:
         accept_rate = 100 * accepted_drafts / sum(draft_lens)
         mean_draft = sum(draft_lens) / rounds
@@ -311,10 +372,11 @@ def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
             f"{mean_accepted_tokens:.2f} accepted tokens/round "
             f"({mean_accept:.2f} accepted drafts/round, "
             f"{accept_rate:.1f}% of drafted, "
-            f"avg draft {mean_draft:.2f}) over {rounds} rounds"
+            f"avg draft {mean_draft:.2f}{clamp_note}) over {rounds} rounds"
         )
 
     return (
         "Speculative decoding: "
         f"{mean_accepted_tokens:.2f} accepted tokens over {rounds} rounds"
+        f"{clamp_note}"
     )

@@ -2476,6 +2476,15 @@ class Glm5NextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    # ``rollback_speculative_cache`` below rolls the batch back with ONE trim
+    # length, ONE KDA replay prefix and ONE indexer pool length -- the cache is
+    # rectangular in the batch dimension and cannot represent per-row accept
+    # counts. Declaring the requirement makes the speculative loops clamp
+    # per-row accepts to the batch minimum before they call us. Named after
+    # upstream Blaizzy/mlx-vlm 3b8f727d (qwen3_5/deepseek_v4 carry the same
+    # class attribute) so a later rebase is a no-conflict fast-forward.
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
