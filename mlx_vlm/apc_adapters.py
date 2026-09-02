@@ -147,6 +147,42 @@ def _is_alias(node: Any) -> bool:
     )
 
 
+def _adopt_tree(obj: Any) -> Any:
+    """Like :func:`_snapshot_tree` but WITHOUT copying the arrays.
+
+    Only sound when the caller is handing over a cache it will never touch
+    again -- the end-of-turn session capture, where the request is finished and
+    the cache is about to be dropped anyway.  Deduplication still runs, so an
+    adopted DSA layer still stores the latent once.
+
+    Honest limit, because it bounds the saving: ``KVCache.state`` returns
+    ``keys[..., :offset, :]`` whenever the buffer is over-allocated (cache.py:338
+    grows in steps of 256), and evaluating that slice materialises a new buffer
+    regardless of what we do here.  So adoption avoids the copy outright only
+    when ``offset`` is a multiple of the step; otherwise it avoids the SECOND
+    copy (the snapshot on top of the slice) and no more.  Storing the raw buffer
+    plus the offset would avoid it in every case, but that needs a restore path
+    that sets ``.offset`` directly instead of going through the ``state`` setter,
+    which infers ``offset`` from the array shape -- left for later, deliberately,
+    because getting it wrong turns padding into real tokens.
+    """
+    if isinstance(obj, mx.array):
+        return obj
+    if _is_alias(obj):
+        return obj
+    if isinstance(obj, tuple):
+        if dedup_enabled():
+            return tuple(_dedup_seq(obj, _adopt_tree))
+        return tuple(_adopt_tree(o) for o in obj)
+    if isinstance(obj, list):
+        if dedup_enabled():
+            return _dedup_seq(obj, _adopt_tree)
+        return [_adopt_tree(o) for o in obj]
+    if isinstance(obj, dict):
+        return {k: _adopt_tree(v) for k, v in obj.items()}
+    return obj
+
+
 def _snapshot_tree(obj: Any) -> Any:
     """Deep-copy the MLX arrays inside a state tree; pass scalars/None through."""
     if isinstance(obj, mx.array):
@@ -215,7 +251,9 @@ class PrefixStateAdapter(Protocol):
 
     capability: Capability
 
-    def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]: ...
+    def capture(
+        self, cache: Any, prefix_len: int, adopt: bool = False
+    ) -> Optional[StateFragment]: ...
 
     def restore(self, fresh_cache: Any, fragment: StateFragment) -> None: ...
 
@@ -226,6 +264,21 @@ class PrefixStateAdapter(Protocol):
     def serialize(self, fragment: StateFragment) -> Any: ...
 
     def deserialize(self, tree: Any) -> StateFragment: ...
+
+
+def _capture_one(adapter: Any, cache: Any, prefix_len: int, adopt: bool):
+    """Call ``adapter.capture``, tolerating adapters that predate ``adopt``.
+
+    The default path is byte-for-byte the old two-argument call, so an adapter
+    outside this file is unaffected until somebody asks for adoption; if it then
+    cannot do it, we fall back to copying rather than failing the capture.
+    """
+    if not adopt:
+        return adapter.capture(cache, prefix_len)
+    try:
+        return adapter.capture(cache, prefix_len, adopt=True)
+    except TypeError:
+        return adapter.capture(cache, prefix_len)
 
 
 def _is_snapshotable(cache: Any) -> bool:
@@ -241,7 +294,9 @@ class CheckpointAdapter:
 
     capability = Capability.CHECKPOINT
 
-    def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]:
+    def capture(
+        self, cache: Any, prefix_len: int, adopt: bool = False
+    ) -> Optional[StateFragment]:
         if not _is_snapshotable(cache):
             return None
         snap = getattr(cache, "prefix_cache_snapshot", None)
@@ -253,7 +308,8 @@ class CheckpointAdapter:
                 "meta_state": cache.meta_state,
             }
         )
-        return StateFragment(self.capability, prefix_len, payload=_snapshot_tree(raw))
+        take = _adopt_tree if adopt else _snapshot_tree
+        return StateFragment(self.capability, prefix_len, payload=take(raw))
 
     def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
         payload = _expand_tree(fragment.payload)
@@ -300,14 +356,16 @@ class CompositeAdapter:
         subs = getattr(cache, "caches", None)
         return list(subs) if subs is not None else None
 
-    def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]:
+    def capture(
+        self, cache: Any, prefix_len: int, adopt: bool = False
+    ) -> Optional[StateFragment]:
         children = self._children(cache)
         if children is None:
             return None
         frags = []
         for sub in children:
             adapter = resolve_adapter(sub)
-            frag = adapter.capture(sub, prefix_len)
+            frag = _capture_one(adapter, sub, prefix_len, adopt)
             if frag is None:
                 return None
             frags.append(frag)

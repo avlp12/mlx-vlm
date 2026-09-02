@@ -45,16 +45,25 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 
-from .apc_adapters import Capability, StateFragment, resolve_adapter
+from .apc_adapters import (
+    Capability,
+    StateFragment,
+    _capture_one,
+    resolve_adapter,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ContextVault",
+    "VaultTier",
+    "record_session_turn",
+    "lookup_session",
     "VaultCheckpoint",
     "VaultStats",
     "align_boundaries",
@@ -120,18 +129,23 @@ def _max_ladder() -> int:
 # --------------------------------------------------------------------------
 
 
-def capture_fragments(caches: Sequence[Any], prefix_len: int) -> Optional[List[StateFragment]]:
+def capture_fragments(
+    caches: Sequence[Any], prefix_len: int, adopt: bool = False
+) -> Optional[List[StateFragment]]:
     """Detached snapshot of every cache entry at ``prefix_len``.
 
     Returns ``None`` if any component lacks a restore contract, so a partial
     ladder is never stored (a half-restored cache is silently wrong, not slow).
+
+    ``adopt`` skips the defensive copy and takes the caller's buffers.  Only for
+    a cache the caller will never touch again -- see ``_adopt_tree``.
     """
     frags: List[StateFragment] = []
     for entry in caches:
         adapter = resolve_adapter(entry)
         if adapter.capability == Capability.UNSUPPORTED:
             return None
-        frag = adapter.capture(entry, prefix_len)
+        frag = _capture_one(adapter, entry, prefix_len, adopt)
         if frag is None:
             return None
         frags.append(frag)
@@ -283,6 +297,30 @@ class CheckpointLadder:
 # --------------------------------------------------------------------------
 
 
+class VaultTier(str, Enum):
+    """Which guarantee a rung carries.  These are NOT interchangeable.
+
+    PREFILL -- the shipped tier.  Rungs land on multiples of prefill_step_size
+    (:func:`align_boundaries`), so restore-plus-tail is bit-identical to a
+    straight-through cold prefill.
+
+    SESSION -- taken when a response finishes, at whatever length that is, after
+    a suffix that was decoded one token at a time.  That is already a different
+    chunk decomposition from a 2048-token prefill chunk, before the store is
+    involved at all, so this tier CANNOT claim cold-prefill equality and does not
+    try to.  Its guarantee is "bit-identical to continuing the same session",
+    which is exactly the semantics a returning conversation wants.
+
+    The tiers live in separate tries rather than in one trie with a filter, so a
+    prefill lookup cannot reach a session rung even if a future caller forgets to
+    pass a tier.  Making it structural is the whole point: a session rung served
+    to a prefill query would be a fluent wrong answer, not a slow one.
+    """
+
+    PREFILL = "prefill"
+    SESSION = "session"
+
+
 @dataclass
 class VaultCheckpoint:
     """One ladder rung: the full cache state as of ``prefix_len`` tokens."""
@@ -300,6 +338,19 @@ class VaultCheckpoint:
     # Restoring a shard of somebody else's topology yields a cache of exactly
     # the right shape and entirely the wrong contents.
     origin: str = ""
+    # Which guarantee this rung carries; travels with the checkpoint for the
+    # same reason ``origin`` does -- a rung can reach restore_into without ever
+    # having been looked up in this vault.
+    tier: VaultTier = VaultTier.PREFILL
+    # Groups the rungs of one conversation so eviction can shed a session's
+    # DEEPEST rung first and degrade to the prefill ladder instead of to cold.
+    session_id: str = ""
+    expires_at: Optional[float] = None
+
+    def expired(self, now: Optional[float] = None) -> bool:
+        if self.expires_at is None:
+            return False
+        return (now if now is not None else time.monotonic()) >= self.expires_at
 
 
 class _Node:
@@ -332,6 +383,10 @@ class VaultStats:
     bytes_resident: int = 0
     rejected_unsupported: int = 0
     rejected_foreign: int = 0
+    rejected_tier: int = 0
+    expired: int = 0
+    session_inserts: int = 0
+    session_hits: int = 0
 
     def as_dict(self, budget: int, rungs: int) -> dict:
         return {
@@ -350,6 +405,10 @@ class VaultStats:
             "utilization": (self.bytes_resident / budget) if budget else 0.0,
             "rejected_unsupported": self.rejected_unsupported,
             "rejected_foreign": self.rejected_foreign,
+            "rejected_tier": self.rejected_tier,
+            "expired": self.expired,
+            "session_inserts": self.session_inserts,
+            "session_hits": self.session_hits,
         }
 
 
@@ -364,7 +423,7 @@ class ContextVault:
     def __init__(self, identity: str, budget_bytes: Optional[int] = None):
         self.identity = identity
         self.budget = vault_budget_bytes() if budget_bytes is None else int(budget_bytes)
-        self._root = _Node((), 0, None)
+        self._roots = {t: _Node((), 0, None) for t in VaultTier}
         self._lock = threading.RLock()
         self._resident = 0
         self._rungs = 0
@@ -372,9 +431,17 @@ class ContextVault:
 
     # -- internals ------------------------------------------------------
 
-    def _walk(self, tokens: Sequence[int]) -> Tuple[Optional[_Node], int]:
+    @property
+    def _root(self) -> _Node:
+        """The prefill trie.  Kept as a property so every pre-tier caller and
+        test that reaches for ``_root`` still means what it used to mean."""
+        return self._roots[VaultTier.PREFILL]
+
+    def _walk(
+        self, tokens: Sequence[int], tier: VaultTier = VaultTier.PREFILL
+    ) -> Tuple[Optional[_Node], int]:
         """Deepest node whose path is a prefix of ``tokens``, plus its depth."""
-        node = self._root
+        node = self._roots[tier]
         best: Optional[_Node] = None
         pos = 0
         if node.checkpoint is not None:
@@ -395,9 +462,11 @@ class ContextVault:
                 best = node
         return best, (best.depth if best else 0)
 
-    def _insert_path(self, tokens: Sequence[int], depth: int) -> _Node:
+    def _insert_path(
+        self, tokens: Sequence[int], depth: int, tier: VaultTier = VaultTier.PREFILL
+    ) -> _Node:
         """Return the node at ``depth``, splitting edges as needed."""
-        node = self._root
+        node = self._roots[tier]
         pos = 0
         while pos < depth:
             first = tokens[pos]
@@ -430,7 +499,8 @@ class ContextVault:
         return node
 
     def _prune(self, node: Optional[_Node]) -> None:
-        while node is not None and node is not self._root:
+        roots = set(id(r) for r in self._roots.values())
+        while node is not None and id(node) not in roots:
             if node.checkpoint is not None or node.children:
                 return
             parent = node.parent
@@ -441,15 +511,43 @@ class ContextVault:
             node = parent
 
     def _iter_nodes(self) -> Iterable[_Node]:
-        stack = [self._root]
+        stack = list(self._roots.values())
         while stack:
             n = stack.pop()
             yield n
             stack.extend(n.children.values())
 
+    def _sweep_expired(self) -> int:
+        """Drop TTL-expired rungs.  Returns bytes reclaimed."""
+        now = time.monotonic()
+        freed = 0
+        for n in list(self._iter_nodes()):
+            cp = n.checkpoint
+            if cp is not None and cp.expired(now):
+                freed += cp.nbytes
+                self._resident -= cp.nbytes
+                self._rungs -= 1
+                self.stats.expired += 1
+                n.checkpoint = None
+                self._prune(n)
+        return freed
+
+    def _deepest_of_session(self, session_id: str) -> Optional[_Node]:
+        """The deepest surviving rung of one conversation."""
+        best: Optional[_Node] = None
+        for n in self._iter_nodes():
+            cp = n.checkpoint
+            if cp is None or cp.session_id != session_id:
+                continue
+            if best is None or cp.prefix_len > best.checkpoint.prefix_len:
+                best = n
+        return best
+
     def _evict_until(self, headroom: int) -> None:
         if self.budget <= 0:
             return
+        if self._resident + headroom > self.budget:
+            self._sweep_expired()
         while self._resident + headroom > self.budget:
             victim: Optional[_Node] = None
             for n in self._iter_nodes():
@@ -460,6 +558,14 @@ class ContextVault:
                     victim = n
             if victim is None:
                 return
+            # A session degrades from its deep end: shedding the deepest rung
+            # costs the tail, shedding a shallow one costs everything below it.
+            # So the LRU scan picks the SESSION, and the session picks the rung.
+            # Prefill rungs keep the old behaviour exactly (session_id is "").
+            if victim.checkpoint.session_id:
+                deepest = self._deepest_of_session(victim.checkpoint.session_id)
+                if deepest is not None:
+                    victim = deepest
             self._resident -= victim.checkpoint.nbytes
             self._rungs -= 1
             self.stats.evictions += 1
@@ -468,19 +574,24 @@ class ContextVault:
 
     # -- public API -----------------------------------------------------
 
-    def lookup(self, tokens: Sequence[int]) -> Optional[VaultCheckpoint]:
-        """Deepest stored checkpoint that prefixes ``tokens``, or ``None``."""
+    def lookup(
+        self, tokens: Sequence[int], tier: VaultTier = VaultTier.PREFILL
+    ) -> Optional[VaultCheckpoint]:
+        """Deepest stored rung of ``tier`` that prefixes ``tokens``."""
         with self._lock:
             self.stats.lookups += 1
-            node, depth = self._walk(tokens)
-            if node is None or node.checkpoint is None or depth == 0:
+            self._sweep_expired()
+            node, _ = self._walk(tokens, tier)
+            if node is None or node.checkpoint is None:
                 self.stats.misses += 1
                 return None
             cp = node.checkpoint
             cp.last_used = time.monotonic()
             cp.hits += 1
             self.stats.hits += 1
-            self.stats.tokens_saved += depth
+            if tier is VaultTier.SESSION:
+                self.stats.session_hits += 1
+            self.stats.tokens_saved += cp.prefix_len
             return cp
 
     def insert(
@@ -488,6 +599,9 @@ class ContextVault:
         tokens: Sequence[int],
         prefix_len: int,
         fragments: Optional[Sequence[StateFragment]],
+        tier: VaultTier = VaultTier.PREFILL,
+        session_id: str = "",
+        ttl_s: Optional[float] = None,
     ) -> bool:
         """Store the cache state as of ``prefix_len`` tokens of ``tokens``."""
         if fragments is None:
@@ -500,7 +614,7 @@ class ContextVault:
         eval_fragments(frags)
         nbytes = fragments_nbytes(frags)
         with self._lock:
-            node = self._insert_path(tokens, prefix_len)
+            node = self._insert_path(tokens, prefix_len, tier)
             if node.checkpoint is not None:
                 # Already stored at this exact depth; refresh recency only.
                 node.checkpoint.last_used = time.monotonic()
@@ -513,14 +627,24 @@ class ContextVault:
                 fragments=frags,
                 nbytes=nbytes,
                 origin=self.identity,
+                tier=tier,
+                session_id=session_id,
+                expires_at=(time.monotonic() + ttl_s) if ttl_s else None,
             )
             self._resident += nbytes
             self._rungs += 1
             self.stats.inserts += 1
+            if tier is VaultTier.SESSION:
+                self.stats.session_inserts += 1
             self.stats.bytes_resident = self._resident
             return True
 
-    def restore_into(self, caches: Sequence[Any], checkpoint: VaultCheckpoint) -> bool:
+    def restore_into(
+        self,
+        caches: Sequence[Any],
+        checkpoint: VaultCheckpoint,
+        tier: VaultTier = VaultTier.PREFILL,
+    ) -> bool:
         """Rebuild ``caches`` from ``checkpoint``, unless it came from elsewhere.
 
         The refusal is not belt-and-braces over the identity-keyed store: a
@@ -530,6 +654,14 @@ class ContextVault:
         check has to be on provenance rather than on structure. Refusing costs
         a cold prefill; accepting costs a fluent wrong answer.
         """
+        got = getattr(checkpoint, "tier", VaultTier.PREFILL)
+        if got != tier:
+            self.stats.rejected_tier += 1
+            logger.warning(
+                "vault: refusing a %s rung for a %s restore; the two tiers carry "
+                "different guarantees and a session rung is not bit-identical to "
+                "a cold prefill", got, tier)
+            return False
         origin = getattr(checkpoint, "origin", "")
         if origin and origin != self.identity:
             self.stats.rejected_foreign += 1
@@ -542,7 +674,7 @@ class ContextVault:
 
     def clear(self) -> None:
         with self._lock:
-            self._root = _Node((), 0, None)
+            self._roots = {t: _Node((), 0, None) for t in VaultTier}
             self._resident = 0
             self._rungs = 0
             self.stats.bytes_resident = 0
@@ -751,3 +883,110 @@ def vault_identity_for_model(model: Any) -> str:
 
 
 __all__ += ["vault_identity_for_model"]
+
+
+# --------------------------------------------------------------------------
+# Session tier: end-of-turn capture, keyed by prompt + response
+# --------------------------------------------------------------------------
+
+
+def session_id_for(tokens: Sequence[int], turns: int = 0) -> str:
+    """Stable id for the conversation ``tokens`` belongs to.
+
+    Derived from the first 64 tokens, which no turn ever rewrites, so every turn
+    of one conversation lands in the same eviction group without the server
+    having to thread a session handle through.  A collision costs eviction
+    granularity, never correctness: the trie still keys on the full prefix.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for t in list(tokens)[:64]:
+        h.update(int(t).to_bytes(8, "little", signed=True))
+    return h.hexdigest()[:16]
+
+
+def record_session_turn(
+    vault: Optional[ContextVault],
+    tokens: Sequence[int],
+    caches: Sequence[Any],
+    *,
+    completed: bool,
+    session_id: str = "",
+    ttl_s: Optional[float] = None,
+    adopt: bool = True,
+) -> bool:
+    """Store the cache as of the end of a finished turn.  Never raises.
+
+    This is the whole point of the session tier.  The prefill ladder's deepest
+    rung sits at the last boundary BELOW the prompt, so a returning conversation
+    re-prefills its own last turn plus everything generated since; a rung taken
+    here leaves only the new user message.
+
+    ``completed=False`` stores nothing: a truncated response is a prefix no
+    future turn will send, so the rung would be pure eviction pressure, and an
+    abort mid-token may leave a cache that matches no complete token sequence.
+
+    A fault here is on the RESPONSE path, where raising would surface to the
+    client, so every failure is logged and swallowed -- the cost of losing a rung
+    is a cold prefill next turn, which is exactly the status quo.
+    """
+    if vault is None:
+        # TP disables the vault wholesale (server/generation.py:1286-1290): the
+        # request path carries no rungs to rank 1.  The session tier inherits
+        # that refusal rather than adding a second, differently-wrong one.
+        return False
+    if not completed:
+        return False
+    try:
+        toks = list(tokens)
+        if not toks:
+            return False
+        frags = capture_fragments(caches, len(toks), adopt=adopt)
+        if frags is None:
+            return False
+        return vault.insert(
+            toks,
+            len(toks),
+            frags,
+            tier=VaultTier.SESSION,
+            session_id=session_id or session_id_for(toks),
+            ttl_s=ttl_s,
+        )
+    except Exception:  # noqa: BLE001 - a vault fault must never fail a response
+        logger.warning("vault: session capture failed; continuing without it",
+                       exc_info=True)
+        return False
+
+
+def lookup_session(
+    vault: Optional[ContextVault], tokens: Sequence[int]
+) -> Optional[VaultCheckpoint]:
+    """Deepest session rung that prefixes ``tokens``; never raises."""
+    if vault is None:
+        return None
+    try:
+        return vault.lookup(tokens, tier=VaultTier.SESSION)
+    except Exception:  # noqa: BLE001
+        logger.warning("vault: session lookup failed; falling back to a cold "
+                       "prefill", exc_info=True)
+        return None
+
+
+def restore_session(
+    vault: Optional[ContextVault],
+    caches: Sequence[Any],
+    checkpoint: VaultCheckpoint,
+) -> bool:
+    """Restore a SESSION rung.  Refuses a prefill rung; never raises."""
+    if vault is None:
+        return False
+    try:
+        return vault.restore_into(caches, checkpoint, tier=VaultTier.SESSION)
+    except Exception:  # noqa: BLE001
+        logger.warning("vault: session restore failed; falling back to a cold "
+                       "prefill", exc_info=True)
+        return False
+
+
+__all__ += ["session_id_for", "restore_session"]
