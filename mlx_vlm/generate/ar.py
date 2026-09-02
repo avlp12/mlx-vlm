@@ -1731,6 +1731,24 @@ class PromptProcessingBatch:
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
 
+        # Absolute column, in the padded prefill sequence, of each row's LAST
+        # REAL token -- the only position whose logits are ever sampled.  A
+        # right-padded row's real tokens stop BEFORE the sequence does, so once
+        # the prefill chunks, that column can land in an earlier chunk than the
+        # final forward; ``generate()`` used to index it off the final forward's
+        # width alone, which goes negative for such a row.  ``prompt_step()``
+        # now captures the row's ``[1, vocab]`` slice wherever it lands.
+        # ``None`` -- the left-padded and unpadded cases, i.e. every batch that
+        # is not a mixed warm/cold one -- keeps ``prompt_step`` on exactly the
+        # code path it took before: there, every row's last real token is the
+        # final column of the final forward.
+        self._last_real_column: Optional[List[int]] = None
+        self._captured_last_logits: List[Optional[mx.array]] = []
+        if right_pad_per_row is not None and any(right_pad_per_row):
+            width = self._input_ids.shape[1]
+            self._last_real_column = [width - 1 - int(p) for p in right_pad_per_row]
+            self._captured_last_logits = [None] * len(right_pad_per_row)
+
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
         self._token_context = (
@@ -2025,6 +2043,48 @@ class PromptProcessingBatch:
             out[k] = _slice_sequence_aligned_prompt_kwarg(k, out[k], stop=n)
         return out
 
+    def _rows_ending_in_chunk(self, n: int) -> List[int]:
+        """Rows whose last real token lies in the next ``n`` columns.
+
+        Empty unless the batch is right-padded, so a left-padded or unpadded
+        batch never enters the capture branch below.
+        """
+        if self._last_real_column is None:
+            return []
+        start = self._processed_prompt_columns
+        return [
+            i
+            for i, col in enumerate(self._last_real_column)
+            if start <= col < start + n
+        ]
+
+    def _capture_last_real_logits(self, chunk_out, rows: List[int]) -> List[mx.array]:
+        """Keep each named row's last-real-token logits out of this chunk.
+
+        Only a ``[1, vocab]`` slice per row is retained -- never the chunk's
+        ``[B, chunk, vocab]`` projection, which is dropped with ``chunk_out``
+        as soon as this returns.  ``mx.contiguous`` so the kept row owns its
+        buffer rather than viewing the chunk's.
+        """
+        logits = chunk_out.logits if hasattr(chunk_out, "logits") else chunk_out
+        if logits is None:
+            raise RuntimeError(
+                "chunked prefill of a right-padded batch needs the chunk's logits"
+            )
+        start = self._processed_prompt_columns
+        width = logits.shape[1]
+        captured = []
+        for i in rows:
+            j = self._last_real_column[i] - start
+            if not 0 <= j < width:
+                raise RuntimeError(
+                    f"row {i}: last real token at chunk column {j}, chunk is {width} wide"
+                )
+            row_logits = mx.contiguous(logits[i : i + 1, j : j + 1, :].squeeze(1))
+            self._captured_last_logits[i] = row_logits
+            captured.append(row_logits)
+        return captured
+
     def prompt_step(self) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
@@ -2038,14 +2098,24 @@ class PromptProcessingBatch:
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
-        self.model(
+        capture_rows = self._rows_ending_in_chunk(n)
+        # The forward's arguments are exactly what they were before this fix --
+        # nothing about the capture reaches the model -- so the prompt cache
+        # this chunk writes cannot move.
+        chunk_out = self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.async_eval([c.state for c in self.prompt_cache])
+        pending: List[mx.array] = []
+        if capture_rows:
+            pending = self._capture_last_real_logits(chunk_out, capture_rows)
+        # Drop the chunk's full projection before the eval, so only the kept
+        # per-row slices are materialised beyond this statement.
+        chunk_out = None
+        mx.async_eval([c.state for c in self.prompt_cache] + pending)
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._store_vault_checkpoints()
@@ -2101,13 +2171,38 @@ class PromptProcessingBatch:
         )
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
-            # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
-            seq = logits.shape[1]
-            last_idx = mx.array(
-                [seq - 1 - p for p in self._right_pad_per_row], dtype=mx.int32
-            )[:, None, None]
+            # Per-row last *real* token sits at absolute column
+            # (width - 1 - right_pad[i]); subtracting the columns the chunk loop
+            # already consumed puts it in THIS forward.  Unchunked, nothing has
+            # been consumed and this is the (seq - 1 - right_pad[i]) it always
+            # was.  A row whose last real token fell in an earlier chunk was
+            # captured there; its take index is a placeholder that is discarded.
+            start = self._processed_prompt_columns
+            last_col = self._last_real_column
+            captures = self._captured_last_logits
+            if last_col is None:
+                # ``right_pad_per_row`` was attached after construction, so no
+                # chunk could have captured anything: the whole prompt is in
+                # this forward and the original formula is exact.
+                seq = logits.shape[1]
+                last_col = [seq - 1 - p for p in self._right_pad_per_row]
+                captures = [None] * len(last_col)
+                start = 0
+            take = [
+                0 if capture is not None else col - start
+                for col, capture in zip(last_col, captures)
+            ]
+            last_idx = mx.array(take, dtype=mx.int32)[:, None, None]
             last_idx = mx.broadcast_to(last_idx, (logits.shape[0], 1, logits.shape[-1]))
             logits = mx.take_along_axis(logits, last_idx, axis=1).squeeze(1)
+            if any(c is not None for c in captures):
+                logits = mx.concatenate(
+                    [
+                        capture if capture is not None else logits[i : i + 1]
+                        for i, capture in enumerate(captures)
+                    ],
+                    axis=0,
+                )
         else:
             logits = logits[:, -1, :]
         if self.logits_processors and any(self.logits_processors):
@@ -2280,6 +2375,8 @@ class PromptProcessingBatch:
         self._token_context = []
         self.logits_processors = []
         self._apc_meta = []
+        self._captured_last_logits = []
+        self._last_real_column = None
         return gen_batch
 
     @property
