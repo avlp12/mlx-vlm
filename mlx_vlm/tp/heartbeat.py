@@ -73,10 +73,12 @@ formation 1/1 times.  ``Beacon`` refuses to bind or send to that port.
 
 ADDRESSING
 ==========
-Defaults to the link-local pair measured by lane 7 (gesicht en11 169.254.30.147
-<-> epsilon en14 169.254.240.246), which is a different driver, ring and socket
-path from jaccl RDMA -- so an RDMA wedge does not stop it.  Measured TCP RTT p50
-188 us at 64 B, ~500x faster than the 250 ms beat period it serves.
+Defaults to the dedicated 10GBASE-T pair (gesicht en0 10.0.1.1 <-> epsilon en0
+10.0.1.2): its own port, its own copper, its own PHY, so it is independent of
+the Thunderbolt cable jaccl runs on -- a TB5 cable fault cannot silence it.
+Measured 215 us TCP RTT p50 at 64 B, ~1000x faster than the 250 ms beat period.
+See DEFAULT_HOSTS for the full four-path comparison and why latency does not
+decide this choice.
 
 Both endpoints are env-overridable so that moving to a genuine 10 GbE link (or
 any other pair) is a configuration change, not a code change:
@@ -105,10 +107,37 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Lane 7 measured these as the only low-latency path between the boxes that is
-# independent of the jaccl RDMA stack.  Wi-Fi was excluded on measurement
-# (TCP RTT p50 5987 us, ping stddev 47 ms).
-DEFAULT_HOSTS = ("169.254.30.147", "169.254.240.246")
+# The dedicated 10GBASE-T link, which is the only path between the boxes that is
+# PHYSICALLY independent of the Thunderbolt cable jaccl runs on: its own RJ45
+# port, its own copper, its own PHY.  A TB5 cable or port fault cannot take it
+# down, so a heartbeat here distinguishes "the fast link died" from "rank 0
+# wedged" -- which the previous default could not.
+#
+# Lane 7 measured all four candidate paths, 64 B application TCP round trip,
+# TCP_NODELAY, 200 untimed warm-ups, two interleaved passes under comparable load:
+#
+#     path                        p50        min      1-stream throughput
+#     tbnet (Thunderbolt 5)     65 us      47 us      47,470 Mbit/s
+#     10GbE en0  <-- default   215 us     128 us       9,403 Mbit/s
+#     169.254 (tunnelled)      180 us     143 us         341 Mbit/s
+#     Wi-Fi                   5987 us    3702 us         330 Mbit/s
+#
+# Latency does NOT decide this: at 4 Hz the beat period is 250 ms, so every
+# candidate except Wi-Fi is ~1000x faster than it needs to be.  INDEPENDENCE
+# decides it, and only en0 has the physical kind.  The 169.254 pair is inferred
+# to tunnel over the same TB5 cable (six "Ethernet Adapter" pseudo-NICs, one per
+# TB receptacle; the active one is the 4th and the only connected receptacle is
+# #4), so it protects against a jaccl/RDMA SOFTWARE wedge but not a cable fault.
+#
+# The 10GbE's fatter tail (p99 340-405 us vs 265-283 us) is consistent with
+# energy-efficient-ethernet parking the PHY between packets -- visible in
+# `ifconfig en0` as "energy-efficient-ethernet".  Irrelevant at 4 Hz; if a future
+# use ever needs the tail, EEE is the first thing to look at.
+DEFAULT_HOSTS = ("10.0.1.1", "10.0.1.2")
+
+# The previous default, kept because it is a genuine fallback: if en0 is
+# unplugged this still works and still catches the dominant (software) hang class.
+FALLBACK_HOSTS = ("169.254.30.147", "169.254.240.246")
 DEFAULT_PORT = 39600
 JACCL_COORDINATOR_DEFAULT_PORT = 39500      # never bind or send here
 
