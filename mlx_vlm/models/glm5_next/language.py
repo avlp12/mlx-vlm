@@ -1,4 +1,6 @@
+import contextlib
 import os
+import threading
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -340,7 +342,64 @@ _GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "122
 # MTP head (mtp.py, its own indexer and its own cache) and direct sub-module
 # callers (the attribution probes, which invoke layer.self_attn by hand) always
 # take the original path.
-_VIS_MEMO_CTX = None
+#
+# THE CONTEXT IS THREAD-LOCAL, AND IT HAS TO BE.  It used to be a module global
+# saved and restored around the layer loop, which is correct for one forward at a
+# time and WRONG the moment two run concurrently -- which is exactly what
+# co-scheduling a decode beside a prefill does (lane 7 item 3a).  With two
+# threads:
+#
+#   A enters, saves outer=None, installs MemoA
+#   B enters, saves outer=MemoA, installs MemoB
+#   A's remaining layers now read MemoB
+#   A exits, restores None          -> B loses memoisation mid-forward
+#   B exits, restores MemoA         -> A STALE MEMO SURVIVES THE FORWARD
+#
+# The last line is the dangerous one.  Chunk keys are (B, T, S, c0, c1), so a
+# cross-thread read misses rather than returning another sequence's visibility --
+# but a memo that outlives its forward will be consulted by the NEXT forward, and
+# that one can collide on the key.  A stale hit returns the identical array object
+# from a different sequence's state, and the memo's whole correctness argument is
+# "the identical array object the first layer built" -- which is only sound while
+# "first layer" means this forward.
+#
+# threading.local gives each thread its own slot; the save/restore below is then
+# per-thread and the interleaving above cannot happen.  Single-threaded behaviour
+# is unchanged and bit-identical: one thread, one slot, same sequence of values.
+class _VisMemoState(threading.local):
+    def __init__(self):
+        # Runs once per thread on first access, so every thread starts at None
+        # instead of inheriting whatever the creating thread had.
+        self.ctx = None
+
+
+_VIS_MEMO_STATE = _VisMemoState()
+
+
+def __getattr__(name):
+    """Make the removed module global fail loudly instead of quietly.
+
+    ``_VIS_MEMO_CTX`` was readable and writable from outside (the memo tests
+    drove it directly).  Silently returning None from a stale read would look
+    like "no memo is open", which is a plausible-but-wrong answer; raising names
+    the change and points at the replacement.  PEP 562: only consulted when
+    normal attribute lookup has already failed, so it costs nothing on the hot
+    path.
+
+    A stale WRITE cannot be intercepted this way -- it would just create an
+    unused module attribute.  That direction is benign: the memo simply never
+    opens, and no-memo is the reference path the memo is verified against.
+    """
+    if name == "_VIS_MEMO_CTX":
+        raise AttributeError(
+            "_VIS_MEMO_CTX no longer exists: the visibility memo is THREAD-LOCAL "
+            "now, because two concurrent forwards raced on the old module global "
+            "and could leave a stale memo installed past a forward. Use "
+            "_get_vis_memo_ctx() / _set_vis_memo_ctx() / _vis_memo_scope(owners)."
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 _VIS_MEMO_ENV = None
 _VIS_MEMO_MB = None
 _VIS_MEMO_VERIFY = None
@@ -404,8 +463,34 @@ class _VisibilityMemo:
         return True
 
 
+def _get_vis_memo_ctx():
+    """This thread's open memo, or None."""
+    return _VIS_MEMO_STATE.ctx
+
+
+def _set_vis_memo_ctx(value):
+    """Install a memo for THIS THREAD only.  Prefer _vis_memo_scope."""
+    _VIS_MEMO_STATE.ctx = value
+
+
+@contextlib.contextmanager
+def _vis_memo_scope(owners):
+    """Open a memo for the span of one forward, on this thread.
+
+    Restores the previous value on the way out, including on exception, so a
+    raised forward cannot leave a memo installed for the next one.
+    """
+    state = _VIS_MEMO_STATE
+    outer = state.ctx
+    state.ctx = _VisibilityMemo(owners) if _vis_memo_enabled() else None
+    try:
+        yield state.ctx
+    finally:
+        state.ctx = outer
+
+
 def _active_vis_memo(indexer):
-    ctx = _VIS_MEMO_CTX
+    ctx = _VIS_MEMO_STATE.ctx
     if ctx is None or not _vis_memo_enabled() or not ctx.serves(indexer):
         return None
     return ctx
@@ -2125,19 +2210,12 @@ class Glm5NextModel(nn.Module):
         # in lockstep, so the mask-only half of the indexer is identical across
         # them; outside this block (MTP head, attribution probes calling
         # layer.self_attn by hand) the memo is closed and nothing changes.
-        global _VIS_MEMO_CTX
-        outer_memo = _VIS_MEMO_CTX
-        _VIS_MEMO_CTX = (
-            _VisibilityMemo(self._dsa_indexer_ids) if _vis_memo_enabled() else None
-        )
-        try:
+        with _vis_memo_scope(self._dsa_indexer_ids):
             for i, (layer, c) in enumerate(zip(self.layers, cache)):
                 mask = ssm_mask if layer.is_linear else fa_mask
                 h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
                 if i in capture_set and hidden_sink is not None:
                     hidden_sink.append(h.mean(axis=2))
-        finally:
-            _VIS_MEMO_CTX = outer_memo
 
         h = h.mean(axis=2)
         if hidden_sink is not None and not capture_set:

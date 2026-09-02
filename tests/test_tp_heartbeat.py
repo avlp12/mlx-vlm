@@ -109,9 +109,13 @@ def test_idle_peer_waits_indefinitely():
 
 
 def test_driving_with_progress_is_healthy():
+    """verb_seq is the counter that must advance: fwd_idx is reset to 0 at every
+    forward boundary by transport.reset_forward_counter, so it cannot carry the
+    ordering (see Beacon._progress_key)."""
     c = FakeClock(); b = make(clock=c)
     for i in range(400):
-        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=i))
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING,
+                                fwd_idx=i % 101, verb_seq=i))
         c.advance(0.25)
         assert b.poll()[0] == hb.HEALTHY
 
@@ -425,3 +429,129 @@ def test_fallback_hosts_still_declared():
     deleted."""
     assert hb.FALLBACK_HOSTS == ("169.254.30.147", "169.254.240.246")
     assert hb.FALLBACK_HOSTS != hb.DEFAULT_HOSTS
+
+
+# ------------------------------------- progress = strict advance (lane 1, I98x)
+# The stall timer used to reset whenever the progress key CHANGED. UDP is
+# entitled to reorder, so an older beat arriving after a newer one restarted the
+# window. That failed safe -- detection late by one window, never a false kill --
+# but it is not the contract.
+
+def test_reordered_datagram_does_not_reset_the_stall_timer():
+    """An older beat arriving after a newer one must not look like progress."""
+    c = FakeClock(); b = make(clock=c)
+    b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=50, verb_seq=50))
+    started = b._peer_progress_at
+    c.advance(1.0)
+    # the network hands us a beat from BEFORE the one we already have
+    b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=49, verb_seq=49))
+    assert b._peer_progress_at == started, "a reordered beat reset the stall timer"
+    # ... and the peer still wedges on schedule
+    for _ in range(int(b.stall_s / 0.25) + 8):
+        c.advance(0.25)
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=50, verb_seq=50))
+    assert b.poll()[0] == hb.PEER_STALLED
+
+
+def test_reordered_datagram_still_counts_as_LIVENESS():
+    """It does not feed stall_s, but it does prove the sender thread is alive, so
+    it must still feed dead_s. Conflating the two would report a live-but-slow
+    peer as dead."""
+    c = FakeClock(); b = make(clock=c)
+    b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=50, verb_seq=50))
+    for _ in range(int(b.dead_s / 0.25) + 8):
+        c.advance(0.25)
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=49, verb_seq=49))
+    assert b.poll()[0] != hb.PEER_DEAD, "a live peer sending reorders was called dead"
+
+
+def test_forward_boundary_is_progress_not_regression():
+    """THE TRAP IN THE OBVIOUS FIX.
+
+    transport.reset_forward_counter() sets _FWD_IDX back to 0 at the start of
+    every forward (server/tp_mode.py:385 and tp/worker.py:566 both call it), so
+    fwd_idx runs 1..101 and drops to 1 again. Ordering on a tuple that CONTAINS
+    fwd_idx -- (epoch, fwd_idx, verb_seq) -- reads a forward boundary as a
+    REGRESSION, so the stall timer stops resetting and PEER_STALLED fires on a
+    perfectly healthy peer. That is a false kill, the failure the ppid probe was
+    deleted for. Only (epoch, verb_seq) is monotonic.
+
+    Modelled faithfully: a 4 Hz beat SAMPLES the counters, and at ~33-92 ms per
+    forward several forwards complete between beats. So consecutive beats show
+    fwd_idx at arbitrary phases of its 1..101 cycle while verb_seq accumulates
+    monotonically. Sampling fwd_idx in lockstep with the beat would hide the bug,
+    because the naive rule would still ratchet once per cycle.
+    """
+    import random
+    rng = random.Random(20260902)               # seeded: deterministic, unsynchronised
+    c = FakeClock(); b = make(clock=c)
+    seq = 0
+    # 2000 beats = 500 s at 4 Hz. Long enough that the naive rule's gap
+    # distribution is exercised rather than sampled once: under it, progress
+    # registers only when the sampled fwd_idx ties the running max, i.e. with
+    # probability ~1/101 per beat, so gaps are geometric with mean ~101 beats
+    # (25 s) and roughly 30% of them exceed the 30 s stall bound. Over ~20 gaps
+    # the chance of never exceeding it is under 0.1%. A fixed stride would hit
+    # exactly every 101 beats with zero variance and hide the bug -- it did.
+    for n in range(1, 2000):
+        seq += 7                                # ~7 forwards' worth of reduces
+        fwd = rng.randint(1, 101)               # arbitrary phase of the cycle
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING,
+                                fwd_idx=fwd, verb_seq=seq))
+        c.advance(0.25)
+        assert b.poll()[0] == hb.HEALTHY, (
+            f"healthy peer reported {b.poll()[0]} at beat {n} "
+            f"(fwd_idx={fwd}, verb_seq={seq}) -- fwd_idx is in the ordering")
+
+
+def test_frozen_peer_is_never_rebaselined():
+    """Regression guard. A wedged driver re-sends the SAME counters forever. An
+    earlier version counted equal keys toward the restart run, re-baselined after
+    8 beats, and made PEER_STALLED unreachable -- it silently disabled the whole
+    module. Equal keys must be inert."""
+    c = FakeClock(); b = make(clock=c)
+    b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=57, verb_seq=57))
+    frozen_at = b._peer_progress_at
+    # long enough to pass BOTH the restart run and the stall bound
+    n = max(b.REBASELINE_AFTER * 6, int(b.stall_s / 0.25) + 8)
+    for _ in range(n):
+        c.advance(0.25)
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=57, verb_seq=57))
+    assert b._peer_progress_at == frozen_at, "a frozen peer re-baselined the timer"
+    assert b.poll()[0] == hb.PEER_STALLED
+
+
+def test_peer_restart_rebaselines_instead_of_stalling_forever():
+    """If rank 0 restarts, its counters go back to zero and stay below the high
+    water mark permanently. Without a re-baseline the timer would never reset and
+    a healthy fresh peer would be reported stalled forever."""
+    c = FakeClock(); b = make(clock=c)
+    for i in range(1, 40):
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=i, verb_seq=i))
+        c.advance(0.25)
+    # peer restarts: epoch and verb_seq reset
+    for i in range(1, b.REBASELINE_AFTER + 4):
+        c.advance(0.25)
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, epoch=0,
+                                fwd_idx=i, verb_seq=i))
+    assert b.poll()[0] == hb.HEALTHY, "a restarted peer was reported stalled"
+    # and it tracks the restarted peer from there on
+    for i in range(b.REBASELINE_AFTER + 4, b.REBASELINE_AFTER + 40):
+        c.advance(0.25)
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, epoch=0,
+                                fwd_idx=i, verb_seq=i))
+    assert b.poll()[0] == hb.HEALTHY
+
+
+def test_isolated_reorders_never_accumulate_to_a_rebaseline():
+    """A reorder every other beat must not eventually look like a restart: any
+    in-order beat clears the run."""
+    c = FakeClock(); b = make(clock=c)
+    for i in range(2, 200, 2):
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING, fwd_idx=i, verb_seq=i))
+        c.advance(0.125)
+        b.ingest(beat_from_peer(b, state=hb.STATE_DRIVING,
+                                fwd_idx=i - 1, verb_seq=i - 1))   # stale
+        c.advance(0.125)
+        assert b._peer_regressions < b.REBASELINE_AFTER
+    assert b.poll()[0] == hb.HEALTHY

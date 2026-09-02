@@ -247,7 +247,11 @@ class Beacon:
         self._peer: Optional[Beat] = None
         self._peer_at: float = 0.0
         self._peer_progress_at: float = 0.0
-        self._peer_progress_key: Optional[tuple] = None
+        # High-water mark of the peer's MONOTONIC counters, plus a run-length of
+        # beats seen below it.  See ingest() for why a plain "did the key change"
+        # test and a plain lexicographic test are both wrong.
+        self._peer_hwm: Optional[tuple] = None
+        self._peer_regressions: int = 0
         self._started_at = self._clock()
 
         self._stop = threading.Event()
@@ -392,17 +396,80 @@ class Beacon:
                 continue
             self.ingest(buf)
 
+    # A restart resets the peer's counters to zero, which looks like a permanent
+    # regression.  UDP reordering does not persist; a restart does.  So after this
+    # many consecutive STRICTLY-BELOW-high-water beats, re-baseline instead of
+    # stalling forever.  8 beats is 2 s at the default 4 Hz.  Beats EQUAL to the
+    # high-water mark are excluded from this run on purpose -- that is the frozen
+    # peer, and counting it here would make a wedge undetectable.
+    REBASELINE_AFTER = 8
+
+    @staticmethod
+    def _progress_key(b: "Beat") -> tuple:
+        """The part of a beat that is MONOTONIC, and only that part.
+
+        NOT (epoch, fwd_idx, verb_seq).  ``fwd_idx`` is transport._FWD_IDX, which
+        ``reset_forward_counter()`` sets back to 0 at the start of every forward
+        (server/tp_mode.py and tp/worker.py both call it).  So fwd_idx runs
+        1..101 and drops to 1 again at each forward boundary.  Ordering on a
+        tuple containing it would read every healthy new forward as a REGRESSION,
+        never reset the stall timer, and fire PEER_STALLED on a peer that is
+        working perfectly -- a false kill, which is the failure the removed ppid
+        probe was deleted for.
+
+        ``verb_seq`` is transport._ALL_SUM_CALLS, which is never reset and counts
+        every constructed reduce, so it advances across forward boundaries and
+        across epochs.  ``epoch`` leads it only to order a counter restart within
+        a live process.  fwd_idx stays IN the beat -- naming the divergent reduce
+        is its whole purpose -- it is just not part of the ordering.
+        """
+        return (b.epoch, b.verb_seq)
+
     def ingest(self, buf: bytes) -> Optional[Beat]:
-        """Feed one datagram.  Separated from the socket so tests can drive it."""
+        """Feed one datagram.  Separated from the socket so tests can drive it.
+
+        PROGRESS IS A STRICT ADVANCE, NOT A CHANGE.  This used to reset the stall
+        timer whenever the key DIFFERED from the previous one, so a reordered
+        datagram -- an older beat arriving after a newer one, which UDP is
+        entitled to do -- restarted the window.  That failed safe (detection was
+        delayed by one window, never a false kill) but it did not match the
+        contract, and a peer that wedges right after a reorder would have been
+        reported late for no reason.
+        """
         b = Beat.unpack(buf)
         if b is None or b.rank == self.rank:
             return None                    # junk, or our own packet looped back
         now = self._clock()
+        key = self._progress_key(b)
         with self._lock:
-            key = (b.epoch, b.fwd_idx, b.verb_seq, b.state)
-            if key != self._peer_progress_key:
-                self._peer_progress_key = key
+            if self._peer_hwm is None or key > self._peer_hwm:
+                self._peer_hwm = key
                 self._peer_progress_at = now
+                self._peer_regressions = 0
+            elif key == self._peer_hwm:
+                # THE FROZEN PEER.  A wedged driver re-sends the same counters
+                # forever, so this is the single most important branch in the
+                # class: it must do NOTHING.  An earlier version counted equal
+                # keys toward the restart run below, which re-baselined after 8
+                # beats and made PEER_STALLED unreachable -- the exact failure the
+                # whole module exists to detect.  Caught by
+                # test_wedge_inside_a_collective_is_caught.
+                pass
+            else:
+                # STRICTLY behind the high-water mark: a reorder, or a peer whose
+                # counters restarted.  Do NOT reset the timer for either.
+                self._peer_regressions += 1
+                if self._peer_regressions >= self.REBASELINE_AFTER:
+                    logger.info("[hb] peer counters went backwards for %d beats "
+                                "(%s <= %s); treating it as a restart and "
+                                "re-baselining", self._peer_regressions, key,
+                                self._peer_hwm)
+                    self._peer_hwm = key
+                    self._peer_progress_at = now
+                    self._peer_regressions = 0
+            # Liveness is unconditional: a reordered beat still proves the peer's
+            # sender thread is alive, so it must feed dead_s even when it does not
+            # feed stall_s.
             self._peer = b
             self._peer_at = now
         return b
