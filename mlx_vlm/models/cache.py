@@ -749,6 +749,17 @@ class ArraysCache(_BaseCache):
             self._left_padding_advance += N
 
     def make_mask(self, N: int):
+        # The ``lengths`` branch is unreachable from the mixed warm/cold prefill
+        # that sets ``lengths``: ``PromptProcessingBatch`` gives a right-padded
+        # batch ``left_padding = [0] * B``, and ``left_padding`` wins this ``if``,
+        # so a right-padded row attends its own padding.  Restoring the mask is
+        # NOT enough to make right padding work here and the branch is left as
+        # it is on purpose -- the recurrent state and the conv window are still
+        # taken at the padded column, and neither can be rolled back the way
+        # ``BatchKVCache.finalize`` rolls a K/V buffer.  The ruling is therefore
+        # to decline the batch: see ``generate/ar.py::_apply_right_pad_policy``,
+        # which never lets a model holding one of these caches see right padding
+        # in the first place.
         if self.left_padding is not None:
             pos = mx.arange(N)
             return pos >= self.left_padding[:, None]
@@ -1045,6 +1056,40 @@ class BatchKVCache(_BaseCache):
             self.offset -= padding
             self.left_padding += padding
             self._right_padding = None
+            # The roll moves row ``i``'s data ``padding[i]`` columns to the
+            # RIGHT, so every piece of state a consumer derived from the
+            # PRE-ROLL column frame now points at the wrong columns.  The one
+            # consumer in this tree is the GLM-5 DSA indexer, which hangs three
+            # derived attributes off this object (``glm5_next/language.py``
+            # writes them at the end of ``Glm5NextIndexer.__call__``):
+            #
+            #   ``_pool``   -- (pool_keys, pool_indices, pool_valid, T).  The
+            #                  indices are absolute columns in the pre-roll
+            #                  frame; the S == 1 incremental branch reuses the
+            #                  complete blocks verbatim, so after a roll it
+            #                  selects ``padding[i]`` columns to the LEFT of the
+            #                  data -- i.e. padding.
+            #   ``_fpool``  -- the same thing in the preallocated store.
+            #   ``_no_pad`` -- True iff every column was valid.  A right-padded
+            #                  prefill marks its padding VALID (the row's own
+            #                  columns are all it ever attends), so this comes
+            #                  out True and is exactly the flag that admits the
+            #                  incremental branch above.
+            #
+            # A pool block is ``index_kpool`` CONTIGUOUS positions anchored at
+            # the row's first valid key, and a per-row shift by a non-multiple
+            # of the block size leaves no prefix of the old pool usable, so the
+            # pools are dropped rather than rolled -- the next decode step
+            # rebuilds them in one O(T) pooling pass, which is the path a
+            # left-padded batch takes anyway.  This is the same invalidation
+            # ``glm5_next/language.py::give_back_sparse_cache_rows`` performs
+            # after its own per-row shift; see that function for the argument.
+            # Written unconditionally (not under a hasattr guard) so a cache
+            # that never carried a pool ends up with the value the readers'
+            # ``getattr(..., None/False)`` defaults already assume.
+            self._pool = None
+            self._fpool = None
+            self._no_pad = False
 
     @property
     def state(self):
@@ -1801,6 +1846,14 @@ class BatchQuantizedKVCache(_BaseCache):
         self.offset -= padding
         self.left_padding += padding
         self._right_padding = None
+        # Same invalidation, same reason as ``BatchKVCache.finalize`` above: a
+        # per-row roll invalidates any pool a consumer derived from the pre-roll
+        # column frame.  ``_make_cache`` recurses into a ``CacheList`` with
+        # ``quantize=True``, so under ``--kv-bits`` the GLM-5 indexer's side
+        # cache is one of these, not a ``BatchKVCache``.
+        self._pool = None
+        self._fpool = None
+        self._no_pad = False
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Quantize incoming keys/values and append to the cache.
