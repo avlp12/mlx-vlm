@@ -102,6 +102,14 @@ _FUSED_KDA_QPROJ_MAX_BATCH = 2
 # same reason: it is the width the parity matrix has actually been run to.
 _FUSED_KDA_MAX_WIDTH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_WIDTH", "16"))
 
+# Kill switch for the S>1 block kernel.  Default ON because it is bit-exact, but
+# it has to be flippable IN-PROCESS: the only honest A/B for a kernel this small
+# is paired arms inside one load, and a process-per-arm comparison would put the
+# measurement back into the cross-process noise [I892] named.
+_FUSED_KDA_BLOCK = os.environ.get(
+    "MLX_VLM_GLM5_FUSED_KDA_BLOCK", "1"
+).lower() in ("1", "true", "yes", "on")
+
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
@@ -695,6 +703,8 @@ class Glm5NextLinearAttention(nn.Module):
         and a shared helper with an S-shaped hole in it is how a width nobody
         parity-tested reaches a kernel.
         """
+        if not _FUSED_KDA_BLOCK:
+            return False
         if S < 2 or S > _FUSED_KDA_MAX_WIDTH:
             return False
         if B < 1 or B > _FUSED_KDA_MAX_BATCH:

@@ -182,3 +182,52 @@ def test_sink_tensors_match_what_the_eager_path_stashes():
     assert mx.array_equal(fq, eq).item(), "sink q differs"
     assert mx.array_equal(fk, ek).item(), "sink k differs"
     assert mx.array_equal(fv, ev).item(), "sink v differs"
+
+
+@needs_metal
+def test_the_two_predicates_are_disjoint_so_the_S1_path_is_untouched():
+    """The S=1 kernel's eligibility and the block kernel's must never both fire,
+    and neither may reach into the other's width.  This is the guarantee that
+    adding the block path cannot regress plain decode: at S==1 the block
+    predicate refuses on width alone, before it looks at anything else.
+    """
+    from mlx_vlm.models.glm5_next import language as L
+
+    class _Probe:
+        """Only the width test should be reached; everything else is poisoned."""
+        num_heads = H
+        head_dim = D
+        conv_kernel_size = K
+        _fused_kda_ty = 32
+
+        def __getattr__(self, name):  # any deeper access is a bug
+            raise AssertionError(f"block predicate looked past S at {name!r}")
+
+    p = _Probe()
+    assert L.Glm5NextLinearAttention._fused_kda_block_eligible(
+        p, 1, 1, None, None, mx.zeros((1, 1, 1), mx.bfloat16)
+    ) is False
+    assert L.Glm5NextLinearAttention._fused_kda_block_eligible(
+        p, 1, L._FUSED_KDA_MAX_WIDTH + 1, None, None, mx.zeros((1, 1, 1), mx.bfloat16)
+    ) is False
+
+
+@needs_metal
+def test_block_kill_switch_is_honoured():
+    """The A/B depends on this: flipping the module global has to take effect
+    without a reimport, or the paired arms are measuring the same path twice."""
+    from mlx_vlm.models.glm5_next import language as L
+
+    prev = L._FUSED_KDA_BLOCK
+    try:
+        L._FUSED_KDA_BLOCK = False
+
+        class _Probe:
+            def __getattr__(self, name):
+                raise AssertionError(f"refused kernel still touched {name!r}")
+
+        assert L.Glm5NextLinearAttention._fused_kda_block_eligible(
+            _Probe(), 1, 4, None, None, mx.zeros((1, 1, 1), mx.bfloat16)
+        ) is False
+    finally:
+        L._FUSED_KDA_BLOCK = prev
