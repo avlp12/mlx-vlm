@@ -29,6 +29,7 @@ from .fused_kda import (
     fused_kda_verify_block,
 )
 from .qmv_custom import DEFAULT_GEOMETRY, maybe_qmv, qmv_applicable
+from . import verify_pad as _vp
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
 _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
@@ -983,7 +984,10 @@ class Glm5NextLinearAttention(nn.Module):
                 self._gs, self._bits = mods[0].group_size, mods[0].bits
             self._fused_ready = True
         if self._fq:
-            out = mx.quantized_matmul(
+            # _vp.quantized_matmul is mx.quantized_matmul plus the verify-block
+            # row pad (verify_pad.py); outside a verify window it forwards
+            # unchanged, argument for argument.
+            out = _vp.quantized_matmul(
                 inputs,
                 self._fw,
                 self._fs,
@@ -1216,7 +1220,7 @@ class Glm5NextLinearAttention(nn.Module):
         cache[0] = conv_state_out
         cache[1] = state_out
         cache.advance(S)
-        return self.o_proj(y.reshape(B, S, -1))
+        return _vp.project(self.o_proj, y.reshape(B, S, -1))
 
     def _fused_kda_step(
         self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink=None, mask=None
@@ -1308,14 +1312,14 @@ class Glm5NextLinearAttention(nn.Module):
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
         else:
             q_o, k_o, v_o = (
-                self.q_proj(inputs),
-                self.k_proj(inputs),
-                self.v_proj(inputs),
+                _vp.project(self.q_proj, inputs),
+                _vp.project(self.k_proj, inputs),
+                _vp.project(self.v_proj, inputs),
             )
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
-            fa_o = self.forget_gate.f_a_proj(inputs)
-            ga_o = self.g_a_proj(inputs)
-            b_o = self.b_proj(inputs)
+            fa_o = _vp.project(self.forget_gate.f_a_proj, inputs)
+            ga_o = _vp.project(self.g_a_proj, inputs)
+            b_o = _vp.project(self.b_proj, inputs)
             if self._fused_kda_ready() and self._fused_kda_eligible(
                 B, S, mask, cache, gdn_sink, q_o
             ):
@@ -1394,7 +1398,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         gate = self.g_b_proj(ga_o).reshape(B, S, self.num_heads, self.head_dim)
         out = self.o_norm(out, gate).reshape(B, S, -1)
-        return self.o_proj(out)
+        return _vp.project(self.o_proj, out)
 
 
 class Glm5NextIndexer(nn.Module):
@@ -1569,7 +1573,7 @@ class Glm5NextIndexer(nn.Module):
         select_k = min(self.index_topk // kp, P)
         scores = q @ pool_keys[:, None].swapaxes(-1, -2)
         scores = mx.maximum(scores * self.softmax_scale, 0.0)
-        weights = self.weights_proj(x) * (self._scale_heads**-0.5)
+        weights = _vp.project(self.weights_proj, x) * (self._scale_heads**-0.5)
         index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
         # Reduce before the top-k, exactly as the eager path does.  Two reasons,
         # and the second is the one that bites:
@@ -1676,8 +1680,8 @@ class Glm5NextIndexer(nn.Module):
 
     def __call__(self, x, qr, mask, cache=None):
         B, S, _ = x.shape
-        q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim)
-        k = self.k_norm(self.wk(x)).reshape(B, S, self.head_dim)
+        q = _vp.project(self.wq_b, qr).reshape(B, S, self.n_heads, self.head_dim)
+        k = self.k_norm(_vp.project(self.wk, x)).reshape(B, S, self.head_dim)
         gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
 
         if mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S):
@@ -1818,7 +1822,9 @@ class Glm5NextIndexer(nn.Module):
                 ]
             scores = q[:, c0:c1] @ pool_keys_t
             scores = mx.maximum(scores * self.softmax_scale, 0.0)
-            weights = self.weights_proj(x[:, c0:c1]) * (self._scale_heads**-0.5)
+            weights = _vp.project(self.weights_proj, x[:, c0:c1]) * (
+                self._scale_heads**-0.5
+            )
             # Contract the head axis as a batched matmul rather than an
             # elementwise product + sum: it never materializes the
             # [B, cs, n_heads, P] product (halving the scorer transient),
@@ -1945,11 +1951,11 @@ class Glm5NextSparseAttention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        qr = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(qr)
+        qr = self.q_a_layernorm(_vp.project(self.q_a_proj, x))
+        q = _vp.project(self.q_b_proj, qr)
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
 
-        compressed_kv = self.kv_a_proj_with_mqa(x)
+        compressed_kv = _vp.project(self.kv_a_proj_with_mqa, x)
         kv_latent = self.kv_a_layernorm(compressed_kv)
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
@@ -2057,7 +2063,7 @@ class Glm5NextSparseAttention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return _vp.project(self.o_proj, output)
 
     def _gathered_attention(self, q, kv_latent, topk_indices):
         # Per-query top-k gather: each query attends only to its selected latents
@@ -2101,7 +2107,7 @@ class Glm5NextSparseAttention(nn.Module):
         attn = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
         attn = attn * row_has_keys.astype(attn.dtype)[:, None, :, 0, None]
         out = self.unembed_out(attn).transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(out)
+        return _vp.project(self.o_proj, out)
 
 
 class Glm5NextClampedSwiGLU(nn.Module):
@@ -2145,7 +2151,7 @@ class Glm5NextPackedSharedMLP(nn.Module):
             y = maybe_qmv(layer, x, **DEFAULT_GEOMETRY)
             if y is not None:
                 return y
-        return layer(x)
+        return _vp.project(layer, x)
 
     def __call__(self, x: mx.array) -> mx.array:
         gate_up = self._proj(self.gate_up_proj, x)
@@ -2174,7 +2180,7 @@ class Glm5NextMLP(DeepseekMLP):
             y = maybe_qmv(layer, x, **DEFAULT_GEOMETRY)
             if y is not None:
                 return y
-        return layer(x)
+        return _vp.project(layer, x)
 
     def __call__(self, x: mx.array) -> mx.array:
         gate = self._proj(self.gate_proj, x)
@@ -2629,6 +2635,9 @@ class LanguageModel(nn.Module):
         self.model = Glm5NextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        # Law 23: a default is verified by the server's own log, not by the test
+        # that sets it.  One line per process, at load.
+        _vp.log_config_once()
 
     def __call__(
         self,
@@ -2645,8 +2654,12 @@ class LanguageModel(nn.Module):
         skip_logits = kwargs.pop("skip_logits", False)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         # glm5_next verifies with a plain capturing forward (no exact kernel), so
-        # speculative_verify only needs to be consumed here.
-        kwargs.pop("speculative_verify", False)
+        # speculative_verify is consumed here -- and is the ONLY signal that this
+        # forward is a verify block.  It arms the dense-projection row pad
+        # (verify_pad.py): prefill and S=1 decode must keep their exact byte
+        # sequence, and a ragged prefill chunk can present the same M as a verify
+        # block, so the pad cannot be gated on M alone.
+        speculative_verify = bool(kwargs.pop("speculative_verify", False))
         # A capture list is supplied whenever a drafter is attached: collect each KDA
         # layer's per-step recurrent state so a round can be rolled back on rejection.
         #
@@ -2674,20 +2687,30 @@ class LanguageModel(nn.Module):
             [] if (capture_layer_ids is not None or return_hidden) else None
         )
 
-        out = self.model(
-            inputs,
-            cache=cache,
-            inputs_embeds=inputs_embeds,
-            gdn_sink=gdn_sink,
-            hidden_sink=hidden_sink,
-            capture_layer_ids=capture_layer_ids,
+        # MLX dispatches quantized_matmul on the FLATTENED row count, so the M a
+        # projection sees is B * S, not S.
+        seq = inputs if inputs is not None else inputs_embeds
+        rows = (
+            int(seq.shape[0]) * int(seq.shape[1])
+            if seq is not None and seq.ndim >= 2
+            else None
         )
-        # Only the last few positions' logits are ever needed for generation; slicing
-        # before the (vocab-wide) projection skips it on discarded prefill positions.
-        nlk = kwargs.get("num_logits_to_keep", 0)
-        logits = None
-        if not skip_logits:
-            logits = self._logits(out[:, -nlk:, :] if nlk else out)
+        with _vp.verify_window(speculative_verify, width=rows):
+            out = self.model(
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                gdn_sink=gdn_sink,
+                hidden_sink=hidden_sink,
+                capture_layer_ids=capture_layer_ids,
+            )
+            # Only the last few positions' logits are ever needed for generation;
+            # slicing before the (vocab-wide) projection skips it on discarded
+            # prefill positions.
+            nlk = kwargs.get("num_logits_to_keep", 0)
+            logits = None
+            if not skip_logits:
+                logits = self._logits(out[:, -nlk:, :] if nlk else out)
 
         return LanguageModelOutput(
             logits=logits,
@@ -2711,7 +2734,7 @@ class LanguageModel(nn.Module):
     def _logits(self, normed_hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(normed_hidden)
-        return self.lm_head(normed_hidden)
+        return _vp.project(self.lm_head, normed_hidden)
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         # `hidden` is the pre-final-norm hidden captured for the drafter; apply the
