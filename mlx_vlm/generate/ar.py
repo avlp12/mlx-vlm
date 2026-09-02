@@ -2982,10 +2982,23 @@ class BatchGenerator:
             if gb is None:
                 _context_vault.record_session_skip("no_generation_batch")
                 return False
-            if uid not in gb.uids:
+            # ``uids`` is "rows still generating", NOT "rows in this batch":
+            # SpeculativeGenerationBatch._refresh_uids rebuilds it from
+            # ``_finished``, so a uid leaves it at the very moment finish_reason
+            # is set -- which is exactly when we are called. The live diagnostic
+            # on 32046983 named this gate (uid_gone_from_batch, twice, both
+            # turns) and it is why the feature stored nothing.
+            #
+            # ``_all_uids`` is the stable list and is what the row indices are
+            # aligned to: _append_token_responses attributes tokens via
+            # _all_uids[row], and filter() -- the only thing that compacts the
+            # prompt cache -- rewrites both together. Plain GenerationBatch has
+            # no _all_uids and never prunes on finish, so uids is correct there.
+            all_uids = getattr(gb, "_all_uids", None) or gb.uids
+            if uid not in all_uids:
                 _context_vault.record_session_skip("uid_gone_from_batch")
                 return False
-            row = gb.uids.index(uid)
+            row = all_uids.index(uid)
             row_cache = _apc.snapshot_prompt_cache_row(gb.prompt_cache, row)
             if not row_cache:
                 _context_vault.record_session_skip("row_cache_unavailable")
