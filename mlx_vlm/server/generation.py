@@ -47,6 +47,7 @@ from ..sample_utils import (
 )
 from ..speculative.utils import (
     make_speculative_prompt_cache,
+    prefill_capture_kwargs,
     run_speculative_server_rounds,
     speculative_hidden_state,
     speculative_prefill_kwargs,
@@ -222,7 +223,15 @@ def _run_chunked_speculative_prefill(
             )
             mx.clear_cache()
 
-    final_kwargs = {**remaining_kwargs, **speculative_kwargs}
+    # Prefill leg: the drafter reads the hidden captures, and nothing reads a
+    # prefill's gdn_states (see prefill_capture_kwargs for the consumer list), so
+    # do not let the model build the sequence-shaped KDA rollback stash.  Applied
+    # HERE and not to the dict the chunking policy sees, so the policy decision is
+    # byte-for-byte what it was.
+    final_kwargs = {
+        **remaining_kwargs,
+        **prefill_capture_kwargs(lm, speculative_kwargs),
+    }
     final_kwargs["inputs_embeds"] = remaining_embeds
     with mx.stream(generation_stream):
         out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)

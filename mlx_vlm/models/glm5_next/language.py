@@ -2533,6 +2533,12 @@ class LanguageModel(nn.Module):
     # class attribute) so a later rebase is a no-conflict fast-forward.
     requires_uniform_batch_acceptance = True
 
+    # Advertises the ``capture_gdn_states`` kwarg below, so a caller can turn the
+    # KDA rollback stash off without having to know which model it is holding.
+    # Read with ``getattr(lm, "supports_capture_gdn_states", False)``: models that
+    # forward ``**kwargs`` into their decoder stack would raise on an unknown one.
+    supports_capture_gdn_states = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -2561,7 +2567,24 @@ class LanguageModel(nn.Module):
         kwargs.pop("speculative_verify", False)
         # A capture list is supplied whenever a drafter is attached: collect each KDA
         # layer's per-step recurrent state so a round can be rolled back on rejection.
-        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
+        #
+        # ROLLBACK IS A VERIFY-PATH NEED, AND ONLY A VERIFY-PATH NEED.  The stash is
+        # eleven tensors per KDA layer, six of them shaped over the whole sequence,
+        # and two of those are ``mx.split`` VIEWS that pin their parents -- ``v``
+        # pins the [B, S, 3*H*D] conv output and ``b_o`` pins the [B, S, 3*H*D +
+        # 2*head_dim + H] fused in-projection.  At S=1 (a decode step) or S=8 (a
+        # verify block) that is nothing.  On a prefill it is 197,248 B per token per
+        # KDA layer on GLM-5.3-Flash's geometry -- 6.7 MB/token over 34 layers, held
+        # live for the whole request by whoever keeps the returned object.
+        #
+        # Nothing reads a prefill leg's ``gdn_states``: every consumer in the tree
+        # takes it from a *verify* forward.  So a prefill caller passes
+        # ``capture_gdn_states=False`` and the sink is never opened.  Default True,
+        # so every verify path is byte-for-byte what it was.
+        capture_gdn_states = bool(kwargs.pop("capture_gdn_states", True))
+        gdn_sink: Optional[list] = (
+            [] if (capture_layer_ids is not None and capture_gdn_states) else None
+        )
         # With a non-empty capture list the DFlash drafter reads the per-layer hidden;
         # with an empty list (MTP) or return_hidden the nextn drafter reads the
         # pre-final-norm hidden, applying its own norm (the DeepSeek-derived convention).

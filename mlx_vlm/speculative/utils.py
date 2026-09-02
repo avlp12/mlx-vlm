@@ -113,6 +113,36 @@ def speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
     )
 
 
+def prefill_capture_kwargs(lm, capture_kwargs: dict) -> dict:
+    """Prefill flavour of :func:`speculative_prefill_kwargs`.
+
+    The prefill leg needs the *hidden* captures -- they are the drafter's context.
+    It does not need the KDA rollback stash: rollback happens inside a speculative
+    round, and every consumer of ``gdn_states`` in this tree reads it off a VERIFY
+    forward, never off the object a prefill returns --
+
+        speculative/dflash.py:861, :1065      (verify_out.gdn_states)
+        speculative/lookup.py:109             (verify_out.gdn_states)
+        speculative/mtp.py:175, :884, :1283   (verify_out / verify.gdn_states)
+        speculative/eagle3.py:176-201         (first_out / tail_out / verify_out)
+        speculative/utils.py:322-323          (prefill leg: hidden_states and
+                                               shared_kv_states only)
+
+    On a model that carries recurrent state the stash is sequence-shaped, so on a
+    long prompt it is the dominant retained allocation of the whole request.  Ask
+    the model not to build it -- but only if the model says it understands the
+    request, because a model that forwards ``**kwargs`` into its decoder stack
+    would raise on an unknown one.
+    """
+    if not capture_kwargs:
+        return capture_kwargs
+    if not getattr(lm, "supports_capture_gdn_states", False):
+        return capture_kwargs
+    if capture_kwargs.get("capture_layer_ids") is None:
+        return capture_kwargs
+    return {**capture_kwargs, "capture_gdn_states": False}
+
+
 def speculative_hidden_state(draft_kind: str, outputs):
     if draft_kind == "lookup":
         return None
