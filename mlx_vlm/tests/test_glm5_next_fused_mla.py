@@ -15,6 +15,12 @@ import mlx.nn as nn
 
 
 def _reload(**env):
+    """Reload the module with the given env.
+
+    NOTE: MLX_VLM_GLM5_MQA_FOLD defaults ON as of the e2e adoption, so passing None (unset) for it
+    selects the FOLD, not the baseline. Baseline arms must pass "0" explicitly. Passing None here
+    for that key would silently turn every A/B in this file into an A/A.
+    """
     for k, v in env.items():
         if v is None:
             os.environ.pop(k, None)
@@ -163,7 +169,7 @@ class TestFusedMLA(unittest.TestCase):
         mx.eval(x)
 
         ref, n_ref, sh_ref = self._run(
-            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": None}, x
+            {"MLX_VLM_GLM5_MQA_FOLD": "0", "MLX_VLM_GLM5_FUSED_MLA": None}, x
         )
         self.assertEqual(n_ref, 0)
         self.assertEqual(sh_ref, [(1, 8, 96, 512)], "baseline should take MLX's own dense call")
@@ -171,7 +177,7 @@ class TestFusedMLA(unittest.TestCase):
 
         # dense prefill (L=96 > 1): only the fused kernel can take it; the fold is L==1 only.
         got, n_k, sh = self._run(
-            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1",
+            {"MLX_VLM_GLM5_MQA_FOLD": "0", "MLX_VLM_GLM5_FUSED_MLA": "1",
              "MLX_VLM_GLM5_FUSED_MLA_MIN_TG": "1"}, x
         )
         self.assertEqual(n_k, 1, "fused kernel was NOT entered on the dense prefill path")
@@ -184,7 +190,7 @@ class TestFusedMLA(unittest.TestCase):
         x = mx.random.normal((1, 1, 256)).astype(mx.bfloat16)
         mx.eval(x)
         ref, _, sh_ref = self._run(
-            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": None}, x
+            {"MLX_VLM_GLM5_MQA_FOLD": "0", "MLX_VLM_GLM5_FUSED_MLA": None}, x
         )
         self.assertEqual(sh_ref, [(1, 8, 1, 512)])
         u = _ulp_bf16(ref.astype(mx.float32))
@@ -200,7 +206,7 @@ class TestFusedMLA(unittest.TestCase):
         self.assertLess(err, 8 * u, f"fold err={err} ulp={u}")
 
         got, n_k, sh = self._run(
-            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1",
+            {"MLX_VLM_GLM5_MQA_FOLD": "0", "MLX_VLM_GLM5_FUSED_MLA": "1",
              "MLX_VLM_GLM5_FUSED_MLA_MIN_TG": "1"}, x
         )
         self.assertEqual(n_k, 1, "fused kernel was NOT entered on the L==1 path")
@@ -219,7 +225,7 @@ class TestFusedMLA(unittest.TestCase):
         x = mx.random.normal((1, 1, 256)).astype(mx.bfloat16)
         mx.eval(x)
         _, n_k, sh = self._run(
-            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1",
+            {"MLX_VLM_GLM5_MQA_FOLD": "0", "MLX_VLM_GLM5_FUSED_MLA": "1",
              "MLX_VLM_GLM5_FUSED_MLA_MIN_TG": None}, x
         )
         self.assertEqual(n_k, 0, "the launch-size guard did not decline a 1-threadgroup call")

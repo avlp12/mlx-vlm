@@ -222,11 +222,27 @@ def _mqa_fold_enabled() -> bool:
     being genuinely fused rather than merely well-shaped -- the day MLX supports head
     dim 512 in the full path.
 
-    Default OFF pending the paired e2e gate.  MLX_VLM_GLM5_MQA_FOLD=1 to enable.
+    DEFAULT ON.  Set MLX_VLM_GLM5_MQA_FOLD=0 to restore MLX's own dispatch.
+
+    Adopted on the e2e gate (receipt logs/sweep6/lane5_VERDICT_fold_e2e.md; harness
+    prep/sweep6/fold_e2e.py on epsilon, mlx 0.32.1, real text, B=1, stride 2048, 3 paired
+    cycles plus a discarded warm-up).  Paired per chunk, then medianed over cycles:
+
+        prefill chunks where this CANNOT fire (depth < gate)   1.0059   range 1.0054-1.0063
+        prefill chunks where it fires                          1.2064   range 1.2000-1.2594
+        whole 131k prefill wall                                1.185, 1.214, 1.185
+        decode B=1, 32 tokens at depth 131072                  0.9907   (pre-registered null)
+        batch B=8 / B=16 at T=1024 (indexer bypasses)          1.0003 / 1.0017
+
+    Identity, I912: 48-token greedy off a 16384-token real-text prime gives the IDENTICAL token
+    stream and identical text, on a determinism control that is exactly 100% (max |dlogit| 0),
+    while a single bfloat16 ulp flipped in one embedding element diverges at token 30.  Logits are
+    not bit-identical (max 1.016 on a scale of 27.38) and that is not claimed.
     """
     global _MQA_FOLD_ENV
     if _MQA_FOLD_ENV is None:
-        _MQA_FOLD_ENV = _env_flag("MLX_VLM_GLM5_MQA_FOLD")
+        v = os.environ.get("MLX_VLM_GLM5_MQA_FOLD")
+        _MQA_FOLD_ENV = True if v is None else v.lower() not in ("0", "", "false", "no", "off")
     return _MQA_FOLD_ENV
 
 
