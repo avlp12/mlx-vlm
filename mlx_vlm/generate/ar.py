@@ -23,6 +23,7 @@ from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
+    prefill_capture_kwargs,
     run_speculative_rounds,
     run_speculative_server_rounds,
     speculative_hidden_state,
@@ -348,7 +349,15 @@ def generate_step(
 
         step_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
-            step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
+            # Prefill only -- with a drafter attached the loop below is unreachable
+            # (the speculative branch returns first), so every _step that carries
+            # these kwargs is a prefill forward.  Drop the rollback stash there.
+            step_kwargs = {
+                **kwargs,
+                **prefill_capture_kwargs(
+                    model.language_model, speculative_prefill_capture_kwargs
+                ),
+            }
         if getattr(model.language_model, "supports_logits_to_keep", False):
             step_kwargs = {**step_kwargs, "logits_to_keep": 1}
 
@@ -2076,8 +2085,12 @@ class PromptProcessingBatch:
         """Process final tokens and transition to GenerationBatch."""
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
+            # Prefill leg: hidden captures yes, KDA rollback stash no.
             call_kwargs.update(
-                speculative_prefill_kwargs(self.draft_kind, self.draft_model)
+                prefill_capture_kwargs(
+                    self.model,
+                    speculative_prefill_kwargs(self.draft_kind, self.draft_model),
+                )
             )
 
         output = self.model(
