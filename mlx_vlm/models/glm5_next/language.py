@@ -1561,6 +1561,21 @@ class Glm5NextDecoderLayer(nn.Module):
         # attention-half glue heavy enough to matter.
         self.compile_attn = False
         self._attn_pre_c = None
+        # Fold the post-collapse RMSNorm into the hyper-connection kernel.
+        #
+        # DEFAULT OFF: measured, below resolution. Three ABBA-paired cycles of
+        # 100 timed steps gave +0.391, -0.023, +0.106 ms -- mean +0.158 ms on a
+        # 33.4 ms step (0.47%), sign not consistent. B=8 and B=16 were +0.64%
+        # and +0.69%, both single unpaired measurements. It leans positive and
+        # it is very close to the 0.24 ms the launch model predicts for removing
+        # one dispatch from 90 dependent instances, but it does not clear the
+        # pre-registered bar, and the same bar declined compile_attn.
+        #
+        # This also settles the rest of the HC redesign: if one launch is worth
+        # 0.158 ms, the full 5->2 fold is worth about 0.5 ms (1.5%), and buying
+        # that needs a cross-threadgroup GEMV kernel of exactly the shape that
+        # came in 22x slower at I906. Not worth it. The mechanism stays, tested.
+        self.fold_hc_norm = False
 
     def _attn_prologue(self, x: mx.array):
         """Stateless attention-half prologue: hyper-connection + input norm.
@@ -1576,6 +1591,11 @@ class Glm5NextDecoderLayer(nn.Module):
         compiled block today, so the fused sinkhorn+collapse ``metal_kernel`` is
         known to survive tracing.
         """
+        if self.fold_hc_norm:
+            xc, post, comb = self.attn_hc(
+                x, norm_w=self.input_layernorm.weight,
+                norm_eps=self.input_layernorm.eps)
+            return xc, post, comb
         xc, post, comb = self.attn_hc(x)
         return self.input_layernorm(xc), post, comb
 
@@ -1615,8 +1635,14 @@ class Glm5NextDecoderLayer(nn.Module):
     def _ffn_block(self, x: mx.array) -> mx.array:
         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
         residual = x
-        xc, post, comb = self.ffn_hc(x)
-        m = self.mlp(self.post_attention_layernorm(xc))
+        if self.fold_hc_norm:
+            xc, post, comb = self.ffn_hc(
+                x, norm_w=self.post_attention_layernorm.weight,
+                norm_eps=self.post_attention_layernorm.eps)
+            m = self.mlp(xc)
+        else:
+            xc, post, comb = self.ffn_hc(x)
+            m = self.mlp(self.post_attention_layernorm(xc))
         return hc_expand(m, residual, post, comb)
 
 

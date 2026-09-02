@@ -125,32 +125,108 @@ def _make_hc_sinkhorn_collapse_kernel():
 
         constexpr uint D4 = (uint)D / 4;
 
-        for (uint d4 = tid; d4 < D4; d4 += 256) {
-            float4 x0 = float4(x_row0[d4]);
-            float4 x1 = float4(x_row1[d4]);
-            float4 x2 = float4(x_row2[d4]);
-            float4 x3 = float4(x_row3[d4]);
+        // ================================================================
+        // PHASE 3 (FOLD_NORM only): the RMSNorm that follows the collapse.
+        //
+        // Every caller does norm(collapse(x)) -- input_layernorm on the
+        // attention half, post_attention_layernorm on the FFN half -- so the
+        // norm is a second dispatch reading back what this kernel just wrote.
+        // The collapse already holds those values in registers, and 90 of these
+        // cycles run per decode step in a dependent chain where a launch costs
+        // far more than this arithmetic. Fold it.
+        //
+        // The collapsed row is kept in registers (ACC float4s per thread), the
+        // sum of squares is reduced across the threadgroup, then the same
+        // registers are rescaled and written. D=4096 with 256 threads gives
+        // ACC=4, i.e. 16 floats per thread.
+        // ================================================================
+        // NOTE: these are C++ TEMPLATE PARAMETERS, not preprocessor macros.
+        // `#if FOLD_NORM` compiles to `#if 0` -- the preprocessor cannot see a
+        // template argument -- and silently takes the false branch. That cost a
+        // debugging round here: the folded output came back bit-identical to the
+        // UNNORMED collapse. The same defect is latent in the `#if (D % 4)`
+        // tail this replaces, which has always been dead code and was only
+        // correct because every D we use is a multiple of 4. Use ordinary `if`
+        // on a compile-time-constant condition; the compiler folds it.
+        threadgroup float ssq_red[8];        // 256 threads / 32 = 8 simdgroups
+        threadgroup float rms_scale_shared;
 
-            float4 result = fma(float4(p0), x0,
-                            fma(float4(p1), x1,
-                            fma(float4(p2), x2, float4(p3) * x3)));
+        if (FOLD_NORM) {
+            constexpr uint ACC = (D4 + 255) / 256;
+            float4 acc[ACC];
+            float ssq = 0.0f;
+            uint n = 0;
+            for (uint d4 = tid; d4 < D4; d4 += 256) {
+                float4 x0 = float4(x_row0[d4]);
+                float4 x1 = float4(x_row1[d4]);
+                float4 x2 = float4(x_row2[d4]);
+                float4 x3 = float4(x_row3[d4]);
 
-            out4[d4] = U4(result);
+                float4 result = fma(float4(p0), x0,
+                                fma(float4(p1), x1,
+                                fma(float4(p2), x2, float4(p3) * x3)));
+                acc[n++] = result;
+                ssq += dot(result, result);
+            }
+
+            float sg_sum = simd_sum(ssq);
+            if (lane == 0) {
+                ssq_red[sg] = sg_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float total = 0.0f;
+                for (uint i = 0; i < 8; ++i) {
+                    total += ssq_red[i];
+                }
+                rms_scale_shared =
+                    metal::rsqrt(total / (float)D + NORM_EPS_INT * 1e-9f);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float rms_scale = rms_scale_shared;
+
+            // Index norm_w as scalars rather than casting to a vector
+            // pointer: MLX places it in the `constant` address space, and a
+            // C-style cast to `const device T4*` is a cross-address-space cast
+            // the Metal compiler rejects. Which space MLX picks is its own
+            // heuristic, so not depending on it is the robust choice; norm_w is
+            // 8 KB and stays in cache either way.
+            n = 0;
+            for (uint d4 = tid; d4 < D4; d4 += 256) {
+                const uint b = d4 * 4;
+                float4 w = float4((float)norm_w[b + 0], (float)norm_w[b + 1],
+                                  (float)norm_w[b + 2], (float)norm_w[b + 3]);
+                out4[d4] = U4(acc[n++] * rms_scale * w);
+            }
+        } else {
+            for (uint d4 = tid; d4 < D4; d4 += 256) {
+                float4 x0 = float4(x_row0[d4]);
+                float4 x1 = float4(x_row1[d4]);
+                float4 x2 = float4(x_row2[d4]);
+                float4 x3 = float4(x_row3[d4]);
+
+                float4 result = fma(float4(p0), x0,
+                                fma(float4(p1), x1,
+                                fma(float4(p2), x2, float4(p3) * x3)));
+
+                out4[d4] = U4(result);
+            }
+
+            // Scalar tail for D not divisible by 4. A runtime `if`, for the
+            // reason in the note above.
+            if (D % 4 != 0) {
+                for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
+                    float val = p0*(float)x_row[0*D+d] + p1*(float)x_row[1*D+d]
+                              + p2*(float)x_row[2*D+d] + p3*(float)x_row[3*D+d];
+                    out_row[d] = (U)val;
+                }
+            }
         }
-
-        // Scalar tail for D not divisible by 4
-        #if (D % 4) != 0
-        for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
-            float val = p0*(float)x_row[0*D+d] + p1*(float)x_row[1*D+d]
-                      + p2*(float)x_row[2*D+d] + p3*(float)x_row[3*D+d];
-            out_row[d] = (U)val;
-        }
-        #endif
     """
 
     return mx.fast.metal_kernel(
         name="hc_sinkhorn_collapse",
-        input_names=["x_in", "mixes", "scale", "base"],
+        input_names=["x_in", "mixes", "scale", "base", "norm_w"],
         output_names=["collapsed", "post", "comb"],
         source=source,
         ensure_row_contiguous=True,
@@ -160,11 +236,36 @@ def _make_hc_sinkhorn_collapse_kernel():
 _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 
 
-def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
+def hc_fold_norm_supported(x, norm_w, D) -> bool:
+    """Can this call fold the following RMSNorm into the collapse?
+
+    The fold keeps the collapsed row in registers (ACC = ceil(D/4/256) float4s
+    per thread), so a large D would spill and lose more than the launch is
+    worth. It also takes the vectorised path only, so D must be a multiple of 4.
+    """
+    if norm_w is None:
+        return False
+    if D % 4 != 0 or D > 8192:
+        return False
+    return norm_w.dtype == x.dtype and norm_w.shape == (D,)
+
+
+def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps,
+               norm_w=None, norm_eps=1e-5):
+    """Fused sinkhorn + collapse, optionally with the following RMSNorm folded in.
+
+    With ``norm_w`` the third output is norm(collapse(x)) rather than
+    collapse(x), which removes one dispatch from a chain that runs 90 times per
+    decode step. Without it the behaviour is exactly as before.
+    """
     B, L, H, D = x.shape
+    fold = hc_fold_norm_supported(x, norm_w, D)
+    # A dummy that is never read when FOLD_NORM is 0: metal_kernel wants every
+    # declared input present, and a 4-element array costs nothing.
+    w = norm_w if fold else mx.zeros((4,), dtype=x.dtype)
 
     return _hc_sinkhorn_collapse_kernel(
-        inputs=[x, mixes, scale, base],
+        inputs=[x, mixes, scale, base, w],
         template=[
             ("T", x.dtype),
             ("U", x.dtype),
@@ -172,6 +273,8 @@ def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
             ("ITERS", sinkhorn_iters),
             ("D", D),
             ("EPS_INT", round(eps / 1e-9)),
+            ("FOLD_NORM", 1 if fold else 0),
+            ("NORM_EPS_INT", round(norm_eps / 1e-9)),
         ],
         grid=(B * L * 256, 1, 1),
         threadgroup=(256, 1, 1),
@@ -229,7 +332,16 @@ class HyperConnection(nn.Module):
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
 
-    def __call__(self, x: mx.array):
+    def __call__(self, x: mx.array, norm_w=None, norm_eps: float = 1e-5):
+        """Hyper-connection.
+
+        ``norm_w`` folds the RMSNorm that every caller applies to the collapsed
+        output into the fused kernel, so the collapse and the norm are one
+        dispatch instead of two. The folded norm reads the collapse from
+        registers, before it is rounded to the output dtype, so it is very
+        slightly MORE precise than norming the stored result -- the two agree to
+        about one ulp of the output dtype, not bit-exactly.
+        """
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
@@ -240,9 +352,18 @@ class HyperConnection(nn.Module):
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
         )
-        hc_func = _hc_ops if use_ops else _hc_kernel
+        if use_ops:
+            xc, post, comb = _hc_ops(
+                x, y, mixes, self.scale, self.base,
+                self.hc_mult, self.sinkhorn_iters, self.hc_eps,
+            )
+            # Same contract on the ops path, so a caller that hands us norm_w
+            # gets a normed collapse whichever path ran.
+            if norm_w is not None:
+                xc = mx.fast.rms_norm(xc, norm_w, norm_eps)
+            return xc, post, comb
 
-        return hc_func(
+        return _hc_kernel(
             x,
             y,
             mixes,
@@ -251,6 +372,8 @@ class HyperConnection(nn.Module):
             self.hc_mult,
             self.sinkhorn_iters,
             self.hc_eps,
+            norm_w=norm_w,
+            norm_eps=norm_eps,
         )
 
 
