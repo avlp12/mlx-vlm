@@ -100,10 +100,34 @@ class TestGatherGateDefault(unittest.TestCase):
         os.environ.pop("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", None)
         mod = importlib.reload(L)
         try:
-            # Receipt logs/sweep3/R8_gate_band_r8.json: 12288 beats both 16384 and
-            # 32768 on total wall in 4 of 4 interleaved cycles, and beats 16384 on
-            # the only region where they differ (chunks 5-6) by 731-885 ms.
-            self.assertEqual(mod._GATHER_MIN_CONTEXT, 12288)
+            # Receipt logs/sweep6/lane5_VERDICT_gate_resweep.md. The gate is a crossover between
+            # the dense masked path and the gathered path, and MLX_VLM_GLM5_MQA_FOLD moved the
+            # gathered side (3.95 -> 15.10 TFLOP/s), so R8's 12288 -- correct for the cost it was
+            # fitted against -- is stale. Re-swept e2e over {4096, 6144, 8192, 12288} x fold
+            # {OFF, ON}, drift-corrected wall: with the fold ON, 6144 wins (49052.6 ms) and 12288
+            # is the WORST of the four (50935.4); with the fold OFF, 12288 still wins every cycle,
+            # which reproduces R8 and is the check that the two sweeps measure the same thing.
+            self.assertEqual(mod._GATHER_MIN_CONTEXT, 6144)
+        finally:
+            importlib.reload(L)
+
+    def test_the_gate_default_is_coupled_to_the_fold(self):
+        """6144 is only correct while the fold is on; if the fold is ever defaulted off, 12288 is.
+
+        This is the coupling that makes the gate value legitimate rather than arbitrary, and it is
+        the thing most likely to be broken silently later -- somebody turns the fold off to debug
+        something, ships it, and the gate is now fitted against a cost that no longer exists.
+        """
+        import importlib, os
+        for k in ("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "MLX_VLM_GLM5_MQA_FOLD"):
+            os.environ.pop(k, None)
+        mod = importlib.reload(L)
+        try:
+            self.assertTrue(
+                mod._mqa_fold_enabled(),
+                "the gate default of 6144 was measured with the MQA fold ON; if the fold is "
+                "defaulted off, re-sweep the gate (fold OFF put the optimum back at 12288)",
+            )
         finally:
             importlib.reload(L)
 
