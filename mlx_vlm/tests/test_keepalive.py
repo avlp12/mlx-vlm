@@ -169,16 +169,19 @@ class TestKeepaliveInGenerationLoop:
     def test_disabled_keepalive_leaves_the_idle_timeout_alone(self, monkeypatch):
         monkeypatch.setenv(ENV_KEEPALIVE_HZ, "0")
         gen = _bare_generator(GpuKeepalive())
-        seen = {}
+        # Record every call: after the blocking get raises, the collector drains
+        # with get_nowait(), which re-enters this same override with timeout=None.
+        # Asserting on a single slot would read the drain call, not the wait.
+        seen = []
 
         class _Q(Queue):
             def get(self, block=True, timeout=None):
-                seen["timeout"] = timeout
+                seen.append(timeout)
                 raise server_generation.QueueEmpty
 
         gen.requests = _Q()
         gen._collect_pending_requests(active=False, idle_timeout=7.5)
-        assert seen["timeout"] == 7.5
+        assert seen[0] == 7.5, seen
 
     def test_accessor_tolerates_an_uninitialised_instance(self):
         """The suite builds ResponseGenerator via __new__ in ~22 places."""
