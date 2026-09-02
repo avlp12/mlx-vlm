@@ -1,3 +1,4 @@
+import contextlib
 import gc
 import logging
 import os
@@ -58,6 +59,12 @@ from .keepalive import GpuKeepalive
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
+
+# Escape hatch for benchmark harnesses that want to measure the un-hoisted
+# behaviour (and for bisecting a wiring regression).  Default on: the window it
+# covers -- the first request after a server start -- is otherwise unprotected,
+# because the keepalive is powerless while the wired limit is 0.
+ENV_HOIST_WIRED_LIMIT = "MLX_VLM_HOIST_WIRED_LIMIT"
 
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
@@ -1157,6 +1164,7 @@ class ResponseGenerator:
         # against a half-initialised model or perturb a load the fleet gate is
         # watching.  Constructing it here does no GPU work.
         self._keepalive = GpuKeepalive()
+        self._wired_stack = None
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1174,6 +1182,77 @@ class ResponseGenerator:
             ka = GpuKeepalive()
             self._keepalive = ka
         return ka
+
+    # ---------------------------------------------------------------- wiring
+    def _hold_wired_limit(self, streams) -> None:
+        """Hold the wired-memory limit for the life of the generation thread.
+
+        The GPU keepalive (server/keepalive.py) can only hold the model resident
+        while the wired LIMIT is non-zero -- measured on epsilon 2026-09-02
+        (glm53flash/logs/sweep4/L3_wirelimit.json).  With the limit held, a 1 Hz
+        tick across a 30 s idle kept wired at 190.65 GB and cut the first-request
+        penalty to +15.5 ms.  With the limit at 0 the identical tick was
+        POWERLESS: wired collapsed to 5.85 GB and the request still paid
+        +1046-1119 ms despite 28 ticks landing.  GPU activity alone is not
+        enough; residency needs a non-zero limit to hold against.
+
+        Until now the limit was owned solely by BatchGenerator, which does not
+        exist yet before the first request and is cleared by the AR loop's
+        exception handler.  Both windows therefore ran at limit 0, so the first
+        request after a server start -- and the first after any error -- paid the
+        full re-wiring cost that the keepalive was added to remove.
+
+        BatchGenerator's own wired_limit is left exactly as it is.  Nesting is
+        idempotent: the inner context captures max_rec from this outer one and
+        restores max_rec rather than 0, so nothing double-sets and close() stops
+        dropping the limit to the floor.
+
+        Never fatal.  A server that cannot wire is slow, not broken, so a refusal
+        is logged and serving continues.
+        """
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        if os.environ.get(ENV_HOIST_WIRED_LIMIT, "1") == "0":
+            logger.info(
+                "%s=0: not holding the wired limit from the generation thread. "
+                "BatchGenerator still wires per batch, so the first request after a "
+                "server start pays the re-wiring cost.", ENV_HOIST_WIRED_LIMIT,
+            )
+            return
+        stack = contextlib.ExitStack()
+        try:
+            stack.enter_context(
+                wired_limit(getattr(model, "language_model", model), streams)
+            )
+        except Exception:  # noqa: BLE001 - a wiring refusal must not stop a start
+            logger.exception(
+                "Could not hold the wired-memory limit for the generation thread; "
+                "serving continues without it. Expect the first request after an "
+                "idle gap to pay the re-wiring cost (about 1.2 s)."
+            )
+            try:
+                stack.close()
+            except Exception:
+                pass
+            return
+        self._wired_stack = stack
+        logger.info(
+            "Wired-memory limit held for the generation thread (covers the window "
+            "before the first request, where the keepalive alone cannot hold "
+            "residency)."
+        )
+
+    def _release_wired_limit(self) -> None:
+        """Drop the limit held by :meth:`_hold_wired_limit`, if any."""
+        stack = getattr(self, "_wired_stack", None)
+        self._wired_stack = None
+        if stack is None:
+            return
+        try:
+            stack.close()
+        except Exception:  # noqa: BLE001 - shutdown must not be masked
+            logger.exception("Error releasing the wired-memory limit.")
 
     def _effective_prefill_step_size(self) -> int:
         prefill_step_size = getattr(self, "prefill_step_size", None)
@@ -1852,6 +1931,7 @@ class ResponseGenerator:
             self._run_impl()
         finally:
             self.keepalive.close()
+            self._release_wired_limit()
             clear_mlx_streams()
             # The GPU thread is the last owner of the model on the way down.
             # Its frame holds the BatchGenerator (already closed above, which
@@ -1883,6 +1963,7 @@ class ResponseGenerator:
 
         self._ready.set()
         self.keepalive.arm()
+        self._hold_wired_limit([mx.default_stream(mx.default_device())])
 
         # Diffusion models cannot run through the AR batch generator.
         if is_diffusion_model(self.model):
