@@ -37,6 +37,7 @@ What this module pins, in the order the argument runs:
     lengths and the left padding the batch driver applies.
 """
 
+import logging
 import os
 from types import SimpleNamespace
 
@@ -45,7 +46,11 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.generate import ar as ar_module
-from mlx_vlm.generate.ar import PromptProcessingBatch, _left_pad_prompts
+from mlx_vlm.generate.ar import (
+    PromptProcessingBatch,
+    _left_pad_prompts,
+    _right_pad_prompts,
+)
 from mlx_vlm.models.glm5_next.config import TextConfig
 from mlx_vlm.models.glm5_next.language import LanguageModel
 from mlx_vlm.server import generation as server_generation
@@ -1116,3 +1121,236 @@ def test_the_batched_offset_adoption_is_bit_identical_per_row(row):
         _draft_round_one(model, mx.contiguous(full[:, -BATCH_KEEP:]), skip=skip),
         why=f"row {row}: trimming without adopting {skip} moved the drafter",
     )
+
+
+# ------------------------------- 9. the right-padded (mixed warm/cold) batch
+#
+# ``BatchGenerator._build_mixed_prompt_batch`` (``generate/ar.py:2699-2942``) builds
+# a ``PromptProcessingBatch`` with ``right_pad_per_row`` AND ``draft_model`` /
+# ``draft_kind`` (:2935-2938), so a right-padded batch with a hidden-reading
+# drafter is reachable.  Two things are wrong with chunking it, and neither is about the
+# capture:
+#
+# * the drafter's window is the TRAILING rows of the capture, and for a short
+#   right-padded row those are padding;
+# * ``generate()`` picks each row's last real token at ``seq - 1 - right_pad`` where
+#   ``seq`` is the FINAL forward's width -- which goes negative once the prefill
+#   chunked.  That defect is PRE-EXISTING and needs no drafter at all; it is pinned
+#   below rather than fixed here.
+#
+# So the batch driver refuses both halves for a right-padded batch: no chunking, no
+# trim, capture full width, ``capture_gdn_states`` still off.  Correctness at the old
+# memory cost.
+
+RP_FULL = [list(range(3, 43)), list(range(7, 47))]  # both whole prompts are 40 long
+RP_PREFIX = [16, 0]  # row 0 is warm: 16 tokens already in the cache
+RP_SUFFIX = [RP_FULL[i][RP_PREFIX[i] :] for i in range(2)]  # 24 and 40
+RP_MAX_SUFFIX = max(len(s) for s in RP_SUFFIX)
+RP_RIGHT_PAD = [RP_MAX_SUFFIX - len(s) for s in RP_SUFFIX]  # [16, 0]
+RP_META = [
+    {"full_input_ids": RP_FULL[i], "prefix_len": RP_PREFIX[i]} for i in range(2)
+]
+
+
+def _right_padded_batch(*, step, drafter, apc_meta=RP_META):
+    """A mixed warm/cold batch, shaped exactly as ``_build_mixed_prompt_batch`` shapes one.
+
+    ``warm_cache`` is deliberately not supplied: the row-0 prefix K/V is absent, so
+    row 0's arithmetic is not what a served warm row would compute.  Everything this
+    section asserts is about the DRIVER's policy -- how many forwards, how wide the
+    capture, which token ids reach the drafter, which position is sampled -- and none
+    of it depends on the prefix K/V being real.
+    """
+    lm = _lm()
+    spy = _BatchSpy(lm)
+    padded = _right_pad_prompts(RP_SUFFIX, max_length=RP_MAX_SUFFIX)
+    draft_kwargs = (
+        dict(draft_model=drafter, draft_kind="dflash") if drafter is not None else {}
+    )
+    batch = PromptProcessingBatch(
+        model=spy,
+        uids=[0, 1],
+        input_ids=RP_SUFFIX,
+        max_tokens=[4, 4],
+        inputs_embeds=lm.model.embed_tokens(padded),
+        prompt_kwargs={},
+        prefill_step_size=step,
+        right_pad_per_row=list(RP_RIGHT_PAD),
+        suffix_lens=[len(s) for s in RP_SUFFIX],
+        apc_meta=apc_meta,
+        **draft_kwargs,
+    )
+    while batch.needs_processing():
+        batch.prompt_step()
+    gen_batch = batch.generate(
+        sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        stop_criteria=lambda token: False,
+    )
+    mx.eval(_cache_arrays(gen_batch.prompt_cache))
+    return gen_batch, spy, batch
+
+
+def _first_tokens(gen_batch):
+    tokens = getattr(gen_batch, "first_tokens", None)
+    if tokens is None:
+        tokens = gen_batch._next_tokens
+    mx.eval(tokens)
+    return tokens.tolist()
+
+
+def test_a_right_padded_batch_refuses_the_chunking_and_the_trim(caplog):
+    """One forward, full-width capture, no offset -- and a line saying why."""
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.generate"):
+        gen_batch, spy, batch = _right_padded_batch(
+            step=BATCH_STEP, drafter=_StubDrafter()
+        )
+
+    assert batch.prefill_step_size is None
+    assert len(spy.calls) == 1, [c.get("n_to_process") for c in spy.calls]
+    # The capture is still asked for, and the gdn stash is still refused.
+    assert spy.calls[0]["capture_layer_ids"] == list(CAPTURE_IDS)
+    assert spy.calls[0]["capture_gdn_states"] is False
+    # Full width, untrimmed: 40 columns, and nothing is owed to the drafter.
+    assert gen_batch.hidden.shape == (2, RP_MAX_SUFFIX, len(CAPTURE_IDS) * 128)
+    assert gen_batch.target_hidden_offset == 0
+    assert batch._prefill_hidden.keep is None
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("declining chunked prefill" in m for m in messages), messages
+    assert any("right-padded batch" in m for m in messages), messages
+
+
+def test_a_right_padded_batch_hands_the_drafter_the_whole_prompt_per_row():
+    """A warm row's prefill input is its SUFFIX; its prompt is prefix + suffix.
+
+    Before this policy, row 0's ``prompt_tokens`` was its 24-token suffix
+    right-padded with 16 zeros -- an n-gram corpus missing everything the cache
+    already held, and 16 trailing zeros that were never tokens at all.
+    """
+    gen_batch, _, _ = _right_padded_batch(step=BATCH_STEP, drafter=_StubDrafter())
+
+    assert gen_batch.prompt_tokens.shape == (2, len(RP_FULL[0]))
+    for row, whole in enumerate(RP_FULL):
+        assert gen_batch.prompt_tokens[row].tolist() == whole, f"row {row}"
+    # Specifically: row 0 is NOT the right-padded suffix it prefills with.
+    assert gen_batch.prompt_tokens[0].tolist() != (
+        RP_SUFFIX[0] + [0] * RP_RIGHT_PAD[0]
+    )
+
+
+def test_a_right_padded_spec_prefill_matches_the_greedy_arm_it_now_shares():
+    """Refusing the chunking puts the spec arm on the unchunked decomposition.
+
+    So it must be bit-identical to unchunked greedy -- per row, in the sampled token
+    and in every prompt-cache array.  (Against CHUNKED greedy it is not, and must not
+    be expected to be: chunked greedy still walks into the negative-index defect
+    pinned by the next test.)
+    """
+    spec, _, _ = _right_padded_batch(step=BATCH_STEP, drafter=_StubDrafter())
+    greedy_unchunked, _, _ = _right_padded_batch(step=None, drafter=None)
+
+    assert _first_tokens(spec) == _first_tokens(greedy_unchunked)
+
+    spec_arrays = _cache_arrays(spec.prompt_cache)
+    greedy_arrays = _cache_arrays(greedy_unchunked.prompt_cache)
+    assert len(spec_arrays) == len(greedy_arrays) == 10
+    for i, (a, b) in enumerate(zip(spec_arrays, greedy_arrays)):
+        assert a.shape == b.shape, f"cache array {i}"
+        if a.ndim and a.shape[0] == 2:
+            for row in range(2):
+                assert mx.array_equal(
+                    a[row : row + 1], b[row : row + 1]
+                ), f"cache array {i}, row {row}"
+        else:
+            assert mx.array_equal(a, b), f"cache array {i}"
+
+
+def test_right_padded_chunked_prefill_indexes_a_negative_row_position():
+    """PRE-EXISTING DEFECT, pinned here, NOT fixed by this branch.
+
+    ``PromptProcessingBatch.generate`` picks each row's last real token at
+    ``seq - 1 - right_pad[i]`` (``generate/ar.py:2213-2219``) where ``seq`` is the
+    width of the FINAL forward.  Unchunked that is the whole prompt and the index is
+    right.  Once the prefill chunked, ``seq`` is only what the loop left over, and
+    for a right-padded row the index goes NEGATIVE -- an out-of-range
+    ``take_along_axis`` on an 8-wide axis.
+
+    Measured on this fixture: unchunked greedy emits [125, 99]; chunked greedy emits
+    a different first token for the padded row at every chunk size tried
+    (step 4 -> 76, 8 -> 112, 12 -> 0, 16 -> 54, 24 -> 1, 32 -> 54), while the second
+    row -- which carries no right padding -- emits 99 in every arm, and the prompt
+    cache is bit-equal in every arm.  So the cache is right and the SELECTION is
+    wrong.  It needs no drafter: this is the greedy batch path.
+
+    Delete this test when the index is fixed to count from the whole prompt.
+    """
+    lm = _lm()
+    padded = _right_pad_prompts(RP_SUFFIX, max_length=RP_MAX_SUFFIX)
+    batch = PromptProcessingBatch(
+        model=lm,
+        uids=[0, 1],
+        input_ids=RP_SUFFIX,
+        max_tokens=[4, 4],
+        inputs_embeds=lm.model.embed_tokens(padded),
+        prompt_kwargs={},
+        prefill_step_size=BATCH_STEP,
+        right_pad_per_row=list(RP_RIGHT_PAD),
+        suffix_lens=[len(s) for s in RP_SUFFIX],
+    )
+    # No drafter, so nothing declines the chunking.
+    assert batch.prefill_step_size == BATCH_STEP
+    while batch.needs_processing():
+        batch.prompt_step()
+
+    seq = batch._inputs_embeds.shape[1]  # the final forward's width
+    assert seq < RP_MAX_SUFFIX, "the prefill did not chunk; fixture is wrong"
+    indices = [seq - 1 - pad for pad in batch._right_pad_per_row]
+    assert indices[1] >= 0, "the unpadded row is fine"
+    assert indices[0] < 0, (
+        f"expected a negative index for the right-padded row, got {indices[0]}; "
+        "if this now passes the defect is fixed -- delete this test"
+    )
+
+
+def test_a_warm_row_without_a_recoverable_prefix_declines_the_trim(caplog):
+    """The other refusal: a warm row whose whole prompt cannot be named.
+
+    ``apc_meta`` declares a prefix but carries no ``full_input_ids``, so the drafter
+    cannot be handed the whole prompt.  It does not get a trimmed one either -- and
+    ``prompt_tokens`` stays the prefill input rather than silently passing a suffix
+    off as a prompt.
+    """
+    rows = [list(range(3, 27)), list(range(7, 47))]
+    meta = [{"prefix_len": 5}, None]  # prefix declared, whole prompt not
+
+    lm = _lm()
+    spy = _BatchSpy(lm)
+    padded = _left_pad_prompts(rows)
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.generate"):
+        batch = PromptProcessingBatch(
+            model=spy,
+            uids=[0, 1],
+            input_ids=rows,
+            max_tokens=[4, 4],
+            inputs_embeds=lm.model.embed_tokens(padded),
+            prompt_kwargs={},
+            prefill_step_size=BATCH_STEP,
+            apc_meta=meta,
+            draft_model=_StubDrafter(),
+            draft_kind="dflash",
+        )
+    while batch.needs_processing():
+        batch.prompt_step()
+    gen_batch = batch.generate(
+        sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        stop_criteria=lambda token: False,
+    )
+
+    assert batch.prefill_step_size is None
+    assert len(spy.calls) == 1
+    assert gen_batch.hidden.shape == (2, BATCH_S, len(CAPTURE_IDS) * 128)
+    assert gen_batch.target_hidden_offset == 0
+    assert mx.array_equal(gen_batch.prompt_tokens, padded)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("not recoverable" in m for m in messages), messages

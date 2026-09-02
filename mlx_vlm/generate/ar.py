@@ -1786,6 +1786,10 @@ class PromptProcessingBatch:
         # a snapshot taken before the loop starts.  Passing ``self._input_ids`` at
         # the round-loop call site instead hands over only the tail that survived
         # chunking.  ``generate_step`` keeps the same snapshot as ``full_prompt_ids``.
+        #
+        # This is only the PREFILL input, though: on a warm row it is the suffix, and
+        # the prefix came from a cache.  Refined below once ``_apc_meta`` is known --
+        # see ``_whole_prompt_ids_rows``.
         self._speculative_prompt_ids = self._input_ids
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
@@ -1932,13 +1936,91 @@ class PromptProcessingBatch:
             # consumer wants the LAST token only, so it stays off the chunks.
             if self._prefill_capture_kwargs.get("capture_layer_ids"):
                 self._chunk_capture_kwargs = self._prefill_capture_kwargs
+
+        # ``prompt_tokens`` must be the WHOLE prompt, and on a warm row the prefill
+        # input is only the suffix.  ``_build_mixed_prompt_batch`` records the whole
+        # thing per row as ``apc_meta[i]["full_input_ids"]``; recover it from there.
+        whole_rows = self._whole_prompt_ids_rows(input_ids, self._apc_meta)
+        if whole_rows is not None:
+            self._speculative_prompt_ids = _left_pad_prompts(whole_rows)
+
+        # Two refusals, both of them policy rather than mechanism, and both of them
+        # costing memory rather than correctness.
+        #
+        # 1.  A RIGHT-PADDED batch (the mixed warm/cold driver,
+        #     ``_build_mixed_prompt_batch``) is refused both halves of the chunked
+        #     capture.  The drafter's window is the TRAILING rows of the capture, and
+        #     for a short right-padded row those are padding; and a chunk boundary is
+        #     not the same column of real content in every row, so the pieces the
+        #     accumulator stitches do not line up across the batch.  Declining
+        #     chunking also keeps this path away from a SECOND, pre-existing defect:
+        #     the last-real-token index below is computed as ``seq - 1 - right_pad``
+        #     against the FINAL forward's width, which goes negative once the prefill
+        #     chunked, so a right-padded row already samples the wrong position under
+        #     chunking with no drafter attached at all.
+        # 2.  A warm row whose prefix cannot be named (no ``full_input_ids``) means
+        #     the drafter cannot be handed the whole prompt, so it does not get a
+        #     trimmed one either.
+        #
+        # In both cases the capture stays FULL WIDTH and untrimmed and the prefill
+        # runs in one forward.  ``capture_gdn_states=False`` still rides on it, so
+        # the sequence-shaped KDA rollback stash is still never built; what is given
+        # back is the prefill's own logits and live set, i.e. exactly the cost this
+        # branch's parent started from.
+        self._capture_refusal: Optional[str] = None
+        if self._chunk_capture_kwargs:
+            if right_pad_per_row is not None:
+                self._capture_refusal = (
+                    "right-padded batch (mixed warm/cold prefill): the drafter's "
+                    "window is the trailing rows, which are padding for a short "
+                    "row, and a chunk boundary is not the same column of real "
+                    "content in every row"
+                )
+            elif whole_rows is None:
+                self._capture_refusal = (
+                    "a warm row's prefix is not recoverable (apc_meta carries no "
+                    "full_input_ids), so the drafter cannot be handed the whole "
+                    "prompt"
+                )
+        if self._capture_refusal is not None:
+            logger.info(
+                "speculative prefill: declining chunked prefill and the "
+                "trailing-context trim for this batch -- %s. The capture stays full "
+                "width and the prefill runs in one forward; capture_gdn_states is "
+                "still off.",
+                self._capture_refusal,
+            )
+            self.prefill_step_size = None
         self._prefill_hidden = PrefillHiddenAccumulator(
             keep=(
                 prefill_context_keep(draft_kind, draft_model)
-                if self._chunk_capture_kwargs
+                if self._chunk_capture_kwargs and self._capture_refusal is None
                 else None
             )
         )
+
+    @staticmethod
+    def _whole_prompt_ids_rows(input_ids, apc_meta):
+        """The whole prompt per row, or ``None`` if a warm row's prefix is unnameable.
+
+        A cold row's prefill input IS its whole prompt.  A warm row's is the suffix;
+        its whole prompt is ``apc_meta[i]["full_input_ids"]``.  Returning ``None``
+        rather than a best effort is deliberate: a caller that silently used the
+        suffix would hand the prompt-lookup drafter an n-gram corpus missing
+        everything the cache already held.
+        """
+        rows = []
+        for i, ids in enumerate(input_ids):
+            meta = apc_meta[i] if i < len(apc_meta) else None
+            full = (meta or {}).get("full_input_ids")
+            prefix_len = int((meta or {}).get("prefix_len", 0) or 0)
+            if full is not None and len(full) >= len(ids):
+                rows.append(list(full))
+            elif prefix_len > 0:
+                return None
+            else:
+                rows.append(list(ids))
+        return rows
 
     def __len__(self):
         return len(self.uids)
