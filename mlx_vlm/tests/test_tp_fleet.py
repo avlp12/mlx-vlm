@@ -255,9 +255,42 @@ def test_a_missing_memory_section_does_not_block(monkeypatch):
     text = _QUIET_HEAD
     r = fleet.require_quiet_fleet(threshold_gb=20, ps_runner=lambda host: text)
     assert r["quiet"] is True
-    assert r["pressure"]["localhost"] == {
-        "swap_used_gb": None, "free_pct": None, "free_gb": None,
-        "wired_gb": None}
+    # Assert the INTENT -- every field unanswered -- rather than an exact key
+    # set. The key set legitimately grew when the reclaimable accounting added
+    # inactive/file-backed counts, and an exact-equality assertion turned that
+    # into a spurious failure about something the test does not care about.
+    pressure = r["pressure"]["localhost"]
+    assert set(pressure) >= {"swap_used_gb", "free_pct", "free_gb", "wired_gb"}
+    assert all(v is None for v in pressure.values()), pressure
+
+
+def test_peer_without_page_counts_downgrades_to_free_only(caplog):
+    """An older peer sends no inactive/file-backed counts. Under the reclaimable
+    accounting it must be judged by the OLDER, STRICTER rule -- not refused for
+    the question, and never waved through silently."""
+    head = _QUIET_HEAD + (
+        "===MEM===\n"
+        "total = 0.00M  used = 0.00M  free = 0.00M\n"
+        "System-wide memory free percentage: 90%\n"
+        "VMFREEGB 400.0 6.0\n"          # two fields only: the older probe
+    )
+    with caplog.at_level("WARNING"):
+        r = fleet.require_headroom_box(None, 183.0, label="old peer",
+                                       ps_runner=lambda host: head,
+                                       accounting="reclaimable")
+    assert r["accounting"] == "free_only"
+    assert r["accounting_downgraded_from"] == "reclaimable"
+    assert "free_only" in r["downgrade_reason"]
+    assert any("free_only" in m for m in caplog.messages), caplog.messages
+    # 400 GB free clears 183+60, so the stricter rule still passes it.
+    assert r["headroom_ok"] is True
+    # And the stricter rule must actually BE stricter: the same peer with only
+    # 100 GB free is refused, where reclaimable would have had nothing to add.
+    thin = head.replace("VMFREEGB 400.0 6.0", "VMFREEGB 100.0 6.0")
+    with pytest.raises(fleet.HeavyRunActive, match="free_only"):
+        fleet.require_headroom_box(None, 183.0, label="old peer thin",
+                                   ps_runner=lambda host: thin,
+                                   accounting="reclaimable")
 
 
 def test_absolute_headroom_is_what_a_load_actually_needs():

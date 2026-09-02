@@ -697,10 +697,25 @@ def require_headroom_box(host: Optional[str], load_gb: float,
                          f"expected one of {sorted(avail)}")
     have = avail[acct]
     if have is None:
+        # A peer that cannot answer must not be REFUSED for the question -- it
+        # gets the older, stricter rule instead. Refusing here would take a box
+        # offline for running an older build, which is a worse failure than
+        # being conservative about its headroom. Never a silent pass: the
+        # downgrade is logged and lands in the receipt.
+        fallback = "free_only"
+        receipt["accounting_downgraded_from"] = acct
+        receipt["accounting"] = acct = fallback
+        receipt["downgrade_reason"] = (
+            "probe reported no inactive/file-backed page counts "
+            "(older build on this box?); falling back to free_only")
+        logger.warning(
+            "[gate] %s: %s -- headroom for %s judged under free_only instead",
+            who, receipt["downgrade_reason"], label or "this load")
+        have = avail[fallback]
+    if have is None:
         raise HeavyRunActive(
-            f"refusing {label or 'this load'} on {who}: accounting {acct!r} "
-            "needs inactive/file-backed page counts and this box's probe did "
-            "not report them (older build on the peer?).")
+            f"refusing {label or 'this load'} on {who}: the probe reported no "
+            "usable memory numbers at all, so headroom cannot be judged.")
     if have < need:
         receipt["quiet"] = False
         extra = ""

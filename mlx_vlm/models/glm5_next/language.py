@@ -1790,6 +1790,34 @@ class Glm5NextDecoderLayer(nn.Module):
         self.ffn_hc = HyperConnection(config)
         self.compile_ffn = True
         self._ffn_c = None
+        # DEFAULT OFF: measured, not demonstrated. In the configuration that
+        # ships (compile_ffn already on) three ABBA-paired cycles of 120 timed
+        # steps gave +0.324, +0.235, -0.147 ms -- mean +0.137 ms on a 33.9 ms
+        # step, 0.4%, with the sign flipping. That is indistinguishable from
+        # zero, and a default-on compiled graph per layer costs compile time,
+        # memory and a real staleness hazard (_attn_pre_c captures the attn_hc
+        # it traced) for no measured gain. The mechanism is kept, tested and
+        # TP-guarded so it can be switched on if a future change makes the
+        # attention-half glue heavy enough to matter.
+        self.compile_attn = False
+        self._attn_pre_c = None
+
+    def _attn_prologue(self, x: mx.array):
+        """Stateless attention-half prologue: hyper-connection + input norm.
+
+        The FFN half is compiled whole because it touches no cache.  The
+        attention half cannot be -- ``self_attn`` advances the KV / recurrent
+        state, and ``mx.compile`` would trace that mutation once and then replay
+        a stale graph.  So the compiled unit is the glue in FRONT of the
+        attention, which is pure in ``x`` and this module's own weights.  The
+        glue BEHIND it, ``hc_expand``, already carries ``@mx.compile``.
+
+        ``ffn_hc`` is the same HyperConnection class and already runs inside a
+        compiled block today, so the fused sinkhorn+collapse ``metal_kernel`` is
+        known to survive tracing.
+        """
+        xc, post, comb = self.attn_hc(x)
+        return self.input_layernorm(xc), post, comb
 
     def __call__(
         self,
@@ -1799,11 +1827,20 @@ class Glm5NextDecoderLayer(nn.Module):
         gdn_sink: Optional[list] = None,
     ) -> mx.array:
         residual = x
-        xc, post, comb = self.attn_hc(x)
-        if self.is_linear:
-            r = self.self_attn(self.input_layernorm(xc), mask, cache, gdn_sink=gdn_sink)
+        # Same gate as the FFN half below, for the same reason and with the same
+        # per-shape compile cache: B=1 and S<=8 covers plain decode and the
+        # speculative verify block, and adaptive-K varies S only inside that
+        # window, so the variant count stays bounded at 8 per layer.
+        if self.compile_attn and x.shape[0] == 1 and x.shape[1] <= 8:
+            if self._attn_pre_c is None:
+                self._attn_pre_c = mx.compile(self._attn_prologue)
+            h, post, comb = self._attn_pre_c(x)
         else:
-            r = self.self_attn(self.input_layernorm(xc), mask, cache)
+            h, post, comb = self._attn_prologue(x)
+        if self.is_linear:
+            r = self.self_attn(h, mask, cache, gdn_sink=gdn_sink)
+        else:
+            r = self.self_attn(h, mask, cache)
         x = hc_expand(r, residual, post, comb)
         # Compile the FFN block for single-stream decode (B=1) at small sequence lengths:
         # S=1 decode and the short S=block_size speculative-verify block. mx.compile keeps

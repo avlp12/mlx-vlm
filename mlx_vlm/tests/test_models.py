@@ -3259,6 +3259,52 @@ class TestModels(unittest.TestCase):
         self.assertEqual(last.shape[1], 1)
         self.assertLess(float(mx.max(mx.abs(last[:, -1] - full[:, -1]))), 1e-4)
 
+    def _glm5_next_cfg(self):
+        # Shared by the compile tests so they build the SAME model,
+        # not a lookalike that could drift apart from it.
+        from mlx_vlm.models import glm5_next
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        return cfg
+
     def test_glm5_next_ffn_compile_matches_eager(self):
         # Compiling the stateless FFN block (mx.compile) must match the eager path.
         from mlx_vlm.models import glm5_next
@@ -3316,6 +3362,62 @@ class TestModels(unittest.TestCase):
             # decode step is single-stream (B=1, S=1) -> the compiled FFN path is active
             outs[on] = lm(mx.array([[19]]), cache=c).logits
         self.assertLess(float(mx.max(mx.abs(outs[True] - outs[False]))), 1e-3)
+
+    def test_glm5_next_attn_prologue_compile_matches_eager(self):
+        # The attention-half prologue (attn_hc + input_layernorm) is compiled the
+        # way the FFN half is.  It must not change the answer, and -- unlike the
+        # FFN half -- it sits in FRONT of the cache-advancing attention, so a
+        # single step is not enough: a mis-traced prologue can agree once and
+        # then diverge as the cache moves.  Three steps through one cache.
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+        cfg = self._glm5_next_cfg()
+        lm = LanguageModel(cfg)
+        p = mx.array([[3, 5, 7, 9, 11, 13, 15, 17]])
+        outs = {}
+        for on in (False, True):
+            for L in lm.model.layers:
+                L.compile_attn = on
+                L._attn_pre_c = None
+                L.compile_ffn = False       # isolate the prologue
+                L._ffn_c = None
+            c = lm.make_cache()
+            lm(p, cache=c)                  # prefill (S>1: eager either way)
+            steps = []
+            for tok in (19, 23, 29):
+                steps.append(lm(mx.array([[tok]]), cache=c).logits)
+            mx.eval(steps)
+            outs[on] = steps
+            # Assert the path, never assume it. A comparison whose "compiled"
+            # arm silently stayed eager passes for the wrong reason -- the same
+            # failure shape as nn.Module's training=True default routing both
+            # arms of an HC comparison down the ops path.
+            built = [L._attn_pre_c is not None for L in lm.model.layers]
+            self.assertEqual(all(built), on,
+                             f"compile_attn={on} but compiled prologues={built}")
+        for i, (a, b) in enumerate(zip(outs[True], outs[False])):
+            self.assertLess(float(mx.max(mx.abs(a - b))), 1e-3,
+                            f"attention prologue compile diverged at step {i}")
+
+    def test_glm5_next_tp_shard_disables_both_compiles(self):
+        # Compiling a graph that contains a collective stalled the serving path
+        # on 2026-09-01.  shard_layer turns the FFN compile off for that reason;
+        # the attention prologue must be turned off with it, and this is the
+        # check that a future edit cannot quietly re-enable one of them.
+        from mlx_vlm.tp.glm5_next import shard_layer
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+        cfg = self._glm5_next_cfg()
+        lm = LanguageModel(cfg)
+        layer = lm.model.layers[-1]
+        # compile_attn ships OFF (measured, not demonstrated), so turn both ON
+        # explicitly first -- the property under test is that shard_layer turns
+        # them off, which is only meaningful against an enabled starting state.
+        layer.compile_ffn = True
+        layer.compile_attn = True
+        shard_layer(layer, rank=0, size=1, reduce_fn=lambda x: x)
+        self.assertFalse(layer.compile_ffn)
+        self.assertFalse(layer.compile_attn)
+        self.assertIsNone(layer._ffn_c)
+        self.assertIsNone(layer._attn_pre_c)
 
     def test_glm5_next_indexer_stale_pool_guard(self):
         # Under continuous batching, BatchGenerator grows/shrinks the batch axis

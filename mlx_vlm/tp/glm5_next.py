@@ -169,6 +169,14 @@ def shard_layer(layer, rank: int, size: int, reduce_fn):
     # compile it.
     layer.compile_ffn = False
     layer._ffn_c = None
+    # The attention-half prologue (attn_hc + input_layernorm) is replicated, not
+    # sharded, so it should contain no collective -- the all-reduce wraps
+    # self_attn, which sits outside it.  Compiling it under TP is nevertheless
+    # the same CLASS of risk that bit on 2026-09-01, and a few hundred
+    # microseconds is not worth finding out in the distributed path.  Off here,
+    # on everywhere else.
+    layer.compile_attn = False
+    layer._attn_pre_c = None
     if layer.is_linear:
         shard_kda(layer.self_attn, rank, size, reduce_fn)
     else:

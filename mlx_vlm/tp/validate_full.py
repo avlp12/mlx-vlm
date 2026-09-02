@@ -79,6 +79,7 @@ def validate_full(size: int = 2, seed: int = 0, quant: bool = False,
     # reference: unsharded, `steps` decode steps through one cache
     for layer in ref.layers:
         layer.compile_ffn = False
+        layer.compile_attn = False
     ref_cache = _caches(ref)
     ref_out = [ref(ids, cache=ref_cache) for _ in range(steps)]
     mx.eval(ref_out)
@@ -89,6 +90,7 @@ def validate_full(size: int = 2, seed: int = 0, quant: bool = False,
         m = copy.deepcopy(ref)
         for layer in m.layers:
             layer.compile_ffn = False
+            layer.compile_attn = False
         shard_model(m, r, size, reduce_fn=group.reducer(r))
         # the slices are lazy and bound to THIS thread's stream; materialize
         # them here or the workers cannot evaluate a graph that references them
