@@ -494,7 +494,16 @@ def router_fp32_enabled(config: Any = None) -> bool:
     to what astype produces today and the matmul receives identical inputs.
     """
     flag = getattr(config, "router_weight_fp32", None) if config is not None else None
-    return bool(flag) if flag is not None else _env_flag(ROUTER_FP32_ENV)
+    if flag is not None:
+        return bool(flag)
+    if ROUTER_FP32_ENV in os.environ:
+        return _env_flag(ROUTER_FP32_ENV)
+    # Default ON since 2026-09-02: paired in-process A/B on the served decode path
+    # measured +0.87 / +1.58 / +1.34 % (ABBA, 3 cycles, 100 steps/arm), sign
+    # consistent, max logit diff exactly 0.0 against a control that fails when
+    # the router weight is perturbed by 1e-4.  Set MLX_VLM_GLM5_ROUTER_FP32=0 to
+    # restore the per-token fp32 cast.  Cost: +99 MB resident (42 fp32 routers).
+    return True
 
 
 def fuse_shared_gate_up(weights: dict) -> dict:
