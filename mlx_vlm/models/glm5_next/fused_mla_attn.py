@@ -52,6 +52,34 @@ The kernel works on a 3-D view so one kernel serves both call sites:
     (at L==1 with a single KV head the head axis and the query axis are interchangeable --
      that fold is what turns 64 broadcast GEMVs into one GEMM; see _gathered_attention.)
 
+MEASUREMENT STATUS (read before quoting any number for this kernel)
+------------------------------------------------------------------
+Everything below is ISOLATED MICROBENCH at the model's shapes on one M3 Ultra.  It is not an
+in-model measurement; no end-to-end number is claimed, and the adoption decision is pending a
+coordinator-granted box window.  Receipt: lane5_probe1_CLEAN_and_contamination.md.
+
+Paired ratios against MLX's composite fallback, current tiling (BQ=32, BK=128):
+
+    dense prefill, depth 8192, Kv 10240, top-k mask   2.04x   <- the kernel's real win
+    dense prefill, depth 0,    Kv 2048,  causal       0.85x   <- still a LOSS
+    gathered chunk, batch 256, Kv 2051                2.25x   <- but the plain MQA reshape
+                                                                gets 4.07x on the same cell,
+                                                                so the reshape wins there
+
+The kernel runs at roughly 70% of the rate MLX's own GEMM achieves on the same contraction.
+Closing that gap is what would make it win everywhere; it is not closed.
+
+RETRACTED, do not re-attempt: batching the QK fragment loads into `simdgroup_bfloat8x8 A[4],
+B[4]` arrays (to hide device-load latency) made every cell 2.5-3.6x SLOWER -- 34.5 -> 122.8 ms
+on the causal depth-0 cell.  Arrays of simdgroup_matrix spill here even with the indices
+constant after full unrolling.
+
+Known-bad regime, guarded in language.py rather than here: this is a tiled kernel with no
+split-K.  It launches ``G * ceil(R / 32)`` threadgroups, so single-stream decode (G = 1, R = 64
+-> TWO threadgroups on an 80-core GPU) is catastrophically under-occupied -- measured 1.42 ms
+against the composite's 0.31 ms.  A decode variant needs the second-pass reduce that MLX's own
+``sdpa_vector_2pass_*`` kernels use; it is not written yet.
+
 NUMERICS
 --------
 fp32 score and output accumulation, bf16 inputs/outputs, probabilities rounded to bf16 before
@@ -88,15 +116,17 @@ inline short2 mla_frag_coord(ushort lane) {
 # BQ x BK score tile; NSG = (BQ/8) * (BK/8) simdgroups, and the same grid is reused for the
 # O tile as WM=(BQ/8) x WN=(BK/8) with each simdgroup owning D/WN output columns.
 _BQ = 32
-_BK = 64
-_NSG = (_BQ // 8) * (_BK // 8)          # 32
+_BK = 128
+_SFRAG = 2                              # score fragments per simdgroup along the key axis
+_NSG = (_BQ // 8) * (_BK // (8 * _SFRAG))   # 4 * 8 = 32
 _NTHREADS = _NSG * 32                   # 1024
 
 _SOURCE = r"""
   constexpr int BQ  = """ + str(_BQ) + r""";
   constexpr int BK  = """ + str(_BK) + r""";
+  constexpr int SFRAG = 2;                    // score fragments per simdgroup, key axis
   constexpr int WM  = BQ / 8;                 // 4  simdgroup rows
-  constexpr int WN  = BK / 8;                 // 8  simdgroup cols
+  constexpr int WN  = BK / (8 * SFRAG);       // 8  simdgroup cols
   constexpr int NSG = WM * WN;                // 32 simdgroups
   constexpr int DCOLS = D / WN;               // 64 output cols per simdgroup
   constexpr int NFRAG = DCOLS / 8;            // 8  O fragments per simdgroup
@@ -144,9 +174,16 @@ _SOURCE = r"""
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const int nk_tiles = N / BK;
+  // Tail handling WITHOUT padding the KV tensor.  A partial last tile cannot be read with
+  // simdgroup_load (it would run past the allocation), and padding kv costs a full copy --
+  // 553 MB per call at the gathered prefill shape, more than the attention itself.  Instead the
+  // last tile is SHIFTED BACK to end exactly at NV and the keys it re-covers are masked off by
+  // the `>= lo` test, so every key is still counted exactly once.  Requires NV >= BK, which the
+  // host checks.
+  const int nk_tiles = (N + BK - 1) / BK;
   for (int kb = 0; kb < nk_tiles; ++kb) {
-    const int k0 = kb * BK;
+    const int lo = kb * BK;
+    const int k0 = (lo + BK > N) ? (N - BK) : lo;
 
     // ---- tile liveness: skip a tile no query in this block can see.
     // Generic over causal and over the indexer's scattered top-k mask; this is where the
@@ -159,7 +196,7 @@ _SOURCE = r"""
       for (uint i = thread_position_in_threadgroup.x; i < BQ * BK; i += NSG * 32) {
         int r = q_row0 + int(i / BK);
         int c = k0 + int(i % BK);
-        if (r < R && c < NV) {
+        if (r < R && c >= lo && c < NV) {
           ulong mo = (ulong)(MSK_GS ? g * MSK_GS : 0) + (ulong)(MSK_RS ? r * MSK_RS : 0) + (ulong)c;
           if (mask[mo]) { live = 1; break; }
         }
@@ -171,59 +208,68 @@ _SOURCE = r"""
 #endif
 
     // ---- S = Q . K^T   (one 8x8 fragment per simdgroup, full D contraction)
-    simdgroup_float8x8 S = simdgroup_float8x8(0);
+    simdgroup_float8x8 S0 = simdgroup_float8x8(0);
+    simdgroup_float8x8 S1 = simdgroup_float8x8(0);
     {
-      // Batch UNROLL fragment loads before the mmas.  With one 8x8 output fragment per
-      // simdgroup the natural loop is 2 device loads per mma and stalls on load latency;
-      // issuing UNROLL pairs up front lets the compiler overlap them.  This is the single
-      // largest throughput lever measured on this kernel.
-      constexpr int UNROLL = 4;
+      // NOTE, measured: batching the fragment loads into arrays
+      // (simdgroup_bfloat8x8 A[4], B[4]; load all; then 4 mmas) to hide device-load latency
+      // made this kernel 2.5-3.6x SLOWER on every cell -- 34 -> 123 ms on the causal depth-0
+      // prefill cell.  Arrays of simdgroup_matrix do not stay in registers here even when the
+      // indices are compile-time constants after full unrolling; the extra live matrices spill.
+      // The plain load-load-mma loop below is the faster form.  Do not "optimise" it back.
+      // SFRAG=2 score fragments per simdgroup: one Q fragment feeds TWO mmas, so the
+      // load:mma ratio is 3:2 instead of 2:1 and the Q row block is fetched half as often.
+      // Written with named matrices, never an array -- see the NOTE below.
       const device bfloat16_t* qp = Q + (ulong)(q_row0 + 8 * wm) * D;
-      const device bfloat16_t* kp = KV + (ulong)(k0 + 8 * wn) * D;
-      for (int d = 0; d < D; d += 8 * UNROLL) {
-        simdgroup_bfloat8x8 A[UNROLL], B[UNROLL];
-#pragma clang loop unroll(full)
-        for (int u = 0; u < UNROLL; ++u) {
-          simdgroup_load(A[u], qp + d + 8 * u, D);
-          simdgroup_load(B[u], kp + d + 8 * u, D, ulong2(0, 0), true);   // K^T
-        }
-#pragma clang loop unroll(full)
-        for (int u = 0; u < UNROLL; ++u)
-          simdgroup_multiply_accumulate(S, A[u], B[u], S);
+      const device bfloat16_t* kp0 = KV + (ulong)(k0 + 8 * SFRAG * wn) * D;
+      const device bfloat16_t* kp1 = kp0 + (ulong)8 * D;
+      for (int d = 0; d < D; d += 8) {
+        simdgroup_bfloat8x8 A, B0, B1;
+        simdgroup_load(A, qp + d, D);
+        simdgroup_load(B0, kp0 + d, D, ulong2(0, 0), true);   // K^T
+        simdgroup_load(B1, kp1 + d, D, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(S0, A, B0, S0);
+        simdgroup_multiply_accumulate(S1, A, B1, S1);
       }
     }
-    simdgroup_store(S, Sm + (8 * wm) * LDS + 8 * wn, LDS);
+    simdgroup_store(S0, Sm + (8 * wm) * LDS + 8 * SFRAG * wn, LDS);
+    simdgroup_store(S1, Sm + (8 * wm) * LDS + 8 * SFRAG * wn + 8, LDS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ---- online softmax: simdgroup `sg` owns row `sg` (NSG == BQ), 2 cols per lane
     {
-      const int r = sg;
+      constexpr int CPL = BK / 32;              // score columns per lane
+      const int r = sg;                         // NSG == BQ, so simdgroup sg owns row sg
       const int gr = q_row0 + r;
-      float v0 = -3.0e38f, v1 = -3.0e38f;
-      const int c0 = int(lane) * 2;
-      if (gr < R) {
-        v0 = Sm[r * LDS + c0]     * SCALE;
-        v1 = Sm[r * LDS + c0 + 1] * SCALE;
-        const int gc0 = k0 + c0;
-        if (gc0     >= NV) v0 = -3.0e38f;
-        if (gc0 + 1 >= NV) v1 = -3.0e38f;
+      const int c0 = int(lane) * CPL;
+      float v[CPL];
 #if HAS_MASK
-        {
-          ulong mo = (ulong)(MSK_GS ? g * MSK_GS : 0) + (ulong)(MSK_RS ? gr * MSK_RS : 0);
-          if (gc0     <  NV && !mask[mo + gc0])     v0 = -3.0e38f;
-          if (gc0 + 1 <  NV && !mask[mo + gc0 + 1]) v1 = -3.0e38f;
-        }
+      const ulong mo = (ulong)(MSK_GS ? g * MSK_GS : 0) + (ulong)(MSK_RS ? gr * MSK_RS : 0);
 #endif
+      float mt = -3.0e38f;
+      for (int t = 0; t < CPL; ++t) {
+        float x = -3.0e38f;
+        const int gc = k0 + c0 + t;
+        if (gr < R && gc >= lo && gc < NV) {
+          x = Sm[r * LDS + c0 + t] * SCALE;
+#if HAS_MASK
+          if (!mask[mo + gc]) x = -3.0e38f;
+#endif
+        }
+        v[t] = x;
+        mt = fmax(mt, x);
       }
-      const float mt = simd_max(fmax(v0, v1));
+      mt = simd_max(mt);
       const float mprev = mrow[r];
       const float mnew = fmax(mprev, mt);
       const float corr = fast::exp(mprev - mnew);
-      const float p0 = fast::exp(v0 - mnew);
-      const float p1 = fast::exp(v1 - mnew);
-      const float st = simd_sum(p0 + p1);
-      Pm[r * LDP + c0]     = bfloat16_t(p0);
-      Pm[r * LDP + c0 + 1] = bfloat16_t(p1);
+      float sl = 0.0f;
+      for (int t = 0; t < CPL; ++t) {
+        const float pt = fast::exp(v[t] - mnew);
+        sl += pt;
+        Pm[r * LDP + c0 + t] = bfloat16_t(pt);
+      }
+      const float st = simd_sum(sl);
       if (lane == 0) {
         mrow[r] = mnew;
         lrow[r] = lrow[r] * corr + st;
@@ -248,13 +294,11 @@ _SOURCE = r"""
       for (int kk = 0; kk < BK; kk += 8) {
         simdgroup_bfloat8x8 A;
         simdgroup_load(A, pp + kk, LDP);
-        simdgroup_bfloat8x8 B[NFRAG];
-#pragma clang loop unroll(full)
-        for (int f = 0; f < NFRAG; ++f)
-          simdgroup_load(B[f], vp + (ulong)kk * D + f * 8, D);
-#pragma clang loop unroll(full)
-        for (int f = 0; f < NFRAG; ++f)
-          simdgroup_multiply_accumulate(O[f], A, B[f], O[f]);
+        for (int f = 0; f < NFRAG; ++f) {
+          simdgroup_bfloat8x8 B;
+          simdgroup_load(B, vp + (ulong)kk * D + f * 8, D);
+          simdgroup_multiply_accumulate(O[f], A, B, O[f]);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -322,11 +366,12 @@ def mla_flash_attention(
     if q.dtype != mx.bfloat16 or kv.dtype != mx.bfloat16:
         raise ValueError("fused MLA attention is bfloat16-only")
 
+    # The kernel shifts its last key tile back to end at N, so no padding is needed for a
+    # non-multiple key count.  Only a key count SHORTER than one tile has nowhere to shift to.
     n_valid = N
-    pad = (-N) % _BK
-    if pad:
-        kv = mx.pad(kv, [(0, 0), (0, pad), (0, 0)])
-        N = N + pad
+    if N < _BK:
+        kv = mx.pad(kv, [(0, 0), (0, _BK - N), (0, 0)])
+        N = _BK
 
     has_mask = mask is not None
     if has_mask:
@@ -347,6 +392,8 @@ def mla_flash_attention(
         msk_gs = msk_rs = 0
 
     p = mx.array([R, N, G // Gk, msk_gs, msk_rs, n_valid], dtype=mx.int32)
+    # p[1] is the allocated key count (== n_valid unless a sub-tile pad happened);
+    # p[5] is the number of keys that carry data.
     inputs = [q, kv, p] + ([m] if has_mask else [])
     n_qtiles = (R + _BQ - 1) // _BQ
     return _kernel(D, has_mask, scale)(

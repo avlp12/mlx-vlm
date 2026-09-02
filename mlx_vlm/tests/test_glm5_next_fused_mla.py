@@ -34,7 +34,11 @@ class TestFusedMLA(unittest.TestCase):
     def setUp(self):
         self.saved = {
             k: os.environ.get(k)
-            for k in ("MLX_VLM_GLM5_MQA_FOLD", "MLX_VLM_GLM5_FUSED_MLA")
+            for k in (
+                "MLX_VLM_GLM5_MQA_FOLD",
+                "MLX_VLM_GLM5_FUSED_MLA",
+                "MLX_VLM_GLM5_FUSED_MLA_MIN_TG",
+            )
         }
 
     def tearDown(self):
@@ -167,7 +171,8 @@ class TestFusedMLA(unittest.TestCase):
 
         # dense prefill (L=96 > 1): only the fused kernel can take it; the fold is L==1 only.
         got, n_k, sh = self._run(
-            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1"}, x
+            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1",
+             "MLX_VLM_GLM5_FUSED_MLA_MIN_TG": "1"}, x
         )
         self.assertEqual(n_k, 1, "fused kernel was NOT entered on the dense prefill path")
         self.assertEqual(sh, [], "MLX's own sdpa should not be reached when the kernel takes it")
@@ -195,11 +200,30 @@ class TestFusedMLA(unittest.TestCase):
         self.assertLess(err, 8 * u, f"fold err={err} ulp={u}")
 
         got, n_k, sh = self._run(
-            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1"}, x
+            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1",
+             "MLX_VLM_GLM5_FUSED_MLA_MIN_TG": "1"}, x
         )
         self.assertEqual(n_k, 1, "fused kernel was NOT entered on the L==1 path")
         err = float(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max())
         self.assertLess(err, 8 * u, f"fused decode err={err} ulp={u}")
+
+
+    def test_small_launch_declines_the_kernel(self):
+        """At the default threadgroup floor a tiny launch must fall through, not run slow.
+
+        The test module is 8 heads / 1 batch, so an L==1 step asks for a single threadgroup.
+        The kernel is tiled with no split-K and loses badly there (1.42 ms vs 0.31 ms measured
+        at the real 64-head shape), so the guard must decline and hand the call back to MLX.
+        """
+        mx.random.seed(3)
+        x = mx.random.normal((1, 1, 256)).astype(mx.bfloat16)
+        mx.eval(x)
+        _, n_k, sh = self._run(
+            {"MLX_VLM_GLM5_MQA_FOLD": None, "MLX_VLM_GLM5_FUSED_MLA": "1",
+             "MLX_VLM_GLM5_FUSED_MLA_MIN_TG": None}, x
+        )
+        self.assertEqual(n_k, 0, "the launch-size guard did not decline a 1-threadgroup call")
+        self.assertEqual(sh, [(1, 8, 1, 512)])
 
 
 if __name__ == "__main__":

@@ -186,6 +186,10 @@ def _mla_absorb_multi_enabled() -> bool:
 _MQA_FOLD_ENV = None
 _FUSED_MLA_ENV = None
 
+# Threadgroup floor for the fused MLA kernel (see _mqa_sdpa).  80 GPU cores; one threadgroup per
+# 32 query rows per row-group, so 64 is one tile-wave with room for tail imbalance.
+_FUSED_MLA_MIN_TG = int(os.environ.get("MLX_VLM_GLM5_FUSED_MLA_MIN_TG", "64"))
+
 
 def _mqa_fold_enabled() -> bool:
     """Fold the head axis into the query axis when the KV has exactly one head.
@@ -244,7 +248,13 @@ def _mqa_sdpa(q, kv, scale, mask):
     B, H, L, D = q.shape
     N = kv.shape[2]
 
-    if _fused_mla_enabled() and kv.shape[1] == 1 and q.dtype == mx.bfloat16:
+    # The fused kernel is tiled with no split-K, so it launches G * ceil(R/32) threadgroups.
+    # Below that floor it cannot fill the GPU and loses badly to the composite -- measured
+    # 1.42 ms against 0.31 ms at single-stream decode (G=1, R=64 -> two threadgroups).
+    # Guard here rather than in the kernel so the kernel stays a plain primitive.
+    n_tg = (B * ((H + 31) // 32)) if L == 1 else (B * H * ((L + 31) // 32))
+    if _fused_mla_enabled() and n_tg >= _FUSED_MLA_MIN_TG and kv.shape[1] == 1 \
+            and q.dtype == mx.bfloat16:
         m3 = None
         if mask is not None:
             if mask.dtype != mx.bool_:
