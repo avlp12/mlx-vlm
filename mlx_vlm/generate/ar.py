@@ -22,8 +22,10 @@ from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
+    PrefillHiddenAccumulator,
     make_speculative_prompt_cache,
     prefill_capture_kwargs,
+    prefill_context_keep,
     run_speculative_rounds,
     run_speculative_server_rounds,
     speculative_hidden_state,
@@ -344,6 +346,34 @@ def generate_step(
         if hasattr(lm, "_rope_deltas"):
             lm._rope_deltas = None
 
+    # The chunk loop below must carry the SAME capture as the final forward, or
+    # the drafter is handed a one-row context (issue #2096: ``chunk_kwargs`` was
+    # built from ``kwargs`` only, so turning chunking on for a capturing drafter
+    # silently dropped the prompt).  Only a per-layer capture stitches back
+    # together -- see ``_run_chunked_speculative_prefill`` in server/generation.py
+    # for why MTP's ``return_hidden`` is deliberately excluded.
+    _prefill_capture_kwargs = (
+        prefill_capture_kwargs(
+            model.language_model if hasattr(model, "language_model") else model,
+            speculative_prefill_capture_kwargs,
+        )
+        if speculative_prefill_capture_kwargs
+        else {}
+    )
+    _chunk_capture_kwargs = (
+        _prefill_capture_kwargs
+        if _prefill_capture_kwargs.get("capture_layer_ids")
+        else {}
+    )
+    target_hidden_offset = 0
+    _prefill_hidden = PrefillHiddenAccumulator(
+        keep=(
+            prefill_context_keep(draft_kind, draft_model)
+            if _chunk_capture_kwargs
+            else None
+        )
+    )
+
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
 
@@ -352,12 +382,7 @@ def generate_step(
             # Prefill only -- with a drafter attached the loop below is unreachable
             # (the speculative branch returns first), so every _step that carries
             # these kwargs is a prefill forward.  Drop the rollback stash there.
-            step_kwargs = {
-                **kwargs,
-                **prefill_capture_kwargs(
-                    model.language_model, speculative_prefill_capture_kwargs
-                ),
-            }
+            step_kwargs = {**kwargs, **_prefill_capture_kwargs}
         if getattr(model.language_model, "supports_logits_to_keep", False):
             step_kwargs = {**step_kwargs, "logits_to_keep": 1}
 
@@ -485,7 +510,10 @@ def generate_step(
             # (vault merge fix: the old single ``checkpoint_len`` became the
             # boundary ladder -- pipeline stays disabled whenever any
             # checkpoint boundary is requested.)
-            if not ladder:
+            # ``_chunk_capture_kwargs`` disables it too: ``pipeline.prefill_chunk``
+            # returns no output object, so a pipelined chunk's hidden capture
+            # cannot be accumulated and the drafter would lose the prompt.
+            if not ladder and not _chunk_capture_kwargs:
                 from ..pipeline_runtime import maybe_open_pipeline
 
                 pipeline = maybe_open_pipeline(model, total_tokens, verbose=verbose)
@@ -506,6 +534,8 @@ def generate_step(
                     chunk_kwargs = kwargs
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**kwargs, "logits_to_keep": 1}
+                    if _chunk_capture_kwargs:
+                        chunk_kwargs = {**chunk_kwargs, **_chunk_capture_kwargs}
                     if pipeline is not None:
                         pipeline.prefill_chunk(
                             model,
@@ -516,15 +546,22 @@ def generate_step(
                         # only stage A's caches exist on this box until finalize
                         mx.eval([c.state for c in pipeline.local_caches(prompt_cache)])
                     else:
-                        model.language_model(
+                        chunk_out = model.language_model(
                             inputs=input_ids[:, :n_to_process],
                             inputs_embeds=inputs_embeds[:, :n_to_process],
                             cache=prompt_cache,
                             n_to_process=n_to_process,
                             **chunk_kwargs,
                         )
+                        _prefill_hidden.append(chunk_out)
+                        # Drop the chunk's logits (and any gdn stash) BEFORE the
+                        # eval, so the vocab-wide projection is never materialised
+                        # for a chunk nobody samples from.
+                        chunk_out = None
                         quantize_cache_fn(prompt_cache)
-                        mx.eval([c.state for c in prompt_cache])
+                        mx.eval(
+                            [c.state for c in prompt_cache] + _prefill_hidden.pending()
+                        )
                     processed_tokens += n_to_process
                     for reached in ladder.reached(processed_tokens):
                         prompt_cache_checkpoint(reached, prompt_cache)
@@ -543,6 +580,11 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+        if _chunk_capture_kwargs and last_outputs is not None:
+            _prefill_hidden.append(last_outputs)
+            stitched, target_hidden_offset = _prefill_hidden.finish()
+            if stitched is not None:
+                last_outputs.hidden_states = stitched
 
     mx.async_eval(y, logprobs)
 
@@ -562,6 +604,7 @@ def generate_step(
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
             prompt_tokens=full_prompt_ids,
+            target_hidden_offset=target_hidden_offset,
         )
         return
 

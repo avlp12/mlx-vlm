@@ -699,7 +699,13 @@ def test_speculative_prefill_chunks_only_above_step_size():
     assert remaining_ids.tolist() == [[3]]
     assert [call[0].tolist() for call in calls] == [[[1, 2]], [[3]]]
     assert calls[0][2]["n_to_process"] == 2
-    assert "capture_layer_ids" not in calls[0][2]
+    # INVERTED 2026-09-03 (glm5-dflash-chunked-prefill).  This assertion used to
+    # read ``"capture_layer_ids" not in calls[0][2]`` -- i.e. it PINNED the
+    # behaviour that made a chunked capturing prefill wrong: the drafter would
+    # have received only the final forward's one row as its whole prompt context.
+    # The loop now carries the same capture on every chunk and the accumulator
+    # stitches the pieces (see PrefillHiddenAccumulator).
+    assert calls[0][2]["capture_layer_ids"] == [1, 2]
     assert calls[1][2]["capture_layer_ids"] == [1, 2]
 
 

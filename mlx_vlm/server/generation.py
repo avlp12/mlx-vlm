@@ -46,8 +46,11 @@ from ..sample_utils import (
     top_p_sampling,
 )
 from ..speculative.utils import (
+    PrefillHiddenAccumulator,
     make_speculative_prompt_cache,
     prefill_capture_kwargs,
+    prefill_context_keep,
+    prefill_context_offset,
     run_speculative_server_rounds,
     speculative_hidden_state,
     speculative_prefill_kwargs,
@@ -186,8 +189,30 @@ def _run_chunked_speculative_prefill(
     *,
     prefill_step_size: Optional[int],
     generation_stream,
+    hidden_context_keep: Optional[int] = None,
 ) -> Tuple[object, mx.array]:
-    """Prefill target cache in chunks, capturing speculative state only at end."""
+    """Prefill the target cache in chunks, stitching the speculative capture.
+
+    Every chunk carries the same capture kwargs as the final forward and its
+    per-layer hidden is accumulated; the chunk's LOGITS and its ``gdn_states``
+    are dropped before the chunk is evaluated.  Those two are the whole reason a
+    dflash-attached prefill used to run unchunked over the entire prompt:
+
+    * ``logits`` -- ``[B, S, vocab]``.  Only the last position is ever sampled
+      (``_sample_last_token`` on ``out.logits`` at the call site), so no chunk
+      but the last one has a logits consumer.  On GLM-5.3-Flash that is 309,760
+      B per prompt token retained for the life of the request.
+    * ``gdn_states`` -- the KDA rollback stash, already suppressed on the final
+      forward by ``prefill_capture_kwargs``; the same suppression is applied to
+      every chunk, so a chunk never builds it either.
+
+    ``hidden_context_keep``, when given, is the number of trailing context rows
+    the drafter will actually read (``speculative.utils.prefill_context_keep``).
+    The accumulator drops the rest -- see ``PrefillHiddenAccumulator`` for why
+    that must happen at the seam and not inside the loop, and
+    ``_dflash_rounds``/``adopt_pretruncated_context`` for the offset the caller
+    then owes the drafter.
+    """
     remaining_input_ids = input_ids
     remaining_embeds = inputs_embeds
     remaining_kwargs = dict(prompt_kwargs or {})
@@ -197,6 +222,22 @@ def _run_chunked_speculative_prefill(
         sequence_length=inputs_embeds.shape[1],
     )
 
+    # Prefill leg: the drafter reads the hidden captures, and nothing reads a
+    # prefill's gdn_states (see prefill_capture_kwargs for the consumer list), so
+    # do not let the model build the sequence-shaped KDA rollback stash.  Applied
+    # HERE and not to the dict the chunking policy sees, so the policy decision is
+    # byte-for-byte what it was.
+    capture_kwargs = prefill_capture_kwargs(lm, speculative_kwargs)
+    # Only a per-layer capture (``capture_layer_ids``) survives being split across
+    # chunks and stitched back.  MTP's ``return_hidden`` capture is a single
+    # pre-final-norm hidden whose consumer wants the LAST token only
+    # (``_mtp_rounds`` reads ``hidden_states[-1]``), and its chunk loop is already
+    # correct without it -- so it stays off the chunks, exactly as before.
+    chunk_capture_kwargs = (
+        capture_kwargs if capture_kwargs.get("capture_layer_ids") else {}
+    )
+    accumulator = PrefillHiddenAccumulator(keep=hidden_context_keep)
+
     if (
         prefill_step_size is not None
         and prefill_step_size > 0
@@ -204,18 +245,24 @@ def _run_chunked_speculative_prefill(
     ):
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
-            chunk_kwargs = _slice_prefill_kwargs(
-                remaining_kwargs, sequence_keys, n_to_process
-            )
+            chunk_kwargs = {
+                **_slice_prefill_kwargs(remaining_kwargs, sequence_keys, n_to_process),
+                **chunk_capture_kwargs,
+            }
             with mx.stream(generation_stream):
-                lm(
+                chunk_out = lm(
                     remaining_input_ids[:, :n_to_process],
                     cache=prompt_cache,
                     inputs_embeds=remaining_embeds[:, :n_to_process],
                     n_to_process=n_to_process,
                     **chunk_kwargs,
                 )
-            mx.eval([c.state for c in prompt_cache])
+            accumulator.append(chunk_out)
+            # Drop the chunk's logits (and any gdn stash) BEFORE the eval below,
+            # so the vocab-wide projection is never materialised for a chunk
+            # nobody samples from.
+            chunk_out = None
+            mx.eval([c.state for c in prompt_cache] + accumulator.pending())
             remaining_input_ids = remaining_input_ids[:, n_to_process:]
             remaining_embeds = remaining_embeds[:, n_to_process:]
             remaining_kwargs = _drop_prefill_kwargs(
@@ -223,18 +270,18 @@ def _run_chunked_speculative_prefill(
             )
             mx.clear_cache()
 
-    # Prefill leg: the drafter reads the hidden captures, and nothing reads a
-    # prefill's gdn_states (see prefill_capture_kwargs for the consumer list), so
-    # do not let the model build the sequence-shaped KDA rollback stash.  Applied
-    # HERE and not to the dict the chunking policy sees, so the policy decision is
-    # byte-for-byte what it was.
-    final_kwargs = {
-        **remaining_kwargs,
-        **prefill_capture_kwargs(lm, speculative_kwargs),
-    }
+    final_kwargs = {**remaining_kwargs, **capture_kwargs}
     final_kwargs["inputs_embeds"] = remaining_embeds
     with mx.stream(generation_stream):
         out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
+    accumulator.append(out)
+    stitched, context_offset = accumulator.finish()
+    if stitched is not None:
+        out.hidden_states = stitched
+        # The return arity is part of this helper's contract (test_server.py), so
+        # the offset the drafter is owed rides on the output object; read it with
+        # ``speculative.utils.prefill_context_offset``.
+        out.speculative_context_offset = int(context_offset)
     return out, remaining_input_ids
 
 
@@ -2434,7 +2481,9 @@ class ResponseGenerator:
                     prefill_kwargs,
                     prefill_step_size=prefill_step_size,
                     generation_stream=generation_stream,
+                    hidden_context_keep=prefill_context_keep(draft_kind, drafter),
                 )
+                target_hidden_offset = prefill_context_offset(out)
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B
@@ -2535,6 +2584,7 @@ class ResponseGenerator:
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
                     row_ids=sample_row_ids,
+                    target_hidden_offset=target_hidden_offset,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
