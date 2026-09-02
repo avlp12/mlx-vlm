@@ -14,6 +14,14 @@ These tests pin (a) that the flag does exactly that and changes nothing else,
 (b) that the two view-pinned parents really stop being held -- measured in bytes,
 not asserted from the shapes -- and (c) that the helper only offers the kwarg to
 models that advertise it.
+
+The (b) group is a MEMORY measurement, and on Metal a naive
+``get_active_memory`` delta reads the allocator rather than the retention: the
+backend is asynchronous and the unevaluated tail of the graph is not resident
+yet.  ``_held_once`` below states what it does about that, and with it the
+numbers agree between CPU and Metal to within 1 % and are stable across
+repetitions on both -- so these tests stay device-agnostic rather than being
+demoted to CPU-only.
 """
 
 import mlx.core as mx
@@ -144,20 +152,57 @@ def _stash_parent_bytes(lm, S):
     return (conv_out + in_proj) * S * itemsize
 
 
-def _held_bytes(lm, prompt, **extra):
-    """Live bytes still referenced once the forward's result is in hand."""
+def _held_once(lm, prompt, **extra):
+    """Live bytes still referenced once the forward's result is in hand.
+
+    Three things make this a measurement rather than a reading of the allocator:
+
+    * ``mx.synchronize()`` before and after.  On Metal the command buffer is
+      asynchronous, so without it ``get_active_memory`` samples a moving target
+      -- the pre-fix version of this helper returned a NEGATIVE delta on one of
+      six repetitions on an M3 Ultra.
+    * force eval of exactly the retained object.  ``mx.eval(out.logits)`` alone
+      leaves ``gdn_states`` as UNEVALUATED graph nodes, so how many of the split
+      parents are resident at the sampling instant depends on backend scheduling.
+      Evaluating the sink is what the claim is about: the stash's views pin their
+      parents, and materialising them is what the server's downstream rollback
+      consumer does anyway.
+    * ``mx.clear_cache()`` on both sides, so the allocator's free pool is not
+      counted as live on either.
+
+    And the delta is taken across DROPPING the result, not against a baseline
+    sampled before the forward: on Metal a stale residue from a previous arm can
+    survive one ``clear_cache`` and inflate such a baseline (that is how the
+    pre-fix helper produced a negative "held" of -1,582,856 B for the on arm of
+    ``test_the_view_pinned_parents_are_no_longer_held``).  Sampling on both sides
+    of ``del out, cache`` cancels anything that was already resident, and answers
+    the question the tests actually ask: how many bytes does holding this
+    forward's result cost.
+
+    With all four, the number is bit-stable across repetitions on CPU and on
+    Metal alike (six repetitions each, 2026-09-03).
+    """
+    mx.synchronize()
     mx.clear_cache()
-    base = mx.get_active_memory()
     cache = lm.make_cache()
     out = lm(prompt, cache=cache, capture_layer_ids=CAPTURE_IDS, **extra)
-    # Materialise the way the server does: one eval of the logits pulls the whole
-    # forward, and whatever Python still points at keeps its buffer.
     mx.eval(out.logits)
+    if out.gdn_states:
+        mx.eval([t for layer in out.gdn_states for t in layer if isinstance(t, mx.array)])
+    mx.synchronize()
     mx.clear_cache()
-    held = mx.get_active_memory() - base
+    with_result = mx.get_active_memory()
     del out, cache
+    mx.synchronize()
     mx.clear_cache()
-    return held
+    without_result = mx.get_active_memory()
+    return with_result - without_result
+
+
+def _held_bytes(lm, prompt, reps=3, **extra):
+    """The floor of a few repetitions: any residue from a previous arm can only
+    make a sample bigger, never smaller."""
+    return min(_held_once(lm, prompt, **extra) for _ in range(reps))
 
 
 def test_the_view_pinned_parents_are_no_longer_held():
@@ -181,10 +226,12 @@ def test_the_view_pinned_parents_are_no_longer_held():
         f"freed {on - off} B, but the two split parents alone are {parents} B "
         f"(on={on}, off={off}, S={S})"
     )
-    # Measured on this config (fp32, H=2, D=64, S=256): on 3,198,050 B,
-    # off 1,870,946 B, freed 1,327,104 B = 1,296 elements/token against 898
+    # Measured on this config (fp32, H=2, D=64, S=256), 2026-09-03:
+    #   CPU  on 3,198,050 B  off 1,870,946 B  freed 1,327,104 B
+    #   GPU  on 3,197,042 B  off 1,886,322 B  freed 1,310,720 B
+    # i.e. 1,296 (CPU) / 1,280 (GPU) elements per token against 898
     # elements/token for the parents alone.  The six stashed tensors would be
-    # 1,666 elements/token; the 370-element gap is not identified and is left
+    # 1,666 elements/token; the remaining gap is not identified and is left
     # unclaimed rather than asserted -- the inequality above is what matters.
     assert (on - off) / S >= _stash_parent_bytes(lm, 1)
 
@@ -202,6 +249,10 @@ def test_retention_scales_with_prompt_length_before_and_not_after():
 
     grew_on = on_256 - on_128
     grew_off = off_256 - off_128
+    # Measured 2026-09-03: CPU grew_on 1,415,971 B / grew_off 776,995 B;
+    # GPU grew_on 1,414,451 B / grew_off 775,475 B.  The slope drop is
+    # 638,976 B on BOTH devices, to the byte, against 459,776 B for the two
+    # split parents alone.
     assert grew_on > 0
     assert grew_off < grew_on, (
         f"per-token growth did not fall: on {grew_on} B over 128 tokens, "
