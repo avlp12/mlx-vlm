@@ -23,6 +23,26 @@ from .config import DFlashConfig
 # every test that touches it has to reach into a module global to undo that.  One
 # ``os.environ`` lookup happens once per draft round, next to a multi-GFLOP
 # matmul, so the memo buys nothing and costs test ergonomics.
+#
+# NUMERICS, measured 2026-09-03 (mlx 0.32.1.dev20260902, M3 Ultra).  Bit-identical
+# on CPU.  On Metal, bit-identity is a row-count-dependent property of the matmul
+# kernel: MLX's quantized matmul changes reduction order at M = 1, 2, 15, 33 and
+# ~100 rows and is stable for every M >= 100.  Pre-truncation only fires when
+# S > sliding_window - 1, so the shipped GLM-5.3-Flash DFlash2 geometry (fc
+# 5*4096 -> 4096, 8-bit affine, group 64, window 2048) only ever compares
+# M_new = 2047 against M_ref = S >= 2048, both in the stable regime: measured
+# 0 of 8,384,512 output elements differ at S in {2048, 2049, 3000, 4096, 5000,
+# 8192, 12000, 16384}, q8 and bf16 alike.  A drafter with a small enough window
+# to land in the low-M regimes (the toy geometries in
+# mlx_vlm/tests/test_dflash_fc_pretrunc.py keep 7 rows) does differ, by <= 4.34
+# bfloat16 ulp of the row maximum, with the drafter's argmax unchanged in 0 of
+# 384 draft positions over 32 seeds.  Drafter-only either way: the target's
+# forward is not on this path, so a draft that differs can only be accepted or
+# rejected, never emitted unverified.  R29
+# (/Users/gesicht/glm53flash/logs/sweep10/R29_VERDICT.md, 16,394-token prompt,
+# ABAB x 3 on epsilon) ran this ON against the pre-truncation-free tree and
+# measured accept/round 2.9231 -> 2.9231 and text sha1 18d1fe50b8beac71513a
+# identical.  Hence DEFAULT ON.
 def _fc_pretrunc_enabled() -> bool:
     return os.environ.get("MLX_VLM_DFLASH_FC_PRETRUNC", "1") not in ("0", "false", "False")
 
