@@ -143,6 +143,35 @@ _LOG_ROOT = os.environ.get("MLX_VLM_FLEET_RECEIPT_ROOT",
                            os.path.expanduser("~/glm53flash/logs"))
 
 
+def gate_requirement(peak_gib: float, margin_gib: float = 60.0) -> dict:
+    """The headroom a load needs, in BOTH units, so callers cannot conflate them.
+
+    THIS EXISTS BECAUSE THE CONFLATION HAS NOW HAPPENED TWICE IN ONE DAY, and
+    both times it looked like arithmetic rather than a unit error:
+
+      * lane 5's pre-registration: "peak = 173.0 + 1.23*B GiB ... predicts
+        192.7 GB" -- one sentence, two units;
+      * lane 3's X3 gate dry-run: worst_cell 219.1 GiB -> gated_on 235.3 (the
+        same number in GB) -> required 295.3, i.e. a GiB peak converted to GB
+        and then a 60 **GiB** margin added as 60 **GB**. 60 GiB is 64.4 GB, so
+        the safety margin quietly loses 4.4 GB -- 7% of itself -- while the
+        number on the page still reads "60".
+
+    Nothing here is under-sized enough to be dangerous today (T2 clears with
+    ~66 GB spare either way). It is corrected because a margin that erodes when
+    you restate it is not a margin you can reason about, and the next load may
+    not have 66 GB of slack.
+
+    Everything inside this module is GiB (``_GB = 1024**3``) despite the ``_gb``
+    suffixes, so ``require_headroom_box`` wants the GiB figure.
+    """
+    gib = round(peak_gib + margin_gib, 2)
+    return {"peak_gib": round(peak_gib, 2), "margin_gib": margin_gib,
+            "required_gib": gib, "required_gb": round(gib * (1024 ** 3) / 1e9, 2),
+            "pass_to_require_headroom": "required_gib",
+            "note": "fleet compares against free_gb, which is GiB despite the name"}
+
+
 def single_box_required_gib(*, batch: int, prompt_tokens: int,
                             chunk: Optional[int] = None,
                             segment_align: bool = False,
