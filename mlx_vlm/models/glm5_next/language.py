@@ -1550,7 +1550,16 @@ class Glm5NextDecoderLayer(nn.Module):
         self.ffn_hc = HyperConnection(config)
         self.compile_ffn = True
         self._ffn_c = None
-        self.compile_attn = True
+        # DEFAULT OFF: measured, not demonstrated. In the configuration that
+        # ships (compile_ffn already on) three ABBA-paired cycles of 120 timed
+        # steps gave +0.324, +0.235, -0.147 ms -- mean +0.137 ms on a 33.9 ms
+        # step, 0.4%, with the sign flipping. That is indistinguishable from
+        # zero, and a default-on compiled graph per layer costs compile time,
+        # memory and a real staleness hazard (_attn_pre_c captures the attn_hc
+        # it traced) for no measured gain. The mechanism is kept, tested and
+        # TP-guarded so it can be switched on if a future change makes the
+        # attention-half glue heavy enough to matter.
+        self.compile_attn = False
         self._attn_pre_c = None
 
     def _attn_prologue(self, x: mx.array):

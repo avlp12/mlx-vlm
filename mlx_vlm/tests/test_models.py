@@ -3401,8 +3401,11 @@ class TestModels(unittest.TestCase):
         cfg = self._glm5_next_cfg()
         lm = LanguageModel(cfg)
         layer = lm.model.layers[-1]
-        self.assertTrue(layer.compile_ffn)
-        self.assertTrue(layer.compile_attn)
+        # compile_attn ships OFF (measured, not demonstrated), so turn both ON
+        # explicitly first -- the property under test is that shard_layer turns
+        # them off, which is only meaningful against an enabled starting state.
+        layer.compile_ffn = True
+        layer.compile_attn = True
         shard_layer(layer, rank=0, size=1, reduce_fn=lambda x: x)
         self.assertFalse(layer.compile_ffn)
         self.assertFalse(layer.compile_attn)
