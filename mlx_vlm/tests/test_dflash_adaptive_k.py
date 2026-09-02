@@ -14,6 +14,7 @@ receipt in our corpus ran with --fixed-block, so it has never actually run here.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +31,7 @@ class _Drafter:
 
 def _reset():
     dflash._ADAPTIVE_K_ENV = None
+    dflash._FIXED_WIDTH_ENV = None
     dflash._ROUND_FIXED = None
     dflash._ROUND_COST = None
     dflash._ADAPTIVE_K_WINDOW = None
@@ -58,11 +60,18 @@ def test_default_on_and_the_env_is_the_kill_switch():
     It shipped OFF because on the stale constants it lost 11% to the very ladder
     it was meant to replace.  On the refitted ones it beats the ladder on both
     workloads, six paired cycles out of six (logs/sweep3/R9_spec_width_r9.json).
-    The kill switch stays, and this pins both halves: that the default is on, and
-    that setting the variable to 0 really does hand control back to the ladder --
-    including handing back the pin, which adaptive-K deliberately overrides.
+    The kill switch stays, and this pins both halves: that the knob turns the
+    policy on, and that setting the variable to 0 really does hand control back
+    to the ladder -- including handing back the pin, which adaptive-K
+    deliberately overrides.
+
+    R24 CHANGED THE DEFAULT: adaptive-K is no longer what runs with no
+    environment set (fixed block total 8 is), so this test now SELECTS the
+    policy it is about instead of reaching it by omission.  The assertions
+    below are unchanged; only the selection is.
     """
-    os.environ.pop("MLX_VLM_DFLASH_ADAPTIVE_K", None)
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "1"
+    os.environ.pop("MLX_VLM_DFLASH_FIXED_WIDTH", None)
     _reset()
     assert dflash._adaptive_k_enabled() is True
 
@@ -96,8 +105,11 @@ def test_the_default_widens_for_code_and_narrows_for_prose():
     width in different directions.  A threshold ladder cannot express this, which
     is why it settles narrow on prose and spends 118 rounds on 256 tokens where
     the cost model spends 106.
+
+    Selected explicitly since R24 made fixed width 8 the default.
     """
-    os.environ.pop("MLX_VLM_DFLASH_ADAPTIVE_K", None)
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "1"
+    os.environ.pop("MLX_VLM_DFLASH_FIXED_WIDTH", None)
     _reset()
     assert dflash._dflash_next_block_size(_Drafter([2] * 8, [7] * 8), 8, 64) == 3   # p 0.66
     assert dflash._dflash_next_block_size(_Drafter([6] * 8, [7] * 8), 8, 64) == 6   # p 0.85
@@ -237,3 +249,70 @@ def test_cost_params_are_env_tunable():
     os.environ["MLX_VLM_DFLASH_ROUND_COST"] = "0.134"
     _reset()
     assert dflash._dflash_block_size_for_hazard(0.68, 8) == 5
+
+
+# --- R24: fixed block total 8 is the shipped default -------------------------
+#
+# The knob is MEMOISED (dflash._ADAPTIVE_K_ENV, _FIXED_WIDTH_ENV are module
+# globals filled on first read), so a test that only sets the environment
+# variable would pass while measuring nothing once any other test has read it.
+# Every case below resets the globals explicitly; that is what _reset() is for.
+
+
+def test_default_width_policy_is_fixed_eight():
+    """No environment at all -> block total 8, the drafter's trained width."""
+    for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH"):
+        os.environ.pop(k, None)
+    _reset()
+    assert dflash._adaptive_k_enabled() is False
+    assert dflash._fixed_width() == 8
+    d = _Drafter([7] * 8, [7] * 8)          # acceptance the ladder would grow on
+    assert dflash._dflash_next_block_size(d, 8, 64) == 8
+    d2 = _Drafter([0] * 8, [7] * 8)         # acceptance the ladder would shrink on
+    assert dflash._dflash_next_block_size(d2, 8, 64) == 8, "fixed policy must not adapt"
+
+
+def test_default_width_policy_respects_remaining_budget():
+    for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH"):
+        os.environ.pop(k, None)
+    _reset()
+    assert dflash._dflash_next_block_size(_Drafter([7] * 8, [7] * 8), 8, 3) == 3
+
+
+def test_adaptive_k_knob_restores_adaptive_policy():
+    """The documented escape hatch: the alternative that lost R20/R24."""
+    os.environ.pop("MLX_VLM_DFLASH_FIXED_WIDTH", None)
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "1"
+    _reset()
+    try:
+        assert dflash._adaptive_k_enabled() is True
+        low = dflash._dflash_next_block_size(_Drafter([2] * 8, [7] * 8), 8, 64)
+        high = dflash._dflash_next_block_size(_Drafter([7] * 8, [7] * 8), 8, 64)
+        assert low != high, "adaptive-K must vary the width with acceptance"
+        assert low < 8
+    finally:
+        os.environ.pop("MLX_VLM_DFLASH_ADAPTIVE_K", None)
+        _reset()
+
+
+def test_ladder_still_reachable_when_fixed_disabled():
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "0"
+    os.environ["MLX_VLM_DFLASH_FIXED_WIDTH"] = "0"
+    _reset()
+    try:
+        assert dflash._fixed_width() == 0
+        assert dflash._dflash_next_block_size(SimpleNamespace(accept_lens=[], draft_lens=[]),
+                                              16, 20) == 16
+    finally:
+        for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH"):
+            os.environ.pop(k, None)
+        _reset()
+
+
+def test_explicit_pin_still_wins_over_the_default():
+    for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH"):
+        os.environ.pop(k, None)
+    _reset()
+    d = _Drafter([7] * 8, [7] * 8)
+    d.prefer_requested_block_size = True
+    assert dflash._dflash_next_block_size(d, 16, 64) == 16

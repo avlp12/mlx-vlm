@@ -15,10 +15,36 @@ from .common import (
 
 
 _ADAPTIVE_K_ENV = None
+# Default width policy: a FIXED verify block total, at the drafter's trained
+# width.  0 disables it and falls through to the legacy threshold ladder.
+_FIXED_WIDTH_ENV = None
 _ROUND_FIXED = None
 _ROUND_COST = None
 _ADAPTIVE_K_WINDOW = None
 _ADAPTIVE_K_MINROUNDS = None
+
+
+def _fixed_width() -> int:
+    """The shipped default verify block total.  0 means "not this policy".
+
+    R24 measured fixed block-total 8 against the shipped adaptive-K policy on
+    four workloads, n=3 paired ABAB, and it won every one on worst-pair:
+    code 1.0663, prose 1.0820, chat 1.0798, prose@16,394 1.0832 (receipts
+    logs/sweep3/CARD_spec_row_r24_p1024.json and _r24_p16k.json).  R20 had put
+    the same comparison behind a rule that let a disputed, non-shipping
+    alternative veto it; R24 compared against what actually ships.
+
+    8 is not a tuned number: it is the drafter's own trained block size
+    (dflash_config.block_size), so this policy proposes exactly the width the
+    checkpoint was trained to propose and never more.
+    """
+    global _FIXED_WIDTH_ENV
+    if _FIXED_WIDTH_ENV is None:
+        try:
+            _FIXED_WIDTH_ENV = int(os.environ.get("MLX_VLM_DFLASH_FIXED_WIDTH", "8"))
+        except (TypeError, ValueError):
+            _FIXED_WIDTH_ENV = 8
+    return _FIXED_WIDTH_ENV
 
 
 def _adaptive_k_enabled() -> bool:
@@ -68,7 +94,7 @@ def _adaptive_k_enabled() -> bool:
     global _ADAPTIVE_K_ENV
     if _ADAPTIVE_K_ENV is None:
         _ADAPTIVE_K_ENV = os.environ.get(
-            "MLX_VLM_DFLASH_ADAPTIVE_K", "1"
+            "MLX_VLM_DFLASH_ADAPTIVE_K", "0"
         ).lower() in ("1", "true", "yes", "on")
     return _ADAPTIVE_K_ENV
 
@@ -373,6 +399,15 @@ def _dflash_next_block_size(
         return block_total
     if getattr(draft_model, "prefer_requested_block_size", False):
         return block_total
+
+    fixed = _fixed_width()
+    if fixed > 0:
+        # SHIPPED DEFAULT since R24.  An explicit --fixed-block pin above still
+        # wins, and initial_block_size is still honoured, because a caller that
+        # names a width means it.
+        if initial_block_size is not None:
+            return min(block_total, max(2, int(initial_block_size)))
+        return min(block_total, max(2, fixed))
 
     accept_lens = getattr(draft_model, "accept_lens", None) or []
     draft_lens = getattr(draft_model, "draft_lens", None) or []

@@ -2180,8 +2180,14 @@ def test_dflash_config_defaults_to_checkpoint_block_size():
 def _ladder_policy():
     import mlx_vlm.speculative.dflash as _df
     prev = os.environ.get("MLX_VLM_DFLASH_ADAPTIVE_K")
+    prev_fixed = os.environ.get("MLX_VLM_DFLASH_FIXED_WIDTH")
     os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "0"
+    # Since R24 the DEFAULT policy is a fixed block total, so "adaptive off" no
+    # longer means "ladder".  These tests exercise the ladder, so they have to
+    # select it explicitly rather than reach it by omission.
+    os.environ["MLX_VLM_DFLASH_FIXED_WIDTH"] = "0"
     _df._ADAPTIVE_K_ENV = None
+    _df._FIXED_WIDTH_ENV = None
     try:
         yield
     finally:
@@ -2189,7 +2195,12 @@ def _ladder_policy():
             os.environ.pop("MLX_VLM_DFLASH_ADAPTIVE_K", None)
         else:
             os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = prev
+        if prev_fixed is None:
+            os.environ.pop("MLX_VLM_DFLASH_FIXED_WIDTH", None)
+        else:
+            os.environ["MLX_VLM_DFLASH_FIXED_WIDTH"] = prev_fixed
         _df._ADAPTIVE_K_ENV = None
+        _df._FIXED_WIDTH_ENV = None
 
 
 def test_dflash_next_block_size_starts_at_requested_ceiling():
