@@ -1,7 +1,7 @@
 """Resident session store: the test contract, written before the code.
 
-Coordinator ruling I969(2).  Every test here is skipped until the implementation
-lands; the skips coming off is the definition of done.  Writing them first is
+Coordinator ruling I969(2).  Written before the code; discharged by
+``test_session_store.py`` on 2026-09-02.  Writing them first is
 deliberate -- three of these (T4, T6, T9) describe ways the feature can be
 "working" and silently wrong, and they are much harder to think of once there is
 an implementation to look at.
@@ -34,7 +34,11 @@ SIZING THIS EXISTS TO CASH IN (post-dedup, see test_vault_latent_dedup.py)
 
 import unittest
 
-DESIGN = "design contract: session store not implemented yet"
+# Discharged 2026-09-02 by test_session_store.py, which implements T1-T13 against
+# the shipped machinery.  This file is kept as the rationale of record -- the
+# WHY that the implementation file points back at -- and each spec now names the
+# test that discharges it, so ``pytest -rs`` reads as a contract-to-code map.
+DESIGN = "contract discharged -> see mlx_vlm/tests/test_session_store.py"
 
 
 @unittest.skip(DESIGN)
