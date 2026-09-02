@@ -104,17 +104,21 @@ class TestSessionCapture(unittest.TestCase):
     def test_T1_capture_fires_when_a_response_completes(self):
         v = self._vault()
         toks = list(range(1, 33))
-        self.assertTrue(record_session_turn(v, toks, drive(toks), completed=True))
+        self.assertTrue(record_session_turn(v, toks, drive(toks), completed=True,
+                                     session_id="conv-A"))
         self.assertEqual(v.stats.session_inserts, 1)
         cp = lookup_session(v, toks + [99])
         self.assertIsNotNone(cp, "next turn must hit the end-of-turn rung")
         self.assertEqual(cp.prefix_len, len(toks),
                          "only the new user message should be left to prefill")
+        self.assertEqual(cp.session_id, "conv-A",
+                         "the server's conversation id, not a token-derived one")
 
     def test_T2_capture_is_skipped_when_the_stream_was_aborted(self):
         v = self._vault()
         toks = list(range(1, 17))
-        self.assertFalse(record_session_turn(v, toks, drive(toks), completed=False))
+        self.assertFalse(record_session_turn(v, toks, drive(toks), completed=False,
+                                      session_id="conv-A"))
         self.assertEqual(v.rungs, 0)
         self.assertIsNone(lookup_session(v, toks))
 
@@ -142,7 +146,8 @@ class TestIdentityTiers(unittest.TestCase):
     def test_T4_session_rungs_never_serve_a_prefill_query(self):
         v = self._vault()
         toks = list(range(1, 33))
-        record_session_turn(v, toks, drive(toks), completed=True)
+        record_session_turn(v, toks, drive(toks), completed=True,
+                                     session_id="conv-A")
         self.assertIsNotNone(v.lookup(toks, tier=VaultTier.SESSION))
         self.assertIsNone(v.lookup(toks),
                           "a prefill lookup must not reach into the session tier")
@@ -152,7 +157,8 @@ class TestIdentityTiers(unittest.TestCase):
         v = self._vault()
         head, tail = list(range(1, 25)), list(range(100, 108))
         stopped = drive(head)
-        record_session_turn(v, head, stopped, completed=True, adopt=False)
+        record_session_turn(v, head, stopped, completed=True, adopt=False,
+                            session_id="conv-A")
         resumed = fresh_cache()
         self.assertTrue(restore_session(v, resumed, lookup_session(v, head)))
         for t in tail:
@@ -164,7 +170,8 @@ class TestIdentityTiers(unittest.TestCase):
     def test_T6_a_session_rung_is_refused_for_a_prefill_restore(self):
         v = self._vault()
         toks = list(range(1, 33))
-        record_session_turn(v, toks, drive(toks), completed=True)
+        record_session_turn(v, toks, drive(toks), completed=True,
+                                     session_id="conv-A")
         cp = lookup_session(v, toks)
         self.assertEqual(cp.tier, VaultTier.SESSION)
         self.assertFalse(v.restore_into(fresh_cache(), cp, tier=VaultTier.PREFILL),
@@ -174,7 +181,8 @@ class TestIdentityTiers(unittest.TestCase):
     def test_T7_identity_change_invalidates_session_rungs_too(self):
         v = self._vault()
         toks = list(range(1, 33))
-        record_session_turn(v, toks, drive(toks), completed=True)
+        record_session_turn(v, toks, drive(toks), completed=True,
+                                     session_id="conv-A")
         cp = lookup_session(v, toks)
         other = ContextVault("a-different-build", budget_bytes=1 << 30)
         self.assertFalse(other.restore_into(fresh_cache(), cp, tier=VaultTier.SESSION))
@@ -200,7 +208,8 @@ class TestEviction(unittest.TestCase):
     def test_T9_evicting_a_session_cannot_orphan_a_live_request(self):
         v = ContextVault("orphan", budget_bytes=1 << 30)
         toks = list(range(1, 33))
-        record_session_turn(v, toks, drive(toks), completed=True, adopt=False)
+        record_session_turn(v, toks, drive(toks), completed=True, adopt=False,
+                            session_id="conv-A")
         cp = lookup_session(v, toks)
         live = fresh_cache()
         restore_session(v, live, cp)
@@ -220,7 +229,8 @@ class TestEviction(unittest.TestCase):
     def test_T10_ttl_expiry_frees_bytes_and_is_observable(self):
         v = ContextVault("ttl", budget_bytes=1 << 30)
         toks = list(range(1, 33))
-        record_session_turn(v, toks, drive(toks), completed=True, ttl_s=0.05)
+        record_session_turn(v, toks, drive(toks), completed=True, ttl_s=0.05,
+                            session_id="conv-A")
         self.assertGreater(v.resident_bytes, 0)
         time.sleep(0.08)
         self.assertIsNone(lookup_session(v, toks), "an expired rung must not hit")
@@ -234,7 +244,8 @@ class TestEviction(unittest.TestCase):
         for i in range(4):
             d = list(range(i * 1000, i * 1000 + 32))
             v.insert(d, 16, capture_fragments(drive(d[:16]), 16))
-            record_session_turn(v, d, drive(d), completed=True)
+            record_session_turn(v, d, drive(d), completed=True,
+                                session_id=f"conv-{i}")
         self.assertLessEqual(v.resident_bytes, v.budget)
         self.assertGreater(v.stats.evictions, 0)
 
@@ -242,7 +253,8 @@ class TestEviction(unittest.TestCase):
 class TestServerWiring(unittest.TestCase):
     def test_T12_session_store_is_a_no_op_when_the_vault_is_off(self):
         toks = list(range(1, 17))
-        self.assertFalse(record_session_turn(None, toks, drive(toks), completed=True))
+        self.assertFalse(record_session_turn(None, toks, drive(toks), completed=True,
+                                      session_id="conv-A"))
         self.assertIsNone(lookup_session(None, toks))
         self.assertFalse(restore_session(None, fresh_cache(), None))
 
@@ -252,7 +264,8 @@ class TestServerWiring(unittest.TestCase):
                 raise RuntimeError("boom")
         toks = list(range(1, 17))
         self.assertFalse(
-            record_session_turn(Exploding(), toks, drive(toks), completed=True))
+            record_session_turn(Exploding(), toks, drive(toks), completed=True,
+                                session_id="conv-A"))
 
 
 if __name__ == "__main__":
