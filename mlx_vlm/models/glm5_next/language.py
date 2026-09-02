@@ -2524,6 +2524,15 @@ def trim_sparse_cache(cache, trim: int, index_kpool: int) -> None:
 
 
 class LanguageModel(nn.Module):
+    # ``rollback_speculative_cache`` below rolls the batch back with ONE trim
+    # length, ONE KDA replay prefix and ONE indexer pool length -- the cache is
+    # rectangular in the batch dimension and cannot represent per-row accept
+    # counts. Declaring the requirement makes the speculative loops clamp
+    # per-row accepts to the batch minimum before they call us. Named after
+    # upstream Blaizzy/mlx-vlm 3b8f727d (qwen3_5/deepseek_v4 carry the same
+    # class attribute) so a later rebase is a no-conflict fast-forward.
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -2661,8 +2670,28 @@ class LanguageModel(nn.Module):
         else:
             accepted_list = [int(x) for x in accepted]
         max_a = max(accepted_list)
+        # A ragged batch has no rollback here: this cache is rectangular in the
+        # batch dimension (one KV length, one KDA replay prefix, one indexer
+        # pool length), so trimming by ``max_a`` would leave every shorter row
+        # holding the LIVE KV of tokens it rejected -- attended, wrong tokens,
+        # with the row's logical length and the cache's shared offset diverged.
+        # The clamp in speculative/dflash.py, gated on the class attribute
+        # below, is what makes the precondition true; if it did not run, that
+        # is a wiring bug and must be loud, not silently mis-trimmed.
+        if (
+            len(accepted_list) > 1
+            and len(set(accepted_list)) > 1
+            and getattr(self, "requires_uniform_batch_acceptance", False)
+        ):
+            raise RuntimeError(
+                "glm5_next batched speculative rollback requires uniform "
+                f"per-row acceptance; got ragged accepts {accepted_list}. "
+                "Trimming by the batch maximum leaves rejected-token KV live "
+                "in the shorter rows (issue #1962); the caller must clamp "
+                "accepts to the batch minimum before rollback -- see "
+                "speculative/common.py::_requires_uniform_batch_acceptance."
+            )
         trim = block_size - (max_a + 1)
-        is_batch = len(accepted_list) > 1
 
         gdn_idx = 0
         for c in caches:
@@ -2671,8 +2700,9 @@ class LanguageModel(nn.Module):
             if isinstance(c, ArraysCache):
                 # KDA (linear-attention) layer: replay the fast gated-delta kernel from
                 # the entry state over just the accepted prefix (n tokens) to recover the
-                # rolled-back recurrent state, and slice the conv window to match. Uniform
-                # acceptance, so n is shared across the batch.
+                # rolled-back recurrent state, and slice the conv window to match.
+                # Acceptance is uniform across the batch -- enforced by the guard
+                # above, not merely assumed -- so n is shared.
                 q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state, conv_input, K, lb = (
                     gdn_states[gdn_idx]
                 )

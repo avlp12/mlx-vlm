@@ -6,6 +6,9 @@ import mlx.nn as nn
 from .common import (
     _batch_cache_left_padding,
     _record_speculative_round,
+    _record_uniform_clamp,
+    _requires_uniform_batch_acceptance,
+    _reset_uniform_clamp,
     _SpeculativeSamplerRNG,
     generation_stream,
 )
@@ -371,6 +374,7 @@ def _eagle3_rounds(
         configured_block_total = min(configured_block_total, block_total)
         adaptive_block_size = False
     draft_cache = draft_model.reset(model)
+    _reset_uniform_clamp(draft_model)
     sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=not greedy_sampling)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
@@ -518,6 +522,7 @@ def _eagle3_rounds_batch(
         configured_block_total = min(configured_block_total, block_total)
         adaptive_block_size = False
     draft_cache = draft_model.reset(model, left_padding=left_padding)
+    _reset_uniform_clamp(draft_model)
     sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=not greedy_sampling)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
@@ -607,9 +612,13 @@ def _eagle3_rounds_batch(
         )
         if (
             n_active > 1
-            and getattr(draft_model, "requires_uniform_batch_acceptance", False)
+            and _requires_uniform_batch_acceptance(draft_model, lm)
             and len(set(accepted_list)) > 1
         ):
+            _record_uniform_clamp(
+                draft_model,
+                sum(a - min(accepted_list) for a in accepted_list),
+            )
             accepted_list, new_tokens_list = _eagle3_walk_batch_uniform_acceptance(
                 draft_tokens,
                 target_tokens,

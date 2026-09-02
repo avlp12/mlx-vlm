@@ -7,6 +7,9 @@ import mlx.nn as nn
 from .common import (
     _dflash_block_total,
     _record_speculative_round,
+    _record_uniform_clamp,
+    _requires_uniform_batch_acceptance,
+    _reset_uniform_clamp,
     _speculative_walk,
     _speculative_walk_batch,
     _SpeculativeSamplerRNG,
@@ -751,6 +754,7 @@ def _dflash_rounds(
         draft_model, draft_block_size, ignore_runtime=_fixed_width() > 0
     )
     draft_cache = draft_model.reset(model)
+    _reset_uniform_clamp(draft_model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
@@ -917,6 +921,7 @@ def _dflash_rounds_batch(
         draft_model, draft_block_size, ignore_runtime=_fixed_width() > 0
     )
     draft_model.reset(model)
+    _reset_uniform_clamp(draft_model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
@@ -1022,6 +1027,30 @@ def _dflash_rounds_batch(
                 base_positions=[emitted[active_idx[j]] for j in range(n_active)],
             )
             sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+
+        # Ragged accepts and a rectangular rollback cannot both be right.
+        # ``rollback_speculative_cache`` on a target that declares
+        # ``requires_uniform_batch_acceptance`` reduces the batch to ONE trim
+        # length and ONE replay prefix (glm5_next: language.py ``max_a``, the
+        # shared KDA ``n``, the single indexer ``t2``), so a row that accepted
+        # fewer tokens than the batch maximum would keep the live KV of tokens
+        # it rejected -- real, attended, wrong tokens -- while its emitted
+        # stream says otherwise. Clamp to the batch minimum BEFORE the rollback
+        # and BEFORE the emit loop below so tokens and cache agree for every
+        # row. The rows above the minimum give back the difference and re-draft
+        # it next round: correctness over throughput, counted so the price
+        # shows up in the receipt.
+        if (
+            n_active > 1
+            and _requires_uniform_batch_acceptance(draft_model, lm)
+            and len(set(accepted_list)) > 1
+        ):
+            uniform = min(len(nt) - 1 for nt in new_tokens_list)
+            _record_uniform_clamp(
+                draft_model, sum(a - uniform for a in accepted_list if a > uniform)
+            )
+            new_tokens_list = [nt[: uniform + 1] for nt in new_tokens_list]
+            accepted_list = [uniform] * n_active
 
         min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
