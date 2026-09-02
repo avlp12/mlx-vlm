@@ -11,6 +11,7 @@ These tests use a fake tick, so nothing here touches the GPU.
 from queue import Queue
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
 
 import mlx_vlm.server as server
@@ -258,3 +259,149 @@ class TestKeepaliveLifecycle:
             gen._run()
 
         assert ka.armed is False
+
+
+# --------------------------------------------------- wired-limit hoist (PA796b)
+class _LimitSpy:
+    """Stands in for mx.set_wired_limit and remembers the current value."""
+
+    def __init__(self, start=0):
+        self.value = start
+        self.calls = []
+
+    def set(self, v):
+        self.calls.append(v)
+        old, self.value = self.value, v
+        return old
+
+
+MAXREC = 512 * 2**30
+
+
+def _patch_mlx(monkeypatch, spy, raising=False):
+    def _set(v):
+        if raising:
+            raise RuntimeError("wiring refused by the driver")
+        return spy.set(v)
+
+    monkeypatch.setattr(mx, "set_wired_limit", _set)
+    monkeypatch.setattr(mx, "device_info",
+                        lambda: {"max_recommended_working_set_size": MAXREC})
+    monkeypatch.setattr(mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(mx, "synchronize", lambda *a, **k: None)
+
+
+def _loaded_generator(keepalive=None):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._keepalive = keepalive or _fake_keepalive()
+    gen._wired_stack = None
+    gen._ready = server_generation.Event()
+    gen._load_error = None
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen._initialize_model = lambda: None
+    return gen
+
+
+class TestWiredLimitHoist:
+    def test_limit_is_non_zero_before_the_first_request(self, monkeypatch):
+        """The window the keepalive alone cannot cover (L3_wirelimit.json arm C)."""
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy)
+        gen = _loaded_generator()
+        seen = {}
+        monkeypatch.setattr(server_generation, "is_diffusion_model", lambda _m: True)
+        gen._run_diffusion = lambda: seen.update(limit_while_serving=spy.value)
+
+        gen._run_impl()
+
+        assert seen["limit_while_serving"] == MAXREC
+        assert seen["limit_while_serving"] > 0
+
+    def test_released_when_the_generation_thread_exits(self, monkeypatch):
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy)
+        gen = _loaded_generator()
+        gen._release_model_refs = lambda: None
+        monkeypatch.setattr(server_generation, "is_diffusion_model", lambda _m: True)
+        gen._run_diffusion = lambda: None
+
+        gen._run()
+
+        assert spy.value == 0
+        assert gen._wired_stack is None
+
+    def test_inner_context_no_longer_drops_the_limit_to_zero(self, monkeypatch):
+        """BatchGenerator.close() must restore max_rec, not the floor.
+
+        This is the property that lets BatchGenerator keep its own wiring
+        untouched: nesting is idempotent.
+        """
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy)
+        gen = _loaded_generator()
+        gen._hold_wired_limit([object()])
+        assert spy.value == MAXREC
+
+        with server_generation.wired_limit(SimpleNamespace(), [object()]):
+            assert spy.value == MAXREC
+        assert spy.value == MAXREC, "inner exit dropped the limit to the floor"
+
+        gen._release_wired_limit()
+        assert spy.value == 0
+
+    def test_a_refused_wiring_never_stops_the_server(self, monkeypatch):
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy, raising=True)
+        gen = _loaded_generator()
+        served = []
+        monkeypatch.setattr(server_generation, "is_diffusion_model", lambda _m: True)
+        gen._run_diffusion = lambda: served.append(True)
+
+        gen._run_impl()          # must not raise
+
+        assert served == [True], "serving did not continue after a wiring refusal"
+        assert gen._wired_stack is None
+
+    def test_no_model_is_a_no_op(self, monkeypatch):
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy)
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen._wired_stack = None
+        gen.model = None
+
+        gen._hold_wired_limit([object()])
+
+        assert spy.calls == []
+        assert gen._wired_stack is None
+
+    def test_env_toggle_off_skips_the_hoist(self, monkeypatch):
+        """Benchmark harnesses need the un-hoisted behaviour to A/B against."""
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy)
+        monkeypatch.setenv(server_generation.ENV_HOIST_WIRED_LIMIT, "0")
+        gen = _loaded_generator()
+
+        gen._hold_wired_limit([object()])
+
+        assert spy.calls == []
+        assert gen._wired_stack is None
+
+    def test_env_toggle_defaults_on(self, monkeypatch):
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy)
+        monkeypatch.delenv(server_generation.ENV_HOIST_WIRED_LIMIT, raising=False)
+        gen = _loaded_generator()
+
+        gen._hold_wired_limit([object()])
+
+        assert spy.value == MAXREC
+        gen._release_wired_limit()
+
+    def test_release_is_idempotent(self, monkeypatch):
+        spy = _LimitSpy(start=0)
+        _patch_mlx(monkeypatch, spy)
+        gen = _loaded_generator()
+        gen._hold_wired_limit([object()])
+        gen._release_wired_limit()
+        gen._release_wired_limit()          # must not raise or re-set
+        assert spy.value == 0
