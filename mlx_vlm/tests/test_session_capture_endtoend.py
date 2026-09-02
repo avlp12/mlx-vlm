@@ -134,3 +134,55 @@ class TestStepCapture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVaultObservability(unittest.TestCase):
+    """The seven live checks are observed through this surface.
+
+    Four of them (capture fired, eviction order, resident bytes, session hits)
+    have no other external witness: the vault lives inside the response
+    generator. Exposing it is the same lesson as the APC default -- a cache
+    nobody can observe is a cache nobody can tell is off.
+    """
+
+    def test_absent_generator_reports_disabled(self):
+        old = getattr(_app.runtime, "response_generator", None)
+        try:
+            _app.runtime.response_generator = None
+            self.assertEqual(_app._vault_stats_snapshot(), {"enabled": False})
+        finally:
+            _app.runtime.response_generator = old
+
+    def test_absent_vault_reports_disabled(self):
+        old = getattr(_app.runtime, "response_generator", None)
+        try:
+            _app.runtime.response_generator = types.SimpleNamespace(vault=None)
+            self.assertEqual(_app._vault_stats_snapshot(), {"enabled": False})
+        finally:
+            _app.runtime.response_generator = old
+
+    def test_counters_the_live_checks_need_are_present(self):
+        from mlx_vlm.context_vault import ContextVault
+        old = getattr(_app.runtime, "response_generator", None)
+        try:
+            v = ContextVault("obs", budget_bytes=1 << 20)
+            _app.runtime.response_generator = types.SimpleNamespace(vault=v)
+            snap = _app._vault_stats_snapshot()
+            self.assertTrue(snap["enabled"])
+            for k in ("session_inserts", "session_hits", "evictions",
+                      "bytes_resident", "rungs_resident"):
+                self.assertIn(k, snap, f"{k} is what a live check reads")
+        finally:
+            _app.runtime.response_generator = old
+
+    def test_a_broken_vault_cannot_break_the_endpoint(self):
+        class Boom:
+            def stats_dict(self):
+                raise RuntimeError("boom")
+        old = getattr(_app.runtime, "response_generator", None)
+        try:
+            _app.runtime.response_generator = types.SimpleNamespace(vault=Boom())
+            self.assertEqual(_app._vault_stats_snapshot(),
+                             {"enabled": True, "stats_error": True})
+        finally:
+            _app.runtime.response_generator = old
