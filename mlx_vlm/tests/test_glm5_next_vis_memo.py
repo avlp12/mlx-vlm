@@ -16,6 +16,7 @@ when its memory budget is exhausted.
 """
 
 import os
+import threading
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -118,8 +119,11 @@ def _inputs(config, batch=1, seq=SEQ, seed=7):
 
 def _run(indexers, x, qr, mask, memo):
     """One 'forward': every indexer sees the same x/qr/mask, its own fresh cache."""
-    prev = glm5._VIS_MEMO_CTX
-    glm5._VIS_MEMO_CTX = memo
+    # The memo context is THREAD-LOCAL now (it used to be a module global and two
+    # concurrent forwards raced on it). Drive it through the accessors rather
+    # than assigning a module attribute; the semantics under test are unchanged.
+    prev = glm5._get_vis_memo_ctx()
+    glm5._set_vis_memo_ctx(memo)
     try:
         outs = []
         for ix in indexers:
@@ -128,7 +132,7 @@ def _run(indexers, x, qr, mask, memo):
             outs.append(topk)
         return outs
     finally:
-        glm5._VIS_MEMO_CTX = prev
+        glm5._set_vis_memo_ctx(prev)
 
 
 def _memo_for(indexers):
@@ -201,13 +205,13 @@ def test_memo_declines_foreign_indexer():
     owned = _indexers(config, n=2, seed=40)
     foreign = _indexers(config, n=1, seed=90)[0]
     memo = _memo_for(owned)
-    prev = glm5._VIS_MEMO_CTX
-    glm5._VIS_MEMO_CTX = memo
+    prev = glm5._get_vis_memo_ctx()
+    glm5._set_vis_memo_ctx(memo)
     try:
         assert glm5._active_vis_memo(owned[0]) is memo
         assert glm5._active_vis_memo(foreign) is None
     finally:
-        glm5._VIS_MEMO_CTX = prev
+        glm5._set_vis_memo_ctx(prev)
     # and with no context open at all (probes calling layer.self_attn by hand)
     assert glm5._active_vis_memo(owned[0]) is None
 
@@ -329,9 +333,9 @@ def test_model_forward_registers_and_scopes_the_memo():
     model = _tiny_model()
     n_dsa = sum(1 for l in model.layers if not l.is_linear)
     assert len(model._dsa_indexer_ids) == n_dsa == 2
-    assert glm5._VIS_MEMO_CTX is None
+    assert glm5._get_vis_memo_ctx() is None
     _model_forward(model)
-    assert glm5._VIS_MEMO_CTX is None, "memo context leaked past the forward"
+    assert glm5._get_vis_memo_ctx() is None, "memo context leaked past the forward"
 
 
 def test_model_forward_bit_identical_on_vs_off():
@@ -356,3 +360,154 @@ def test_model_forward_under_verify_mode():
         assert bool(mx.all(checked == plain))
     finally:
         _reset_env(MLX_VLM_GLM5_VIS_MEMO="1", MLX_VLM_GLM5_VIS_MEMO_VERIFY=None)
+
+
+# ------------------------------------------------------- thread safety (I97x)
+# The memo context used to be a MODULE GLOBAL saved and restored around the layer
+# loop.  That is correct for one forward at a time and wrong the moment two run
+# concurrently -- which is exactly what co-scheduling a decode beside a prefill
+# does.  These tests pin the thread-local behaviour, and every one of them FAILS
+# against the old module-global implementation.
+
+def test_memo_scope_survives_the_historic_interleaving():
+    """Force the exact ordering that broke the module global:
+
+        A enters -> B enters -> A checks -> A exits -> B checks -> B exits
+
+    Under the old code, B's entry overwrote the single global, so A's check saw
+    MemoB; A's exit restored None, so B's check saw None; and B's exit restored
+    MemoA, leaving a STALE MEMO INSTALLED PAST BOTH FORWARDS.  That last one is
+    the dangerous part: chunk keys are (B, T, S, c0, c1), so a memo that outlives
+    its forward will be consulted by the next one, and that one can collide.
+    """
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    owners_a = frozenset({1001})
+    owners_b = frozenset({2002})
+    seen = {}
+    err = {}
+    a_in, b_in, a_out, b_out = (threading.Event() for _ in range(4))
+
+    def thread_a():
+        try:
+            with glm5._vis_memo_scope(owners_a) as memo_a:
+                seen["a_entered"] = memo_a
+                a_in.set()
+                assert b_in.wait(5), "B never entered"
+                # B is inside its own scope right now.
+                seen["a_sees_while_b_open"] = glm5._get_vis_memo_ctx()
+            seen["a_after_exit"] = glm5._get_vis_memo_ctx()
+            a_out.set()
+        except BaseException as e:      # noqa: BLE001 - surface it in the assert
+            err["a"] = e
+            a_in.set(); a_out.set()
+
+    def thread_b():
+        try:
+            assert a_in.wait(5), "A never entered"
+            with glm5._vis_memo_scope(owners_b) as memo_b:
+                seen["b_entered"] = memo_b
+                b_in.set()
+                assert a_out.wait(5), "A never exited"
+                # A has now left its scope. B must be untouched by that.
+                seen["b_sees_after_a_exit"] = glm5._get_vis_memo_ctx()
+            seen["b_after_exit"] = glm5._get_vis_memo_ctx()
+            b_out.set()
+        except BaseException as e:      # noqa: BLE001
+            err["b"] = e
+            b_in.set(); b_out.set()
+
+    ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
+    ta.start(); tb.start(); ta.join(10); tb.join(10)
+    assert not err, f"worker raised: {err}"
+
+    # neither thread ever saw the other's memo
+    assert seen["a_sees_while_b_open"] is seen["a_entered"], \
+        "thread A saw thread B's memo -- the context is not thread-local"
+    assert seen["b_sees_after_a_exit"] is seen["b_entered"], \
+        "thread A's exit clobbered thread B's memo"
+    assert seen["a_entered"] is not seen["b_entered"], "both threads got one memo"
+
+    # and each thread's slot is clean afterwards, on both threads and here
+    assert seen["a_after_exit"] is None, "memo survived thread A's scope"
+    assert seen["b_after_exit"] is None, "memo survived thread B's scope"
+    assert glm5._get_vis_memo_ctx() is None, "a memo leaked onto the main thread"
+
+
+def test_worker_threads_start_with_a_clean_slot():
+    """threading.local's per-thread __init__ must give every new thread None,
+    not whatever the creating thread happened to hold."""
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    got = {}
+    with glm5._vis_memo_scope(frozenset({7})):
+        assert glm5._get_vis_memo_ctx() is not None       # main thread holds one
+        t = threading.Thread(target=lambda: got.update(ctx=glm5._get_vis_memo_ctx()))
+        t.start(); t.join(5)
+    assert got["ctx"] is None, "a new thread inherited the parent's memo"
+
+
+def test_scope_restores_on_exception_per_thread():
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    out = {}
+
+    def worker():
+        try:
+            with glm5._vis_memo_scope(frozenset({3})):
+                raise RuntimeError("forward blew up")
+        except RuntimeError:
+            pass
+        out["after"] = glm5._get_vis_memo_ctx()
+
+    t = threading.Thread(target=worker); t.start(); t.join(5)
+    assert out["after"] is None, "a raising forward left its memo installed"
+    assert glm5._get_vis_memo_ctx() is None
+
+
+def test_active_vis_memo_is_thread_local():
+    """_active_vis_memo reads the thread-local slot, so a memo open on one thread
+    must not serve an indexer being asked about on another."""
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    config = _config()
+    owned = _indexers(config, n=1, seed=11)
+    memo = _memo_for(owned)
+    out = {}
+    with glm5._vis_memo_scope(frozenset(id(ix) for ix in owned)):
+        # main thread: served
+        glm5._set_vis_memo_ctx(memo)
+        assert glm5._active_vis_memo(owned[0]) is memo
+        t = threading.Thread(
+            target=lambda: out.update(m=glm5._active_vis_memo(owned[0])))
+        t.start(); t.join(5)
+    assert out["m"] is None, "another thread's indexer lookup found our memo"
+
+
+def test_two_concurrent_model_forwards_are_bit_identical_to_serial():
+    """The end-to-end property item 3(a) depends on: two real forwards running
+    at once must produce exactly what they produce alone.
+
+    This is the test that would have caught the bug in production rather than in
+    review -- it exercises the real layer loop, the real scope, and the real
+    indexers, on two threads at the same time.
+    """
+    _reset_env(MLX_VLM_GLM5_VIS_MEMO="1")
+    model = _tiny_model()
+    serial = _model_forward(model)
+    mx.eval(serial)
+
+    results, errors = {}, {}
+
+    def worker(tag):
+        try:
+            results[tag] = _model_forward(model)
+        except BaseException as e:      # noqa: BLE001
+            errors[tag] = e
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in ("x", "y")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not errors, f"a concurrent forward raised: {errors}"
+    for tag, out in results.items():
+        assert bool(mx.all(out == serial)), \
+            f"concurrent forward {tag} diverged from the serial result"
+    assert glm5._get_vis_memo_ctx() is None, "memo leaked past concurrent forwards"
