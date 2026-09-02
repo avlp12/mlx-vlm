@@ -127,12 +127,31 @@ def _vault_stats_snapshot() -> dict:
     # are "there is no vault" and "the flag is off", and those are exactly the
     # cases a caller most needs named.
     skips = _vault_mod.session_skip_counts()
-    if vault is None:
-        return {"enabled": False, "session_skips": skips}
+    # The disk tier's counters ride in the same block, and for the same reason:
+    # "the directory is unset" and "every restore was refused" are states a
+    # caller most needs named, and neither of them has a vault object to hang on.
     try:
-        return {"enabled": True, "session_skips": skips, **vault.stats_dict()}
+        from .. import vault_disk as _disk_mod
+
+        disk = _disk_mod.disk_stats_snapshot()
     except Exception:  # noqa: BLE001 - observability must not break the endpoint
-        return {"enabled": True, "session_skips": skips, "stats_error": True}
+        disk = {"enabled": False, "stats_error": True}
+    if vault is None:
+        return {"enabled": False, "session_skips": skips, "disk_vault": disk}
+    try:
+        return {
+            "enabled": True,
+            "session_skips": skips,
+            "disk_vault": disk,
+            **vault.stats_dict(),
+        }
+    except Exception:  # noqa: BLE001 - observability must not break the endpoint
+        return {
+            "enabled": True,
+            "session_skips": skips,
+            "disk_vault": disk,
+            "stats_error": True,
+        }
 
 
 def _server_runtime_snapshot() -> dict:

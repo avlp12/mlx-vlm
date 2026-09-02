@@ -485,6 +485,11 @@ class ContextVault:
         self._resident = 0
         self._rungs = 0
         self.stats = VaultStats()
+        # Optional cold tier (:mod:`mlx_vlm.vault_disk`).  None -- the default --
+        # is the vault exactly as it was before the disk tier existed: every
+        # hook below is a no-op, so nothing about RAM behaviour is conditional
+        # on a feature that is off.  Set by ``vault_disk.attach_disk_vault``.
+        self.disk = None
 
     # -- internals ------------------------------------------------------
 
@@ -600,6 +605,48 @@ class ContextVault:
                 best = n
         return best
 
+    @staticmethod
+    def _tokens_for_node(node: _Node) -> Optional[List[int]]:
+        """The token prefix that names ``node``, read back off the trie edges.
+
+        The trie stores each rung's tokens split across the edges on its root
+        path, so a checkpoint about to be evicted can still be *named* -- which
+        is what the disk tier needs and what a bare ``VaultCheckpoint`` does not
+        carry.  Returns None if the reconstruction disagrees with the node's own
+        depth, because a mislabelled disk entry would be found by the wrong
+        prompt later.
+        """
+        parts: List[Tuple[int, ...]] = []
+        n: Optional[_Node] = node
+        while n is not None and n.parent is not None:
+            parts.append(n.edge)
+            n = n.parent
+        toks: List[int] = []
+        for edge in reversed(parts):
+            toks.extend(int(t) for t in edge)
+        return toks if len(toks) == node.depth else None
+
+    def _offload(self, node: _Node, reason: str) -> None:
+        """Hand a rung to the disk tier.  Never blocks, never raises.
+
+        Called with ``self._lock`` held and on the generation thread, so the
+        contract with :meth:`vault_disk.DiskPrefixVault.save_async` is that it
+        only enqueues -- a device write on this thread would trade the stall the
+        vault exists to remove for a smaller one.
+        """
+        disk = getattr(self, "disk", None)
+        cp = node.checkpoint
+        if disk is None or cp is None:
+            return
+        try:
+            toks = self._tokens_for_node(node)
+            if toks is None:
+                return
+            disk.save_async(toks, cp, reason=reason)
+        except Exception:  # noqa: BLE001 - the cold tier must never fail a request
+            logger.warning("vault: disk offload failed; the rung is simply lost",
+                           exc_info=True)
+
     def _evict_until(self, headroom: int) -> None:
         if self.budget <= 0:
             return
@@ -623,6 +670,10 @@ class ContextVault:
                 deepest = self._deepest_of_session(victim.checkpoint.session_id)
                 if deepest is not None:
                     victim = deepest
+            # Save BEFORE dropping: this is the entry whose 444 s of prefill is
+            # about to be thrown away, so it is exactly the one worth 0.55 s of
+            # SSD (P2, sweep11).  The write is queued, not performed here.
+            self._offload(victim, "evict")
             self._resident -= victim.checkpoint.nbytes
             self._rungs -= 1
             self.stats.evictions += 1
@@ -694,6 +745,12 @@ class ContextVault:
             if tier is VaultTier.SESSION:
                 self.stats.session_inserts += 1
             self.stats.bytes_resident = self._resident
+            if getattr(getattr(self, "disk", None), "save_on_insert", False):
+                # Off by default: eviction-time saving writes each rung at most
+                # once and only the rungs that would otherwise be lost, while
+                # insert-time saving writes every rung including the ones that
+                # are about to be superseded by a deeper one on the same ladder.
+                self._offload(node, "insert")
             return True
 
     def restore_into(

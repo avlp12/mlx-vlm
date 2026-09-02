@@ -49,6 +49,7 @@ __all__ = [
     "boundary_hash",
     "fetch_plan",
     "pack_fragments",
+    "plan_fragments",
     "unpack_fragments",
     "vault_digest",
 ]
@@ -128,16 +129,22 @@ def _rebuild(node: Any, arrays: Sequence[mx.array]) -> Any:
     return node["__scalar__"]
 
 
-def pack_fragments(
+def plan_fragments(
     fragments: Sequence[StateFragment],
-) -> Tuple[Dict[str, Any], mx.array]:
-    """Flatten a ladder rung into (manifest, one contiguous uint8 payload)."""
+) -> Tuple[Dict[str, Any], List[mx.array]]:
+    """Manifest for a ladder rung plus the flat uint8 view of every array.
+
+    The manifest is exactly what :func:`pack_fragments` produces; the payload is
+    left as a *list* of per-array uint8 views laid out back to back at the
+    manifest's offsets, so a caller that streams (the disk vault writes 4 MiB at
+    a time) never has to materialise the concatenated buffer. Concatenating the
+    list reproduces ``pack_fragments`` byte for byte, which is what makes the
+    disk file and the wire payload the same format.
+    """
     arrays: List[mx.array] = []
     tree = [_walk(f, arrays) for f in fragments]
     flat = [mx.view(mx.contiguous(a).flatten(), mx.uint8) for a in arrays]
-    payload = mx.concatenate(flat) if flat else mx.zeros((0,), dtype=mx.uint8)
-    mx.eval(payload)
-    manifest = {
+    manifest: Dict[str, Any] = {
         "tree": tree,
         "offsets": [],
         "version": 1,
@@ -150,6 +157,16 @@ def pack_fragments(
         )
         off += n
     manifest["total_bytes"] = off
+    return manifest, flat
+
+
+def pack_fragments(
+    fragments: Sequence[StateFragment],
+) -> Tuple[Dict[str, Any], mx.array]:
+    """Flatten a ladder rung into (manifest, one contiguous uint8 payload)."""
+    manifest, flat = plan_fragments(fragments)
+    payload = mx.concatenate(flat) if flat else mx.zeros((0,), dtype=mx.uint8)
+    mx.eval(payload)
     return manifest, payload
 
 
