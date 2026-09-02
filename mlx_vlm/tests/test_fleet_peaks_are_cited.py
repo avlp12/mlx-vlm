@@ -96,3 +96,35 @@ class TestSizingRule(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGateRequirementUnits(unittest.TestCase):
+    """The GiB/GB conflation, pinned so it cannot recur silently.
+
+    Seen twice on 2026-09-02: lane 5's prereg wrote the fit in GiB and its
+    prediction in GB in one sentence; lane 3's gate dry-run converted a GiB peak
+    to GB and then added the 60 GiB margin as 60 GB, shaving 4.4 GB off a margin
+    that still read "60" on the page.
+    """
+
+    def test_both_units_are_reported(self):
+        r = fleet.gate_requirement(328.0)
+        self.assertEqual(r["required_gib"], 388.0)
+        self.assertAlmostEqual(r["required_gb"], 416.61, places=1)
+
+    def test_the_margin_is_gib_and_worth_more_in_gb(self):
+        """60 GiB is 64.4 GB; adding 60 GB instead loses 4.4 GB of margin."""
+        r = fleet.gate_requirement(328.0)
+        naive_gb = 328.0 * (1024 ** 3) / 1e9 + 60.0
+        self.assertAlmostEqual(r["required_gb"] - naive_gb, 4.4, places=1)
+
+    def test_lane3_dry_run_numbers_are_reproduced(self):
+        """219.1 GiB -> 235.3 GB is the conversion; 295.3 is that plus 60 GB."""
+        r = fleet.gate_requirement(219.1)
+        self.assertAlmostEqual(219.1 * (1024 ** 3) / 1e9, 235.3, places=1)
+        self.assertEqual(r["required_gib"], 279.1)
+        self.assertAlmostEqual(r["required_gb"], 299.7, places=1)
+
+    def test_it_says_which_field_the_gate_wants(self):
+        self.assertEqual(fleet.gate_requirement(100.0)["pass_to_require_headroom"],
+                         "required_gib")
