@@ -113,6 +113,23 @@ def _model_cache_registry() -> ModelCacheRegistry:
     return registry
 
 
+def _vault_stats_snapshot() -> dict:
+    """Warm Context Vault counters, or ``{"enabled": False}``.
+
+    The vault hangs off the response generator rather than off ``runtime``
+    (generation.py builds it per model load), and a stats read must never be
+    able to fail a health check, so every hop is defensive.
+    """
+    gen = getattr(runtime, "response_generator", None)
+    vault = getattr(gen, "vault", None) if gen is not None else None
+    if vault is None:
+        return {"enabled": False}
+    try:
+        return {"enabled": True, **vault.stats_dict()}
+    except Exception:  # noqa: BLE001 - observability must not break the endpoint
+        return {"enabled": True, "stats_error": True}
+
+
 def _server_runtime_snapshot() -> dict:
     registry = _model_cache_registry()
     default_cache = registry.for_kind("text_generation")
@@ -167,6 +184,12 @@ def _server_runtime_snapshot() -> dict:
             if runtime.apc_manager is None
             else {"enabled": True, **runtime.apc_manager.stats_snapshot()}
         ),
+        # The vault sits next to APC here for the same reason APC is here at
+        # all: a cache nobody can observe is a cache nobody can tell is off.
+        # That was the whole X3 finding, and the session tier would have
+        # repeated it -- its inserts, hits, evictions and resident bytes were
+        # reachable only from inside the process until this line existed.
+        "vault": _vault_stats_snapshot(),
     }
 
 
