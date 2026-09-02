@@ -111,33 +111,69 @@ class UnmeasuredConfiguration(RuntimeError):
 # here is typed from memory: test_fleet_peaks_are_cited re-reads every receipt
 # and fails if a number drifts from its source.
 #
-# Key: (batch, prompt_tokens, chunk, segment_align, speculative) -> GiB.
-# ``chunk=None`` means the receipt did not vary it.
-SINGLE_BOX_PEAKS = {
-    # Decode arm, 512-token prompts, fused KDA (logs/tp2/kda_bench_*_202609011436)
-    (1, 512, None, False, False): (173.9, "tp2/kda_bench_x1_cap32_202609011436.json",
-                                   ("preflight", "fit", "anchors", 0, 1)),
-    (2, 512, None, False, False): (175.3, "tp2/kda_bench_x1_cap32_202609011436.json",
-                                   ("preflight", "fit", "anchors", 1, 1)),
-    (4, 512, None, False, False): (177.7, "tp2/kda_bench_x1_cap32_202609011436.json",
-                                   ("preflight", "fit", "anchors", 2, 1)),
-    (8, 512, None, False, False): (183.2, "tp2/kda_bench_x1_cap32_202609011436.json",
-                                   ("preflight", "fit", "anchors", 3, 1)),
-    # 16k real-text prefill, epsilon (logs/sweep6/SWEEP6_L2_e2e_E1.json)
-    (1, 16384, 512, False, False): (190.52, "sweep6/SWEEP6_L2_e2e_E1.json",
-                                    ("arms", 0, "peak_gb")),
-    (1, 16384, 512, True, False): (196.10, "sweep6/SWEEP6_L2_e2e_E1.json",
-                                   ("arms", 1, "peak_gb")),
-}
+# One entry per MEASUREMENT, not per configuration, because two harnesses
+# disagree about the same nominal cell by ~11 GiB and that disagreement has to
+# stay visible:
+#
+#     B @ 512   kda_bench   X3_T1    diff
+#         1       173.90    162.05  -11.85
+#         2       175.30    163.29  -12.01
+#         4       177.70    166.30  -11.40
+#         8       183.20    173.07  -10.13
+#
+# I883 forbids comparing absolutes across harnesses, and this is why. The
+# resolution is in single_box_required_gib: MAX across sources for one
+# configuration, MIN across dominating configurations.
+#
+# Fields: (batch, prompt_tokens, chunk, segment_align, speculative),
+#         peak_gib, receipt (relative to _LOG_ROOT), locator, source commit.
+SINGLE_BOX_PEAKS = (
+    # Decode arm, 512-token prompts, fused KDA, cap32
+    ((1, 512, None, False, False), 173.9, "tp2/kda_bench_x1_cap32_202609011436.json",
+     ("preflight", "fit", "anchors", 0, 1), "kda_bench@2026-09-01"),
+    ((2, 512, None, False, False), 175.3, "tp2/kda_bench_x1_cap32_202609011436.json",
+     ("preflight", "fit", "anchors", 1, 1), "kda_bench@2026-09-01"),
+    ((4, 512, None, False, False), 177.7, "tp2/kda_bench_x1_cap32_202609011436.json",
+     ("preflight", "fit", "anchors", 2, 1), "kda_bench@2026-09-01"),
+    ((8, 512, None, False, False), 183.2, "tp2/kda_bench_x1_cap32_202609011436.json",
+     ("preflight", "fit", "anchors", 3, 1), "kda_bench@2026-09-01"),
+    # 16k real-text prefill, epsilon
+    ((1, 16384, 512, False, False), 190.52, "sweep6/SWEEP6_L2_e2e_E1.json",
+     ("arms", 0, "peak_gb"), "l2_e2e@2026-09-02"),
+    ((1, 16384, 512, True, False), 196.10, "sweep6/SWEEP6_L2_e2e_E1.json",
+     ("arms", 1, "peak_gb"), "l2_e2e@2026-09-02"),
+    # X3 T1 greedy matrix, gesicht, server-faithful (git_head df0c9b56)
+    ((1, 512, None, False, False), 162.05, "sweep9/X3_T1.json",
+     ("cells", 0, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((2, 512, None, False, False), 163.29, "sweep9/X3_T1.json",
+     ("cells", 1, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((4, 512, None, False, False), 166.30, "sweep9/X3_T1.json",
+     ("cells", 2, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((8, 512, None, False, False), 173.07, "sweep9/X3_T1.json",
+     ("cells", 3, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((16, 512, None, False, False), 177.39, "sweep9/X3_T1.json",
+     ("cells", 4, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((1, 8192, None, False, False), 180.03, "sweep9/X3_T1.json",
+     ("cells", 5, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((2, 8192, None, False, False), 180.03, "sweep9/X3_T1.json",
+     ("cells", 6, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((4, 8192, None, False, False), 199.27, "sweep9/X3_T1.json",
+     ("cells", 7, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((8, 8192, None, False, False), 244.40, "sweep9/X3_T1.json",
+     ("cells", 8, "peak_gib"), "x3_matrix@df0c9b56"),
+    ((16, 8192, None, False, False), 258.22, "sweep9/X3_T1.json",
+     ("cells", 9, "peak_gib"), "x3_matrix@df0c9b56"),
+)
 # Configurations the gate CANNOT size yet, listed so their absence is a decision
 # rather than an oversight. Until each lands, a request needing it is refused.
 PEAKS_PENDING = (
-    "(1, 16384, 2048, OFF/ON) -- 198.11 / 210.01 GiB are in the same lane 5 "
-    "receipt but under a stride the arm records as 2048; add once the locator "
-    "is confirmed against the file rather than assumed",
-    "B=8 and B=16 prefill, align OFF -- lane 3 X3 T2",
-    "B=1 speculative peaks -- lane 2 X3/R24",
-    "align ON at batch > 1 -- lane 5, tomorrow",
+    "ctx 131072 at any batch -- lane 3 X3 T2; 328.0 GiB was quoted for B=16 but "
+    "is not in a receipt I have read, so nothing at 131k is sized yet",
+    "speculative peaks -- lane 3 T1 t1b/t1d, which must be cited at commit "
+    "f85ebb6f (width 8); the df0c9b56 default resolved to width 3, so a spec "
+    "peak from the df0c9b56 run would describe a different workload",
+    "chunk 2048 at 16k, align OFF/ON (198.11 / 210.01 quoted) -- locators unread",
+    "align ON at batch > 1 -- lane 5",
 )
 _LOG_ROOT = os.environ.get("MLX_VLM_FLEET_RECEIPT_ROOT",
                            os.path.expanduser("~/glm53flash/logs"))
@@ -178,11 +214,25 @@ def single_box_required_gib(*, batch: int, prompt_tokens: int,
                             speculative: bool = False) -> tuple:
     """Peak GiB to request, and the receipt that justifies it.
 
-    THE RULE, pre-registered. A configuration is sized only by a measured point
-    that DOMINATES it -- one whose batch, prompt length and chunk are all >= the
-    request, whose segment_align is on if the request's is, and likewise
-    speculative. Among dominating points the SMALLEST is returned, so the gate is
-    tight without ever being under.
+    THE RULE, in two stages, because real data broke the one-stage version.
+
+    THE RULE. Per SOURCE, take the smallest measurement that DOMINATES the
+    request -- batch, prompt length and chunk all >=, and segment_align /
+    speculative on if the request's are. Then take the MAX across sources.
+
+    Tight in configuration, conservative in instrument, and in that order. Both
+    halves came from data rather than from reasoning, and each was a real
+    under-request in an earlier draft of this function:
+
+      * collapsing configurations across sources first adopted whichever
+        instrument read low -- kda_bench and X3_T1 disagree by 10-12 GiB on
+        every cell they share;
+      * dominating across mixed sources returned X3's B=16 @ 512 (177.39 GiB)
+        for a B=8 @ 512 request, 5.81 GiB BELOW kda_bench's direct measurement
+        of that exact cell. Monotonicity in batch and prompt length holds inside
+        a harness; it does not survive an 11 GiB level shift between two.
+
+    Nothing is interpolated or extrapolated, and an uncovered request RAISES.
 
     Nothing is interpolated and nothing is extrapolated. The old linear fit
     (173.0 + 1.23*B) is kept as documentation of the batch slope, not as a
@@ -196,22 +246,45 @@ def single_box_required_gib(*, batch: int, prompt_tokens: int,
     recoverable (I891, and the 2026-09-01 freeze).
     """
     want = (batch, prompt_tokens, chunk or 0, segment_align, speculative)
-    best = None
-    for (b, p, c, a, sp), (gib, receipt, loc) in SINGLE_BOX_PEAKS.items():
+
+    def dominates(cfg):
+        b, p, c, a, sp = cfg
         if b < want[0] or p < want[1] or (c or 0) < want[2]:
-            continue
+            return False
         if want[3] and not a:
-            continue
+            return False
         if want[4] and not sp:
+            return False
+        return True
+
+    # Per SOURCE, take the smallest dominating measurement. Monotonicity in
+    # batch / prompt / chunk holds inside one harness, so that is a sound upper
+    # bound for this harness. Then take the MAX across harnesses.
+    #
+    # Both halves were learned from data, not from reasoning, and each was a
+    # real under-request in the first draft:
+    #   * mixing sources before dominating adopted whichever instrument read low
+    #     (kda_bench vs X3_T1 disagree by 10-12 GiB on every shared cell);
+    #   * dominating across mixed sources returned X3's B=16 @ 512 (177.39) for a
+    #     B=8 @ 512 request, 5.81 GiB BELOW kda_bench's direct measurement of
+    #     that very cell -- because monotonicity does not survive a level shift.
+    per_source = {}
+    for cfg, gib, receipt, loc, src in SINGLE_BOX_PEAKS:
+        if not dominates(cfg):
             continue
-        if best is None or gib < best[0]:
-            best = (gib, receipt, loc)
+        cur = per_source.get(src)
+        if cur is None or gib < cur[0]:
+            per_source[src] = (gib, receipt, loc, src)
+    best = None
+    for cand in per_source.values():
+        if best is None or cand[0] > best[0]:
+            best = cand
     if best is None:
         raise UnmeasuredConfiguration(
             f"no cited peak dominates batch={batch} prompt={prompt_tokens} "
             f"chunk={chunk} align={segment_align} spec={speculative}. "
             f"Measure it; do not extrapolate. Pending: {PEAKS_PENDING}")
-    return best[0], f"{best[1]}::{'.'.join(str(x) for x in best[2])}"
+    return best[0], f"{best[1]}::{'.'.join(str(x) for x in best[2])} [{best[3]}]"
 
 
 

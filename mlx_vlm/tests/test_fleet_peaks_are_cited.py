@@ -26,7 +26,7 @@ class TestPeaksAreDerivedFromReceipts(unittest.TestCase):
     def test_every_entry_matches_its_receipt(self):
         root = fleet._LOG_ROOT
         checked = 0
-        for key, (gib, rel, loc) in fleet.SINGLE_BOX_PEAKS.items():
+        for key, gib, rel, loc, src in fleet.SINGLE_BOX_PEAKS:
             path = os.path.join(root, rel)
             if not os.path.exists(path):
                 self.skipTest(f"receipt not on this box: {rel}")
@@ -35,7 +35,7 @@ class TestPeaksAreDerivedFromReceipts(unittest.TestCase):
             got = float(_dig(doc, loc))
             self.assertAlmostEqual(
                 got, gib, places=2,
-                msg=f"{key} claims {gib} but {rel}::{loc} says {got}")
+                msg=f"{key} from {src} claims {gib} but {rel}::{loc} says {got}")
             checked += 1
         self.assertGreater(checked, 0, "the table must not be empty")
 
@@ -61,6 +61,60 @@ class TestSizingRule(unittest.TestCase):
         gib, _ = fleet.single_box_required_gib(batch=1, prompt_tokens=8192, chunk=256)
         self.assertAlmostEqual(gib, 190.52, places=2)
 
+    def test_harness_disagreement_resolves_to_the_HIGHER_measurement(self):
+        """The bug real data exposed in the first draft of this rule.
+
+        kda_bench and X3_T1 both measured B=1 @ 512 and disagree by 11.85 GiB
+        (173.90 vs 162.05). Returning the smallest dominating measurement reads
+        as "tight without being under" and in fact adopts whichever instrument
+        read low. Stage 1 takes the max per configuration; only then does
+        stage 2 take the min across configurations.
+        """
+        gib, why = fleet.single_box_required_gib(batch=1, prompt_tokens=512)
+        self.assertGreater(gib, 162.05,
+                           msg="must not adopt the optimistic harness (X3 read 162.05)")
+
+    def test_a_direct_measurement_is_never_undercut_by_another_harness(self):
+        """The second bug real data exposed.
+
+        kda_bench measured B=8 @ 512 at 183.20. X3_T1 measured B=16 @ 512 at
+        177.39 -- a LARGER configuration reading LOWER, because the two
+        harnesses sit ~11 GiB apart. Dominating across mixed sources returned
+        177.39 for a B=8 request: 5.81 GiB below a direct measurement of that
+        exact cell. Per-source domination, then max, fixes it.
+        """
+        gib, why = fleet.single_box_required_gib(batch=8, prompt_tokens=512)
+        self.assertGreaterEqual(gib, 183.2)
+        self.assertIn("kda_bench", why)
+
+    def test_the_rule_can_be_loose_and_says_so(self):
+        """Honest limitation, pinned so it is not mistaken for tightness.
+
+        Taking the max across per-source bounds means a source that only
+        measured much larger configurations still contributes its (valid but
+        loose) bound. B=1 @ 512 is sized by lane 5's B=1 @ 16k peak because that
+        genuinely dominates it. Safe, not tight; it tightens as the table fills.
+        """
+        gib, why = fleet.single_box_required_gib(batch=1, prompt_tokens=512)
+        self.assertAlmostEqual(gib, 190.52, places=2)
+        self.assertIn("SWEEP6_L2_e2e_E1.json", why)
+
+    def test_b16_at_8k_is_now_sized_from_lane3(self):
+        gib, why = fleet.single_box_required_gib(batch=16, prompt_tokens=8192)
+        self.assertAlmostEqual(gib, 258.22, places=2)
+        self.assertAlmostEqual(fleet.gate_requirement(gib)["required_gib"], 318.22, 2)
+        self.assertIn("X3_T1.json", why)
+        self.assertIn("cells.9.peak_gib", why)
+
+    def test_131k_still_raises_because_nothing_measured_it(self):
+        with self.assertRaises(fleet.UnmeasuredConfiguration):
+            fleet.single_box_required_gib(batch=16, prompt_tokens=131072)
+
+    def test_every_entry_names_its_source_commit_or_run(self):
+        for key, gib, rel, loc, src in fleet.SINGLE_BOX_PEAKS:
+            self.assertTrue(src and "@" in src,
+                            f"{key} must name the run/commit it came from")
+
     def test_segment_align_is_not_satisfied_by_an_OFF_measurement(self):
         gib, _ = fleet.single_box_required_gib(
             batch=1, prompt_tokens=16384, chunk=512, segment_align=True)
@@ -69,7 +123,7 @@ class TestSizingRule(unittest.TestCase):
 
     def test_uncovered_configuration_refuses_rather_than_extrapolating(self):
         with self.assertRaises(fleet.UnmeasuredConfiguration):
-            fleet.single_box_required_gib(batch=16, prompt_tokens=16384, chunk=2048)
+            fleet.single_box_required_gib(batch=32, prompt_tokens=8192)
         with self.assertRaises(fleet.UnmeasuredConfiguration):
             fleet.single_box_required_gib(batch=1, prompt_tokens=131072, chunk=512)
         with self.assertRaises(fleet.UnmeasuredConfiguration):
@@ -92,6 +146,11 @@ class TestSizingRule(unittest.TestCase):
         measured, _ = fleet.single_box_required_gib(
             batch=1, prompt_tokens=16384, chunk=512)
         self.assertGreater(measured - fit_at_b1, 10.0)
+
+    def test_the_fit_would_have_badly_undersized_B16_at_8k(self):
+        """173.0 + 1.23*16 = 192.7 GiB; lane 3 measured 258.22."""
+        measured, _ = fleet.single_box_required_gib(batch=16, prompt_tokens=8192)
+        self.assertGreater(measured - fleet.single_box_gb(16), 60.0)
 
 
 if __name__ == "__main__":
