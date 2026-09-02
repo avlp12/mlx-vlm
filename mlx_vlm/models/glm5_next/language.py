@@ -2679,12 +2679,14 @@ class LanguageModel(nn.Module):
             )
         if draft_kind == "dflash":
             # The dflash drafter's ONLY need from the prefill is the per-layer
-            # hidden capture, and the two prefill drivers now carry the capture
+            # hidden capture, and all THREE prefill drivers now carry the capture
             # kwargs on every chunk and stitch the pieces back along the time
             # axis (``speculative/utils.py::PrefillHiddenAccumulator``, used by
-            # ``server/generation.py::_run_chunked_speculative_prefill`` and by
-            # ``generate/ar.py``).  Nothing reads a prefill's ``gdn_states``, so
-            # the stash stays off on every chunk as well.
+            # ``server/generation.py::_run_chunked_speculative_prefill``, by
+            # ``generate/ar.py::generate_step`` and by
+            # ``generate/ar.py::PromptProcessingBatch`` -- the batched/continuous
+            # batching driver, which was fixed last).  Nothing reads a prefill's
+            # ``gdn_states``, so the stash stays off on every chunk as well.
             #
             # Gated on the capture actually being requested: a prefill_kwargs
             # without ``capture_layer_ids`` gives the accumulator nothing to

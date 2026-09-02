@@ -1529,6 +1529,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        target_hidden_offset: int = 0,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1546,6 +1547,13 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        # Rows the prefill trimmed off the front of the drafter's context.  The
+        # drafter discards that prefix itself when it is handed the whole prompt,
+        # and adds its width to every draft cache offset; when the prefill
+        # discarded it first the offset has to be supplied here or the drafter's
+        # absolute RoPE positions move.  Same contract the single-stream path
+        # carries as ``target_hidden_offset`` (``generate_step``).
+        self.target_hidden_offset = int(target_hidden_offset or 0)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1632,6 +1640,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            target_hidden_offset=self.target_hidden_offset,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1771,6 +1780,13 @@ class PromptProcessingBatch:
                 ]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
+        # ``prompt_step`` consumes ``_input_ids`` one chunk at a time, so anything
+        # that needs the WHOLE prompt -- ``prompt_tokens`` on the speculative round
+        # loop, which is the prompt-lookup drafter's n-gram corpus -- must be handed
+        # a snapshot taken before the loop starts.  Passing ``self._input_ids`` at
+        # the round-loop call site instead hands over only the tail that survived
+        # chunking.  ``generate_step`` keeps the same snapshot as ``full_prompt_ids``.
+        self._speculative_prompt_ids = self._input_ids
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
 
@@ -1891,6 +1907,38 @@ class PromptProcessingBatch:
                 prefill_kwargs=policy_kwargs,
             ):
                 self.prefill_step_size = None
+
+        # This is the THIRD chunked-prefill driver in the tree, and it had the same
+        # defect the other two were fixed for: ``prompt_step`` built its kwargs from
+        # ``self._prompt_kwargs`` alone, so a batched request with a hidden-reading
+        # drafter chunked its prompt and then handed the drafter only the final
+        # forward -- a one-chunk context -- while ``chunked_prefill_policy`` had
+        # already admitted the chunking on the strength of the capture being asked
+        # for.  Carry the same capture on every chunk and stitch the pieces back;
+        # see ``generate_step`` and ``server/generation.py::
+        # _run_chunked_speculative_prefill`` for the identical shape.
+        self._prefill_capture_kwargs: dict = {}
+        self._chunk_capture_kwargs: dict = {}
+        self.target_hidden_offset = 0
+        if draft_model is not None and draft_kind is not None:
+            # Prefill leg: hidden captures yes, KDA rollback stash no.
+            self._prefill_capture_kwargs = prefill_capture_kwargs(
+                self.model,
+                speculative_prefill_kwargs(draft_kind, draft_model),
+            )
+            # Only a per-layer capture (``capture_layer_ids``) survives being split
+            # across chunks and stitched back on the time axis.  MTP's
+            # ``return_hidden`` capture is a single pre-final-norm hidden whose
+            # consumer wants the LAST token only, so it stays off the chunks.
+            if self._prefill_capture_kwargs.get("capture_layer_ids"):
+                self._chunk_capture_kwargs = self._prefill_capture_kwargs
+        self._prefill_hidden = PrefillHiddenAccumulator(
+            keep=(
+                prefill_context_keep(draft_kind, draft_model)
+                if self._chunk_capture_kwargs
+                else None
+            )
+        )
 
     def __len__(self):
         return len(self.uids)
@@ -2081,14 +2129,28 @@ class PromptProcessingBatch:
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
-        self.model(
+        if self._chunk_capture_kwargs:
+            prompt_kwargs = {**prompt_kwargs, **self._chunk_capture_kwargs}
+        chunk_out = self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.async_eval([c.state for c in self.prompt_cache])
+        if self._chunk_capture_kwargs:
+            self._prefill_hidden.append(chunk_out)
+        # Drop the chunk's logits (and any gdn stash) BEFORE the eval below, so the
+        # vocab-wide projection is never materialised for a chunk nobody samples
+        # from.  Without a capture this is exactly the old statement-expression call.
+        chunk_out = None
+        # ``pending()`` is empty unless a capture is active, so the no-drafter path
+        # schedules the same single argument it always did.  Scheduling the captures
+        # is not optional: an unevaluated capture is a graph node that pins every
+        # intermediate behind it (``PrefillHiddenAccumulator.pending``).
+        mx.async_eval(
+            [c.state for c in self.prompt_cache] + self._prefill_hidden.pending()
+        )
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._store_vault_checkpoints()
@@ -2127,14 +2189,10 @@ class PromptProcessingBatch:
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
         call_kwargs = dict(self._prompt_kwargs)
-        if self.draft_model is not None and self.draft_kind is not None:
-            # Prefill leg: hidden captures yes, KDA rollback stash no.
-            call_kwargs.update(
-                prefill_capture_kwargs(
-                    self.model,
-                    speculative_prefill_kwargs(self.draft_kind, self.draft_model),
-                )
-            )
+        # Prefill leg: hidden captures yes, KDA rollback stash no.  Computed once in
+        # ``__init__`` so this forward and every chunk before it carry byte-identical
+        # capture kwargs -- the accumulator raises if the capture width moves.
+        call_kwargs.update(self._prefill_capture_kwargs)
 
         output = self.model(
             self._input_ids,
@@ -2142,6 +2200,14 @@ class PromptProcessingBatch:
             inputs_embeds=self._inputs_embeds,
             **call_kwargs,
         )
+        if self._chunk_capture_kwargs:
+            # Stitch this forward's capture onto the chunks' and hand the drafter one
+            # whole-prompt context.  ``finish()`` also reports the rows it trimmed off
+            # the front, which the drafter is owed as a RoPE offset.
+            self._prefill_hidden.append(output)
+            stitched, self.target_hidden_offset = self._prefill_hidden.finish()
+            if stitched is not None:
+                output.hidden_states = stitched
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
@@ -2216,10 +2282,11 @@ class PromptProcessingBatch:
                 shared_kv_states=(
                     output.shared_kv_states if self.draft_kind == "mtp" else None
                 ),
-                prompt_tokens=self._input_ids,
+                prompt_tokens=self._speculative_prompt_ids,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                target_hidden_offset=self.target_hidden_offset,
             )
             compute_logprobs = False
         else:

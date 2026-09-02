@@ -28,14 +28,24 @@ What this module pins, in the order the argument runs:
     level down; skipping the offset half shifts every draft position and is
     caught by a negative control below.
 4.  **The retention is gone**, in bytes, not in shapes.
+5.  **All three chunk drivers carry the capture**, not two.  ``generate_step`` and
+    ``server/generation.py::_run_chunked_speculative_prefill`` were fixed first;
+    ``generate/ar.py::PromptProcessingBatch`` -- the continuous-batching prefill a
+    served multi-row request actually takes -- had the identical defect plus a
+    second one, ``prompt_tokens`` read after the chunk loop had consumed the prompt
+    down to its tail.  Section 8 pins the batched path at B = 2 with ragged prompt
+    lengths and the left padding the batch driver applies.
 """
 
 import os
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from mlx_vlm.generate import ar as ar_module
+from mlx_vlm.generate.ar import PromptProcessingBatch, _left_pad_prompts
 from mlx_vlm.models.glm5_next.config import TextConfig
 from mlx_vlm.models.glm5_next.language import LanguageModel
 from mlx_vlm.server import generation as server_generation
@@ -827,3 +837,282 @@ def test_ar_chunk_loop_carries_the_capture_and_stitches_the_prompt():
     # Chunk widths were 2, 2, 1 and each chunk's capture is filled with its own
     # width, so the surviving rows say which chunks they came from.
     assert stitched[0][0, :, 0].tolist() == [2.0, 2.0, 1.0]
+
+
+# ------------------------------------- 8. the batched driver (PromptProcessingBatch)
+#
+# The third chunked-prefill driver in the tree.  ``generate_step`` and
+# ``server/generation.py::_run_chunked_speculative_prefill`` were fixed first;
+# ``PromptProcessingBatch`` -- the continuous-batching prefill, the one a served
+# multi-row request actually takes -- kept the defect: ``prompt_step`` built its
+# kwargs from ``self._prompt_kwargs`` alone, so with a dflash drafter attached the
+# policy admitted chunking (because the capture WAS requested) and then the drafter
+# was handed only the final forward.  Second half of the same defect:
+# ``prompt_tokens=self._input_ids`` was read AFTER the chunk loop had consumed
+# ``_input_ids`` down to its tail.
+
+BATCH_ROWS = [list(range(3, 27)), list(range(7, 47))]  # ragged: 24 and 40 tokens
+BATCH_STEP = 8
+BATCH_S = 40  # left-padded width; row 0 carries 16 columns of left padding
+BATCH_KEEP = 15  # the stub drafter's prefill_context_keep()
+
+
+class _BatchSpy:
+    """Records every forward the batch driver makes, and every capture it returns.
+
+    A proxy rather than a subclass: ``PromptProcessingBatch`` calls ``self.model(...)``
+    and reaches for ``make_cache`` / ``chunked_prefill_policy`` /
+    ``supports_capture_gdn_states`` on the same object, so plain attribute
+    forwarding is enough and the real ``Glm5NextLanguageModel`` does the arithmetic.
+    """
+
+    def __init__(self, lm):
+        self._lm = lm
+        self.calls = []
+        self.captures = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(dict(kwargs))
+        out = self._lm(*args, **kwargs)
+        self.captures.append(getattr(out, "hidden_states", None))
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._lm, name)
+
+
+class _StubDrafter:
+    """The smallest object ``speculative/utils.py`` accepts as a dflash drafter."""
+
+    def __init__(self, keep=BATCH_KEEP):
+        self.config = SimpleNamespace(target_layer_ids=list(CAPTURE_IDS))
+        self._keep = keep
+        self.adopted = []
+
+    def prefill_context_keep(self):
+        return self._keep
+
+    def adopt_pretruncated_context(self, cache, skip):
+        self.adopted.append(skip)
+
+
+def _batch_prefill(*, step, drafter, rows=BATCH_ROWS):
+    """Drive a real ``PromptProcessingBatch`` to the handoff, the way the server does.
+
+    Returns ``(gen_batch, spy, padded_ids)``.  ``generate()`` hands the prompt cache
+    to the generation batch and clears its own reference, so the cache to compare is
+    ``gen_batch.prompt_cache``.
+    """
+    lm = _lm()
+    spy = _BatchSpy(lm)
+    padded = _left_pad_prompts(rows)
+    draft_kwargs = (
+        dict(draft_model=drafter, draft_kind="dflash") if drafter is not None else {}
+    )
+    batch = PromptProcessingBatch(
+        model=spy,
+        uids=list(range(len(rows))),
+        input_ids=rows,
+        max_tokens=[4] * len(rows),
+        inputs_embeds=lm.model.embed_tokens(padded),
+        prompt_kwargs={},
+        prefill_step_size=step,
+        **draft_kwargs,
+    )
+    while batch.needs_processing():
+        batch.prompt_step()
+    gen_batch = batch.generate(
+        sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        stop_criteria=lambda token: False,
+    )
+    mx.eval(_cache_arrays(gen_batch.prompt_cache))
+    return gen_batch, spy, padded
+
+
+def test_the_batched_chunk_loop_carries_the_capture_on_every_chunk():
+    """The defect itself, at the driver a served multi-row request takes.
+
+    Four chunks of 8 plus an 8-wide tail (``needs_processing`` stops once what is
+    left fits in one step).  Before the fix the four chunk forwards carried no
+    ``capture_layer_ids`` at all and only the tail did.
+    """
+    drafter = _StubDrafter()
+    _, spy, _ = _batch_prefill(step=BATCH_STEP, drafter=drafter)
+
+    assert len(spy.calls) == 5, [c.get("n_to_process") for c in spy.calls]
+    for i, call in enumerate(spy.calls):
+        assert call.get("capture_layer_ids") == list(CAPTURE_IDS), f"forward {i}"
+        # Prefill leg: hidden captures yes, KDA rollback stash no -- on every chunk,
+        # not just the last one.
+        assert call.get("capture_gdn_states") is False, f"forward {i}"
+
+
+def test_the_batched_capture_is_the_whole_prompt_not_the_last_chunk():
+    """Per row, bit-equal, against the chunks the driver itself produced.
+
+    ``hidden`` is what ``SpeculativeGenerationBatch`` hands the round loop:
+    ``mx.concatenate(hidden_states, axis=-1)`` over the captured layers.  It must be
+    the trailing ``keep`` rows of the WHOLE prompt, and it must be exactly the
+    concatenation of the per-chunk captures -- the accumulator adds nothing of its
+    own.  Before the fix this array was ``[2, 8, ...]``: the tail forward alone.
+    """
+    drafter = _StubDrafter()
+    gen_batch, spy, _ = _batch_prefill(step=BATCH_STEP, drafter=drafter)
+
+    assert gen_batch.hidden.shape == (
+        len(BATCH_ROWS),
+        BATCH_KEEP,
+        len(CAPTURE_IDS) * 128,
+    )
+    per_layer = [
+        mx.concatenate([c[i] for c in spy.captures], axis=1)
+        for i in range(len(CAPTURE_IDS))
+    ]
+    assert per_layer[0].shape[1] == BATCH_S
+    reference = mx.concatenate([h[:, -BATCH_KEEP:] for h in per_layer], axis=-1)
+    for row in range(len(BATCH_ROWS)):
+        assert mx.array_equal(
+            gen_batch.hidden[row : row + 1], reference[row : row + 1]
+        ), f"row {row}: stitched capture is not the chunks' own rows"
+
+
+def test_the_batched_capture_agrees_with_the_unchunked_capture_per_row():
+    """Chunked vs unchunked, per row and per captured layer.
+
+    The KDA layer is BIT-EQUAL on both rows -- including row 0, which carries 16
+    columns of left padding.  The sparse-attention layer agrees to 2.7e-07 on the
+    row that needed no padding.
+
+    On the LEFT-PADDED row the sparse layer moves by up to 1.13 at intermediate
+    positions.  That is the DeepSeek-sparse indexer, not the accumulator: with
+    ``index_topk`` = 6 the early positions of a padded row have fewer than 6 real
+    candidates, so which padding columns fill the top-k is decided over a chunk's
+    candidate set rather than the whole prompt's.  It is a property of chunking a
+    padded row that the greedy batch path already ships, and it moves neither the
+    target -- every one of the 10 prompt-cache arrays is bit-equal across the two
+    arms -- nor the sampled token.  Recorded rather than asserted away.
+    """
+    chunked, _, _ = _batch_prefill(step=BATCH_STEP, drafter=_StubDrafter())
+    unchunked, _, _ = _batch_prefill(step=None, drafter=_StubDrafter())
+
+    assert unchunked.hidden.shape == chunked.hidden.shape == (2, BATCH_KEEP, 256)
+    kda = slice(0, 128)
+    sparse = slice(128, 256)
+    for row in range(len(BATCH_ROWS)):
+        got = chunked.hidden[row : row + 1]
+        ref = unchunked.hidden[row : row + 1]
+        assert mx.array_equal(
+            got[:, :, kda], ref[:, :, kda]
+        ), f"row {row}: the KDA capture is not the unchunked capture's kept rows"
+    unpadded = len(BATCH_ROWS) - 1  # the longest row needed no left padding
+    drift = float(
+        mx.max(
+            mx.abs(
+                chunked.hidden[unpadded, :, sparse].astype(mx.float32)
+                - unchunked.hidden[unpadded, :, sparse].astype(mx.float32)
+            )
+        )
+    )
+    assert drift < 1e-5, f"unpadded row sparse capture drifted {drift}"
+
+
+def test_the_batched_spec_prefill_leaves_the_target_where_greedy_left_it():
+    """The capture only appends to Python sinks -- per row, bit-equal.
+
+    Holds before the fix too (there was no capture on the chunks to disturb
+    anything); it is the guard that carrying one on every chunk did not start
+    disturbing something.
+    """
+    spec, _, _ = _batch_prefill(step=BATCH_STEP, drafter=_StubDrafter())
+    greedy, _, _ = _batch_prefill(step=BATCH_STEP, drafter=None)
+
+    spec_arrays = _cache_arrays(spec.prompt_cache)
+    greedy_arrays = _cache_arrays(greedy.prompt_cache)
+    assert len(spec_arrays) == len(greedy_arrays) == 10
+    for i, (a, b) in enumerate(zip(spec_arrays, greedy_arrays)):
+        assert a.shape == b.shape, f"cache array {i}: {a.shape} != {b.shape}"
+        if a.ndim and a.shape[0] == len(BATCH_ROWS):
+            for row in range(len(BATCH_ROWS)):
+                assert mx.array_equal(
+                    a[row : row + 1], b[row : row + 1]
+                ), f"cache array {i}, row {row}"
+        else:
+            assert mx.array_equal(a, b), f"cache array {i}"
+
+
+def test_the_batched_prompt_tokens_are_the_whole_prompt_per_row():
+    """``prompt_tokens=self._input_ids`` was read after the loop had eaten it.
+
+    The chunk loop reassigns ``self._input_ids = self._input_ids[:, n:]``, so by the
+    time ``generate()`` runs, ``_input_ids`` is the 8-column tail.  The prompt-lookup
+    drafter builds its n-gram index from this array; a tail is not a prompt.
+    """
+    gen_batch, _, padded = _batch_prefill(step=BATCH_STEP, drafter=_StubDrafter())
+
+    assert gen_batch.prompt_tokens.shape == (len(BATCH_ROWS), BATCH_S)
+    for row, ids in enumerate(BATCH_ROWS):
+        seen = gen_batch.prompt_tokens[row].tolist()
+        assert mx.array_equal(
+            gen_batch.prompt_tokens[row : row + 1], padded[row : row + 1]
+        ), f"row {row}"
+        assert seen[BATCH_S - len(ids) :] == ids, f"row {row}: prompt truncated"
+        assert seen[: BATCH_S - len(ids)] == [0] * (BATCH_S - len(ids))
+
+
+def test_the_batched_offset_reaches_the_round_loop():
+    """``target_hidden_offset`` is the half of the trim that is easy to lose.
+
+    The accumulator dropped ``S - keep`` rows off the front of the drafter's
+    context; ``_dflash_rounds_batch`` has taken ``target_hidden_offset`` since
+    bbc7cdf8, but nothing on the batch path filled it in.
+    """
+    from unittest.mock import patch
+
+    drafter = _StubDrafter()
+    gen_batch, _, _ = _batch_prefill(step=BATCH_STEP, drafter=drafter)
+
+    assert gen_batch.target_hidden_offset == BATCH_S - BATCH_KEEP
+
+    seen = {}
+
+    def _record(*args, **kwargs):
+        seen.update(kwargs)
+        return iter(())
+
+    with patch.object(
+        ar_module, "run_speculative_server_rounds", side_effect=_record
+    ):
+        gen_batch._start_rounds()
+
+    assert seen["target_hidden_offset"] == BATCH_S - BATCH_KEEP
+    assert seen["prompt_tokens"].shape == (len(BATCH_ROWS), BATCH_S)
+
+
+@pytest.mark.parametrize("row", [0, 1])
+def test_the_batched_offset_adoption_is_bit_identical_per_row(row):
+    """Every row's draft cache must adopt the SAME offset, and it must be a no-op.
+
+    The batched round loop makes one draft cache per row and applies the single
+    ``target_hidden_offset`` to all of them (``speculative/dflash.py:963``).  Feed a
+    real DFlash2 drafter the row's full context, then the trimmed context plus the
+    adopted offset: output and both cache tensors and every layer offset must be
+    EQUAL, not close -- separately for each row, because a per-row context is what
+    ``_dflash_rounds_batch`` slices out (``hidden_by_orig``).
+    """
+    _, spy, _ = _batch_prefill(step=BATCH_STEP, drafter=_StubDrafter(keep=None))
+    per_layer = [
+        mx.concatenate([c[i] for c in spy.captures], axis=1)
+        for i in range(len(CAPTURE_IDS))
+    ]
+    full = mx.concatenate(per_layer, axis=-1)[row : row + 1].astype(mx.bfloat16)
+    assert full.shape == (1, BATCH_S, 256)
+
+    model = _drafter(hidden=128, n_target=2)
+    assert prefill_context_keep("dflash", model) == BATCH_KEEP
+    skip = BATCH_S - BATCH_KEEP
+
+    _assert_draft_state_equal(
+        _draft_round_one(model, full),
+        _draft_round_one(model, mx.contiguous(full[:, -BATCH_KEEP:]), skip=skip),
+        why=f"row {row}: trimming without adopting {skip} moved the drafter",
+    )
