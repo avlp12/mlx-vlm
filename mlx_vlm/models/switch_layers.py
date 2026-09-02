@@ -37,8 +37,25 @@ def _moe_segment_align() -> int:
     correct by construction and can never introduce a NaN, and the real rows of the padded
     output are bit-identical to the unpadded output.
 
-    DEFAULT OFF pending the paired e2e.  ``MLX_VLM_MOE_SEGMENT_ALIGN=16`` to enable (``1``,
-    ``true`` and ``on`` are accepted and mean 16).
+    E2E, epsilon, real text, ABAB, n=3 + discarded warm-up, 16,384-token prefill
+    (receipt logs/sweep6/SWEEP6_L2_e2e_E1.json):
+
+        chunk  512:  1.1023 / 1.0981 / 1.1005   median 1.1005, worst pair 1.0981
+        chunk 2048:  1.0394 / 1.0462 / 1.0494   median 1.0462, worst pair 1.0394
+
+    On the REAL router: 42 of 42 sparse layers pad, rows +13.55% (the uniform proxy used in the
+    microbench gave +13.2%, so the proxy was sound).  Output is **bitwise identical** -- max
+    |dlogit| 0.0 and 32 greedy tokens identical -- because the transform is exactly
+    output-preserving.
+
+    THE COST TO WATCH IS PEAK MEMORY, not time: 190.5 -> 196.1 GB at the 512 chunk and
+    198.1 -> 210.0 GB at 2048 (+11.9 GB).  The padding rows are real transients.  Peak at B=8/16
+    with this on is NOT measured, and the fleet gate's SHARD_GB["single"] = 183 is already stale
+    against the 198 GB the OFF arm reaches.
+
+    DEFAULT OFF.  Recommended ON for B=1 prefill once the peak-memory gate is re-fitted; keep it
+    OFF under batched serving until B=8/16 peaks exist.  ``MLX_VLM_MOE_SEGMENT_ALIGN=16`` to
+    enable (``1``, ``true`` and ``on`` are accepted and mean 16).
     """
     global _SEG_ALIGN_ENV
     if _SEG_ALIGN_ENV is None:
