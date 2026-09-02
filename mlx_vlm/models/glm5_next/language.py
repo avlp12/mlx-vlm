@@ -452,7 +452,41 @@ def _gather_q_chunk_for(kv_len: int, dim: int) -> int:
 # unaffected by this line -- but that value was fitted against the same
 # pre-formula gather cost and is stale for the same reason.  It needs its own
 # re-sweep on two boxes.
-_GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "12288"))
+# RE-SWEPT AFTER THE MQA FOLD (2026-09-02). The gate is a crossover between the dense masked path
+# and the gathered path, and MLX_VLM_GLM5_MQA_FOLD moved the gathered side: the per-chunk attention
+# went from 3.95 to 15.10 TFLOP/s, so gathering now pays much earlier. Re-swept e2e on one load,
+# real text, stride 2048, target 16384, 3 paired cycles plus a discarded warm-up, gates
+# {4096, 6144, 8192, 12288} x fold {OFF, ON} (receipt logs/sweep6/lane5_VERDICT_gate_resweep.md,
+# harness prep/sweep6/gate_resweep.py). Drift-corrected wall, ms:
+#
+#      gate    fold OFF   fold ON
+#      4096     58096.4   49232.1
+#      6144     56580.0   49052.6   <- new default
+#      8192     55552.8   49298.0   (tied with 6144, 0.5%)
+#     12288     54709.2   50935.4   <- old default; with the fold it is the WORST of the four
+#
+# The fold INVERTS the ordering. Without it, 12288 wins every cycle -- which reproduces both the
+# shipped default and R8's original finding, and is the best available check that this harness
+# measures what R8's did. That inversion also disposes of the ordering hazard: arms run gates
+# ascending and the box heats through a cycle, biasing toward low gates, yet the fold-OFF arms
+# under identical ordering favour the HIGH gate.
+#
+# Per chunk, the crossover is visible directly: gathering LOSES at depth 2048 (Kv 4096) and wins
+# from depth 4096 (Kv 6144), so the crossover is between Kv 4096 and 6144. The arithmetic estimate
+# registered before the sweep was Kv ~= 5729, inside that interval.
+#
+# WHAT IT IS WORTH, stated so it cannot be over-quoted: the gate only changes chunks at depths
+# 4096-8192 (everything deeper is gathered under either value), so the saving is a FIXED
+# ~2073 ms per prefill -- 4.1% of a 16k-token prompt, 0.5% of a 131k one. An order of magnitude
+# smaller than the fold itself.
+#
+# Identity: token-identical to gate 12288 at this prime with the fold on (max |dlogit| 1.328 on a
+# scale of 27), on a determinism control that is exactly 100%. Gate changes are chaos-limited in
+# general, so that is a favourable observation, not a guarantee.
+#
+# With MLX_VLM_GLM5_MQA_FOLD=0 the old crossover applies and 12288 is the right value; this default
+# is correct for the shipped configuration, which has the fold on.
+_GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "6144"))
 
 
 # --------------------------------------------------------------- indexer memo
