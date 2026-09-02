@@ -54,6 +54,7 @@ from ..speculative.utils import (
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from .keepalive import GpuKeepalive
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -1152,8 +1153,27 @@ class ResponseGenerator:
         self._cancelled: set = set()
         self._cancel_lock = Lock()
         self._tokenizer_lock = Lock()
+        # Armed only after the model loads (see _run_impl), so it can never tick
+        # against a half-initialised model or perturb a load the fleet gate is
+        # watching.  Constructing it here does no GPU work.
+        self._keepalive = GpuKeepalive()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    @property
+    def keepalive(self) -> GpuKeepalive:
+        """The GPU keepalive, created on demand.
+
+        ``__init__`` builds one; this accessor exists because the test suite
+        constructs ResponseGenerator through ``__new__`` in a couple of dozen
+        places.  An on-demand instance is never armed, so it ticks nothing and
+        leaves the idle timeout alone.
+        """
+        ka = getattr(self, "_keepalive", None)
+        if ka is None:
+            ka = GpuKeepalive()
+            self._keepalive = ka
+        return ka
 
     def _effective_prefill_step_size(self) -> int:
         prefill_step_size = getattr(self, "prefill_step_size", None)
@@ -1804,7 +1824,15 @@ class ResponseGenerator:
                 if _has_room():
                     append_item(self.requests.get_nowait())
             else:
-                append_item(self.requests.get(timeout=idle_timeout))
+                # Idle: no sequence is generating.  Hold the model's wired
+                # residency (see server/keepalive.py) before parking on the
+                # queue.  This branch is unreachable while a request is in
+                # flight, which is exactly the suppression we want -- a tick
+                # during generation would contend for the same stream.
+                self.keepalive.tick_if_due()
+                append_item(
+                    self.requests.get(timeout=self.keepalive.cap_wait(idle_timeout))
+                )
         except QueueEmpty:
             pass
 
@@ -1823,6 +1851,7 @@ class ResponseGenerator:
         try:
             self._run_impl()
         finally:
+            self.keepalive.close()
             clear_mlx_streams()
             # The GPU thread is the last owner of the model on the way down.
             # Its frame holds the BatchGenerator (already closed above, which
@@ -1853,6 +1882,7 @@ class ResponseGenerator:
             return
 
         self._ready.set()
+        self.keepalive.arm()
 
         # Diffusion models cannot run through the AR batch generator.
         if is_diffusion_model(self.model):
