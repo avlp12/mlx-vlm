@@ -2571,13 +2571,19 @@ class ResponseGenerator:
                     mean_a = (accepted + rounds) / rounds
                     logger.info(
                         "Speculative decode: kind=%s batch=%d tokens=%d "
-                        "accept=%.2f rounds=%d drafted=%s",
+                        "accept=%.2f rounds=%d drafted=%s width=%.2f",
                         draft_kind,
                         B,
                         sum(len(token_lists[u]) for u in uids),
                         mean_a,
                         rounds,
                         drafted,
+                        # Mean verify BLOCK TOTAL actually used = drafted per
+                        # round + 1 (the block's last slot is the bonus).  The
+                        # width policy was previously invisible in the log, which
+                        # is how a default that resolved to 3 instead of 8 shipped
+                        # unnoticed: every other field looked healthy.
+                        (drafted / rounds + 1.0) if drafted is not None else float("nan"),
                     )
 
                 # Finalize any remaining
