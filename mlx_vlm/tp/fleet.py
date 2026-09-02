@@ -107,11 +107,14 @@ SHARD_GB = {"tp": 86.0, "single": 183.0}
 #   reclaimable  -- free + min(inactive, file-backed).  Clean file-backed pages
 #                   are evictable without swapping, so they are headroom.
 #
-# The default stays free_only.  Switching a box to reclaimable is a fleet rule
-# change and is recorded as one; the WATCHED-LOAD clause below is mandatory
-# under it, because "reclaimable" is a claim about the future that has to be
+# The default is reclaimable, ratified 2026-09-02 after a validation load on
+# gesicht: free_only said 0.3 GB and refused; reclaimable said 487.0 GB and
+# passed; the load then completed in 26.2 SECONDS to a 169.03 GB footprint
+# without swap, because the model was already sitting in the page cache that
+# free_only refuses to count.  The WATCHED-LOAD clause below is mandatory under
+# it and is always on: "reclaimable" is a claim about the future, so it is
 # checked while the load happens rather than asserted before it.
-GATE_ACCOUNTING = os.environ.get("MLX_VLM_FLEET_GATE_ACCOUNTING", "free_only")
+GATE_ACCOUNTING = os.environ.get("MLX_VLM_FLEET_GATE_ACCOUNTING", "reclaimable")
 # Abort floor for a watched load.
 #
 # DEVIATION, FLAGGED FOR RATIFICATION: the floor was specified as "free < 20 GB".
@@ -125,7 +128,8 @@ GATE_ACCOUNTING = os.environ.get("MLX_VLM_FLEET_GATE_ACCOUNTING", "free_only")
 # reclaimable clean file-backed pages.  That is the faithful translation of the
 # intent ("the load is losing the race"), because when a load really is losing,
 # the reclaimable pool is what collapses.  swap > 0 remains the primary trigger
-# and is unchanged.
+# and is unchanged.  RATIFIED 2026-09-02; the DEVIATION note above is kept
+# because the reasoning is the justification, not just history.
 WATCH_FLOOR_GB = float(os.environ.get("MLX_VLM_FLEET_WATCH_FLOOR_GB", "20"))
 WATCH_FREE_FLOOR_GB = WATCH_FLOOR_GB  # back-compat alias
 WATCH_POLL_S = float(os.environ.get("MLX_VLM_FLEET_WATCH_POLL_S", "5"))
