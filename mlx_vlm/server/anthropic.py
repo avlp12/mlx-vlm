@@ -37,6 +37,7 @@ _INHERIT_ADAPTER = None
 get_cached_model = None
 _build_gen_args = None
 _read_tenant_id = None
+_read_session_id = None
 _preflight_stream_context_budget = None
 _as_plain_dict = None
 _split_thinking = None
@@ -45,7 +46,7 @@ _count_thinking_tag_tokens = None
 
 def register_routes(app, deps):
     global _INHERIT_ADAPTER
-    global get_cached_model, _build_gen_args, _read_tenant_id
+    global get_cached_model, _build_gen_args, _read_tenant_id, _read_session_id
     global _preflight_stream_context_budget, _as_plain_dict
     global _split_thinking, _count_thinking_tag_tokens
     global generate, stream_generate, apply_chat_template
@@ -60,6 +61,7 @@ def register_routes(app, deps):
     load_tool_module = deps.load_tool_module
     _build_gen_args = deps.build_gen_args
     _read_tenant_id = deps.read_tenant_id
+    _read_session_id = deps.read_session_id
     _preflight_stream_context_budget = deps.preflight_stream_context_budget
     _as_plain_dict = deps.as_plain_dict
     _split_thinking = deps.split_thinking
@@ -485,8 +487,10 @@ async def anthropic_messages_endpoint(http_request: Request):
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
+            # Header only, same as Chat Completions: no conversation concept.
             gen_args = _build_gen_args(
-                request, processor, tenant_id=_read_tenant_id(http_request)
+                request, processor, tenant_id=_read_tenant_id(http_request),
+                session_id=_read_session_id(http_request),
             )
         except Exception as e:
             return _anthropic_error_response(400, str(e))

@@ -90,6 +90,9 @@ _INHERIT_ADAPTER = None
 get_cached_model = None
 _build_gen_args = None
 _read_tenant_id = None
+_read_session_id = None
+_resolve_conversation_id = None
+_note_response_root = None
 _preflight_stream_context_budget = None
 _split_thinking = None
 _count_thinking_tag_tokens = None
@@ -394,6 +397,7 @@ def _chat_usage_chunk(
 def register_routes(app, deps):
     global _INHERIT_ADAPTER
     global get_cached_model, _build_gen_args, _read_tenant_id
+    global _read_session_id, _resolve_conversation_id, _note_response_root
     global _preflight_stream_context_budget, _split_thinking
     global _count_thinking_tag_tokens, _make_logprob_content
     global generate, stream_generate, apply_chat_template
@@ -408,6 +412,9 @@ def register_routes(app, deps):
     load_tool_module = deps.load_tool_module
     _build_gen_args = deps.build_gen_args
     _read_tenant_id = deps.read_tenant_id
+    _read_session_id = deps.read_session_id
+    _resolve_conversation_id = deps.resolve_conversation_id
+    _note_response_root = deps.note_response_root
     _preflight_stream_context_budget = deps.preflight_stream_context_budget
     _split_thinking = deps.split_thinking
     _count_thinking_tag_tokens = deps.count_thinking_tag_tokens
@@ -985,9 +992,16 @@ async def responses_endpoint(request: Request):
         tool_parser_type = _infer_tool_parser_from_processor(processor)
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
+        # Responses API: the conversation is the previous_response_id CHAIN, so
+        # the id is the chain ROOT, resolved in O(1) from a map written at
+        # response time rather than walked on the hot path (I981).
+        conversation_id = _resolve_conversation_id(
+            getattr(openai_request, "previous_response_id", None), request
+        )
         try:
             gen_args = _build_gen_args(
-                openai_request, processor, tenant_id=_read_tenant_id(request)
+                openai_request, processor, tenant_id=_read_tenant_id(request),
+                session_id=conversation_id,
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -1018,6 +1032,9 @@ async def responses_endpoint(request: Request):
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
+        # Record which conversation this response belongs to, so a follow-up
+        # naming it resolves without walking the chain.
+        _note_response_root(response_id, conversation_id)
         message_id = f"msg_{uuid.uuid4().hex}"
 
         if openai_request.stream:
@@ -1720,8 +1737,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             tool_module = None
 
         try:
+            # Chat Completions has no conversation concept, so capture happens
+            # only with an explicit X-Session-Id header; no header, no capture.
             gen_args = _build_gen_args(
-                request, processor, tenant_id=_read_tenant_id(http_request)
+                request, processor, tenant_id=_read_tenant_id(http_request),
+                session_id=_read_session_id(http_request),
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))

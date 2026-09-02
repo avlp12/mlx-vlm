@@ -171,13 +171,15 @@ def _server_runtime_snapshot() -> dict:
 
 
 def _build_gen_args(
-    request, processor=None, tenant_id: Optional[str] = None
+    request, processor=None, tenant_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> GenerationArguments:
     """Build GenerationArguments from a compatible API request."""
     return _request_normalization._build_gen_args(
         request,
         processor=processor,
         tenant_id=tenant_id,
+        session_id=session_id,
         structured_logits_processor_builder=_build_structured_logits_processors,
     )
 
@@ -1118,6 +1120,9 @@ _protocol_deps = SimpleNamespace(
     ),
     build_gen_args=_build_gen_args,
     read_tenant_id=_read_tenant_id,
+    read_session_id=_read_session_id,
+    resolve_conversation_id=resolve_conversation_id,
+    note_response_root=note_response_root,
     preflight_stream_context_budget=_preflight_stream_context_budget,
     as_plain_dict=_as_plain_dict,
     split_thinking=_split_thinking,
