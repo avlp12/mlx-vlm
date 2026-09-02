@@ -12,7 +12,7 @@ from ..base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from ..cache import ArraysCache, CacheList, KVCache
+from ..cache import ArraysCache, BatchKVCache, CacheList, KVCache, dynamic_roll
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
@@ -2523,14 +2523,96 @@ def trim_sparse_cache(cache, trim: int, index_kpool: int) -> None:
     )
 
 
+def _row_give_back_batch_kv(kv: BatchKVCache, extra: mx.array) -> None:
+    """Give row ``i`` back ``extra[i]`` trailing positions of a BatchKVCache.
+
+    The buffer is rectangular and every consumer in this model reads it
+    RIGHT-ALIGNED: one shared write cursor ``_idx``, per-row validity carried by
+    ``left_padding``, per-row length carried by ``offset == _idx - left_padding``.
+    So a row that must end earlier is not made shorter -- it is *shifted right*
+    by ``extra[i]`` and its vacated head becomes left padding.  That is exactly
+    the transform ``BatchKVCache.finalize()`` already performs for a right-padded
+    prefill chunk (``dynamic_roll`` + ``offset -= p`` + ``left_padding += p``);
+    this is the same move, applied per round instead of once.
+
+    The vacated window is ZEROED rather than left holding the wrapped-around
+    tail.  Masking it would be enough for the dense MLA path, but the whole
+    point of the fix is that no rejected token's KV stays live anywhere, and the
+    zero also clears the indexer's per-token validity flag (channel
+    ``2 * head_dim`` of its packed entry), which is what makes the indexer's
+    pooling anchor -- ``first_key = argmax(valid)`` in ``_pool_layout`` -- move
+    with the padding.  That anchoring is what makes selection *equivariant*
+    under left padding: the pools of a padded row cover the same logical tokens,
+    in the same blocks, as an unpadded forward over that row alone.
+    """
+    idx = int(kv._idx)
+    if idx <= 0:
+        return
+    left_padding = kv.left_padding + extra
+    for name in ("keys", "values"):
+        arr = getattr(kv, name)
+        if arr is None or arr.size == 0 or arr.shape[-1] == 0:
+            continue
+        # Rebind rather than write back into a slice of the same array: the
+        # rolled value reads the buffer it would be written to, and an in-place
+        # slice update whose input is itself is a shape of aliasing worth not
+        # relying on. ``BatchKVCache.finalize`` rolls the whole (over-allocated)
+        # buffer and rebinds, and this is the same move; the slots past the
+        # write cursor are zeros by construction, so rolling them is free of
+        # meaning and the ``keep`` mask puts them back to zero.
+        pos = mx.arange(arr.shape[2])
+        keep = (pos[None, :] >= left_padding[:, None]) & (pos[None, :] < idx)
+        rolled = dynamic_roll(arr, extra[:, None], axis=2)
+        setattr(
+            kv,
+            name,
+            mx.where(keep[:, None, :, None], rolled, mx.array(0, arr.dtype)),
+        )
+    kv.offset = kv.offset - extra
+    kv.left_padding = left_padding
+
+
+def give_back_sparse_cache_rows(cache, extra: mx.array) -> None:
+    """Per-row half of the sparse rollback: row ``i`` gives back ``extra[i]``.
+
+    Called after :func:`trim_sparse_cache` has trimmed the batch by the row that
+    accepted the MOST, so ``extra[i] = max_a - accepted_i`` is what row ``i``
+    still owes.  Both halves of the ``CacheList`` move together -- the MLA latent
+    and the indexer's packed keys are appended in lockstep and must stay so.
+
+    The indexer pools are dropped, not rolled: a pool block is ``index_kpool``
+    CONTIGUOUS positions anchored at the row's first valid key, and a per-row
+    shift of ``extra[i]`` moves that anchor by a non-multiple of the block size,
+    so no prefix of the old pool survives.  The next decode step rebuilds it in
+    one O(T) pooling pass -- which is the path a left-padded batch takes anyway
+    (the incremental branch requires ``_no_pad``).
+    """
+    for sub in cache.caches:
+        _row_give_back_batch_kv(sub, extra)
+    indexer_cache = cache[1]
+    indexer_cache._pool = None
+    indexer_cache._fpool = None
+    # The pools above were computed from a `valid` that is now stale; say so,
+    # rather than leaving the fast path's precondition asserting the opposite
+    # until the next eager forward recomputes it.
+    indexer_cache._no_pad = False
+
+
 class LanguageModel(nn.Module):
-    # ``rollback_speculative_cache`` below rolls the batch back with ONE trim
-    # length, ONE KDA replay prefix and ONE indexer pool length -- the cache is
-    # rectangular in the batch dimension and cannot represent per-row accept
-    # counts. Declaring the requirement makes the speculative loops clamp
-    # per-row accepts to the batch minimum before they call us. Named after
-    # upstream Blaizzy/mlx-vlm 3b8f727d (qwen3_5/deepseek_v4 carry the same
-    # class attribute) so a later rebase is a no-conflict fast-forward.
+    # The STATIC declaration: with no further information, assume this model's
+    # rollback cannot represent per-row accept counts, so the speculative loops
+    # clamp to the batch minimum before calling us. Named after upstream
+    # Blaizzy/mlx-vlm 3b8f727d (qwen3_5/deepseek_v4 carry the same class
+    # attribute) so a later rebase is a no-conflict fast-forward.
+    #
+    # It is deliberately still True. The requirement is a property of the CACHE,
+    # not of the model: ``rollback_speculative_cache`` below rolls a ragged batch
+    # back per row when handed batched (left-paddable) caches, and cannot when
+    # handed a scalar-offset ``KVCache`` or a quantized batch cache. The
+    # cache-aware override is ``supports_per_row_speculative_rollback``, which
+    # ``speculative/common.py::_batch_acceptance_must_be_uniform`` consults with
+    # the live caches in hand; flipping this attribute to False instead would
+    # turn those two cases from a clamp into a mid-generation RuntimeError.
     requires_uniform_batch_acceptance = True
 
     # Advertises the ``capture_gdn_states`` kwarg below, so a caller can turn the
@@ -2693,28 +2775,43 @@ class LanguageModel(nn.Module):
         else:
             accepted_list = [int(x) for x in accepted]
         max_a = max(accepted_list)
-        # A ragged batch has no rollback here: this cache is rectangular in the
-        # batch dimension (one KV length, one KDA replay prefix, one indexer
-        # pool length), so trimming by ``max_a`` would leave every shorter row
-        # holding the LIVE KV of tokens it rejected -- attended, wrong tokens,
-        # with the row's logical length and the cache's shared offset diverged.
-        # The clamp in speculative/dflash.py, gated on the class attribute
-        # below, is what makes the precondition true; if it did not run, that
-        # is a wiring bug and must be loud, not silently mis-trimmed.
-        if (
-            len(accepted_list) > 1
-            and len(set(accepted_list)) > 1
-            and getattr(self, "requires_uniform_batch_acceptance", False)
-        ):
+        extra = [max_a - a for a in accepted_list]
+        ragged = any(e > 0 for e in extra)
+        # A ragged batch is rolled back PER ROW: each row is trimmed to the batch
+        # maximum (rectangular, as before) and then gives back the ``extra[i]``
+        # positions it did not accept, by shifting right into per-row left
+        # padding.  That is only representable in a batched cache; on a
+        # scalar-offset ``KVCache`` (or a quantized batch cache, whose keys are
+        # packed tuples with no roll) there is nowhere to put the per-row length,
+        # and trimming by ``max_a`` would leave every shorter row holding the
+        # LIVE KV of tokens it rejected -- attended, wrong tokens, with the row's
+        # logical length and the cache's offset diverged.  The caller is
+        # supposed to have clamped in that case
+        # (speculative/common.py::_batch_acceptance_must_be_uniform reads the
+        # same predicate off the same caches); if it did not, that is a wiring
+        # bug and must be loud, not silently mis-trimmed.
+        if ragged and not self.supports_per_row_speculative_rollback(caches):
             raise RuntimeError(
-                "glm5_next batched speculative rollback requires uniform "
-                f"per-row acceptance; got ragged accepts {accepted_list}. "
+                "glm5_next cannot roll back ragged accepts "
+                f"{accepted_list} into {type(caches[-1]).__name__} caches: "
+                "per-row rollback needs a batched (left-paddable) KV cache. "
                 "Trimming by the batch maximum leaves rejected-token KV live "
                 "in the shorter rows (issue #1962); the caller must clamp "
                 "accepts to the batch minimum before rollback -- see "
-                "speculative/common.py::_requires_uniform_batch_acceptance."
+                "speculative/common.py::_batch_acceptance_must_be_uniform."
             )
         trim = block_size - (max_a + 1)
+        extra_arr = mx.array(extra, dtype=mx.int32) if ragged else None
+        # Per-row KDA replay length as the [B, T] mask the shipped gated-delta
+        # kernel (and its ops reference) already take: a masked step leaves the
+        # recurrent state untouched, so row i's state is the state after exactly
+        # ``accepted_i + 1`` tokens.  No kernel change, one call, same cost.
+        kda_mask = (
+            mx.arange(max_a + 1)[None, :]
+            < mx.array([a + 1 for a in accepted_list])[:, None]
+            if ragged
+            else None
+        )
 
         gdn_idx = 0
         for c in caches:
@@ -2724,8 +2821,8 @@ class LanguageModel(nn.Module):
                 # KDA (linear-attention) layer: replay the fast gated-delta kernel from
                 # the entry state over just the accepted prefix (n tokens) to recover the
                 # rolled-back recurrent state, and slice the conv window to match.
-                # Acceptance is uniform across the batch -- enforced by the guard
-                # above, not merely assumed -- so n is shared.
+                # ``n`` is the batch maximum; ``kda_mask`` stops each row at its own
+                # length, and the conv window is gathered per row for the same reason.
                 q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state, conv_input, K, lb = (
                     gdn_states[gdn_idx]
                 )
@@ -2741,9 +2838,26 @@ class LanguageModel(nn.Module):
                     dt_bias_,
                     state=init_state,
                     lower_bound=lb,
+                    mask=kda_mask,
                 )
                 c[1] = state_n
-                c[0] = conv_input[:, n : n + K - 1]
+                if ragged and K > 1:
+                    # conv_input is [prev window | this block]; row i's window
+                    # is the K-1 entries ending at its own accepted length.
+                    starts = mx.array([a + 1 for a in accepted_list], dtype=mx.int32)
+                    win = starts[:, None] + mx.arange(K - 1)[None, :]
+                    c[0] = mx.contiguous(
+                        mx.take_along_axis(
+                            conv_input,
+                            mx.broadcast_to(
+                                win[..., None],
+                                (win.shape[0], K - 1, conv_input.shape[-1]),
+                            ),
+                            axis=1,
+                        )
+                    )
+                else:
+                    c[0] = conv_input[:, n : n + K - 1]
             else:
                 # Sparse (MLA + lightning-indexer) layer: trim both KV caches, then roll
                 # the indexer pool back to the trimmed length by keeping only the pool
@@ -2751,7 +2865,37 @@ class LanguageModel(nn.Module):
                 # rebuilds just the last partial block (O(index_kpool)) instead of the
                 # whole pool (O(T)) -- critical for long context.
                 trim_sparse_cache(c, trim, self.args.index_kpool)
+                if ragged:
+                    give_back_sparse_cache_rows(c, extra_arr)
         return max_a
+
+    def supports_per_row_speculative_rollback(self, caches) -> bool:
+        """Whether a RAGGED batched rollback can be represented in ``caches``.
+
+        Per-row acceptance needs two things, and only one of them is free.  The
+        KDA replay stops at a per-row length for any cache (the shipped
+        gated-delta kernel already takes a ``[B, T]`` mask).  The sparse layers
+        cannot: a rectangular KV buffer expresses a per-row length only as
+        per-row LEFT PADDING, which is ``BatchKVCache`` state.  A scalar-offset
+        ``KVCache`` (single-stream ``make_cache``) has one offset for the batch,
+        and a quantized batch cache holds packed tuples that ``dynamic_roll``
+        cannot shift, so both keep the uniform-acceptance clamp.
+
+        Read by ``speculative/common.py::_batch_acceptance_must_be_uniform``
+        BEFORE the round is walked, and by ``rollback_speculative_cache`` as the
+        backstop that turns a missing clamp into a crash rather than corruption.
+        """
+        if not caches:
+            return False
+        seen_sparse = False
+        for c in caches:
+            if c is None or isinstance(c, ArraysCache):
+                continue
+            subs = getattr(c, "caches", None)
+            if subs is None or not all(isinstance(sub, BatchKVCache) for sub in subs):
+                return False
+            seen_sparse = True
+        return seen_sparse
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
