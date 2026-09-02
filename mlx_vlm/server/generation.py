@@ -15,6 +15,7 @@ import mlx.core as mx
 from fastapi import HTTPException
 
 from .. import apc as _apc
+from .. import context_vault as _context_vault
 from .._stream_cleanup import clear_mlx_streams
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
@@ -2700,8 +2701,14 @@ class ResponseGenerator:
             # storing something wrong). Best-effort by contract -- capture_session
             # never raises, and losing a rung only costs the next turn a cold
             # prefill, which is the status quo.
-            if r.finish_reason is not None and info.get("session_id"):
-                batch_gen.capture_session(r.uid, session_id=info["session_id"])
+            if r.finish_reason is not None:
+                if info.get("session_id"):
+                    batch_gen.capture_session(r.uid, session_id=info["session_id"])
+                else:
+                    # The guard that fires when the header never arrived. Named,
+                    # because "no session id on the request" and "capture broke"
+                    # produced the same silence on ff9a3045.
+                    _context_vault.record_session_skip("no_session_id_on_request")
 
             draft_rounds = draft_accepted = draft_total = None
             request_draft_kind = None

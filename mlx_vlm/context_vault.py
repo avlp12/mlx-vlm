@@ -109,6 +109,34 @@ def vault_budget_bytes() -> int:
     return int(max(0.0, gb) * (1024**3))
 
 
+# Why a session capture did not happen, counted by reason. Module-level rather
+# than on the vault, because two of the reasons are "there is no vault" and "the
+# flag is off" -- a counter that lives on the object cannot record its absence.
+#
+# THIS EXISTS BECAUSE THE FEATURE WAS INERT LIVE AND SAID NOTHING. On unified
+# ff9a3045 the seven live checks found session_inserts stuck at 0 with an empty
+# log: capture_session has five early returns and none of them spoke, so from
+# outside a disabled feature and a broken one are the same picture. That is the
+# same failure the APC default had, built into my own code while fixing theirs.
+SESSION_SKIPS: Dict[str, int] = {}
+_SKIP_LOCK = threading.Lock()
+
+
+def record_session_skip(reason: str) -> None:
+    with _SKIP_LOCK:
+        SESSION_SKIPS[reason] = SESSION_SKIPS.get(reason, 0) + 1
+
+
+def session_skip_counts() -> Dict[str, int]:
+    with _SKIP_LOCK:
+        return dict(SESSION_SKIPS)
+
+
+def reset_session_skips() -> None:
+    with _SKIP_LOCK:
+        SESSION_SKIPS.clear()
+
+
 def session_capture_enabled() -> bool:
     """End-of-turn capture, ``MLX_VLM_GLM5_VAULT_SESSION``.  Default OFF.
 
@@ -991,19 +1019,23 @@ def record_session_turn(
     is a cold prefill next turn, which is exactly the status quo.
     """
     if vault is None:
+        record_session_skip("no_vault")
         # TP disables the vault wholesale (server/generation.py:1286-1290): the
         # request path carries no rungs to rank 1.  The session tier inherits
         # that refusal rather than adding a second, differently-wrong one.
         return False
     if not completed:
+        record_session_skip("not_completed")
         return False
     try:
         toks = list(tokens)
         if not toks:
+            record_session_skip("empty_tokens")
             return False
         sid = session_id
         if not sid:
             if not derived_session_id_allowed():
+                record_session_skip("no_session_id")
                 logger.warning(
                     "vault: refusing a session capture with no session_id; the "
                     "caller must pass its conversation id (see "
@@ -1013,8 +1045,10 @@ def record_session_turn(
             sid = session_id_for(toks)
         n = prefix_len if prefix_len is not None else prefix_len_from_cache(caches)
         if n is None or n <= 0:
+            record_session_skip("no_cache_offset")
             return False
         if n > len(toks):
+            record_session_skip("cache_longer_than_key")
             # The cache holds more than the key describes; the key would not
             # identify the state. Refuse rather than store a mislabelled rung.
             logger.warning("vault: session capture skipped, cache holds %d tokens "
@@ -1022,6 +1056,7 @@ def record_session_turn(
             return False
         frags = capture_fragments(caches, n, adopt=adopt)
         if frags is None:
+            record_session_skip("uncapturable_cache")
             return False
         return vault.insert(
             toks,
@@ -1032,6 +1067,7 @@ def record_session_turn(
             ttl_s=ttl_s,
         )
     except Exception:  # noqa: BLE001 - a vault fault must never fail a response
+        record_session_skip("exception")
         logger.warning("vault: session capture failed; continuing without it",
                        exc_info=True)
         return False
@@ -1068,4 +1104,5 @@ def restore_session(
 
 
 __all__ += ["session_id_for", "restore_session", "prefix_len_from_cache",
+            "session_skip_counts", "reset_session_skips", "record_session_skip",
             "session_capture_enabled", "derived_session_id_allowed"]
