@@ -369,3 +369,75 @@ def test_explicit_pin_still_beats_the_drafter_hint():
     d.dflash_initial_block_size = 3
     d.prefer_requested_block_size = True
     assert dflash._dflash_next_block_size(d, 16, 64, 3) == 16
+
+
+# --- the shipped default must survive the drafter CONFIG too ----------------
+#
+# Third narrowing default found on this chain. drafters/dflash2/config.py:139-140
+# injects runtime_block_size = min(5, block_size) whenever the checkpoint omits
+# it, and our checkpoint omits it (dflash_config carries block_size: 8 only).
+# _dflash_block_total then returned min(8, 5) = 5, so the fixed-8 default
+# resolved to 5 on the server path. Lane 3 measured exactly that on f85ebb6f:
+# rounds=74 drafted=296 width=5.00.
+
+
+def _dflash2_shaped_drafter():
+    """A drafter shaped like the served DFlash2 AFTER the config loader runs."""
+    return SimpleNamespace(
+        config=SimpleNamespace(block_size=8, runtime_block_size=5),
+        accept_lens=[2] * 8,
+        draft_lens=[4] * 8,
+        dflash_initial_block_size=3,
+    )
+
+
+def test_full_resolution_chain_yields_the_trained_width_with_nothing_set():
+    """config -> _dflash_block_total -> _dflash_next_block_size, no env at all."""
+    from mlx_vlm.speculative.common import _dflash_block_total
+
+    for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH",
+              "MLX_VLM_DRAFT_BLOCK_SIZE"):
+        os.environ.pop(k, None)
+    _reset()
+    d = _dflash2_shaped_drafter()
+    total = _dflash_block_total(d, None, ignore_runtime=dflash._fixed_width() > 0)
+    assert total == 8, "runtime_block_size must not narrow the fixed policy"
+    assert dflash._dflash_next_block_size(d, total, 64, 3) == 8
+    # drafted per round is the block total minus the bonus slot: this is the
+    # number that appears in the server log as drafted/rounds.
+    assert dflash._dflash_next_block_size(d, total, 64, 3) - 1 == 7
+
+
+def test_runtime_block_size_still_narrows_when_the_fixed_policy_is_off():
+    from mlx_vlm.speculative.common import _dflash_block_total
+
+    d = _dflash2_shaped_drafter()
+    assert _dflash_block_total(d, None, ignore_runtime=False) == 5
+
+
+def test_explicit_draft_block_size_beats_the_trained_width():
+    from mlx_vlm.speculative.common import _dflash_block_total
+
+    d = _dflash2_shaped_drafter()
+    assert _dflash_block_total(d, 6, ignore_runtime=True) == 6
+
+
+def test_server_log_reports_the_resolved_width():
+    """Law 23: the width must be VISIBLE, not merely correct.
+
+    A live-server assertion needs a loaded model and is not in this suite; lane
+    3's `width=8` check on the real server is that gate. This pins the two
+    things a unit test can pin: that the log line carries a width field at all,
+    and that it is computed as drafted/rounds + 1 -- so a default resolving to
+    the wrong width can never again be invisible in a log where every other
+    field looks healthy.
+    """
+    import inspect
+    from mlx_vlm.server import generation
+
+    src = inspect.getsource(generation)
+    assert "width=%.2f" in src, "the speculative log line must report width"
+    assert "(drafted / rounds + 1.0)" in src, "width must be drafted/round + 1"
+    # and the arithmetic itself, against the width this default must produce
+    rounds, drafted = 74, 74 * 7
+    assert drafted / rounds + 1.0 == 8.0

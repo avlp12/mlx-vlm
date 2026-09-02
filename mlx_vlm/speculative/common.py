@@ -255,13 +255,32 @@ def speculative_stats_since(
     return rounds, int(round(accepted)), int(drafted)
 
 
-def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int]) -> int:
+def _dflash_block_total(
+    draft_model: nn.Module,
+    draft_block_size: Optional[int],
+    ignore_runtime: bool = False,
+) -> int:
+    """Resolve the requested verify block total.
+
+    ``ignore_runtime`` exists for the FIXED width policy, whose contract is to
+    propose the checkpoint's TRAINED width.  ``runtime_block_size`` is a runtime
+    NARROWING hint -- and for DFlash2 it is not even authored: the config loader
+    injects ``min(5, block_size)`` whenever the checkpoint omits it
+    (drafters/dflash2/config.py:139-140).  Our checkpoint advertises
+    ``block_size: 8`` and no runtime value, so the loader supplies 5 and the
+    shipped fixed-8 default silently resolved to 5 on the server path.
+
+    An explicit ``draft_block_size`` (MLX_VLM_DRAFT_BLOCK_SIZE) still wins over
+    everything, which is why the override is checked first and why the fixed
+    policy cannot simply read config.block_size itself: only here can an
+    explicit pin be told apart from an injected narrowing.
+    """
     if draft_block_size is not None:
         return int(draft_block_size)
 
     configured = int(draft_model.config.block_size)
     runtime = getattr(draft_model.config, "runtime_block_size", None)
-    if runtime is None:
+    if runtime is None or ignore_runtime:
         return configured
     return min(configured, max(1, int(runtime)))
 
