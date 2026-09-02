@@ -1397,6 +1397,31 @@ class Glm5NextLinearAttention(nn.Module):
         return self.o_proj(out)
 
 
+def _batch_row_valid(cache, B, lo, n):
+    """Per-row validity of buffer columns ``[lo, lo + n)``, ``[B, n]`` bool.
+
+    A batched cache is a per-row-length container: ``BatchKVCache.extract(i)``
+    returns exactly ``[left_padding[i], _idx)``, so a column is real for row *i*
+    iff its buffer index is ``>= left_padding[i]``.  That is the row's real
+    length expressed in the coordinates the indexer works in.
+
+    Returns ``None`` when the cache cannot state a per-row length (a
+    scalar-offset ``KVCache``, or no cache at all) -- there is nothing to mask
+    in that case and the caller keeps its all-ones default, so the single-stream
+    path is untouched.
+    """
+    if cache is None:
+        return None
+    left_padding = getattr(cache, "left_padding", None)
+    if left_padding is None:
+        return None
+    if not isinstance(left_padding, mx.array):
+        left_padding = mx.array(left_padding)
+    if left_padding.ndim != 1 or left_padding.size != B:
+        return None
+    return mx.arange(lo, lo + n)[None, :] >= left_padding[:, None]
+
+
 class Glm5NextIndexer(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -1680,10 +1705,27 @@ class Glm5NextIndexer(nn.Module):
         k = self.k_norm(self.wk(x)).reshape(B, S, self.head_dim)
         gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
 
+        # Per-token validity of the S tokens about to be written.
+        #
+        # This is the indexer's ONLY record of which cached columns are real: it
+        # anchors the pool layout (``first_key = argmax(valid)``, _pool_layout),
+        # it is intersected into ``visible``, and it gates the top-k rows this
+        # call returns.  Taking it from ``mask`` only when ``mask.shape == (B, S)``
+        # made it all-ones for every batched forward, because a DSA layer is
+        # handed the 4-D causal+left-pad ``fa_mask``
+        # (Glm5NextModel.__call__ -> create_attention_mask -> BatchKVCache.make_mask,
+        # shape ``[B, 1, S, T]``), never a ``[B, S]`` token mask.  A LEFT-PADDED
+        # prompt was therefore marked valid in the indexer cache, its pad columns
+        # became pooling candidates, and the ``L > 1`` gathered path -- which
+        # takes no attention mask at all, see _gathered_attention -- attended
+        # them.  Derive it from the row's real length instead, which the batched
+        # cache already carries, so the mask's RANK stops mattering.
         if mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S):
             valid_cur = mask
         else:
-            valid_cur = mx.ones((B, S), dtype=mx.bool_)
+            valid_cur = _batch_row_valid(cache, B, getattr(cache, "_idx", 0), S)
+            if valid_cur is None:
+                valid_cur = mx.ones((B, S), dtype=mx.bool_)
 
         # Pack per-token state and append to the indexer cache so pooling/selection
         # run over the full cached sequence -- unifies prefill and incremental decode.
@@ -1727,6 +1769,19 @@ class Glm5NextIndexer(nn.Module):
             packed_full, [self.head_dim, 2 * self.head_dim], axis=-1
         )
         valid = valid_ch[..., 0] > 0
+        # Read-time guard.  The channel above is the WRITE-time record, but a
+        # row's padding can grow after the fact -- ``BatchKVCache.extend``
+        # right-justifies a row that joins a running batch, and per-row
+        # speculative rollback shifts a row right into fresh left padding -- and
+        # the ``L > 1`` gathered path has no attention mask to fall back on.
+        # Intersecting with the cache's LIVE left padding makes "a padding
+        # column is never a top-k candidate" a property of the cache rather than
+        # of whoever wrote it, and keeps ``valid`` a clean suffix, which is what
+        # _pool_layout / _visible_tail need for the pool anchor to move with the
+        # padding.
+        row_valid = _batch_row_valid(cache, B, 0, T)
+        if row_valid is not None:
+            valid = valid & row_valid
 
         offset = T - S
         kv_len = T
