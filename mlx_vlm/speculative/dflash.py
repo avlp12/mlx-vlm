@@ -433,11 +433,23 @@ def _dflash_next_block_size(
 
     fixed = _fixed_width()
     if fixed > 0:
-        # SHIPPED DEFAULT since R24.  An explicit --fixed-block pin above still
-        # wins, and initial_block_size is still honoured, because a caller that
-        # names a width means it.
-        if initial_block_size is not None:
-            return min(block_total, max(2, int(initial_block_size)))
+        # SHIPPED DEFAULT since R24.  An explicit --fixed-block pin
+        # (prefer_requested_block_size, checked above) still wins.
+        #
+        # initial_block_size is DELIBERATELY IGNORED here, and the first version
+        # of this branch got that wrong.  It honoured initial_block_size on the
+        # reasoning that "a caller that names a width means it" -- but
+        # dflash_initial_block_size is a DRAFTER ATTRIBUTE, not a per-request
+        # argument, and dflash.py:756 passes it on EVERY round.  DFlash2 sets it
+        # to 3 (drafters/dflash2/dflash2.py:259), so the shipped default silently
+        # resolved to width 3 on the single-sequence server path and never
+        # reached 8.  Lane 3's X3 T1 server logged rounds=105 drafted=209, i.e.
+        # block total 2.99, which is that bug and not a measurement artefact.
+        #
+        # The ladder below consults initial_block_size only when there is no
+        # acceptance history yet -- it is a WARM-UP HINT for an adapting policy.
+        # A fixed policy has nothing to warm up into, so honouring it converted a
+        # first-round hint into a permanent pin.  Fixed means fixed.
         return min(block_total, max(2, fixed))
 
     accept_lens = getattr(draft_model, "accept_lens", None) or []

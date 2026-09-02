@@ -88,14 +88,19 @@ def test_default_on_and_the_env_is_the_kill_switch():
     d.prefer_requested_block_size = True
     assert dflash._dflash_next_block_size(d, 8, 64) == 8   # pin honoured again
 
-    # Below the minimum round count there is no hazard to act on, so the
-    # fallbacks are unchanged by the flip: full block, or the caller's opener.
+    # Below the minimum round count there is no hazard to act on.  With
+    # adaptive-K off the FIXED policy is what answers now, and it returns 8
+    # whether or not a caller offers an opener -- initial_block_size is a
+    # warm-up hint for an ADAPTING policy, and honouring it in the fixed policy
+    # was the defect that pinned the shipped default to DFlash2's hint of 3.
+    # The ladder's (unchanged) use of the hint is covered by
+    # test_ladder_still_treats_initial_block_size_as_a_warmup_hint.
     os.environ.pop("MLX_VLM_DFLASH_ADAPTIVE_K", None)
     _reset()
     d = _Drafter([1, 2], [7, 7])
     assert dflash._dflash_hazard(d) is None
     assert dflash._dflash_next_block_size(d, 8, 64) == 8
-    assert dflash._dflash_next_block_size(d, 8, 64, initial_block_size=3) == 3
+    assert dflash._dflash_next_block_size(d, 8, 64, initial_block_size=3) == 8
 
 
 def test_the_default_widens_for_code_and_narrows_for_prose():
@@ -316,3 +321,51 @@ def test_explicit_pin_still_wins_over_the_default():
     d = _Drafter([7] * 8, [7] * 8)
     d.prefer_requested_block_size = True
     assert dflash._dflash_next_block_size(d, 16, 64) == 16
+
+
+# --- the shipped default must survive the drafter's own attributes -----------
+#
+# The first version of the fixed policy honoured initial_block_size, which is
+# passed from draft_model.dflash_initial_block_size on EVERY round
+# (dflash.py:756). DFlash2 sets it to 3, so the default silently resolved to
+# width 3 on the single-sequence server path and never reached 8. Lane 3's X3
+# T1 server logged rounds=105 drafted=209 -> block total 2.99, which is that
+# defect. These pin the resolution end-to-end.
+
+
+def test_default_ignores_drafter_initial_block_size():
+    """A DFlash2-shaped drafter must still resolve to 8, not to its hint of 3."""
+    for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH"):
+        os.environ.pop(k, None)
+    _reset()
+    d = _Drafter([1] * 8, [2] * 8)
+    d.dflash_initial_block_size = 3
+    assert dflash._dflash_next_block_size(d, 8, 64, 3) == 8, (
+        "initial_block_size is a warm-up hint for an adapting policy; a fixed "
+        "policy must not be pinned by it"
+    )
+    assert dflash._dflash_next_block_size(d, 8, 64) == 8
+
+
+def test_ladder_still_treats_initial_block_size_as_a_warmup_hint():
+    """The ladder's use of the hint is unchanged -- only the fixed policy ignores it."""
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "0"
+    os.environ["MLX_VLM_DFLASH_FIXED_WIDTH"] = "0"
+    _reset()
+    try:
+        cold = SimpleNamespace(accept_lens=[], draft_lens=[])
+        assert dflash._dflash_next_block_size(cold, 16, 20, 4) == 4
+    finally:
+        for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH"):
+            os.environ.pop(k, None)
+        _reset()
+
+
+def test_explicit_pin_still_beats_the_drafter_hint():
+    for k in ("MLX_VLM_DFLASH_ADAPTIVE_K", "MLX_VLM_DFLASH_FIXED_WIDTH"):
+        os.environ.pop(k, None)
+    _reset()
+    d = _Drafter([1] * 8, [2] * 8)
+    d.dflash_initial_block_size = 3
+    d.prefer_requested_block_size = True
+    assert dflash._dflash_next_block_size(d, 16, 64, 3) == 16
