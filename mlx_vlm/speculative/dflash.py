@@ -743,7 +743,9 @@ def _dflash_rounds(
         )
 
     target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = _dflash_block_total(draft_model, draft_block_size)
+    block_total = _dflash_block_total(
+        draft_model, draft_block_size, ignore_runtime=_fixed_width() > 0
+    )
     draft_cache = draft_model.reset(model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     sampler_rng = _SpeculativeSamplerRNG(
@@ -907,7 +909,9 @@ def _dflash_rounds_batch(
     B = first_bonus.shape[0]
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = _dflash_block_total(draft_model, draft_block_size)
+    block_total = _dflash_block_total(
+        draft_model, draft_block_size, ignore_runtime=_fixed_width() > 0
+    )
     draft_model.reset(model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     sampler_rng = _SpeculativeSamplerRNG(
