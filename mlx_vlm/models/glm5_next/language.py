@@ -366,6 +366,59 @@ _GATHER_MIN_CONTEXT = int(os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT", "122
 # threading.local gives each thread its own slot; the save/restore below is then
 # per-thread and the interleaving above cannot happen.  Single-threaded behaviour
 # is unchanged and bit-identical: one thread, one slot, same sequence of values.
+# ---------------------------------------------------------------- stream memos
+#
+# THREE per-MODULE memos are keyed by SHAPE, not by stream, and therefore cannot
+# be shared by two concurrently-constructed streams:
+#
+#     Glm5NextDecoderLayer._ffn_c       compiled FFN block      (one per layer)
+#     Glm5NextDecoderLayer._attn_pre_c  compiled attn prologue  (one per layer)
+#     <DSA indexer>._ptc                pool-tail constants     (one per indexer)
+#
+# A compiled function closes over arrays from its trace, and _ptc holds arrays
+# built on whichever stream first reached it.  Hand either to a second stream and
+# MLX raises "There is no Stream(gpu, N) in current thread" -- or, worse, two
+# streams at the same shape silently share a trace.  (The pool buffers are NOT in
+# this list: they live on the CACHE, cache._pool / cache._fpool, which is already
+# per-request.)
+#
+# The key is set by the DRIVER, once per stream, not derived per layer:
+# mx.default_stream() costs ~350 ns and there is no cheap value attribute on a
+# Stream (it exposes only .device, and Stream equality is IDENTITY-based, so the
+# object itself is unusable as a dict key -- two default_stream() calls do not
+# compare equal and every lookup would miss).  Deriving it per layer would cost
+# ~29 us per forward for single-stream users who need none of it.
+#
+# So single-stream behaviour is UNCHANGED and FREE: the key stays at its default
+# and every memo has exactly one entry, exactly as before.
+class _StreamMemoState(threading.local):
+    def __init__(self):
+        self.key = "default"
+
+
+_STREAM_MEMO = _StreamMemoState()
+
+
+def stream_memo_key() -> str:
+    return _STREAM_MEMO.key
+
+
+@contextlib.contextmanager
+def stream_memo_scope(key: str):
+    """Bind the per-stream memo key for the duration.
+
+    The multi-stream driver wraps each stream's graph CONSTRUCTION in this.
+    Using two streams without it is a silent correctness hazard, which is why
+    the driver never exposes a path that skips it.
+    """
+    prev = _STREAM_MEMO.key
+    _STREAM_MEMO.key = str(key)
+    try:
+        yield
+    finally:
+        _STREAM_MEMO.key = prev
+
+
 class _VisMemoState(threading.local):
     def __init__(self):
         # Runs once per thread on first access, so every thread starts at None
@@ -1442,7 +1495,7 @@ class Glm5NextIndexer(nn.Module):
         # silently pool only the first kp tokens if that ever stops holding.
         if not 1 <= n <= kp:
             raise ValueError(f"indexer fast tail expects 1..{kp} tokens, got {n}")
-        key = (kp, n, s0)
+        key = (stream_memo_key(), kp, n, s0)
         cached = getattr(self, "_ptc", None)
         if cached is None or cached[0] != key:
             idx = mx.array([min(j, n - 1) for j in range(kp)], dtype=mx.int32)
@@ -2052,7 +2105,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.attn_hc = HyperConnection(config)
         self.ffn_hc = HyperConnection(config)
         self.compile_ffn = True
-        self._ffn_c = None
+        self._ffn_c = {}
         # DEFAULT OFF: measured, not demonstrated. In the configuration that
         # ships (compile_ffn already on) three ABBA-paired cycles of 120 timed
         # steps gave +0.324, +0.235, -0.147 ms -- mean +0.137 ms on a 33.9 ms
@@ -2063,7 +2116,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # TP-guarded so it can be switched on if a future change makes the
         # attention-half glue heavy enough to matter.
         self.compile_attn = False
-        self._attn_pre_c = None
+        self._attn_pre_c = {}
         # Fold the post-collapse RMSNorm into the hyper-connection kernel.
         #
         # DEFAULT OFF: measured, below resolution. Three ABBA-paired cycles of
@@ -2115,9 +2168,11 @@ class Glm5NextDecoderLayer(nn.Module):
         # speculative verify block, and adaptive-K varies S only inside that
         # window, so the variant count stays bounded at 8 per layer.
         if self.compile_attn and x.shape[0] == 1 and x.shape[1] <= 8:
-            if self._attn_pre_c is None:
-                self._attn_pre_c = mx.compile(self._attn_prologue)
-            h, post, comb = self._attn_pre_c(x)
+            _k = stream_memo_key()
+            fn = self._attn_pre_c.get(_k)
+            if fn is None:
+                fn = self._attn_pre_c[_k] = mx.compile(self._attn_prologue)
+            h, post, comb = fn(x)
         else:
             h, post, comb = self._attn_prologue(x)
         if self.is_linear:
@@ -2130,9 +2185,11 @@ class Glm5NextDecoderLayer(nn.Module):
         # a per-shape cache, so each small S compiles once. Batched/prefill shapes stay on
         # the eager path (compiling the 288-expert MoE there spikes memory / can OOM).
         if self.compile_ffn and x.shape[0] == 1 and x.shape[1] <= 8:
-            if self._ffn_c is None:
-                self._ffn_c = mx.compile(self._ffn_block)
-            return self._ffn_c(x)
+            _k = stream_memo_key()
+            fn = self._ffn_c.get(_k)
+            if fn is None:
+                fn = self._ffn_c[_k] = mx.compile(self._ffn_block)
+            return fn(x)
         return self._ffn_block(x)
 
     def _ffn_block(self, x: mx.array) -> mx.array:
