@@ -493,6 +493,13 @@ def _kernel(kind: str = "base"):
                 header=_HEADER,
                 source=_SOURCE + _SINK_SOURCE,
             )
+            _KERNELS["block"] = mx.fast.metal_kernel(
+                name="glm5_kda_verify_block",
+                input_names=_BLOCK_INPUT_NAMES,
+                output_names=_BLOCK_OUTPUT_NAMES,
+                header=_HEADER,
+                source=_BLOCK_SOURCE,
+            )
             _KERNELS["qproj"] = mx.fast.metal_kernel(
                 name="glm5_kda_decode_step_qproj",
                 input_names=_QPROJ_INPUT_NAMES,
@@ -818,4 +825,362 @@ def fused_kda_decode_step(
         threadgroup=(32, ty, 1),
         output_shapes=out_shapes,
         output_dtypes=out_dtypes,
+    )
+
+
+# ===========================================================================
+# S>1: the speculative verify block, one kernel per layer for the whole block.
+#
+# WHAT THIS REPLACES, precisely.  The recurrence was ALREADY fused at S>1 --
+# gated_delta_update falls through to gated_delta_kernel whenever head_dim is a
+# multiple of 32, and that kernel carries its own `for t` scan with the state in
+# registers.  So this is NOT "fusing an unfused scan".  What runs eager at S>1 is
+# the glue around it: the conv window concat/slice/copy, silu, the two fp32 L2
+# norms, the beta sigmoid, and the hand-rolled gated RMSNorm at language.py:423
+# (~12 dispatches on its own, and it does not call mx.fast.rms_norm).  Roughly 33
+# fusable launches per layer x 34 KDA layers.
+#
+# At lane 1's measured 14.72 us for a DEPENDENT launch -- the right instrument
+# here, since this is a serial chain of tiny kernels with nothing in flight to
+# hide a launch behind -- that bounds the prize at ~16.5 ms per verify forward,
+# ~17.5% of a 94 ms W=8 verify.  UPPER BOUND, per the fusion ledger's R1: kernel
+# count x dispatch cost bounds the prize, it does not predict it.
+#
+# TWO THINGS THIS BUYS THAT THE S=1 KERNEL DID NOT:
+#   * the state is loaded and stored ONCE for the whole block instead of once per
+#     token -- W round trips of [H, D, D] fp32 (4 MB/layer) collapse to one;
+#   * q/k/v/g never reach device memory between the conv and the recurrence.
+#
+# S is a RUNTIME scalar, not a template parameter.  Adaptive-K varies the width
+# every round (measured mean 4.6 on code), and a templated S would compile a new
+# pipeline per width and pay a cold compile on the hot path -- the failure mode
+# compile_width_churn.json was written to look for.  One pipeline serves W=1..16.
+_BLOCK_SOURCE = """
+  const uint bh   = threadgroup_position_in_grid.z;
+  const uint b    = bh / (uint)H;
+  const uint h    = bh - b * (uint)H;
+  const uint lane = thread_position_in_threadgroup.x;
+  const uint ty   = thread_position_in_threadgroup.y;
+  const uint tid  = thread_index_in_threadgroup;
+  const uint S    = (uint)nsteps;
+
+  constexpr int NT   = 32 * TY;
+  constexpr int RBLK = D / 128;
+  constexpr int REXTRA = D - RBLK * 128;
+  constexpr int NDK  = D / 32;
+  constexpr int NDV  = D / TY;
+  constexpr uint QKVD = (uint)(H * D);
+  constexpr uint CDIM = 3u * QKVD;
+  constexpr uint KM1  = (uint)(K - 1);
+  const size_t cs_off = (size_t)b * KM1 * CDIM;
+
+  threadgroup float sq[D];
+  threadgroup float sk[D];
+  threadgroup float sv[D];
+  threadgroup float sg[D];
+  threadgroup float sgate[D];
+  threadgroup float sy[D];
+  threadgroup float shr[3];
+  // Rolling pre-conv window: the last K-1 inputs, oldest-to-newest, as a circular
+  // buffer.  3*D per slot (this head's slice of the q/k/v thirds).  At D=128,
+  // K=4 that is 1152 elements -- a few KB next to the ~3 KB of scratch above.
+  threadgroup T twin[(K - 1) * 3 * D];
+
+  // State in registers for the WHOLE block: loaded here, stored after the loop.
+  device const ST* si = state_in  + (size_t)bh * D * D;
+  device ST*       so = state_out + (size_t)bh * D * D;
+  float st[NDV][NDK];
+  for (int j = 0; j < NDV; ++j) {
+    uint dv = ty + (uint)TY * (uint)j;
+    for (int i = 0; i < NDK; ++i) {
+      st[j][i] = float(si[(size_t)dv * D + NDK * lane + i]);
+    }
+  }
+
+  // Seed the window from the cache, oldest at slot 0 -- the same order the eager
+  // path lays out concatenate([conv_state, mixed], axis=1).
+  for (uint idx = tid; idx < KM1 * 3u * (uint)D; idx += NT) {
+    uint slot = idx / (3u * (uint)D);
+    uint r    = idx - slot * 3u * (uint)D;
+    uint part = r / (uint)D;
+    uint d    = r - part * (uint)D;
+    uint c    = part * QKVD + h * (uint)D + d;
+    twin[slot * 3u * (uint)D + r] = conv_state[cs_off + (size_t)slot * CDIM + c];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float a_exp = metal::precise::exp(A_log[h]);
+
+  for (uint t = 0u; t < S; ++t) {
+    const uint tok_off = (b * S + t) * QKVD;      // [B, S, H*D]
+    // ------------------------------------------------------------ phase 0a
+    // Depthwise causal conv over [window ; x_t].  For token t the K taps are
+    // conv_input[t .. t+K-1], which in the circular window are slots
+    // ((t + j) mod K-1) oldest-first, then x_t itself.
+    for (uint idx = tid; idx < 3u * (uint)D; idx += NT) {
+      uint part = idx / (uint)D;
+      uint d    = idx - part * (uint)D;
+      uint c    = part * QKVD + h * (uint)D + d;
+      device const T* wc = conv_w + (size_t)c * K;
+      float acc = 0.0f;
+      for (uint j = 0; j + 1 < (uint)K; ++j) {
+        uint slot = (t + j) % KM1;
+        acc += float(twin[slot * 3u * (uint)D + idx]) * float(wc[j]);
+      }
+      // The eager path zeroes the PRE-conv input of a masked row/token, so the
+      // zero lands here -- before both the conv and the window write.
+      T xnew = valid[b * S + t]
+                 ? ((part == 0u) ? mq[tok_off + h * (uint)D + d]
+                  : ((part == 1u) ? mk[tok_off + h * (uint)D + d]
+                                  : mv[tok_off + h * (uint)D + d]))
+                 : static_cast<T>(0);
+      acc += float(xnew) * float(wc[K - 1]);
+
+      T xb  = static_cast<T>(acc);
+      T sig = mlx_sigmoid_fast(xb);
+      T sl  = xb * sig;
+      if (part == 0u)      sq[d] = float(sl);
+      else if (part == 1u) sk[d] = float(sl);
+      else                 sv[d] = float(sl);
+    }
+    // The window write is deferred past this barrier: until every thread has
+    // finished reading its taps, the slot about to be overwritten is still live.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Retire the oldest slot and install x_t in its place.
+    for (uint idx = tid; idx < 3u * (uint)D; idx += NT) {
+      uint part = idx / (uint)D;
+      uint d    = idx - part * (uint)D;
+      T xnew = valid[b * S + t]
+                 ? ((part == 0u) ? mq[tok_off + h * (uint)D + d]
+                  : ((part == 1u) ? mk[tok_off + h * (uint)D + d]
+                                  : mv[tok_off + h * (uint)D + d]))
+                 : static_cast<T>(0);
+      twin[(t % KM1) * 3u * (uint)D + idx] = xnew;
+    }
+
+    // ------------------------------------------------------------ phase 0b
+    for (uint d = tid; d < (uint)D; d += NT) {
+      float av = float(a[tok_off + h * (uint)D + d]) + dt_bias[h * (uint)D + d];
+      sg[d]    = metal::precise::exp(lower_bound * mlx_sigmoid_fast<float>(a_exp * av));
+      sgate[d] = float(gate[tok_off + h * (uint)D + d]);
+    }
+    if (tid == 0u) {
+      shr[2] = float(mlx_sigmoid_precise(bvec[(b * S + t) * (uint)H + h]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ------------------------------------------------------------ phase 0c
+    if (simdgroup_index_in_threadgroup == 0u) {
+      float pq = 0.0f, pk = 0.0f;
+      for (int blk = 0; blk < RBLK; ++blk) {
+        uint base = (uint)(blk * 128) + 4u * lane;
+        for (int i = 0; i < 4; ++i) {
+          pq = sq_acc(pq, sq[base + i]);
+          pk = sq_acc(pk, sk[base + i]);
+        }
+      }
+      uint base = (uint)(RBLK * 128) + 4u * lane;
+      if (4u * lane + 4u <= (uint)REXTRA) {
+        for (int i = 0; i < 4; ++i) {
+          pq = sq_acc(pq, sq[base + i]);
+          pk = sq_acc(pk, sk[base + i]);
+        }
+      } else {
+        for (int i = 0; 4u * lane + (uint)i < (uint)REXTRA; ++i) {
+          pq = sq_acc(pq, sq[base + i]);
+          pk = sq_acc(pk, sk[base + i]);
+        }
+      }
+      pq = simd_sum(pq);
+      pk = simd_sum(pk);
+      if (lane == 0u) {
+        shr[0] = metal::precise::rsqrt(pq + 1.0e-6f);
+        shr[1] = metal::precise::rsqrt(pk + 1.0e-6f);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      float rq = shr[0], rk = shr[1];
+      for (uint d = tid; d < (uint)D; d += NT) {
+        sq[d] = float(static_cast<T>((sq[d] * rq) * qscale));
+        sk[d] = float(static_cast<T>(sk[d] * rk));
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ------------------------------------------------------- sink emit (t)
+    // The verify path ALWAYS carries a gdn_sink -- that is how a rejected round
+    // is replayed to the accepted token -- so the tensors it needs are emitted
+    // unconditionally rather than behind a second kernel variant.  sq/sk/sv hold
+    // the post-conv, post-L2-norm values the recurrence is about to consume, so
+    // these are bit-identical to what the eager path stashes.  The only sink
+    // member not produced here is conv_input, which is a concat of tensors the
+    // caller already holds and costs it one dispatch.
+    {
+      const uint hd_off = ((b * S + t) * (uint)H + h) * (uint)D;
+      for (uint d = tid; d < (uint)D; d += NT) {
+        q_out[hd_off + d] = static_cast<T>(sq[d]);
+        k_out[hd_off + d] = static_cast<T>(sk[d]);
+        v_out[hd_off + d] = static_cast<T>(sv[d]);
+      }
+    }
+
+    // ------------------------------------------------------------- phase 1
+    // Gated delta rule.  Same arithmetic and the same simd partition as both the
+    // S=1 kernel above and gated_delta_kernel's own t-loop -- lane `lane` owns
+    // key elements [NDK*lane, NDK*lane+NDK).  The ONLY difference from the S=1
+    // kernel is that `st` is not written out here; it carries to the next token.
+    {
+      float beta = shr[2];
+      for (int j = 0; j < NDV; ++j) {
+        uint dv = ty + (uint)TY * (uint)j;
+        float kv = 0.0f;
+        for (int i = 0; i < NDK; ++i) {
+          uint s = NDK * lane + i;
+          st[j][i] = st[j][i] * sg[s];
+          kv += st[j][i] * sk[s];
+        }
+        kv = simd_sum(kv);
+        float delta = (sv[dv] - kv) * beta;
+        float o = 0.0f;
+        for (int i = 0; i < NDK; ++i) {
+          uint s = NDK * lane + i;
+          st[j][i] = st[j][i] + sk[s] * delta;
+          o += st[j][i] * sq[s];
+        }
+        o = simd_sum(o);
+        if (thread_index_in_simdgroup == 0u) {
+          sy[dv] = float(static_cast<T>(o));
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ------------------------------------------------------------- phase 2
+    if (simdgroup_index_in_threadgroup == 0u) {
+      float po = 0.0f;
+      for (int blk = 0; blk < RBLK; ++blk) {
+        uint base = (uint)(blk * 128) + 4u * lane;
+        for (int i = 0; i < 4; ++i) po = sq_acc(po, sy[base + i]);
+      }
+      uint base = (uint)(RBLK * 128) + 4u * lane;
+      if (4u * lane + 4u <= (uint)REXTRA) {
+        for (int i = 0; i < 4; ++i) po = sq_acc(po, sy[base + i]);
+      } else {
+        for (int i = 0; 4u * lane + (uint)i < (uint)REXTRA; ++i) {
+          po = sq_acc(po, sy[base + i]);
+        }
+      }
+      po = simd_sum(po);
+      if (lane == 0u) {
+        shr[0] = metal::precise::rsqrt(po / (float)D + norm_eps);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      float rn = shr[0];
+      for (uint d = tid; d < (uint)D; d += NT) {
+        float x = sy[d] * rn;
+        x = float(o_w[d]) * x;
+        x = x * mlx_sigmoid_precise<float>(sgate[d]);
+        y[tok_off + h * (uint)D + d] = static_cast<T>(x);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ---------------------------------------------------------------- epilogue
+  // One state store for the whole block, and the cache window = the last K-1
+  // pre-conv rows, oldest-first.  The circular buffer already holds exactly
+  // those, at slots ((S + j) mod K-1) -- which is correct for W >= K-1 (all new
+  // tokens) and for W < K-1 (a mix of cached rows and new tokens) alike, with no
+  // special case, because the FIFO never distinguished them.
+  for (int j = 0; j < NDV; ++j) {
+    uint dv = ty + (uint)TY * (uint)j;
+    for (int i = 0; i < NDK; ++i) {
+      so[(size_t)dv * D + NDK * lane + i] = static_cast<ST>(st[j][i]);
+    }
+  }
+  for (uint idx = tid; idx < KM1 * 3u * (uint)D; idx += NT) {
+    uint slot = idx / (3u * (uint)D);
+    uint r    = idx - slot * 3u * (uint)D;
+    uint part = r / (uint)D;
+    uint d    = r - part * (uint)D;
+    uint c    = part * QKVD + h * (uint)D + d;
+    conv_state_out[cs_off + (size_t)slot * CDIM + c] =
+        twin[((S + slot) % KM1) * 3u * (uint)D + r];
+  }
+"""
+
+_BLOCK_OUTPUT_NAMES = _OUTPUT_NAMES + ["q_out", "k_out", "v_out"]
+_BLOCK_INPUT_NAMES = [
+    "mq", "mk", "mv", "conv_state", "conv_w", "a", "bvec", "A_log", "dt_bias",
+    "state_in", "gate", "o_w", "lower_bound", "qscale", "norm_eps", "valid",
+    "nsteps",
+]
+
+
+def fused_kda_verify_block(
+    q_in: mx.array,
+    k_in: mx.array,
+    v_in: mx.array,
+    conv_state: mx.array,
+    conv_w: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    gate: mx.array,
+    o_weight: mx.array,
+    *,
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    lower_bound: float,
+    norm_eps: float,
+    mask: Optional[mx.array] = None,
+    ty: int = 32,
+) -> Tuple[mx.array, ...]:
+    """The whole S-token KDA block in one launch.  S is runtime, not templated.
+
+    Shapes mirror the S=1 entry point with the singleton time axis widened:
+    ``q_in/k_in/v_in/a/gate`` are ``[B, S, H*D]``, ``b`` is ``[B, S, H]``, and the
+    optional ``mask`` is ``[B, S]`` bool -- the eager path zeroes the pre-conv
+    input per (row, token), and so does the kernel.
+
+    Returns ``(y, state_out, conv_state_out, q, k, v)``.  ``y`` is ``[B, S, H*D]``,
+    exactly what the eager path hands to ``o_proj``; ``conv_state_out`` is the last
+    K-1 pre-conv rows, i.e. the eager ``conv_input[:, -(K-1):, :]``; and q/k/v are
+    the post-conv, post-L2-norm ``[B, S, H, D]`` tensors ``gdn_sink`` carries for
+    speculative rollback.  They are emitted unconditionally because the verify
+    path always carries a sink.
+
+    One threadgroup per (batch row, head), same as S=1 -- so B>1 x S>1 needs no
+    new machinery, only a ``[B, S]`` mask instead of ``[B]``.
+    """
+    H, D, K = num_heads, head_dim, conv_kernel_size
+    B, S = q_in.shape[0], q_in.shape[1]
+    dt = q_in.dtype
+    if mask is None:
+        valid = mx.ones((B * S,), dtype=mx.bool_)
+    else:
+        valid = mask.reshape(B * S)
+    kernel = _kernel("block")
+    return kernel(
+        inputs=[
+            q_in, k_in, v_in, conv_state, conv_w, a, b, A_log, dt_bias, state,
+            gate, o_weight,
+            float(lower_bound), float(head_dim**-0.5), float(norm_eps), valid,
+            int(S),
+        ],
+        template=[
+            ("T", dt), ("ST", state.dtype), ("H", num_heads), ("D", head_dim),
+            ("K", conv_kernel_size), ("TY", ty),
+        ],
+        grid=(32, ty, B * num_heads),
+        threadgroup=(32, ty, 1),
+        output_shapes=[(B, S, H * D), state.shape, conv_state.shape]
+        + [(B, S, H, D)] * 3,
+        output_dtypes=[dt, state.dtype, dt, dt, dt, dt],
     )

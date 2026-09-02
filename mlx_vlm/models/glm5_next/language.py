@@ -24,6 +24,7 @@ from .fused_kda import (
     fused_kda_probe,
     fused_kda_qproj_supported,
     fused_kda_supported,
+    fused_kda_verify_block,
 )
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
@@ -96,6 +97,10 @@ _FUSED_KDA_MAX_BATCH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_BATCH", "1
 # base-fused vs +qproj): B=1 8.82 -> 8.55, B=2 10.06 -> 9.49, B=4 10.85 -> 11.65,
 # B=8 15.83 -> 20.95.  Crossover sits between 2 and 4.
 _FUSED_KDA_QPROJ_MAX_BATCH = 2
+
+# Verify-block width the S>1 kernel will serve.  Matched to the batch cap for the
+# same reason: it is the width the parity matrix has actually been run to.
+_FUSED_KDA_MAX_WIDTH = int(os.environ.get("MLX_VLM_GLM5_FUSED_KDA_MAX_WIDTH", "16"))
 
 
 def _env_flag(name: str) -> bool:
@@ -683,6 +688,129 @@ class Glm5NextLinearAttention(nn.Module):
             self._fused_kda_ty = ty
         return True
 
+    def _fused_kda_block_eligible(self, B, S, mask, cache, ref) -> bool:
+        """Same preconditions as the S=1 kernel, with the time axis opened up.
+
+        Deliberately NOT reusing _fused_kda_eligible: that one asserts S == 1,
+        and a shared helper with an S-shaped hole in it is how a width nobody
+        parity-tested reaches a kernel.
+        """
+        if S < 2 or S > _FUSED_KDA_MAX_WIDTH:
+            return False
+        if B < 1 or B > _FUSED_KDA_MAX_BATCH:
+            return False
+        # The eager path zeroes the pre-conv input per (row, token); the kernel
+        # takes the same [B, S] bool and does the same thing.  Any other mask
+        # shape or dtype would broadcast differently, so it falls back.
+        if mask is not None and (mask.dtype != mx.bool_ or mask.shape != (B, S)):
+            return False
+        if cache is None or cache[0] is None or cache[1] is None:
+            return False
+        H, D, K = self.num_heads, self.head_dim, self.conv_kernel_size
+        if cache[0].shape != (B, K - 1, 3 * H * D):
+            return False
+        if cache[1].shape != (B, H, D, D):
+            return False
+        fg = self.forget_gate
+        if fg.A_log.dtype != mx.float32 or fg.dt_bias.dtype != mx.float32:
+            return False
+        if fg.A_log.size != H or fg.dt_bias.size != H * D:
+            return False
+        dt = ref.dtype
+        if not (
+            self.conv1d.weight.dtype == dt
+            and self.o_norm.weight.dtype == dt
+            and cache[0].dtype == dt
+            and self.conv1d.weight.shape == (3 * H * D, K, 1)
+            and self.o_norm.weight.size == D
+        ):
+            return False
+        if self._fused_kda_ty is None:
+            ty = fused_kda_probe(
+                kind="base",
+                num_heads=H,
+                head_dim=D,
+                conv_kernel_size=K,
+                dtype=dt,
+                state_dtype=cache[1].dtype,
+            )
+            if ty is None:
+                self._fused_kda = False
+                return False
+            self._fused_kda_ty = ty
+        return True
+
+    def _fused_kda_block(
+        self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask, mixed
+    ) -> mx.array:
+        """The whole speculative verify block in one kernel launch per layer.
+
+        What this replaces is the GLUE, not the recurrence: gated_delta_update
+        already dispatched a fused scan at S>1.  The eager tail around it -- conv
+        window concat/slice/copy, silu, two fp32 L2 norms, the beta sigmoid and
+        the hand-rolled gated RMSNorm -- is roughly 33 small dependent launches
+        per layer, and at 34 KDA layers that is what this collapses to 34.
+
+        The state is loaded and stored once for the block rather than once per
+        token, so a width-W verify pays one [H, D, D] round trip instead of W.
+        """
+        fg = self.forget_gate
+        H, D = self.num_heads, self.head_dim
+        B, S, _ = q_o.shape
+        a = fg.f_b_proj(fa_o)
+        gate = self.g_b_proj(ga_o)
+        entry_state = cache[1]
+        y, state_out, conv_state_out, q_s, k_s, v_s = fused_kda_verify_block(
+            q_o,
+            k_o,
+            v_o,
+            cache[0],
+            self.conv1d.weight,
+            a,
+            b_o,
+            fg.A_log,
+            fg.dt_bias,
+            entry_state,
+            gate,
+            self.o_norm.weight,
+            num_heads=H,
+            head_dim=D,
+            conv_kernel_size=self.conv_kernel_size,
+            lower_bound=fg.safe_gate_lower_bound,
+            norm_eps=self.o_norm.eps,
+            mask=mask if (mask is not None and mask.dtype == mx.bool_) else None,
+            ty=self._fused_kda_ty,
+        )
+        if gdn_sink is not None:
+            # Same eleven members the eager path stashes, in the same order, so
+            # rollback_speculative_cache cannot tell which path produced them.
+            # conv_input is the one member the kernel does not emit -- it is a
+            # concat of tensors already in hand, and costs one dispatch.
+            masked = (
+                mx.where(mask[..., None], mixed, 0)
+                if (mask is not None and mask.dtype == mx.bool_)
+                else mixed
+            )
+            gdn_sink.append(
+                (
+                    q_s,
+                    k_s,
+                    v_s,
+                    a.reshape(B, S, H, D),
+                    b_o,
+                    fg.A_log.reshape(H, 1),
+                    fg.dt_bias.reshape(H, D),
+                    entry_state,
+                    mx.concatenate([cache[0], masked], axis=1),
+                    self.conv_kernel_size,
+                    fg.safe_gate_lower_bound,
+                )
+            )
+        cache[0] = conv_state_out
+        cache[1] = state_out
+        cache.advance(S)
+        return self.o_proj(y.reshape(B, S, -1))
+
     def _fused_kda_step(
         self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink=None, mask=None
     ) -> mx.array:
@@ -787,6 +915,12 @@ class Glm5NextLinearAttention(nn.Module):
                 return self._fused_kda_step(
                     q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask
                 )
+        if self._fused_kda_ready() and self._fused_kda_block_eligible(
+            B, S, mask, cache, q_o
+        ):
+            return self._fused_kda_block(
+                q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask, mixed
+            )
         if mask is not None and mask.dtype == mx.bool_:
             mixed = mx.where(mask[..., None], mixed, 0)
 
