@@ -3419,6 +3419,75 @@ class TestModels(unittest.TestCase):
         self.assertIsNone(layer._ffn_c)
         self.assertIsNone(layer._attn_pre_c)
 
+    def test_hc_folded_norm_matches_separate_norm(self):
+        """Folding the post-collapse RMSNorm into the HC kernel must agree with
+        doing it as a separate op, to about one ulp of the output dtype.
+
+        Not bit-exact by design: the fold norms the collapse from registers,
+        before it is rounded to bf16, so it is slightly MORE precise than
+        norming the stored result.
+
+        This test exists because the first version of the fold was silently
+        inert -- it used `#if FOLD_NORM` on what is a C++ TEMPLATE PARAMETER,
+        not a preprocessor macro, so the false branch always compiled and the
+        "folded" output came back bit-identical to the UNNORMED collapse. A
+        tolerance-only check would have caught that; the negative control below
+        is what makes the tolerance meaningful.
+        """
+        import mlx.core as mx
+        from mlx_vlm.models.deepseek_v4.hyper_connection import HyperConnection
+
+        if mx.default_device() != mx.gpu or not mx.metal.is_available():
+            self.skipTest("fused HC kernel is GPU-only")
+
+        class _Cfg:
+            hc_mult = 4
+            hc_sinkhorn_iters = 20
+            hc_eps = 1e-6
+            rms_norm_eps = 1e-5
+            hidden_size = 512
+
+        mx.random.seed(0)
+        H, D = 4, 512
+        hc = HyperConnection(_Cfg())
+        hc.fn = mx.random.normal((24, H * D)).astype(mx.float32) * 0.02
+        hc.base = mx.random.normal((24,)).astype(mx.float32) * 0.02
+        hc.scale = mx.ones((3,), dtype=mx.float32)
+        # Assert the path: with training=True this takes _hc_ops and the kernel
+        # under test never runs.
+        hc.train(False)
+        self.assertFalse(hc.training)
+
+        w = (mx.random.normal((D,)) * 0.1 + 1.0).astype(mx.bfloat16)
+        eps = 1e-5
+        x = mx.random.normal((1, 1, H, D)).astype(mx.bfloat16)
+        mx.eval(x, w)
+
+        xc, post_a, comb_a = hc(x)
+        ref = mx.fast.rms_norm(xc, w, eps)
+        folded, post_b, comb_b = hc(x, norm_w=w, norm_eps=eps)
+        mx.eval(ref, folded)
+
+        f32 = lambda a: a.astype(mx.float32)
+        rel = float(mx.max(mx.abs(f32(ref) - f32(folded)))) / float(
+            mx.max(mx.abs(f32(ref))))
+        self.assertLess(rel, 2 * 2**-8, f"folded norm off by {rel:.3e}")
+        # The sinkhorn half must be untouched by the fold.
+        self.assertEqual(float(mx.max(mx.abs(post_a - post_b))), 0.0)
+        self.assertEqual(float(mx.max(mx.abs(comb_a - comb_b))), 0.0)
+
+        # Negative control: a 5%-poisoned weight must break the tolerance, or
+        # the tolerance is not testing anything.
+        bad, _, _ = hc(x, norm_w=w * 1.05, norm_eps=eps)
+        mx.eval(bad)
+        bad_rel = float(mx.max(mx.abs(f32(ref) - f32(bad)))) / float(
+            mx.max(mx.abs(f32(ref))))
+        self.assertGreater(bad_rel, 4 * rel)
+
+        # And the unfolded path must still be the plain collapse.
+        self.assertEqual(
+            float(mx.max(mx.abs(f32(hc(x)[0]) - f32(xc)))), 0.0)
+
     def test_glm5_next_indexer_stale_pool_guard(self):
         # Under continuous batching, BatchGenerator grows/shrinks the batch axis
         # (extend/filter) but does not carry the indexer's cached _pool along, leaving
