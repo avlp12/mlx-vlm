@@ -154,6 +154,23 @@ def _vault_stats_snapshot() -> dict:
         }
 
 
+def _prefill_batch_refusal_counts() -> dict:
+    """Admission refusals from the continuous-batching generator, or ``{}``.
+
+    Read through the module rather than off a generator object: the
+    ``BatchGenerator`` is a local of ``ResponseGenerator``'s loop and is rebuilt
+    whenever the batch drains, so the counters live at module scope in
+    ``generate/ar.py``.  Defensive for the same reason the vault block is: a
+    stats read must never fail a health check.
+    """
+    try:
+        from ..generate.ar import prefill_batch_refusal_counts
+
+        return prefill_batch_refusal_counts()
+    except Exception:  # noqa: BLE001 - observability must not break the endpoint
+        return {}
+
+
 def _server_runtime_snapshot() -> dict:
     registry = _model_cache_registry()
     default_cache = registry.for_kind("text_generation")
@@ -214,6 +231,13 @@ def _server_runtime_snapshot() -> dict:
         # repeated it -- its inserts, hits, evictions and resident bytes were
         # reachable only from inside the process until this line existed.
         "vault": _vault_stats_snapshot(),
+        # Prefill batches the admission policy refused to build, by reason.
+        # ``right_pad_kda`` is the throughput a linear-attention model pays for
+        # correctness: rows with unequal suffix lengths cannot share a
+        # right-padded prefill, so they are served in separate batches
+        # (``generate/ar.py::_apply_right_pad_policy``).  A deployment that sees
+        # this climb is a deployment whose APC admission is being split.
+        "prefill_batch_refusals": _prefill_batch_refusal_counts(),
     }
 
 

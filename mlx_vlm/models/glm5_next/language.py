@@ -2676,6 +2676,24 @@ class LanguageModel(nn.Module):
     # forward ``**kwargs`` into their decoder stack would raise on an unknown one.
     supports_capture_gdn_states = True
 
+    # This model's prefill may NOT end at a different column in different rows.
+    # Half its layers are KDA (linear attention): their state is the recurrent
+    # ``S`` plus a short conv window in an ``ArraysCache``, both of which are
+    # taken AT the last column of the prefill and neither of which records which
+    # column that was.  Right padding therefore ends such a row's prefill
+    # ``right_pad[i]`` steps past its last real token -- the forget gate has
+    # decayed the state that many extra times and the conv window sits on
+    # padding -- and, unlike the K/V buffer that ``BatchKVCache.finalize()``
+    # rolls, there is nothing to roll it back with.  Measured on the tiny CPU
+    # fixture: the prompt logits still agree with a singleton run to 1.4e-06,
+    # and the decode trajectory parts company at the FIRST step, max|delta| 2.2
+    # to 3.2 on a 6.4 logit scale, i.e. different tokens.
+    #
+    # ``generate/ar.py::model_supports_right_padded_prefill`` derives the same
+    # answer from this class's ``make_cache`` (it builds ``ArraysCache``), so
+    # this line changes no behaviour.  It is here because the reason lives here.
+    supports_right_padded_prefill = False
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args

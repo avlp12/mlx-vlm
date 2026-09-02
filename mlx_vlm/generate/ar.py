@@ -975,6 +975,125 @@ def _make_cache(
         return [cache.BatchKVCache(left_padding) for _ in model.layers]
 
 
+# ---------------------------------------------------------------------------
+# Right-padded prefill: the model capability, and the refusals it causes
+# ---------------------------------------------------------------------------
+#
+# ``BatchGenerator._build_mixed_prompt_batch`` squares a mixed warm/cold batch
+# off by RIGHT-padding every row's suffix to the longest one, and then rolls
+# that padding into left padding in ``finalize()`` once the prefill forward is
+# done.  That is sound for a cache whose state is a per-column K/V buffer --
+# rolling the buffer IS the coordinate change -- and it is not sound for a cache
+# whose state is RECURRENT.  A linear-attention layer (GLM-5's KDA, and every
+# hybrid model in this tree that carries an ``ArraysCache``) folds the padded
+# columns into a running state plus a short convolution window:
+#
+#   * ``ArraysCache.make_mask`` (``models/cache.py``) does have a ``lengths``
+#     branch, but a right-padded batch never reaches it: ``PromptProcessingBatch``
+#     sets ``left_padding = [0] * B`` for such a batch (see ``__init__`` below),
+#     and ``left_padding`` wins that ``if``.  The padding is therefore attended.
+#   * Even with the mask restored, the conv state is taken as the last K-1
+#     columns of the padded input, and the forget gate is applied at every
+#     column -- so a row with ``right_pad[i] > 0`` finishes prefill with a state
+#     taken at the wrong column and decayed ``right_pad[i]`` steps too far.
+#   * A recurrent state cannot be rolled back into place the way a K/V buffer
+#     can: it does not carry the column it came from.
+#
+# So right padding is structurally incompatible with these layers UNLESS every
+# row's prefill ends at the same column -- i.e. unless the padding is zero.
+# The capability below is what the builder consults, and the policy it drives is
+# "batch only rows whose suffix lengths are EQUAL".
+#
+# DERIVATION.  The capability is derived from ``model.make_cache()`` -- the
+# presence of an ``ArraysCache`` (this tree's container for a recurrent/conv
+# state) in the prototype cache -- rather than declared per model class, with an
+# explicit class attribute ``supports_right_padded_prefill`` taken as an
+# override when a model sets one.  Derivation is the default because the defect
+# is a property of the STATE, not of the model: 24 model packages under
+# ``mlx_vlm/models`` construct an ``ArraysCache`` today (baichuan_m1,
+# bailing_moe_linear, falcon_h1, glm5_next, granitemoehybrid, inkling, jamba,
+# kimi_k3, kimi_linear, lfm2, lfm2_vl, longcat_flash_ngram, mamba, mamba2,
+# nemotron_h, nemotron_h_nano_omni, nemotron_voicechat, plamo2vl, qwen3_5,
+# qwen3_next, qwen4_exp, recurrent_gemma, rwkv7, zaya1_vl), and a per-class
+# declaration would silently omit the next one to land.  The explicit attribute
+# exists so a model that knows something the prototype does not can still say
+# so; glm5_next sets it to False for exactly that reason (documentation at the
+# site of the KDA layers, not action -- its prototype already answers False).
+_RECURRENT_STATE_CACHE_TYPES = (cache.ArraysCache,)
+
+
+def _cache_entry_has_recurrent_state(entry) -> bool:
+    """True if ``entry`` (one element of a prototype cache) holds recurrent state."""
+    if isinstance(entry, _RECURRENT_STATE_CACHE_TYPES):
+        return True
+    subs = getattr(entry, "caches", None)
+    if subs is None and isinstance(entry, (list, tuple)):
+        subs = entry
+    if subs:
+        return any(_cache_entry_has_recurrent_state(sub) for sub in subs)
+    return False
+
+
+def model_supports_right_padded_prefill(model) -> bool:
+    """Can this model's prefill end at different columns in different rows?
+
+    ``False`` means a right-padded prefill would leave at least one layer's
+    state at the wrong column with no way to roll it back, so the caller must
+    not build such a batch.  Answering ``False`` costs throughput; answering
+    ``True`` wrongly costs correctness, so every uncertain branch answers
+    ``False``.
+    """
+    declared = getattr(model, "supports_right_padded_prefill", None)
+    if declared is not None:
+        return bool(declared)
+    make_cache = getattr(model, "make_cache", None)
+    if make_cache is None:
+        # No prototype to inspect: this model gets a list of plain
+        # ``BatchKVCache`` from ``_make_cache``, which rolls correctly.
+        return True
+    try:
+        prototype = make_cache()
+    except Exception:  # noqa: BLE001 - an unbuildable prototype is not a licence
+        logger.warning(
+            "right-padded prefill: %s.make_cache() raised; declining right "
+            "padding for this model",
+            type(model).__name__,
+        )
+        return False
+    return not any(_cache_entry_has_recurrent_state(c) for c in prototype)
+
+
+# Process-wide, because the ``BatchGenerator`` that counts these is a local of
+# ``ResponseGenerator``'s loop and is rebuilt whenever the batch drains -- there
+# is no long-lived object for the server's ``/health`` snapshot to read.  Same
+# shape, and the same reason, as ``context_vault.session_skip_counts()``.
+_PREFILL_BATCH_REFUSALS: Dict[str, int] = {}
+
+
+def prefill_batch_refusal_counts() -> Dict[str, int]:
+    """Prefill batches the admission policy refused to build, by reason.
+
+    ``right_pad_kda`` counts the REFUSAL EVENTS (batches that would have been
+    right-padded and were split instead); ``right_pad_kda_rows_deferred``
+    counts the rows those events pushed back into the pending queue, which is
+    the number the throughput cost is actually proportional to.
+    """
+    return dict(_PREFILL_BATCH_REFUSALS)
+
+
+def reset_prefill_batch_refusal_counts() -> None:
+    """Zero the counters (tests; not called on any serving path)."""
+    _PREFILL_BATCH_REFUSALS.clear()
+
+
+def _note_prefill_batch_refusal(reason: str, rows_deferred: int) -> None:
+    _PREFILL_BATCH_REFUSALS[reason] = _PREFILL_BATCH_REFUSALS.get(reason, 0) + 1
+    rows_key = f"{reason}_rows_deferred"
+    _PREFILL_BATCH_REFUSALS[rows_key] = _PREFILL_BATCH_REFUSALS.get(
+        rows_key, 0
+    ) + int(rows_deferred)
+
+
 @dataclass
 class BatchStats:
     """
@@ -2813,6 +2932,9 @@ class BatchGenerator:
         self._existing_left_padding = existing_left_padding
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
+        # Lazily filled by ``_supports_right_padded_prefill``; a prototype
+        # ``make_cache()`` is cheap but this is on the admission path.
+        self._right_pad_capability: Optional[bool] = None
 
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
@@ -3022,6 +3144,99 @@ class BatchGenerator:
             if b > int(prefix_len)
         ]
 
+    def _pending_after_admission(
+        self, window: List[tuple], n: int, batch: "PromptProcessingBatch"
+    ) -> List[tuple]:
+        """The pending list after ``batch`` took some rows out of ``window``.
+
+        The mixed builder may admit only SOME of the window: a model that cannot
+        take right-padded prefill (see ``_apply_right_pad_policy``) batches only
+        the rows whose suffix lengths are equal.  The rows it did not take go
+        back at the FRONT of the pending list, keeping their queue position --
+        they are older than everything behind them and the next pass must see
+        them first, which is also what makes the head-anchored split
+        starvation-free.
+        """
+        admitted = set(batch.uids)
+        return [s for s in window if s[0] not in admitted] + (
+            self._unprocessed_sequences[n:]
+        )
+
+    def _supports_right_padded_prefill(self) -> bool:
+        """Memoised ``model_supports_right_padded_prefill`` for this generator.
+
+        Memoised on the instance rather than on the model: an ``nn.Module`` here
+        is a ``dict`` subclass, so it is neither hashable (no
+        ``WeakKeyDictionary``) nor safe to hang a new attribute off (it would
+        land in the module's own dict and be walked by ``parameters()``).
+        """
+        cached = getattr(self, "_right_pad_capability", None)
+        if cached is None:
+            cached = bool(model_supports_right_padded_prefill(self.model))
+            self._right_pad_capability = cached
+        return cached
+
+    def _apply_right_pad_policy(
+        self, sequences: List[tuple], picks: List[Optional[dict]]
+    ) -> Tuple[Optional[List[tuple]], Optional[List[Optional[dict]]]]:
+        """Drop rows that would force RIGHT padding on a model that refuses it.
+
+        Returns the (possibly shortened) ``(sequences, picks)`` to admit, or
+        ``(None, None)`` to tell the caller to decline the mixed batch entirely.
+
+        The policy, when ``supports_right_padded_prefill`` is False (see
+        ``model_supports_right_padded_prefill`` for why the capability exists):
+
+          * rows whose suffix lengths are EQUAL need no right padding at all, so
+            they batch together exactly as before -- the fast path is kept, not
+            removed;
+          * otherwise only the group of rows sharing the suffix length of the
+            row at the HEAD of the queue is admitted, and the rest go back to
+            the pending list.  Anchoring on the head, not on the largest group
+            or on the first warm row, is what makes this starvation-free: the
+            oldest pending row is admitted by SOME branch on every pass;
+          * if that head group happens to contain no warm row, there is nothing
+            for a warm batch to be built out of, so the mixed path declines and
+            the caller's cold-only path admits the whole window LEFT-padded --
+            correct, and the one case where a warm row loses its prefix reuse
+            for this round.
+
+        A batch of one warm row is fine and is the common shape after a split.
+        Left-padded cold-only batching is untouched: the defect is right padding.
+        """
+        if self._supports_right_padded_prefill():
+            return sequences, picks
+        prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
+        suffix_lens = [
+            len(s[1]) - prefix_lens[i] for i, s in enumerate(sequences)
+        ]
+        if len(set(suffix_lens)) <= 1:
+            return sequences, picks  # no right padding would be built anyway
+
+        head_len = suffix_lens[0]
+        keep = [i for i, length in enumerate(suffix_lens) if length == head_len]
+        kept = set(keep)
+        deferred = [i for i in range(len(sequences)) if i not in kept]
+        kept_picks = [picks[i] for i in keep]
+        cold_fallback = not any(p is not None for p in kept_picks)
+        _note_prefill_batch_refusal("right_pad_kda", len(deferred))
+        logger.info(
+            "prefill batch refusal right_pad_kda: %s declines right-padded "
+            "prefill (recurrent/linear-attention state cannot be rolled); "
+            "suffix lens %s -> %s %d row(s) at suffix_len=%d, deferring %d row(s) "
+            "%s",
+            type(self.model).__name__,
+            suffix_lens,
+            "cold-only fallback for" if cold_fallback else "admitting",
+            len(sequences) if cold_fallback else len(keep),
+            head_len,
+            0 if cold_fallback else len(deferred),
+            [] if cold_fallback else [suffix_lens[i] for i in deferred],
+        )
+        if cold_fallback:
+            return None, None
+        return [sequences[i] for i in keep], kept_picks
+
     def _build_mixed_prompt_batch(
         self, sequences: List[tuple]
     ) -> Optional["PromptProcessingBatch"]:
@@ -3032,8 +3247,15 @@ class BatchGenerator:
         scratch in the same batch. Right-padding aligns RoPE positions
         across rows with different prefix/suffix lengths.
 
-        Returns ``None`` if neither APC nor the vault can offer a warm row
-        (in which case the caller should use the cold-only path).
+        On a model that cannot take right-padded prefill -- one with recurrent
+        (linear-attention) layers, see ``model_supports_right_padded_prefill``
+        -- ``_apply_right_pad_policy`` first drops the rows that would force
+        padding, so the batch this returns may cover only part of
+        ``sequences``.  The caller consumes ``batch.uids``, not ``sequences``.
+
+        Returns ``None`` if neither APC nor the vault can offer a warm row, or
+        if the policy left no warm row in the admitted group (in which case the
+        caller should use the cold-only, LEFT-padded path).
         """
         if self.apc_manager is None and getattr(self, "vault", None) is None:
             return None
@@ -3042,6 +3264,10 @@ class BatchGenerator:
         any_warm = any(p is not None for p in picks)
         if not any_warm:
             return None  # caller falls back to cold-only path
+
+        sequences, picks = self._apply_right_pad_policy(sequences, picks)
+        if sequences is None:
+            return None  # caller falls back to cold-only (LEFT-padded) path
 
         uids = [s[0] for s in sequences]
         full_ids = [list(s[1]) for s in sequences]
@@ -3562,7 +3788,9 @@ class BatchGenerator:
                 )
             mixed = self._build_mixed_prompt_batch(sequences)
             if mixed is not None:
-                self._unprocessed_sequences = self._unprocessed_sequences[n:]
+                self._unprocessed_sequences = self._pending_after_admission(
+                    sequences, n, mixed
+                )
                 self._prompt_batch = mixed
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
