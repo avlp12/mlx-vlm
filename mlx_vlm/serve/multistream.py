@@ -136,11 +136,20 @@ class MultiStreamDriver:
 
     # -- one round ---------------------------------------------------------
     def _submit(self, ch: Channel) -> None:
+        # t0 IS TAKEN BEFORE CONSTRUCTION, on purpose. Recording it after
+        # async_eval excludes the Python graph build AND whatever the submit
+        # itself completed, so the reported per-token latency is only the residual
+        # wait. Measured: that made the driver look 15x FASTER than the plain
+        # decode loop (2.56 ms against 37.9 ms), which ARM_0's A2 gate then passed
+        # because its rule was one-sided. A latency this API reports must be
+        # comparable to `construct + eval` in an ordinary loop, or it is not a
+        # latency at all.
+        t0 = time.perf_counter()
         with _memo_scope(ch.name):
             with mx.stream(ch.stream):
                 out = ch.step()
         mx.async_eval(out)                 # SUBMIT, do not block
-        ch.pending.append((out, time.perf_counter()))
+        ch.pending.append((out, t0))
 
     def _collect(self, ch: Channel) -> None:
         out, t0 = ch.pending.popleft()

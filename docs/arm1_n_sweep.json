@@ -1,0 +1,85 @@
+{
+  "prereg": "LANE 7 ARM_1: the N-sweep. Does per-token collection with another channel\noutstanding still overlap?\n\nTHE QUESTION, REFRAMED (coordinator, verbatim): arm B was already N=2 / lag=1\nwith a JOINT collect, so the test is per-token collection with the other channel\noutstanding.\n\nThat is narrower than \"does lag rescue it\". Arm B evaluated both streams with a\nsingle mx.eval(o1, o2) -- submit-both-then-collect-both, which IS lag=1 with N=2,\ni.e. already the shippable configuration. What it did not do is collect PER\nTOKEN. This arm does, via MultiStreamDriver: submit all channels, then collect\nthem one at a time, so while channel 0 is being drained channel 1's forward is\nstill outstanding.\n\nlag IS PINNED AT 1 for every real channel. An autoregressive channel cannot run\nahead -- step N+1 needs step N's token, which does not exist until step N is\ncollected, and submitting ahead silently reuses a stale input (measured:\n[0,0,1,1] where correct is [0,1,2]). The driver refuses it. So the sweep is over\nCHANNELS, not lookahead.\n\n  primary   N = 1, 2, 3 at lag=1  -- the real serving configurations\n  secondary lag = 2, 4 on ONE non-sequential fixed-shape probe, LABELLED as a\n            characterisation only: any gain there is reachable in production by\n            adding channels, never by lookahead on a decode channel.\n\nDECISION RULE (pre-registered): REAL if aggregate >= 1.10x vs the sum of solo\nrates AND every channel keeps >= 95% of its solo per-token rate, at N>=2.\nDEAD otherwise -> the multi-stream design brief downgrades to \"batching only\"\nand 1.257x is recorded as a joint-collect artefact.\nSPLIT (report, do not hide): aggregate clears but one channel keeps <95% ->\noverlap is real but UNFAIR; name which channel loses and by how much.\n",
+  "primary_N_sweep": {
+    "2": [
+      {
+        "cycle": 0,
+        "aggregate_vs_solo_sum": 1.0167,
+        "per_channel_rate_kept": {
+          "u0": 0.5305,
+          "u1": 0.9884
+        },
+        "worst_kept": 0.5305
+      },
+      {
+        "cycle": 1,
+        "aggregate_vs_solo_sum": 1.0173,
+        "per_channel_rate_kept": {
+          "u0": 0.5307,
+          "u1": 0.9883
+        },
+        "worst_kept": 0.5307
+      },
+      {
+        "cycle": 2,
+        "aggregate_vs_solo_sum": 1.0089,
+        "per_channel_rate_kept": {
+          "u0": 0.5254,
+          "u1": 0.9785
+        },
+        "worst_kept": 0.5254
+      }
+    ],
+    "3": [
+      {
+        "cycle": 0,
+        "aggregate_vs_solo_sum": 1.0156,
+        "per_channel_rate_kept": {
+          "u0": 0.349,
+          "u1": 0.5232,
+          "u2": 0.9772
+        },
+        "worst_kept": 0.349
+      },
+      {
+        "cycle": 1,
+        "aggregate_vs_solo_sum": 1.0178,
+        "per_channel_rate_kept": {
+          "u0": 0.3493,
+          "u1": 0.5231,
+          "u2": 0.979
+        },
+        "worst_kept": 0.3493
+      },
+      {
+        "cycle": 2,
+        "aggregate_vs_solo_sum": 1.0225,
+        "per_channel_rate_kept": {
+          "u0": 0.3515,
+          "u1": 0.5266,
+          "u2": 0.9856
+        },
+        "worst_kept": 0.3515
+      }
+    ]
+  },
+  "secondary_lag_probe": {
+    "2": {
+      "note": "NON-SEQUENTIAL fixed-shape probe. Characterisation only -- not a serving configuration.",
+      "forwards_per_s": 12.823,
+      "median_ms": 156.024
+    },
+    "4": {
+      "note": "NON-SEQUENTIAL fixed-shape probe. Characterisation only -- not a serving configuration.",
+      "forwards_per_s": 12.901,
+      "median_ms": 310.486
+    }
+  },
+  "sanity_solo_tps": 26.46,
+  "best": {
+    "N": "3",
+    "worst_cycle_aggregate": 1.0156,
+    "worst_channel_kept": 0.349
+  },
+  "VERDICT": "DEAD - best aggregate 1.016x < 1.10x. The 1.257x was a joint-collect artefact; the design brief downgrades to batching only."
+}

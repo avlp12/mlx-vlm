@@ -1,0 +1,106 @@
+{
+  "prereg": "LANE 7 ARM_0: the four gates that must pass before the memo keying merges.\n\nThe change in language.py touches EVERY forward of the shipped path, so the merge\ninto glm5-serve-unified is held on these. They are about not breaking the\nsingle-stream world and are independent of whether overlap wins.\n\n  A1  bit-exact vs single-stream at B=1 (token ids AND final logits)\n  A2  no per-token latency regression at N=1, lag=1 (median <=2%, p95 <=5%)\n  A3  mixed-shape two-channel correctness vs per-channel serial references\n  A4  no memo growth over 500 single-stream steps (exactly one entry per layer)\n\nA4 exists because Stream equality is IDENTITY-based: if the key were ever derived\nfrom a Stream OBJECT rather than a value, every step would mint a new entry and\nthe memo would grow without bound while never hitting.\n",
+  "gates": {
+    "A1_bit_exact": {
+      "tokens_identical": true,
+      "logits_bit_identical": true,
+      "n_tokens": 128,
+      "first_divergence": null,
+      "PASS": true
+    },
+    "A2_no_regression": {
+      "cycles": [
+        {
+          "cycle": 0,
+          "base_med": 38.415,
+          "drv_med": 38.292,
+          "base_p95": 39.209,
+          "drv_p95": 39.213,
+          "med_ratio": 0.9968,
+          "p95_ratio": 1.0001
+        },
+        {
+          "cycle": 1,
+          "base_med": 38.172,
+          "drv_med": 38.23,
+          "base_p95": 38.597,
+          "drv_p95": 38.469,
+          "med_ratio": 1.0015,
+          "p95_ratio": 0.9967
+        },
+        {
+          "cycle": 2,
+          "base_med": 38.12,
+          "drv_med": 38.236,
+          "base_p95": 38.621,
+          "drv_p95": 38.526,
+          "med_ratio": 1.003,
+          "p95_ratio": 0.9976
+        },
+        {
+          "cycle": 3,
+          "base_med": 38.236,
+          "drv_med": 38.273,
+          "base_p95": 38.641,
+          "drv_p95": 38.633,
+          "med_ratio": 1.0009,
+          "p95_ratio": 0.9998
+        },
+        {
+          "cycle": 4,
+          "base_med": 38.443,
+          "drv_med": 38.262,
+          "base_p95": 38.707,
+          "drv_p95": 38.74,
+          "med_ratio": 0.9953,
+          "p95_ratio": 1.0009
+        }
+      ],
+      "worst_median_ratio": 1.003,
+      "best_median_ratio": 0.9953,
+      "worst_p95_ratio": 1.0009,
+      "median_cycle_ratio": 1.0009,
+      "n_cycles": 5,
+      "rule": "0.90 <= MEDIAN-cycle ratio <= 1.02 and worst p95 <= 1.05 (two-sided)",
+      "PASS": true
+    },
+    "A3_mixed_shape": {
+      "A_identical": true,
+      "B_identical": true,
+      "PASS": true
+    },
+    "A4_no_memo_growth": {
+      "max_entries_ADDED_by_500_steps": 0,
+      "keys_before": [
+        "A",
+        "B",
+        "coldkey",
+        "default",
+        "u0"
+      ],
+      "keys_after": [
+        "A",
+        "B",
+        "coldkey",
+        "default",
+        "u0"
+      ],
+      "new_keys": [],
+      "n_layers": 45,
+      "rule": "500 single-stream steps must add ZERO new entries and zero new keys",
+      "PASS": true
+    }
+  },
+  "anchor_baseline_ms_median": 37.98,
+  "anchor_band_ms": [
+    10.9,
+    99.4
+  ],
+  "first_use_compile_cost": {
+    "cold_key_median_ms": 38.1,
+    "same_key_again_median_ms": 38.24,
+    "ratio": 0.996,
+    "note": "one-time per NEW stream key; warm each channel before serving on it"
+  },
+  "ARM_0_VERDICT": "ALL FOUR GATES PASS - safe to merge the memo keying"
+}
