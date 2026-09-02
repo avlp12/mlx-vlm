@@ -2475,6 +2475,54 @@ class Glm5NextModel(nn.Module):
         return self.norm(h.mean(axis=2))
 
 
+def trim_sparse_cache(cache, trim: int, index_kpool: int) -> None:
+    """Trim a glm5_next sparse-attention cache and roll its indexer pools with it.
+
+    ``cache`` is the ``CacheList(MLA-latent KV, indexer KV)`` that
+    ``Glm5NextSparseAttention`` keeps -- in the target stack (speculative rollback)
+    and in the nextn/MTP drafter (partial-accept rollback) alike.  Both used to
+    hand-roll this; they now share one implementation so the two cannot drift.
+
+    Trimming the KV caches alone leaves the indexer's pooled-key caches describing
+    a LONGER sequence than the cache now holds, so both pools move with the trim:
+
+    * ``_pool`` -- the eager incremental pool.  Keep only the pool blocks still
+      fully in range, so the next decode step rebuilds one partial block
+      (O(index_kpool)) instead of the whole pool (O(T)).  This is a COST fix, not
+      a correctness fix: the incremental guard in ``Glm5NextIndexer.__call__`` is
+      ``cache._pool[3] == T - S``, which after a trim of k and an append of S
+      needs k == 0, so a stale pool is already *rejected* -- it just costs a full
+      repool.  Rolling it back keeps the O(index_kpool) path.
+    * ``_fpool`` -- the preallocated append-only store behind
+      ``MLX_VLM_GLM5_IDX_FAST``.  Dropped outright.  A stale ``_fpool`` is likewise
+      not reachable today (its guard needs ``_fpool[3] == T - 1`` at ``S == 1``,
+      which after a trim of k and an append of n == S == 1 again needs k == 0, and
+      the eager path nulls ``_fpool`` on every call), but that safety rests on an
+      interaction in a different function; invalidating here makes it local to the
+      trim that causes it and survives a future change to either guard.
+    """
+    if trim > 0 and cache.is_trimmable():
+        cache.trim(trim)
+    indexer_cache = cache[1]
+    if trim > 0:
+        indexer_cache._fpool = None
+    pool = getattr(indexer_cache, "_pool", None)
+    if pool is None:
+        return
+    pk, pi, pv, t = pool
+    t2 = t - trim
+    if t2 <= 0:
+        indexer_cache._pool = None
+        return
+    n_stable = t2 // index_kpool
+    indexer_cache._pool = (
+        pk[:, :n_stable],
+        pi[:, :n_stable],
+        pv[:, :n_stable],
+        t2,
+    )
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
@@ -2649,23 +2697,7 @@ class LanguageModel(nn.Module):
                 # blocks that are still fully in-range. The incremental decode path then
                 # rebuilds just the last partial block (O(index_kpool)) instead of the
                 # whole pool (O(T)) -- critical for long context.
-                if trim > 0 and c.is_trimmable():
-                    c.trim(trim)
-                indexer_cache = c[1]
-                pool = getattr(indexer_cache, "_pool", None)
-                if pool is not None:
-                    pk, pi, pv, t = pool
-                    t2 = t - trim
-                    if t2 <= 0:
-                        indexer_cache._pool = None
-                    else:
-                        n_stable = t2 // self.args.index_kpool
-                        indexer_cache._pool = (
-                            pk[:, :n_stable],
-                            pi[:, :n_stable],
-                            pv[:, :n_stable],
-                            t2,
-                        )
+                trim_sparse_cache(c, trim, self.args.index_kpool)
         return max_a
 
     def sanitize(self, weights):

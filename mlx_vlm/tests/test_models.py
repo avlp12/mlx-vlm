@@ -3856,6 +3856,169 @@ class TestModels(unittest.TestCase):
             greedy=True,
         )
 
+    def _glm5_next_mtp_primed_drafter(self):
+        """A bound glm5_next_mtp drafter whose own sparse cache is past index_topk."""
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+        from mlx_vlm.speculative.drafters.glm5_next_mtp import Model, ModelConfig
+
+        mx.random.seed(0)
+        tcfg = self._glm5_next_mtp_text_config()
+        lm = LanguageModel(tcfg)
+        lm.eval()
+        mx.eval(lm.parameters())
+        drafter = Model(ModelConfig(text_config=tcfg, block_size=3))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        drafter.reset(lm)
+
+        sampler = lambda logits: mx.argmax(logits, axis=-1)
+        prompt = mx.array([[2, 4, 6, 8, 10, 12, 14, 16]])
+        out = lm(
+            prompt,
+            cache=lm.make_cache(),
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        hidden = out.hidden_states[-1]
+        bonus = int(mx.argmax(out.logits[:, -1, :]).item())
+        drafter.prefill_from_target_hidden(prompt, hidden, bonus, sampler, greedy=True)
+        return drafter, lm, hidden, bonus, sampler
+
+    def _glm5_next_mtp_reject_without_append(self, drafter, hidden, bonus, sampler):
+        """Two full-accept rounds, then a rejected round that trims and appends nothing.
+
+        The trim-with-no-append round is the one that leaves the indexer pools
+        observable: ``accept_verified_tokens`` only re-enters the indexer when it has
+        something to append, so with ``accepted == 0`` and no new token the pools stay
+        exactly as the trim left them.
+        """
+        verify_hidden = mx.broadcast_to(hidden[:, -1:, :], (1, 3, hidden.shape[-1]))
+        for _ in range(2):
+            draft = drafter.draft_block(
+                bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+            )
+            drafter.accept_verified_tokens(
+                verify_hidden,
+                draft,
+                2,
+                [int(draft[0, -1].item())],
+                sampler,
+                greedy=True,
+            )
+        draft = drafter.draft_block(
+            bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+        )
+        self.assertGreater(drafter._round_appended, 0)  # there is something to trim
+        drafter.accept_verified_tokens(
+            verify_hidden, draft, 0, [], sampler, greedy=True
+        )
+
+    def test_glm5_next_mtp_drafter_trim_rolls_back_indexer_pool(self):
+        # A partial accept trims the drafter's own sparse cache. The indexer's pooled
+        # -key cache must move with it, exactly as the target does in
+        # rollback_speculative_cache -- both now go through trim_sparse_cache. Leaving
+        # `_pool` describing the pre-trim length is not a wrong answer (the incremental
+        # guard `_pool[3] == T - S` rejects it) but it costs a full O(T) repool on the
+        # next step instead of the O(index_kpool) one.
+        drafter, _lm, hidden, bonus, sampler = self._glm5_next_mtp_primed_drafter()
+        cache = drafter._cache[0]
+        self._glm5_next_mtp_reject_without_append(drafter, hidden, bonus, sampler)
+
+        pool = getattr(cache[1], "_pool", None)
+        self.assertIsNotNone(pool)  # the eager path owns the pool when IDX_FAST is off
+        self.assertEqual(pool[3], cache[0].offset)
+        kpool = drafter.mtp.self_attn.indexer.index_kpool
+        self.assertEqual(pool[0].shape[1], pool[3] // kpool)
+
+    def test_glm5_next_mtp_drafter_trim_drops_fast_indexer_pool(self):
+        # Same trim, with the fast indexer decode path live. `_fpool` is the
+        # preallocated append-only pool store; it is keyed on a length, so it must not
+        # survive a trim. The flag is read once into a module global, so the module
+        # global is what the test moves -- setting the env var here would be a no-op.
+        from mlx_vlm.models.glm5_next import language as glm5_lang
+
+        saved = glm5_lang._IDX_FAST_ENV
+        glm5_lang._IDX_FAST_ENV = True
+        try:
+            drafter, _lm, hidden, bonus, sampler = self._glm5_next_mtp_primed_drafter()
+            cache = drafter._cache[0]
+            # A full-accept round appends one token (S == 1), which is what lets
+            # _decode_fast run and build `_fpool` in the first place.
+            verify_hidden = mx.broadcast_to(hidden[:, -1:, :], (1, 3, hidden.shape[-1]))
+            for _ in range(2):
+                draft = drafter.draft_block(
+                    bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+                )
+                drafter.accept_verified_tokens(
+                    verify_hidden,
+                    draft,
+                    2,
+                    [int(draft[0, -1].item())],
+                    sampler,
+                    greedy=True,
+                )
+            draft = drafter.draft_block(
+                bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+            )
+            self.assertIsNotNone(getattr(cache[1], "_fpool", None))  # precondition
+            self.assertGreater(drafter._round_appended, 0)
+            drafter.accept_verified_tokens(
+                verify_hidden, draft, 0, [], sampler, greedy=True
+            )
+            self.assertIsNone(getattr(cache[1], "_fpool", None))
+        finally:
+            glm5_lang._IDX_FAST_ENV = saved
+
+    def test_glm5_next_indexer_fast_pool_guard_rejects_after_trim(self):
+        # Receipt for a claim that had to be walked back: a STALE `_fpool` surviving a
+        # trim cannot actually be consumed, so the drafter's old untracked trim was a
+        # cost bug and not silent corruption.
+        #
+        # The fast-decode guard is `_fpool[3] == T - 1` AND `S == 1`. After a trim of
+        # k tokens followed by an append of n tokens in one call, T == T0 - k + n and
+        # S == n, so the guard needs n == 1 (from S) and then T0 == T0 - k, i.e. k == 0.
+        # The "trim k then append n == k + 1" shape is therefore only expressible with
+        # S == n > 1, which the guard rejects on S alone. And the eager path it falls
+        # to nulls `_fpool`, so a stale one cannot survive to a later step either.
+        from mlx_vlm.models.glm5_next import language as glm5_lang
+
+        saved = glm5_lang._IDX_FAST_ENV
+        original = glm5_lang.Glm5NextIndexer._decode_fast
+        calls = []
+
+        def _spy(self, *args, **kwargs):
+            calls.append(1)
+            return original(self, *args, **kwargs)
+
+        glm5_lang._IDX_FAST_ENV = True
+        glm5_lang.Glm5NextIndexer._decode_fast = _spy
+        try:
+            drafter, _lm, hidden, bonus, sampler = self._glm5_next_mtp_primed_drafter()
+            cache = drafter._cache[0]
+            step_hidden = hidden[:, -1:, :]
+            # Warm the fast path: two single-token steps, the second of which must
+            # take it (positive control -- without this the negative one proves nothing).
+            drafter._forward_tokens(mx.array([[5]]), step_hidden, mx.int32)
+            calls.clear()
+            drafter._forward_tokens(mx.array([[7]]), step_hidden, mx.int32)
+            self.assertEqual(len(calls), 1)
+            self.assertIsNotNone(getattr(cache[1], "_fpool", None))
+
+            # Now the hazardous shape, built by hand: trim WITHOUT invalidating (the
+            # pre-fix behaviour), so `_fpool` is stale by exactly k == 1.
+            stale = cache[1]._fpool
+            cache.trim(1)
+            cache[1]._fpool = stale
+            self.assertEqual(stale[3], cache[0].offset + 1)  # stale by k == 1
+            calls.clear()
+            drafter._forward_tokens(mx.array([[9]]), step_hidden, mx.int32)
+            self.assertEqual(len(calls), 0)  # guard rejected the stale prefix
+            self.assertIsNone(getattr(cache[1], "_fpool", None))  # eager path cleared it
+        finally:
+            glm5_lang.Glm5NextIndexer._decode_fast = original
+            glm5_lang._IDX_FAST_ENV = saved
+
     def test_glm5_next_mtp_never_lose_gate(self):
         # The never-lose gate has two parts: (1) the drafter yields an empty block at
         # block_size<=1 so the orchestrator can run a plain decode step, and (2) the
