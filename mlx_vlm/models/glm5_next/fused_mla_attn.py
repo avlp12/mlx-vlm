@@ -62,14 +62,37 @@ logs/sweep6/lane5_SERVING_RUNTIME_revalidation.md.
 
 Paired ratios against MLX's composite fallback, current tiling (BQ=32, BK=128):
 
-    dense prefill, depth 8192, Kv 10240, top-k mask   2.22x   <- the kernel's real win
-    dense prefill, depth 0,    Kv 2048,  causal       0.88x   <- still a LOSS
-    gathered chunk, batch 256, Kv 2051                2.04x   <- but the plain MQA reshape
-                                                                gets 3.82x on the same cell,
-                                                                so the reshape wins there
+    dense prefill, depth 8192, top-k mask, REALISTIC pattern   0.51x  <- a LOSS
+    dense prefill, depth 8192, top-k mask, contiguous stand-in 2.18x  <- RETRACTED, see below
+    dense prefill, depth 0,    Kv 2048,  causal                0.88x  <- a LOSS
+    gathered chunk, batch 256, Kv 2051                         2.04x  <- but the plain MQA
+                                                                         reshape gets 3.82x on
+                                                                         the same cell, so the
+                                                                         reshape wins there
 
-The kernel runs at roughly 70% of the rate MLX's own GEMM achieves on the same contraction.
-Closing that gap is what would make it win everywhere; it is not closed.
+**THERE IS NO REGIME OF THIS MODEL WHERE THIS KERNEL IS THE RIGHT CALL.**  Keep it OFF.  It stays
+in the tree as the upstream artifact -- MLX has no fused full-attention kernel at head dim 512 on
+any branch -- not as a serving optimisation.
+
+RETRACTED, and the retraction is the most useful thing here.  The 2.22x/2.02x dense top-k win I
+reported was an artifact of the mask I benchmarked with.  I selected a CONTIGUOUS tail block of
+2051 keys; the real indexer selects 512 scattered pools of 4 (index_kpool) plus a tail.  At the
+same selection density, the contiguous mask leaves 79.4% of key tiles entirely empty for the
+liveness check to skip, and the realistic one leaves **0.0%**.  Verdict inverts: 2.18x -> 0.51x.
+Corroborated e2e against the real indexer: 0.89x on that band.  Receipt
+logs/sweep6/lane5_RETRACTION_kernel_dense_band.md.
+
+The lesson generalises the campaign's real-text rule (I897) one level down: a synthetic MASK can
+collapse the data-dependent structure a kernel's fast path lives on, exactly as a synthetic prompt
+collapses MoE routing.
+
+WHAT THIS IMPLIES FOR THE DESIGN.  Consuming the top-k INDICES rather than a mask is not an
+optimisation that additionally deletes the gather -- it is the only form that can work on this
+sparsity pattern, because gathering makes every tile dense by construction.  That is what
+_gathered_attention already does with take_along_axis, and it is where a v2 belongs.
+
+The kernel runs at roughly 70% of the rate MLX's own GEMM achieves on the same contraction, so
+even with dense tiles it does not currently win.  That gap is not closed.
 
 RETRACTED, do not re-attempt: batching the QK fragment loads into `simdgroup_bfloat8x8 A[4],
 B[4]` arrays (to hide device-load latency) made every cell 2.5-3.6x SLOWER -- 34.5 -> 122.8 ms
