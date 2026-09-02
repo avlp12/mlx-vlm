@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checkable
@@ -26,22 +27,165 @@ def _copy_array(x: mx.array) -> mx.array:
     return mx.contiguous(mx.array(x, dtype=x.dtype))
 
 
+_ALIAS_TAG = "__vault_alias__"
+_ENV_DEDUP = "MLX_VLM_GLM5_VAULT_DEDUP"
+
+
+def dedup_enabled() -> bool:
+    """Whether capture collapses byte-identical sibling arrays. Default ON.
+
+    Bit-identical by construction (see :func:`_bytes_identical`), so it takes the
+    playbook's default-ON identity tier.  ``MLX_VLM_GLM5_VAULT_DEDUP=0`` is the
+    A/B kill switch and restores the pre-dedup payload shape exactly.
+
+    Deliberately NOT read once and cached: the tests toggle it in-process, and a
+    cached read is how ``_adaptive_k_enabled``-style globals become untestable.
+
+    Deliberately NOT added to ``context_vault._NUMERIC_TOGGLES`` either.  That
+    tuple invalidates the whole store when a toggle changes the *contents* of a
+    cache; this toggle changes only how those contents are stored, and a rung
+    captured under either setting restores to the same bytes (pinned by
+    ``test_off_switch_reproduces_the_undeduped_payload``).  Folding it in would
+    throw away a valid store for no numeric reason.
+    """
+    return os.environ.get(_ENV_DEDUP, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+_UINT_OF_SIZE = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}
+
+
+def _bytes_identical(a: mx.array, b: mx.array) -> bool:
+    """Do ``a`` and ``b`` have identical BIT PATTERNS (not merely equal values)?
+
+    ``mx.array_equal`` is the wrong predicate here and both of its failure modes
+    are live on this cache:
+
+      * NaN != NaN, so two byte-identical buffers containing NaN compare unequal
+        and the dedup would silently not fire (measured: array_equal False,
+        bit-compare True);
+      * +0.0 == -0.0, so two buffers that differ in their sign bit compare EQUAL
+        and a dedup driven by it would change the restored bytes (measured:
+        array_equal True, bit-compare False).
+
+    Reinterpreting through an unsigned integer of the same width makes the test
+    exact in both directions, which is what the vault's warm-equals-cold gate
+    needs.  Anything unexpected (odd dtype, view refusal) returns False, so the
+    failure mode is "did not save memory", never "restored the wrong bytes".
+    """
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    if a.size == 0:
+        return True
+    try:
+        u = _UINT_OF_SIZE.get(a.dtype.size)
+        if u is None:
+            return False
+        return bool(mx.array_equal(mx.view(a, u), mx.view(b, u)).item())
+    except Exception:  # noqa: BLE001 - a dedup fault must never fail a capture
+        return False
+
+
+def _dedup_seq(items: Sequence[Any], snap) -> List[Any]:
+    """Snapshot a tuple/list, replacing a byte-identical repeat with an alias.
+
+    Only siblings inside the same container are compared, which is O(k^2) in a
+    container that holds 2 entries in practice and keeps the scan off the rest of
+    the tree.  The concrete win this exists for: glm5_next caches the DSA latent
+    as BOTH keys and values (models/glm5_next/language.py:1416 passes the same
+    array twice into KVCache.update_and_fetch, and models/cache.py:353-354
+    allocates two separate buffers for it), so 1024 of every 2562 B/token/layer
+    the vault stores is a byte-exact duplicate -- 40.0% of the growing term.
+    """
+    out: List[Any] = []
+    kept: List[tuple] = []  # (position in out, snapshotted array)
+    for item in items:
+        if isinstance(item, mx.array):
+            hit = None
+            for pos, prev in kept:
+                if _bytes_identical(prev, item):
+                    hit = pos
+                    break
+            if hit is not None:
+                out.append((_ALIAS_TAG, hit))
+                continue
+            c = snap(item)
+            kept.append((len(out), c))
+            out.append(c)
+        else:
+            out.append(snap(item))
+    return out
+
+
+def _expand_seq(items: Sequence[Any], snap) -> List[Any]:
+    """Inverse of :func:`_dedup_seq`.
+
+    Each alias is materialised as its OWN buffer, never as a second reference to
+    the original: ``KVCache.update_and_fetch`` writes into ``self.keys`` and
+    ``self.values`` in place (models/cache.py:365-366), so handing it two names
+    for one buffer would corrupt the cache on the first decode step after a
+    restore.  The wire tier turns tuples into tuples faithfully
+    (context_vault_wire.py:106/126), so an alias survives a peer fetch as either
+    a tuple or a list; both spellings are accepted.
+    """
+    out: List[Any] = []
+    for item in items:
+        if _is_alias(item):
+            out.append(_copy_array(out[int(item[1])]))
+        else:
+            out.append(snap(item))
+    return out
+
+
+def _is_alias(node: Any) -> bool:
+    return (
+        isinstance(node, (tuple, list))
+        and len(node) == 2
+        and isinstance(node[0], str)
+        and node[0] == _ALIAS_TAG
+        and isinstance(node[1], int)
+        and not isinstance(node[1], bool)
+    )
+
+
 def _snapshot_tree(obj: Any) -> Any:
     """Deep-copy the MLX arrays inside a state tree; pass scalars/None through."""
     if isinstance(obj, mx.array):
         return _copy_array(obj)
+    if _is_alias(obj):
+        return obj
     if isinstance(obj, tuple):
+        if dedup_enabled():
+            return tuple(_dedup_seq(obj, _snapshot_tree))
         return tuple(_snapshot_tree(o) for o in obj)
     if isinstance(obj, list):
+        if dedup_enabled():
+            return _dedup_seq(obj, _snapshot_tree)
         return [_snapshot_tree(o) for o in obj]
     if isinstance(obj, dict):
         return {k: _snapshot_tree(v) for k, v in obj.items()}
     return obj
 
 
+def _expand_tree(obj: Any) -> Any:
+    """Deep-copy a stored payload back into fresh buffers, expanding aliases."""
+    if isinstance(obj, mx.array):
+        return _copy_array(obj)
+    if _is_alias(obj):
+        raise ValueError("vault: alias marker outside a sequence container")
+    if isinstance(obj, tuple):
+        return tuple(_expand_seq(obj, _expand_tree))
+    if isinstance(obj, list):
+        return _expand_seq(obj, _expand_tree)
+    if isinstance(obj, dict):
+        return {k: _expand_tree(v) for k, v in obj.items()}
+    return obj
+
+
 def _eval_tree(obj: Any, out: List[mx.array]) -> None:
     if isinstance(obj, mx.array):
         out.append(obj)
+    elif _is_alias(obj):
+        return
     elif isinstance(obj, (tuple, list)):
         for o in obj:
             _eval_tree(o, out)
@@ -112,7 +256,7 @@ class CheckpointAdapter:
         return StateFragment(self.capability, prefix_len, payload=_snapshot_tree(raw))
 
     def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
-        payload = _snapshot_tree(fragment.payload)
+        payload = _expand_tree(fragment.payload)
         restore = getattr(fresh_cache, "prefix_cache_restore", None)
         if callable(restore):
             restore(payload)
