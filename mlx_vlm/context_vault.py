@@ -559,7 +559,8 @@ class ContextVault:
         return self._roots[VaultTier.PREFILL]
 
     def _walk(
-        self, tokens: Sequence[int], tier: VaultTier = VaultTier.PREFILL
+        self, tokens: Sequence[int], tier: VaultTier = VaultTier.PREFILL,
+        *, require_harvest_width_1: bool = False,
     ) -> Tuple[Optional[_Node], int]:
         """Deepest node whose path is a prefix of ``tokens``, plus its depth."""
         node = self._roots[tier]
@@ -579,7 +580,10 @@ class ContextVault:
                 break
             pos += len(edge)
             node = child
-            if node.checkpoint is not None:
+            if node.checkpoint is not None and (
+                not require_harvest_width_1 or _harvest_prov.is_b1_eligible(
+                    node.checkpoint.harvest_provenance)
+            ):
                 best = node
         return best, (best.depth if best else 0)
 
@@ -751,13 +755,15 @@ class ContextVault:
     # -- public API -----------------------------------------------------
 
     def lookup(
-        self, tokens: Sequence[int], tier: VaultTier = VaultTier.PREFILL
+        self, tokens: Sequence[int], tier: VaultTier = VaultTier.PREFILL,
+        *, require_harvest_width_1: bool = False,
     ) -> Optional[VaultCheckpoint]:
         """Deepest stored rung of ``tier`` that prefixes ``tokens``."""
         with self._lock:
             self.stats.lookups += 1
             self._sweep_expired()
-            node, _ = self._walk(tokens, tier)
+            node, _ = self._walk(
+                tokens, tier, require_harvest_width_1=require_harvest_width_1)
             if node is None or node.checkpoint is None:
                 self.stats.misses += 1
                 return None

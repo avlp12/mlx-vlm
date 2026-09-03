@@ -1349,15 +1349,16 @@ class DiskBlockStore:
                 or token_tuple[:prefix_len] != stored_tokens
             ):
                 continue
+            provenance = _exact_provenance_from_metadata(metadata)
+            if not _prov.may_persist(provenance):
+                continue
             if require_harvest_width_1:
                 # The B=1-only determinism policy applied to the DISK tier.  A
                 # shard written before this field existed carries no width, and
                 # unknown is refused rather than assumed: the whole point of
                 # L1b-1 is that a poisoned entry is indistinguishable from a
                 # clean one by anything except its provenance.
-                if _prov.batch_width_of(
-                    _exact_provenance_from_metadata(metadata)
-                ) != 1:
+                if not _prov.is_b1_eligible(provenance):
                     continue
             if best is None or prefix_len > best[1]:
                 best = (int(cache_hash), prefix_len)
@@ -1414,6 +1415,8 @@ class DiskBlockStore:
             return None
         tensor_entries, metadata, data_start = parsed
         if metadata.get("layout") != "exact_cache_v1":
+            return None
+        if not _prov.may_persist(_exact_provenance_from_metadata(metadata)):
             return None
         try:
             token_ids = tuple(
@@ -3113,7 +3116,7 @@ class APCManager:
                         continue
                     if (
                         require_harvest_width_1
-                        and _prov.batch_width_of(entry.provenance) != 1
+                        and not _prov.is_b1_eligible(entry.provenance)
                     ):
                         # Skipped, not preferred-against: the scan simply never
                         # sees it, so the winner is the deepest WIDTH-1 entry.

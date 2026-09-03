@@ -818,6 +818,7 @@ def stream_generate(
     # from nowhere at all.  Reported as ``cached_from_width=`` on the server's
     # own prefill log line -- law 23, the receipt is the server's own.
     cached_from_width: Optional[int] = None
+    cached_provenance: Optional[dict] = None
     full_input_ids_list = input_ids.flatten().tolist()
     apc_blocks_in_use: List[_apc.APCBlock] = []
     apc_extra_hash = 0
@@ -911,9 +912,8 @@ def stream_generate(
             primed = _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
             if primed:
                 reused_prefix_len = plen
-                cached_from_width = _harvest_prov.batch_width_of(
-                    plan.get("harvest_provenance")
-                )
+                cached_provenance = plan.get("harvest_provenance")
+                cached_from_width = _harvest_prov.batch_width_of(cached_provenance)
                 input_ids = input_ids[:, plen:]
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
@@ -968,9 +968,14 @@ def stream_generate(
             _vault = None
     if _vault is not None and reused_prefix_len == 0:
         try:
-            _hit = _vault.lookup(full_input_ids_list)
+            _policy = ({"require_harvest_width_1": True}
+                       if _harvest_prov.serve_b1_from_b1_only() else {})
+            _hit = _vault.lookup(full_input_ids_list, **_policy)
         except Exception:  # noqa: BLE001
             _hit = None
+        if _hit is not None and _harvest_prov.serve_b1_from_b1_only():
+            if not _harvest_prov.is_b1_eligible(getattr(_hit, "harvest_provenance", None)):
+                _hit = None
         if _hit is not None and 0 < _hit.prefix_len < len(full_input_ids_list):
             _fresh = cache.make_prompt_cache(
                 model.language_model, max_kv_size=kwargs.get("max_kv_size", None)
@@ -984,6 +989,8 @@ def stream_generate(
                 model, input_ids, mask, kwargs
             ):
                 reused_prefix_len = _hit.prefix_len
+                cached_provenance = getattr(_hit, "harvest_provenance", None)
+                cached_from_width = _harvest_prov.batch_width_of(cached_provenance)
                 input_ids = input_ids[:, _hit.prefix_len :]
                 kwargs["prompt_cache"] = _fresh
                 kwargs.pop("cached_image_features", None)
@@ -1047,7 +1054,9 @@ def stream_generate(
                     full_input_ids_list[:prefix_len],
                     prompt_cache,
                     extra_hash=apc_extra_hash,
-                    harvest_provenance=_harvest_prov.make(1),
+                    harvest_provenance=_harvest_prov.make(
+                        1, prefix_len=reused_prefix_len, parent=cached_provenance
+                    ),
                 )
 
         if _vault is not None and _vault_boundaries:
@@ -1069,7 +1078,9 @@ def stream_generate(
                         full_input_ids_list,
                         abs_len,
                         _vault_mod.capture_fragments(prompt_cache, abs_len),
-                        harvest_provenance=_harvest_prov.make(1),
+                        harvest_provenance=_harvest_prov.make(
+                            1, prefix_len=reused_prefix_len, parent=cached_provenance
+                        ),
                     )
                 except Exception:  # noqa: BLE001 - storing is best-effort
                     pass
@@ -1109,7 +1120,9 @@ def stream_generate(
                             full_input_ids_list,
                             tracked_cache,
                             extra_hash=apc_extra_hash,
-                            harvest_provenance=_harvest_prov.make(1),
+                            harvest_provenance=_harvest_prov.make(
+                                1, prefix_len=reused_prefix_len, parent=cached_provenance
+                            ),
                         )
                     except Exception as e:
                         logger.warning("APC exact-cache store failed: %s", e)

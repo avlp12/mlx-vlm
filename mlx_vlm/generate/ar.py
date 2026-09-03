@@ -2339,8 +2339,12 @@ class PromptProcessingBatch:
         # ``uids`` is the honest fallback there and identical before any row
         # finishes, which for a PREFILL batch is always.
         width = len(getattr(self, "_prompt_uids", None) or self.uids) or 1
+        meta = (getattr(self, "_apc_meta", []) or [])
+        row_meta = (meta[batch_idx] or {}) if batch_idx < len(meta) else {}
         return _harvest_prov.make(
             width,
+            prefix_len=int(row_meta.get("prefix_len") or 0),
+            parent=row_meta.get("harvest_provenance"),
             right_pad=right_pad,
             left_pad=left_pad,
         )
@@ -2836,7 +2840,8 @@ class PromptProcessingBatch:
         return rope_deltas
 
 
-def _vault_disk_deepen(vault, ids_list, hit, hit_tier, tiers):
+def _vault_disk_deepen(vault, ids_list, hit, hit_tier, tiers, *,
+                       require_harvest_width_1=False, min_depth=0):
     """Promote a deeper cold entry off disk, then let the RAM tier serve it.
 
     Module-level on purpose.  ``_vault_pick_for`` is called unbound against
@@ -2858,13 +2863,19 @@ def _vault_disk_deepen(vault, ids_list, hit, hit_tier, tiers):
     disk = getattr(vault, "disk", None)
     if disk is None:
         return hit, hit_tier
-    have = int(hit.prefix_len) if hit is not None else 0
+    have = max(int(hit.prefix_len) if hit is not None else 0, min_depth)
     for tier in tiers:
         try:
-            cand = disk.restore_into_vault(vault, list(ids_list), tier, min_depth=have)
+            policy = ({"require_harvest_width_1": True}
+                      if require_harvest_width_1 else {})
+            cand = disk.restore_into_vault(
+                vault, list(ids_list), tier, min_depth=have, **policy)
         except Exception:  # noqa: BLE001 - a disk fault costs a cold prefill, no more
             continue
-        if cand is None:
+        if cand is None or (
+            require_harvest_width_1 and not _harvest_prov.is_b1_eligible(
+                getattr(cand, "harvest_provenance", None))
+        ):
             continue
         if have < int(cand.prefix_len) < len(ids_list):
             hit, hit_tier = cand, tier
@@ -3114,7 +3125,8 @@ class BatchGenerator:
             )
         if vault is None:
             return pick
-        return self._vault_pick_for(ids_list, prompt_kwargs, pick)
+        return self._vault_pick_for(
+            ids_list, prompt_kwargs, pick, serve_batch_width=serve_batch_width)
 
     def _vault_prefix_trim_is_safe(self) -> bool:
         """Refuse a vault warm start where trimming the prompt breaks RoPE.
@@ -3129,7 +3141,7 @@ class BatchGenerator:
         return not callable(getattr(self.model, "get_rope_index", None))
 
     def _vault_pick_for(
-        self, ids_list, prompt_kwargs, pick: Optional[dict]
+        self, ids_list, prompt_kwargs, pick: Optional[dict], serve_batch_width: int = 1
     ) -> Optional[dict]:
         """Deepen (or supply) the warm start from the context vault.
 
@@ -3151,6 +3163,8 @@ class BatchGenerator:
         tiers = [_PREFILL_TIER]
         if _context_vault.session_capture_enabled():
             tiers.append(_context_vault.VaultTier.SESSION)
+        require_b1 = (serve_batch_width == 1 and _harvest_prov.serve_b1_from_b1_only())
+        policy = {"require_harvest_width_1": True} if require_b1 else {}
         hit = None
         hit_tier = _PREFILL_TIER
         for tier in tiers:
@@ -3159,17 +3173,22 @@ class BatchGenerator:
                 # so a duck-typed vault (the server tests use one) keeps working
                 # and this path stays byte-for-byte what it replaced. The tier
                 # kwarg is only used where it is load-bearing.
-                cand = (vault.lookup(list(ids_list)) if tier is _PREFILL_TIER
-                        else vault.lookup(list(ids_list), tier=tier))
+                cand = (vault.lookup(list(ids_list), **policy) if tier is _PREFILL_TIER
+                        else vault.lookup(list(ids_list), tier=tier, **policy))
             except Exception:  # noqa: BLE001 - a vault fault must never fail a request
                 return pick
-            if cand is None:
+            if cand is None or (
+                require_b1 and not _harvest_prov.is_b1_eligible(
+                    getattr(cand, "harvest_provenance", None))
+            ):
                 continue
             if not (have < int(cand.prefix_len) < len(ids_list)):
                 continue
             if hit is None or int(cand.prefix_len) > int(hit.prefix_len):
                 hit, hit_tier = cand, tier
-        hit, hit_tier = _vault_disk_deepen(vault, ids_list, hit, hit_tier, tiers)
+        hit, hit_tier = _vault_disk_deepen(
+            vault, ids_list, hit, hit_tier, tiers,
+            require_harvest_width_1=require_b1, min_depth=have)
         if hit is None:
             return pick
         if not self._vault_prefix_trim_is_safe():

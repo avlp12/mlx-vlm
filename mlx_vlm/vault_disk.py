@@ -693,6 +693,10 @@ def _header_refusal(
         # nothing on the entry to say so (L1b-1).  ``MLX_VLM_VAULT_DISK_PERSIST_MIN_WIDTH=0``
         # relaxes both halves of the policy together.
         return "harvest_provenance_missing"
+    if require_harvest_provenance and not _harvest_prov.may_persist(
+        {f: header.get(f) for f in _harvest_prov.FIELDS}
+    ):
+        return "harvest_width_not_durable"
     if tier is not None and header.get("tier") != tier:
         return "tier_mismatch"
     if expect_prompt_sha is not None and header.get("prompt_sha256") != expect_prompt_sha:
@@ -1056,7 +1060,7 @@ class DiskPrefixVault:
         # wrong answer"; a rung harvested inside a batched prefill and restored
         # into a solo request is the same class of wrong answer, one layer down,
         # and until this field existed nothing on disk could tell them apart.
-        # Five flat fields rather than a nested object so a header can be
+        # Flat capture and lineage fields rather than a nested object so a header can be
         # grepped and an index record can copy one of them.
         base.update(provenance or {})
         base["harvest_provenance_complete"] = provenance is not None
@@ -1164,6 +1168,7 @@ class DiskPrefixVault:
         *,
         min_depth: int = 0,
         strict: bool = True,
+        require_harvest_width_1: bool = False,
     ) -> Optional[dict]:
         """Deepest stored entry whose prompt hash matches a prefix of ``tokens``.
 
@@ -1189,6 +1194,13 @@ class DiskPrefixVault:
             d = int(r["prefix_len"])
             if digests.get(d) != r.get("prompt_sha256"):
                 continue
+            if _harvest_prov.persist_max_harvest_width() > 0 or require_harvest_width_1:
+                header = read_header(self._entry_path(r["key"])) or {}
+                provenance = {f: header.get(f) for f in _harvest_prov.FIELDS}
+                if not _harvest_prov.may_persist(provenance):
+                    continue
+                if require_harvest_width_1 and not _harvest_prov.is_b1_eligible(provenance):
+                    continue
             if best is None or d > int(best["prefix_len"]):
                 best = r
         return dict(best) if best else None
@@ -1309,6 +1321,7 @@ class DiskPrefixVault:
         min_depth: int = 0,
         strict: bool = True,
         wait_s: float = 0.0,
+        require_harvest_width_1: bool = False,
     ) -> Optional[VaultCheckpoint]:
         """Promote the deepest usable disk entry into ``vault``; never raises.
 
@@ -1320,7 +1333,9 @@ class DiskPrefixVault:
         try:
             if wait_s > 0:
                 self._wait_for_writes(wait_s)
-            rec = self.best_record(tokens, tier, min_depth=min_depth, strict=strict)
+            rec = self.best_record(
+                tokens, tier, min_depth=min_depth, strict=strict,
+                require_harvest_width_1=require_harvest_width_1)
             if rec is None:
                 self.stats.bump("disk_misses")
                 return None
@@ -1347,7 +1362,9 @@ class DiskPrefixVault:
                     f: header.get(f) for f in _harvest_prov.FIELDS
                 },
             )
-            cp = vault.lookup(list(tokens), tier=tier)
+            policy = ({"require_harvest_width_1": True}
+                      if require_harvest_width_1 else {})
+            cp = vault.lookup(list(tokens), tier=tier, **policy)
             if cp is None or int(cp.prefix_len) < depth:
                 self.stats.bump("disk_misses")
                 return None

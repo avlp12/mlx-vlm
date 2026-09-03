@@ -47,13 +47,16 @@ class MirroredVault:
         return boundary_hash(tokens, int(depth), self._vault.identity)
 
     # -- the three verbs dispatch uses ------------------------------------
-    def lookup(self, tokens: Sequence[int]):
-        hit = self._vault.lookup(tokens)
+    def lookup(self, tokens: Sequence[int], *, require_harvest_width_1: bool = False):
+        policy = ({"require_harvest_width_1": True}
+                  if require_harvest_width_1 else {})
+        hit = self._vault.lookup(tokens, **policy)
         with self._lock:
             self._pending = (list(tokens), hit) if hit is not None else None
         return hit
 
-    def insert(self, tokens: Sequence[int], prefix_len: int, fragments) -> bool:
+    def insert(self, tokens: Sequence[int], prefix_len: int, fragments,
+               *, harvest_provenance=None) -> bool:
         """Store rank 0's half, and tell rank 1 to store its own.
 
         Announced *before* the local insert, while both ranks' caches are still
@@ -62,14 +65,16 @@ class MirroredVault:
         state the rung is supposed to describe.
         """
         if fragments is None:
-            return self._vault.insert(tokens, prefix_len, fragments)
+            return self._vault.insert(
+            tokens, prefix_len, fragments, harvest_provenance=harvest_provenance)
         try:
             self._mirror.announce_vault_store(
                 self._name(tokens, prefix_len), int(prefix_len))
         except Exception:  # noqa: BLE001 - storing is best-effort on both ranks
             logger.warning("tp vault: store announce failed", exc_info=True)
             return False
-        return self._vault.insert(tokens, prefix_len, fragments)
+        return self._vault.insert(
+            tokens, prefix_len, fragments, harvest_provenance=harvest_provenance)
 
     def restore_into(self, caches: Sequence[Any], checkpoint) -> bool:
         """Restore both halves, or neither.
