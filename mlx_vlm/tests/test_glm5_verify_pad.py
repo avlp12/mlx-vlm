@@ -177,10 +177,21 @@ def test_a_junk_knob_falls_back_to_the_default_instead_of_raising(monkeypatch):
     assert vp.config().pad_m == vp.DEFAULT_PAD_M
 
 
-def test_the_shipped_defaults_are_the_measured_ones(monkeypatch):
+def test_the_shipped_default_is_OFF(monkeypatch):
+    """R-PL1b measured this lever LOSING 8-13 % of round time on the served path.
+
+    The default is 0 and the reason is a measurement, not a caution: MLX's
+    qmm/qmv crossover is an artefact of issuing the matmuls independently, and it
+    reverses in the dependent chain a real forward actually runs (P-L1c/P-L1d,
+    t(12)/t(11) 0.54 -> 1.06 at kda_in_proj_fused).  Anything that flips this
+    default has to beat that measurement, not merely re-derive the microbench.
+    """
     _arm(monkeypatch)
     cfg = vp.config()
-    assert (cfg.pad_m, cfg.pad_min, cfg.pad_min_q8) == (12, 9, 8)
+    assert (cfg.pad_m, cfg.pad_min, cfg.pad_min_q8) == (0, 9, 8)
+    assert not cfg.enabled
+    with vp.verify_window(True):
+        assert not vp.window_is_open()
 
 
 # ----------------------------------------------- 3. pad-and-slice is exact math

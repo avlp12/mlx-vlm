@@ -57,7 +57,8 @@ re-read costs proportionally more.  Hence a per-bit-width floor: pad from M >= 8
 at 8 bits and wider, from M >= 9 below.  Both are env-tunable, because both are
 two-point microbench extrapolations, not a fitted curve.
 
-    MLX_VLM_VERIFY_PAD_M        pad target, default 12.  0 DISABLES the lever.
+    MLX_VLM_VERIFY_PAD_M        pad target, DEFAULT 0 = OFF (see below; it was
+                                12 until R-PL1b measured it losing).
     MLX_VLM_VERIFY_PAD_MIN      lowest M padded at bits < 8, default 9.
     MLX_VLM_VERIFY_PAD_MIN_Q8   lowest M padded at bits >= 8, default 8.
 
@@ -68,13 +69,76 @@ and declines the 18-limit ones (mla q_a/kv_a, indexer, shared expert), which the
 probe never measured.  Set PAD_M=18 to admit them -- UNMEASURED as of this
 writing.
 
+MEASURED ON THE SERVED PATH, AND DECLINED: DEFAULT OFF
+------------------------------------------------------
+R-PL1b ran this on epsilon against the production server loop, one load, ABAB
+x 3 cycles, W8 and W9, code and prose at 1024 (receipt
+``logs/sweep11/RPL1b_p1024.json``, verdict ``RPL1b_VERDICT.md``).  Per-round wall
+clock got WORSE in every one of the four pairs:
+
+    arm         round ms, pad off -> pad on
+    code W8       80.90 -> 91.40   +13.0 %
+    code W9       89.96 -> 97.11   + 7.9 %
+    prose W8      80.51 -> 89.32   +10.9 %
+    prose W9      90.52 -> 99.62   +10.1 %
+
+(The tok/s of the code W8 pair went UP 2.3 %, but only because the padded arm
+decoded a different, easier stream and its accepted-per-round rose 3.83 -> 4.45.
+Round time is the honest quantity here, and it is uniformly worse.)
+
+WHY, measured directly (``logs/sweep11/PL1c_dependency_RESULT.json``,
+``PL1d_ladder_RESULT.json``, same shapes, no model loaded): P-L1 issued its 259
+matmuls with NO data dependencies, so the GPU could overlap them.  A real forward
+cannot -- layer i+1's in-projection needs layer i's output -- and ``qmm_splitk``
+is a TWO-kernel algorithm (partial products, then a reduction) whose second
+kernel's latency hides completely under overlap and not at all in a serial chain.
+Rerunning the M ladder both ways, on the same weights, in both sweep orders:
+
+    kda_in_proj_fused, 34 layers, ms   M=1     M=8     M=9    M=11    M=12
+      issued independently             5.73   10.92   13.57   18.75   10.12
+      issued as a dependent chain      6.00    8.82    9.90   12.28   13.06
+
+    kda_o_proj, 34 layers, ms          M=1     M=8     M=9    M=11    M=12
+      issued independently             2.21    4.96    5.40    6.88    4.20
+      issued as a dependent chain      2.63    3.64    4.11    4.93    5.37
+
+Independently issued, t(12)/t(11) is 0.54 and 0.61 -- the discontinuity the lever
+was built on.  In a dependent chain it is 1.06 and 1.09: THERE IS NO
+DISCONTINUITY, the curve rises monotonically through the crossover and then goes
+flat.  The pad and slice OPS are not the problem; they cost 1.5 us per call
+(M8pad12 minus M12raw = 0.05 ms over 34 calls).  The problem is that ``qmm`` is
+the slower kernel at these shapes once the calls are serialized.
+
+The same probe halves the re-read penalty the skinny-kernel program is priced on:
+k(M=9)/k(M=1) is 2.37 and 2.44 issued independently but only 1.65 and 1.56 in a
+dependent chain.
+
+So ``MLX_VLM_VERIFY_PAD_M`` DEFAULTS TO 0.  The code stays because the knob is
+how the above was measured, because the module is the only place the
+``get_qmv_batch_limit`` table is written down in Python, and because the same
+scaffolding is what a later, better lever (a real weight-stationary kernel, or a
+batched ``qmm`` that avoids the split-K reduction) would be A/B'd against.
+
 NOT BIT-IDENTICAL, BY CONSTRUCTION
 ----------------------------------
 ``qmm_splitk`` and ``qmv_wide`` are different kernels with different fp32
 reduction partitions.  The padded path is the same mathematics summed in a
 different order; it is NOT bit-identical to the unpadded one and does not claim
-to be.  It is gated on max|delta| within the output dtype's ulp class plus argmax
-equality, and on the KLD/digest panel before any default flip.
+to be.  R-PL1e measured it on epsilon with a determinism control that is exactly
+max|delta| == 0.0 (``logs/sweep11/RPL1e_identity_RESULT.json``), 8 blocks at each
+of S=8 and S=9, against BOTH references:
+
+                                    S=8              S=9
+    determinism, off vs off      0.0    64/64     0.0    72/72
+    pad on vs pad off            2.44   64/64     3.50   72/72
+    pad off vs PER-TOKEN greedy  2.69   64/64     2.13   70/72
+    pad on  vs PER-TOKEN greedy  2.78   64/64     2.75   70/72
+    (max|delta| on a logit scale of 27.6 / 28.9, then argmax agreement)
+
+The pad flips ZERO argmaxes in 136 positions against the unpadded block, and the
+two flips against per-token greedy at S=9 are ALREADY THERE in the shipped
+unpadded path -- same block, same position, with and without the pad.  The
+departure the pad adds is smaller than the departure S >= 2 already costs.
 
 SCOPE
 -----
@@ -120,7 +184,7 @@ PAD_M_ENV = "MLX_VLM_VERIFY_PAD_M"
 PAD_MIN_ENV = "MLX_VLM_VERIFY_PAD_MIN"
 PAD_MIN_Q8_ENV = "MLX_VLM_VERIFY_PAD_MIN_Q8"
 
-DEFAULT_PAD_M = 12
+DEFAULT_PAD_M = 0  # OFF -- R-PL1b measured the lever losing 8-13 % of round time
 DEFAULT_PAD_MIN = 9
 DEFAULT_PAD_MIN_Q8 = 8
 
