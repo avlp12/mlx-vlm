@@ -513,69 +513,93 @@ def generate_step(
             # ``_chunk_capture_kwargs`` disables it too: ``pipeline.prefill_chunk``
             # returns no output object, so a pipelined chunk's hidden capture
             # cannot be accumulated and the drafter would lose the prompt.
-            if not ladder and not _chunk_capture_kwargs:
-                from ..pipeline_runtime import maybe_open_pipeline
+            from ..pipeline_runtime import maybe_open_pipeline, pipeline_bypass_reason
 
+            bypass = (
+                pipeline_bypass_reason(
+                    ladder=bool(ladder),
+                    capture=bool(_chunk_capture_kwargs),
+                    warm=warm_prefix,
+                    pixel_values=pixel_values,
+                    mask=mask,
+                    cache=prompt_cache,
+                    input_ids=input_ids,
+                    kv_quantized=any(
+                        v is not None for v in (kv_bits, kv_key_bits, kv_value_bits)
+                    ),
+                )
+                if os.environ.get("MLX_VLM_PIPELINE_HOSTS", "").strip()
+                else "disabled"
+            )
+            if bypass is None:
                 pipeline = maybe_open_pipeline(model, total_tokens, verbose=verbose)
+            elif verbose and os.environ.get("MLX_VLM_PIPELINE_HOSTS"):
+                print(f"[pipeline] bypass={bypass}", flush=True)
+            try:
                 if pipeline is not None:
-                    pipeline.begin(total_tokens, prefill_step_size)
-            with tqdm(
-                total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
-            ) as pbar:
-                while inputs_embeds.shape[1] > 1:
-                    n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
-                    # Land exactly on the next boundary. Vault boundaries are
-                    # multiples of prefill_step_size, so this clamp is a no-op
-                    # for them and the chunk decomposition -- and thus
-                    # bit-identity against a straight-through prefill -- is
-                    # preserved. An unaligned caller-supplied boundary still
-                    # works, but trades that guarantee away.
-                    n_to_process = ladder.clamp(processed_tokens, n_to_process)
-                    chunk_kwargs = kwargs
-                    if getattr(model.language_model, "supports_logits_to_keep", False):
-                        chunk_kwargs = {**kwargs, "logits_to_keep": 1}
-                    if _chunk_capture_kwargs:
-                        chunk_kwargs = {**chunk_kwargs, **_chunk_capture_kwargs}
-                    if pipeline is not None:
-                        pipeline.prefill_chunk(
-                            model,
-                            input_ids[:, :n_to_process],
-                            inputs_embeds[:, :n_to_process],
-                            prompt_cache,
+                    pipeline.begin(total_tokens, prefill_step_size, input_ids=input_ids)
+                with tqdm(
+                    total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
+                ) as pbar:
+                    while inputs_embeds.shape[1] > 1:
+                        n_to_process = min(
+                            prefill_step_size, inputs_embeds.shape[1] - 1
                         )
-                        # only stage A's caches exist on this box until finalize
-                        mx.eval([c.state for c in pipeline.local_caches(prompt_cache)])
-                    else:
-                        chunk_out = model.language_model(
-                            inputs=input_ids[:, :n_to_process],
-                            inputs_embeds=inputs_embeds[:, :n_to_process],
-                            cache=prompt_cache,
-                            n_to_process=n_to_process,
-                            **chunk_kwargs,
-                        )
-                        _prefill_hidden.append(chunk_out)
-                        # Drop the chunk's logits (and any gdn stash) BEFORE the
-                        # eval, so the vocab-wide projection is never materialised
-                        # for a chunk nobody samples from.
-                        chunk_out = None
-                        quantize_cache_fn(prompt_cache)
-                        mx.eval(
-                            [c.state for c in prompt_cache] + _prefill_hidden.pending()
-                        )
-                    processed_tokens += n_to_process
-                    for reached in ladder.reached(processed_tokens):
-                        prompt_cache_checkpoint(reached, prompt_cache)
-                    inputs_embeds = inputs_embeds[:, n_to_process:]
-                    input_ids = input_ids[:, n_to_process:]
-                    mx.clear_cache()
-                    pbar.update(n_to_process)
+                        # Land exactly on the next boundary. Vault boundaries are
+                        # multiples of prefill_step_size, so this clamp is a no-op
+                        # for them and the chunk decomposition -- and thus
+                        # bit-identity against a straight-through prefill -- is
+                        # preserved. An unaligned caller-supplied boundary still
+                        # works, but trades that guarantee away.
+                        n_to_process = ladder.clamp(processed_tokens, n_to_process)
+                        chunk_kwargs = kwargs
+                        if getattr(model.language_model, "supports_logits_to_keep", False):
+                            chunk_kwargs = {**kwargs, "logits_to_keep": 1}
+                        if _chunk_capture_kwargs:
+                            chunk_kwargs = {**chunk_kwargs, **_chunk_capture_kwargs}
+                        if pipeline is not None:
+                            pipeline.prefill_chunk(
+                                model,
+                                input_ids[:, :n_to_process],
+                                inputs_embeds[:, :n_to_process],
+                                prompt_cache,
+                            )
+                            # only stage A's caches exist on this box until finalize
+                            mx.eval([c.state for c in pipeline.local_caches(prompt_cache)])
+                        else:
+                            chunk_out = model.language_model(
+                                inputs=input_ids[:, :n_to_process],
+                                inputs_embeds=inputs_embeds[:, :n_to_process],
+                                cache=prompt_cache,
+                                n_to_process=n_to_process,
+                                **chunk_kwargs,
+                            )
+                            _prefill_hidden.append(chunk_out)
+                            # Drop the chunk's logits (and any gdn stash) BEFORE the
+                            # eval, so the vocab-wide projection is never materialised
+                            # for a chunk nobody samples from.
+                            chunk_out = None
+                            quantize_cache_fn(prompt_cache)
+                            mx.eval(
+                                [c.state for c in prompt_cache] + _prefill_hidden.pending()
+                            )
+                        processed_tokens += n_to_process
+                        for reached in ladder.reached(processed_tokens):
+                            prompt_cache_checkpoint(reached, prompt_cache)
+                        inputs_embeds = inputs_embeds[:, n_to_process:]
+                        input_ids = input_ids[:, n_to_process:]
+                        mx.clear_cache()
+                        pbar.update(n_to_process)
 
-            if pipeline is not None:
-                # pull stage B's KDA/DSA caches back and install them, so the
-                # last token and all of decode run locally over the full stack
-                pipeline.finalize(prompt_cache)
-                quantize_cache_fn(prompt_cache)
-                pipeline.close()
+                if pipeline is not None:
+                    # pull stage B's KDA/DSA caches back and install them, so the
+                    # last token and all of decode run locally over the full stack
+                    pipeline.finalize(prompt_cache)
+                    quantize_cache_fn(prompt_cache)
+
+            finally:
+                if pipeline is not None:
+                    pipeline.close()
 
             input_ids = input_ids[:, -1:]
 

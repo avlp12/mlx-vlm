@@ -62,7 +62,9 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
+import math
 import os
 import queue
 import socket
@@ -70,6 +72,8 @@ import struct
 import sys
 import threading
 import time
+import uuid
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -82,6 +86,193 @@ from .utils import load_model
 MAGIC = b"GP51"
 HDR = struct.Struct("!4sIIIIIQ")  # magic, chunk_idx, B, S, HC, D, nbytes
 EOF_IDX = 0xFFFFFFFF
+MAX_JSON_BYTES = 4 * 1024 * 1024
+
+
+def _hex(value, length, name):
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or any(c not in "0123456789abcdef" for c in value)
+    ):
+        raise ValueError(f"invalid pipeline {name}")
+    return value
+
+
+def token_bytes(input_ids):
+    """Canonical cold B=1 token prefix; never hashes embeddings or padding."""
+    ids = np.asarray(input_ids)
+    if ids.ndim != 2 or ids.shape[0] != 1 or ids.dtype.kind not in "iu":
+        raise ValueError("pipeline requires B=1 integer token IDs")
+    if np.any(ids < 0) or np.any(ids > 2147483647):
+        raise ValueError("pipeline token ID out of range")
+    return ids.astype("<i4", copy=False).tobytes()
+
+
+@dataclass(frozen=True)
+class PrefillEnvelope:
+    """Request identity. Model/source pins are supplied by a verified manifest.
+
+    The tail sees activations, so the token digest is a head-side attestation,
+    not an independent tokenization check on the tail.
+    """
+
+    schema: int
+    request_id: str
+    model_sha256: str
+    source_revision: str
+    split: int
+    n_layers: int
+    batch: int
+    depth: int
+    token_sha256: str
+    chunks: tuple
+
+    def __post_init__(self):
+        _hex(self.request_id, 32, "request_id")
+        _hex(self.model_sha256, 64, "model_sha256")
+        _hex(self.source_revision, 40, "source_revision")
+        _hex(self.token_sha256, 64, "token_sha256")
+        for name in ("schema", "split", "n_layers", "batch", "depth"):
+            if type(getattr(self, name)) is not int:
+                raise ValueError(f"invalid pipeline {name}")
+        if (
+            self.schema != 1
+            or self.batch != 1
+            or not 0 < self.split < self.n_layers <= 1024
+        ):
+            raise ValueError("unsupported pipeline schema/batch/layers")
+        if not 0 < self.depth <= 2**24 or not 0 < len(self.chunks) <= 65536:
+            raise ValueError("invalid pipeline depth/chunks")
+        if (
+            any(type(n) is not int or n <= 0 for n in self.chunks)
+            or sum(self.chunks) != self.depth
+        ):
+            raise ValueError("pipeline depth/chunks mismatch")
+
+    @classmethod
+    def create(
+        cls, *, model_sha256, source_revision, split, n_layers, input_ids, chunk
+    ):
+        if type(chunk) is not int or chunk <= 0:
+            raise ValueError("invalid pipeline chunk size")
+        raw = token_bytes(input_ids)
+        depth = len(raw) // 4
+        chunks = tuple(min(chunk, depth - p) for p in range(0, depth, chunk))
+        return cls(
+            1,
+            uuid.uuid4().hex,
+            model_sha256,
+            source_revision,
+            split,
+            n_layers,
+            1,
+            depth,
+            hashlib.sha256(raw).hexdigest(),
+            chunks,
+        )
+
+    def to_dict(self):
+        out = asdict(self)
+        out["chunks"] = list(self.chunks)
+        return out
+
+    @classmethod
+    def from_dict(cls, obj):
+        if not isinstance(obj, dict) or set(obj) != set(cls.__dataclass_fields__):
+            raise ValueError("missing or unknown pipeline envelope fields")
+        if not isinstance(obj["chunks"], (tuple, list)):
+            raise ValueError("invalid pipeline chunks")
+        return cls(**{**obj, "chunks": tuple(obj["chunks"])})
+
+    def require_match(self, expected):
+        if self != expected:
+            raise ValueError("pipeline envelope mismatch")
+
+
+def _check_peer_identity(message, model_sha256, source_revision, split, n_layers):
+    wanted = dict(
+        schema=1,
+        model_sha256=_hex(model_sha256, 64, "model_sha256"),
+        source_revision=_hex(source_revision, 40, "source_revision"),
+        split=split,
+        n_layers=n_layers,
+    )
+    if any(message.get(k) != v for k, v in wanted.items()):
+        raise ValueError("pipeline peer identity mismatch")
+    return wanted
+
+
+def _abort_socket(sock):
+    """Wake socket workers; model owners unwind normally at a chunk boundary."""
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _queue_put(q, item, errors, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        if errors:
+            raise RuntimeError(f"pipeline worker failed: {errors[0]}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("pipeline queue progress timeout")
+        try:
+            q.put(item, timeout=min(0.1, remaining))
+            return
+        except queue.Full:
+            pass
+
+
+def _check_stop(path):
+    if path and Path(path).exists():
+        raise InterruptedError("pipeline cooperative STOP requested")
+
+
+class StopAwareSocket:
+    """Tail-owned stop-file checks during idle and transfer, without signals."""
+
+    def __init__(self, sock, stop_file, timeout):
+        self.sock, self.stop_file, self.timeout = sock, stop_file, timeout
+        sock.settimeout(min(0.25, timeout))
+
+    def gettimeout(self):
+        return self.timeout
+
+    def recv_into(self, view, n):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            _check_stop(self.stop_file)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("pipeline socket receive timeout")
+            try:
+                return self.sock.recv_into(view, n)
+            except socket.timeout:
+                pass
+
+    def sendall(self, data):
+        view = memoryview(data).cast("B")
+        sent = 0
+        deadline = time.monotonic() + self.timeout
+        while sent < len(view):
+            _check_stop(self.stop_file)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("pipeline socket send timeout")
+            try:
+                n = self.sock.send(view[sent : sent + 2**20])
+            except socket.timeout:
+                continue
+            if not n:
+                raise ConnectionError("pipeline peer closed during send")
+            sent += n
+
+    def shutdown(self, how):
+        return self.sock.shutdown(how)
+
+    def close(self):
+        return self.sock.close()
 
 
 # ---------------------------------------------------------------- model side
@@ -100,11 +291,13 @@ def load_stage(model_path: str, lo: int, hi: int, prune: bool = True):
     lm = model.language_model.model
     n_layers = len(lm.layers)
     local = list(range(lo, hi))
+    for i in range(n_layers):
+        if i < lo or i >= hi:
+            caches[i] = None
     if prune:
         for i in range(n_layers):
             if i < lo or i >= hi:
                 lm.layers[i] = None
-                caches[i] = None
         # the vision tower is unused for a text prefill benchmark
         model.vision_model = None
         if lo > 0:
@@ -132,7 +325,9 @@ class Stage:
         # Masks depend only on (N, cache offset), and offsets are identical for
         # every layer of a kind, so any local layer of that kind can supply it.
         self.ssm_local = next((i for i in local if self.lm.layers[i].is_linear), None)
-        self.fa_local = next((i for i in local if not self.lm.layers[i].is_linear), None)
+        self.fa_local = next(
+            (i for i in local if not self.lm.layers[i].is_linear), None
+        )
 
     def __call__(self, h: mx.array, inputs: Optional[mx.array] = None) -> mx.array:
         """Run this stage over one chunk (delegates to Glm5NextModel)."""
@@ -161,7 +356,11 @@ def boundary_bytes(S: int, hc: int, D: int, itemsize: int = 2) -> int:
 
 def _recv_exact(sock, view, n):
     got = 0
+    timeout = sock.gettimeout()
+    deadline = None if timeout is None else time.monotonic() + timeout
     while got < n:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("pipeline payload progress timeout")
         k = sock.recv_into(view[got:], n - got)
         if not k:
             raise ConnectionError("peer closed mid-payload")
@@ -178,6 +377,8 @@ def _recv_json(sock):
     raw = bytearray(4)
     _recv_exact(sock, memoryview(raw), 4)
     (n,) = struct.unpack("!I", bytes(raw))
+    if not 0 < n <= MAX_JSON_BYTES:
+        raise ValueError("pipeline JSON frame exceeds limit")
     buf = bytearray(n)
     _recv_exact(sock, memoryview(buf), n)
     return json.loads(bytes(buf))
@@ -289,17 +490,20 @@ def collect_state(caches):
     return entries
 
 
-def handoff_send(sock, caches):
+def handoff_send(sock, caches, *, envelope):
     """Stretch goal: ship stage B's KDA/DSA caches back so decode can run on box A.
 
     Always on the control socket: measured 4.6 GB/s at 131k, and it is a
     one-shot cost (0.18% of a 131k prefill), so it is not worth the extra
     ring-template plumbing.
     """
+    t_pack = time.perf_counter()
     entries = collect_state(caches)
     mx.eval([a for _, _, arrs in entries for a in arrs])
     meta = [{"layer": i, "desc": d} for i, d, _ in entries]
-    _send_json(sock, {"cmd": "handoff", "meta": meta})
+    _validate_meta(meta, envelope)
+    pack_s = time.perf_counter() - t_pack
+    _send_json(sock, {"cmd": "handoff", "envelope": envelope.to_dict(), "meta": meta})
     total = 0
     t0 = time.perf_counter()
     for _, _, arrs in entries:
@@ -311,6 +515,7 @@ def handoff_send(sock, caches):
             total += a.nbytes
     dt = time.perf_counter() - t0
     return {
+        "handoff_pack_s": pack_s,
         "handoff_send_s": dt,
         "handoff_bytes": total,
         "handoff_tensors": sum(len(a) for _, _, a in entries),
@@ -321,6 +526,119 @@ _DTYPES = {
     n: getattr(mx, n)
     for n in ("bfloat16", "float16", "float32", "uint8", "uint16", "int32", "int64")
 }
+_ITEMSIZES = dict(bfloat16=2, float16=2, float32=4, uint8=1, uint16=2, int32=4, int64=8)
+
+
+def _validate_desc(desc, level=0):
+    if not isinstance(desc, dict) or level > 8:
+        raise ValueError("invalid pipeline state descriptor")
+    kind = desc.get("k")
+    if kind == "none" and set(desc) == {"k"}:
+        return 0
+    if kind == "seq" and set(desc) == {"k", "items"}:
+        items = desc["items"]
+        if not isinstance(items, list) or len(items) > 64:
+            raise ValueError("invalid pipeline state sequence")
+        return sum(_validate_desc(d, level + 1) for d in items)
+    if kind != "arr" or set(desc) != {"k", "dtype", "shape", "nbytes"}:
+        raise ValueError("invalid pipeline array descriptor")
+    shape, dtype, nbytes = desc["shape"], desc["dtype"], desc["nbytes"]
+    if dtype not in _ITEMSIZES or not isinstance(shape, list) or len(shape) > 8:
+        raise ValueError("invalid pipeline dtype/shape")
+    if any(type(d) is not int or d < 0 or d > 2**24 for d in shape):
+        raise ValueError("invalid pipeline shape")
+    if (
+        type(nbytes) is not int
+        or nbytes != math.prod(shape) * _ITEMSIZES[dtype]
+        or nbytes > 8 * 2**30
+    ):
+        raise ValueError("pipeline shape/nbytes mismatch")
+    return nbytes
+
+
+def _validate_meta(meta, envelope):
+    if not isinstance(meta, list) or len(meta) != envelope.n_layers - envelope.split:
+        raise ValueError("pipeline handoff layer count mismatch")
+    layers = []
+    total = 0
+    for ent in meta:
+        if (
+            not isinstance(ent, dict)
+            or set(ent) != {"layer", "desc"}
+            or type(ent["layer"]) is not int
+        ):
+            raise ValueError("invalid pipeline layer descriptor")
+        layers.append(ent["layer"])
+        total += _validate_desc(ent["desc"])
+    if sorted(layers) != list(range(envelope.split, envelope.n_layers)):
+        raise ValueError("pipeline handoff layer indices mismatch")
+    if total > 64 * 2**30:
+        raise ValueError("pipeline handoff exceeds byte limit")
+
+
+def expected_state_meta(model, envelope):
+    """Exact GLM KDA/DSA shape and dtype schema, independent of peer metadata.
+
+    Schema 1 is bf16 text prefill with fp32 recurrent accumulation. Quantized
+    caches and other state formats require a different, explicitly supported
+    schema rather than coercion at the receiver.
+    """
+
+    def arr(shape, dtype="bfloat16"):
+        return dict(
+            k="arr",
+            shape=list(shape),
+            dtype=dtype,
+            nbytes=math.prod(shape) * _ITEMSIZES[dtype],
+        )
+
+    def seq(*items):
+        return dict(k="seq", items=list(items))
+
+    result = []
+    layers = model.language_model.model.layers
+    if len(layers) != envelope.n_layers:
+        raise ValueError("pipeline model layer count mismatch")
+    for i in range(envelope.split, envelope.n_layers):
+        layer = layers[i]
+        if layer is None:
+            # Prototype heads prune tail modules before loading weights, but
+            # retain the validated architecture config needed for the schema.
+            cfg = model.language_model.args
+            linear = cfg.layer_types[i] == "linear_attention"
+            if linear:
+                h, d, k = (
+                    cfg.linear_num_heads,
+                    cfg.linear_head_dim,
+                    cfg.linear_conv_kernel_dim,
+                )
+            else:
+                rank, index_dim = cfg.kv_lora_rank, cfg.index_head_dim
+        else:
+            a = layer.self_attn
+            linear = layer.is_linear
+            if linear:
+                h, d, k = a.num_heads, a.head_dim, a.conv_kernel_size
+            else:
+                rank, index_dim = a.kv_lora_rank, a.indexer.head_dim
+        if linear:
+            desc = seq(arr((1, k - 1, 3 * h * d)), arr((1, h, d, d), "float32"))
+        else:
+            latent = arr((1, 1, envelope.depth, rank))
+            packed = arr((1, 1, envelope.depth, 2 * index_dim + 1))
+            desc = seq(
+                seq(latent, latent),
+                seq(packed, arr((1, 1, envelope.depth, 0), "float32")),
+            )
+        result.append(dict(layer=i, desc=desc))
+    return result
+
+
+def _require_state_meta(meta, expected_meta):
+    if sorted(meta, key=lambda e: e["layer"]) != sorted(
+        expected_meta, key=lambda e: e["layer"]
+    ):
+        raise ValueError("pipeline cache schema dtype/shape mismatch")
 
 
 def _walk_arrays(desc, fn, out):
@@ -332,11 +650,16 @@ def _walk_arrays(desc, fn, out):
     return out
 
 
-def handoff_recv(sock, rebuild: bool = False):
+def handoff_recv(sock, rebuild: bool = False, *, expected, expected_meta):
     """Receive stage B's caches. ``rebuild`` materializes them for decode."""
     msg = _recv_json(sock)
-    assert msg.get("cmd") == "handoff", msg
+    if msg.get("cmd") != "handoff":
+        raise ValueError("expected pipeline handoff")
+    PrefillEnvelope.from_dict(msg.get("envelope")).require_match(expected)
+    _validate_meta(msg.get("meta"), expected)
+    _require_state_meta(msg["meta"], expected_meta)
     total = 0
+    wire_s = rebuild_s = 0.0
     states = {}
     t0 = time.perf_counter()
     for ent in msg["meta"]:
@@ -346,20 +669,28 @@ def handoff_recv(sock, rebuild: bool = False):
             n = d["nbytes"]
             dt = _DTYPES[d["dtype"]]
             if n == 0:
-                arrays.append(mx.zeros(tuple(d["shape"]), dtype=dt))
+                arrays.append(
+                    mx.zeros(tuple(d["shape"]), dtype=dt) if rebuild else None
+                )
                 continue
             buf = bytearray(n)
+            t_wire = time.perf_counter()
             _recv_exact(sock, memoryview(buf), n)
+            wire_s += time.perf_counter() - t_wire
             total += n
             if rebuild:
+                t_rebuild = time.perf_counter()
                 flat = mx.array(np.frombuffer(buf, dtype=np.uint8))
                 arrays.append(flat.view(dt).reshape(tuple(d["shape"])))
+                rebuild_s += time.perf_counter() - t_rebuild
             else:
                 arrays.append(None)
         if rebuild:
             states[ent["layer"]] = rebuild_state(ent["desc"], iter(arrays))
     dt = time.perf_counter() - t0
     return {
+        "handoff_wire_recv_s": wire_s,
+        "handoff_rebuild_s": rebuild_s,
         "handoff_recv_s": dt,
         "handoff_bytes": total,
         "handoff_tensors": sum(
@@ -370,10 +701,88 @@ def handoff_recv(sock, rebuild: bool = False):
     }
 
 
-def install_state(caches, states):
-    """Install received stage-B state into the head's own cache list."""
-    for i, st in states.items():
-        caches[i].state = st
+def install_state(caches, states, *, fresh_caches, expected, expected_meta):
+    """Validate into fresh caches, then atomically replace only tail entries.
+
+    Never reuse indexer auxiliary pools, padding metadata, or offsets from a
+    prior request. Unsupported cache types fail closed; this is cold B=1 only.
+    """
+    from .models.cache import ArraysCache, CacheList, KVCache
+
+    layers = list(range(expected.split, expected.n_layers))
+    if (
+        len(caches) != expected.n_layers
+        or len(fresh_caches) != expected.n_layers
+        or sorted(states) != layers
+    ):
+        raise ValueError("pipeline install layer mismatch")
+    _require_state_meta(
+        [dict(layer=i, desc=describe_state(st)) for i, st in states.items()],
+        expected_meta,
+    )
+
+    def cache_nodes(c):
+        return [c] + (
+            [n for child in c.caches for n in cache_nodes(child)]
+            if type(c) is CacheList
+            else []
+        )
+
+    old_ids = {id(n) for c in caches if c is not None for n in cache_nodes(c)}
+    if any(id(n) in old_ids for i in layers for n in cache_nodes(fresh_caches[i])):
+        raise ValueError("pipeline install requires fresh unaliased caches")
+
+    def prepare(cache, state):
+        if not cache.empty() or any(
+            getattr(cache, attr, None) is not None
+            for attr in ("left_padding", "lengths")
+        ):
+            raise ValueError("pipeline install requires empty unpadded caches")
+        if type(cache) is CacheList:
+            if not isinstance(state, (list, tuple)) or len(state) != len(cache.caches):
+                raise ValueError("pipeline cache structure mismatch")
+            for child, value in zip(cache.caches, state):
+                prepare(child, value)
+        elif type(cache) is KVCache:
+            if (
+                not isinstance(state, (list, tuple))
+                or len(state) != 2
+                or any(
+                    not isinstance(a, mx.array)
+                    or a.ndim != 4
+                    or a.shape[0] != 1
+                    or a.shape[-2] != expected.depth
+                    for a in state
+                )
+            ):
+                raise ValueError("pipeline KV state depth/shape mismatch")
+            cache.state = state
+        elif type(cache) is ArraysCache:
+            if (
+                not isinstance(state, (list, tuple))
+                or len(state) != len(cache.cache)
+                or any(
+                    not isinstance(a, mx.array) or a.ndim < 2 or a.shape[0] != 1
+                    for a in state
+                )
+            ):
+                raise ValueError("pipeline recurrent state shape mismatch")
+            cache.state = state
+        else:
+            raise ValueError("unsupported pipeline cache type")
+        for attr in ("_pool", "_fpool", "_no_pad"):
+            if hasattr(cache, attr):
+                delattr(cache, attr)
+
+    for i in layers:
+        if fresh_caches[i] is caches[i]:
+            raise ValueError("pipeline install requires fresh caches")
+        prepare(fresh_caches[i], states[i])
+    # Evaluate before committing replacement so deferred rebuild errors cannot
+    # leave a partially installed destination.
+    mx.eval([fresh_caches[i].state for i in layers])
+    for i in layers:
+        caches[i] = fresh_caches[i]
 
 
 # ------------------------------------------------------------------- roles
@@ -386,12 +795,15 @@ def make_prompt(tokens: int, seed: int, vocab: int = 150000) -> mx.array:
 
 
 def run_head(args):
+    _hex(args.model_sha256, 64, "model_sha256")
+    _hex(args.source_revision, 40, "source_revision")
     lo, hi = 0, args.split
     model, caches, local, n_layers, load_s = load_stage(args.model, lo, hi, args.prune)
     stage = Stage(model, caches, local, n_layers)
     print(f"[head] layers {lo}:{hi} of {n_layers} loaded in {load_s:.1f}s", flush=True)
 
     sock = socket.socket()
+    sock.settimeout(args.io_timeout)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     deadline = time.time() + args.connect_timeout
     while True:
@@ -403,9 +815,22 @@ def run_head(args):
                 raise
             time.sleep(2.0)
     print(f"[head] connected to {args.peer}:{args.port}", flush=True)
-    _send_json(sock, {"cmd": "hello", "transport": args.transport, "split": args.split})
+    _send_json(
+        sock,
+        {
+            "cmd": "hello",
+            "transport": args.transport,
+            "schema": 1,
+            "split": args.split,
+            "n_layers": n_layers,
+            "model_sha256": args.model_sha256,
+            "source_revision": args.source_revision,
+        },
+    )
     hi = _recv_json(sock)
-    assert hi.get("ok"), hi
+    _check_peer_identity(
+        hi, args.model_sha256, args.source_revision, args.split, n_layers
+    )
     if args.transport == "ring":
         g = ring_group()
         print(f"[head] ring rank {g.rank()}/{g.size()}", flush=True)
@@ -418,6 +843,9 @@ def run_head(args):
         # fresh caches for the next length
         _reset_caches(stage, args.model)
     _send_json(sock, {"cmd": "bye"})
+    if _recv_json(sock) != {"cmd": "bye", "ok": True}:
+        raise ValueError("pipeline bye not acknowledged")
+    sock.close()
     out = {"role": "head", "split": args.split, "load_s": load_s, "runs": results}
     _dump(args, out)
 
@@ -430,7 +858,9 @@ def _reset_caches(stage: Stage, model_path: str = ""):
     new = [None] * stage.n_layers
     for i in stage.local:
         layer = stage.lm.layers[i]
-        new[i] = ArraysCache(size=2) if layer.is_linear else CacheList(KVCache(), KVCache())
+        new[i] = (
+            ArraysCache(size=2) if layer.is_linear else CacheList(KVCache(), KVCache())
+        )
     stage.caches = new
     gc.collect()
     mx.clear_cache()
@@ -439,11 +869,20 @@ def _reset_caches(stage: Stage, model_path: str = ""):
 def _head_one(args, stage: Stage, sock, tokens: int):
     chunk = args.chunk
     prompt = make_prompt(tokens, args.seed)
+    envelope = PrefillEnvelope.create(
+        model_sha256=args.model_sha256,
+        source_revision=args.source_revision,
+        split=args.split,
+        n_layers=stage.n_layers,
+        input_ids=prompt,
+        chunk=chunk,
+    )
     n_chunks = (tokens + chunk - 1) // chunk
     _send_json(
         sock,
         {
             "cmd": "run",
+            "envelope": envelope.to_dict(),
             "tokens": tokens,
             "chunk": chunk,
             "split": args.split,
@@ -453,7 +892,8 @@ def _head_one(args, stage: Stage, sock, tokens: int):
         },
     )
     ack = _recv_json(sock)
-    assert ack.get("ok"), ack
+    if not ack.get("ok") or ack.get("request_id") != envelope.request_id:
+        raise ValueError("pipeline run not acknowledged")
 
     sendq: "queue.Queue" = queue.Queue(maxsize=args.depth)
     send_times = []
@@ -464,7 +904,7 @@ def _head_one(args, stage: Stage, sock, tokens: int):
             # MLX streams are thread-local: the comm stream must be made here.
             stream = mx.new_stream(mx.cpu) if args.transport == "ring" else None
             while True:
-                item = sendq.get()
+                item = sendq.get(timeout=args.io_timeout)
                 if item is None:
                     sock.sendall(HDR.pack(MAGIC, EOF_IDX, 0, 0, 0, 0, 0))
                     return
@@ -499,23 +939,34 @@ def _head_one(args, stage: Stage, sock, tokens: int):
         t_gpu = time.perf_counter() - t0
         nb = None if args.transport == "ring" else to_wire(h)
         t1 = time.perf_counter()
-        sendq.put((idx, h, nb))  # blocks when the tail is behind -> backpressure
+        _queue_put(sendq, (idx, h, nb), err, args.io_timeout)
         t_block = time.perf_counter() - t1
         per_chunk.append({"idx": idx, "n": n, "gpu_s": t_gpu, "block_s": t_block})
         pos += n
         mx.clear_cache()
     t_head_done = time.perf_counter() - t_start
-    sendq.put(None)
-    th.join()
+    _queue_put(sendq, None, err, args.io_timeout)
+    th.join(timeout=args.io_timeout)
+    if th.is_alive():
+        _abort_socket(sock)
+        raise TimeoutError("pipeline sender did not retire")
     if err:
         raise RuntimeError(err[0])
 
     # tail signals "last chunk retired" before any optional handoff so the
     # pipeline wall clock is not polluted by the stretch-goal transfer
     done = _recv_json(sock)
-    assert done.get("cmd") == "done", done
+    PrefillEnvelope.from_dict(done.get("envelope")).require_match(envelope)
     t_total = time.perf_counter() - t_start
-    handoff = handoff_recv(sock) if args.handoff else None
+    handoff = (
+        handoff_recv(
+            sock,
+            expected=envelope,
+            expected_meta=expected_state_meta(stage.model, envelope),
+        )
+        if args.handoff
+        else None
+    )
     if handoff is not None:
         handoff.pop("states", None)
     tail = _recv_json(sock)
@@ -543,6 +994,12 @@ def _head_one(args, stage: Stage, sock, tokens: int):
 
 
 def run_tail(args):
+    # Validate pins before loading any weights. Identity is supplied by the
+    # caller's verified model manifest; no path-name equivalence is inferred.
+    _hex(args.model_sha256, 64, "model_sha256")
+    _hex(args.source_revision, 40, "source_revision")
+    stop_file = getattr(args, "stop_file", None)
+    _check_stop(stop_file)
     lo, hi = args.split, args.layers
     model, caches, local, n_layers, load_s = load_stage(args.model, lo, hi, args.prune)
     stage = Stage(model, caches, local, n_layers)
@@ -553,47 +1010,107 @@ def run_tail(args):
     srv.bind((args.bind, args.port))
     srv.listen(1)
     print(f"[tail] listening on {args.bind}:{args.port}", flush=True)
-    sock, addr = srv.accept()
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    print(f"[tail] peer {addr}", flush=True)
-    hello = _recv_json(sock)
-    assert hello.get("cmd") == "hello", hello
-    assert hello["split"] == args.split, (hello, args.split)
-    args.transport = hello["transport"]
-    _send_json(sock, {"ok": True, "load_s": load_s})
-    if args.transport == "ring":
-        g = ring_group()
-        print(f"[tail] ring rank {g.rank()}/{g.size()}", flush=True)
-
-    while True:
-        req = _recv_json(sock)
-        if req.get("cmd") == "bye":
-            break
-        assert req["split"] == args.split, (req, args.split)
-        _send_json(sock, {"ok": True, "load_s": load_s})
-        rep = _tail_one(args, stage, sock, req)
-        _send_json(sock, rep)
-        print(json.dumps(rep), flush=True)
-        _reset_caches(stage, args.model)
-    sock.close()
+    srv.settimeout(min(0.25, args.connect_timeout))
+    sock = None
+    try:
+        deadline = time.monotonic() + args.connect_timeout
+        while True:
+            _check_stop(stop_file)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("pipeline tail accept timeout")
+            try:
+                sock, addr = srv.accept()
+                break
+            except socket.timeout:
+                pass
+        sock.settimeout(args.io_timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock = StopAwareSocket(sock, stop_file, args.io_timeout)
+        print(f"[tail] peer {addr}", flush=True)
+        hello = _recv_json(sock)
+        if hello.get("cmd") != "hello" or hello.get("transport") not in (
+            "socket",
+            "ring",
+        ):
+            raise ValueError("invalid pipeline hello")
+        identity = _check_peer_identity(
+            hello, args.model_sha256, args.source_revision, args.split, n_layers
+        )
+        args.transport = hello["transport"]
+        _send_json(sock, {"ok": True, "load_s": load_s, **identity})
+        if args.transport == "ring":
+            ring_group()
+        while True:
+            req = _recv_json(sock)
+            if req.get("cmd") == "bye":
+                _send_json(sock, {"cmd": "bye", "ok": True})
+                break
+            if req.get("cmd") != "run" or req.get("transport") != args.transport:
+                raise ValueError("invalid pipeline run")
+            envelope = PrefillEnvelope.from_dict(req.get("envelope"))
+            _check_peer_identity(
+                envelope.to_dict(),
+                args.model_sha256,
+                args.source_revision,
+                args.split,
+                n_layers,
+            )
+            _check_stop(stop_file)
+            # Reset BEFORE acknowledging ownership of every request, including
+            # the first/no-prune request. No stale head layers enter handoff.
+            _reset_caches(stage, args.model)
+            _send_json(sock, {"ok": True, "request_id": envelope.request_id})
+            rep = _tail_one(args, stage, sock, req)
+            _send_json(sock, rep)
+            print(json.dumps(rep), flush=True)
+    finally:
+        if sock is not None:
+            _abort_socket(sock)
+            sock.close()
+        srv.close()
+        # No signals: the owner releases its local references and returns.
+        stage.caches = []
+        del stage, caches, model
+        gc.collect()
+        mx.clear_cache()
 
 
 def _tail_one(args, stage: Stage, sock, req):
+    envelope = PrefillEnvelope.from_dict(req.get("envelope"))
     recvq: "queue.Queue" = queue.Queue(maxsize=args.depth)
     recv_times = []
     err = []
+    stop = threading.Event()
+    timeout = args.io_timeout
+    expected_hc = stage.hc_mult
+    expected_d = stage.lm.layers[stage.local[0]].input_layernorm.weight.shape[0]
 
     def receiver():
         try:
             stream = mx.new_stream(mx.cpu) if args.transport == "ring" else None
             hdrbuf = bytearray(HDR.size)
+            next_idx = 0
             while True:
                 _recv_exact(sock, memoryview(hdrbuf), HDR.size)
                 magic, idx, B, S, HC, D, nbytes = HDR.unpack(bytes(hdrbuf))
-                assert magic == MAGIC, magic
+                if magic != MAGIC:
+                    raise ValueError("pipeline boundary magic mismatch")
                 if idx == EOF_IDX:
-                    recvq.put(None)
+                    if next_idx != len(envelope.chunks) or any((B, S, HC, D, nbytes)):
+                        raise ValueError("pipeline premature/invalid EOF")
+                    _queue_put(recvq, None, err, timeout)
                     return
+                if (
+                    next_idx >= len(envelope.chunks)
+                    or idx != next_idx
+                    or B != 1
+                    or S != envelope.chunks[idx]
+                    or HC != expected_hc
+                    or D != expected_d
+                    or nbytes != (0 if args.transport == "ring" else B * S * HC * D * 2)
+                ):
+                    raise ValueError("pipeline boundary shape/chunk/bytes mismatch")
+                next_idx += 1
                 # header already arrived -> this times the payload transfer only
                 t0 = time.perf_counter()
                 if args.transport == "ring":
@@ -603,10 +1120,16 @@ def _tail_one(args, stage: Stage, sock, req):
                     _recv_exact(sock, memoryview(buf), nbytes)
                     payload = buf
                 recv_times.append(time.perf_counter() - t0)
-                recvq.put((idx, payload, (B, S, HC, D)))
+                if stop.is_set():
+                    return
+                _queue_put(recvq, (idx, payload, (B, S, HC, D)), err, timeout)
         except Exception as e:  # noqa: BLE001
             err.append(repr(e))
-            recvq.put(None)
+            _abort_socket(sock)
+            try:
+                recvq.put_nowait(None)
+            except queue.Full:
+                pass
 
     th = threading.Thread(target=receiver, daemon=True)
     th.start()
@@ -614,29 +1137,47 @@ def _tail_one(args, stage: Stage, sock, req):
     per_chunk = []
     t_start = time.perf_counter()
     last_logits = None
-    while True:
-        t0 = time.perf_counter()
-        item = recvq.get()
-        t_wait = time.perf_counter() - t0
-        if item is None:
-            break
-        idx, buf, shape = item
-        t1 = time.perf_counter()
-        h = buf if isinstance(buf, mx.array) else from_wire(buf, shape)
-        mx.eval(h)
-        t_deser = time.perf_counter() - t1
-        t2 = time.perf_counter()
-        out = stage(h)
-        mx.eval(out)
-        stage.eval_state()
-        t_gpu = time.perf_counter() - t2
-        last_logits = out
-        per_chunk.append(
-            {"idx": idx, "wait_s": t_wait, "deser_s": t_deser, "gpu_s": t_gpu}
-        )
-        mx.clear_cache()
+    try:
+        while True:
+            _check_stop(getattr(args, "stop_file", None))
+            if err:
+                raise RuntimeError(err[0])
+            t0 = time.perf_counter()
+            item = recvq.get(timeout=timeout)
+            t_wait = time.perf_counter() - t0
+            if item is None:
+                break
+            idx, buf, shape = item
+            t1 = time.perf_counter()
+            h = buf if isinstance(buf, mx.array) else from_wire(buf, shape)
+            mx.eval(h)
+            t_deser = time.perf_counter() - t1
+            t2 = time.perf_counter()
+            out = stage(h)
+            mx.eval(out)
+            stage.eval_state()
+            t_gpu = time.perf_counter() - t2
+            last_logits = out
+            per_chunk.append(
+                {
+                    "idx": idx,
+                    "n": shape[1],
+                    "wait_s": t_wait,
+                    "deser_s": t_deser,
+                    "gpu_s": t_gpu,
+                }
+            )
+            mx.clear_cache()
+    except BaseException:
+        stop.set()
+        err.append("tail consumer aborted")
+        _abort_socket(sock)
+        raise
+    finally:
+        th.join(timeout=timeout)
     t_total = time.perf_counter() - t_start
-    th.join(timeout=5)
+    if th.is_alive():
+        raise TimeoutError("pipeline receiver did not retire")
     if err:
         raise RuntimeError(err[0])
 
@@ -645,9 +1186,14 @@ def _tail_one(args, stage: Stage, sock, req):
         lg = stage.finish(last_logits)
         mx.eval(lg)
         tok = int(mx.argmax(lg[0, -1]).item())
-    _send_json(sock, {"cmd": "done"})
-    ho = handoff_send(sock, stage.caches) if req.get("handoff") else None
+    _send_json(sock, {"cmd": "done", "envelope": envelope.to_dict()})
+    ho = (
+        handoff_send(sock, stage.caches, envelope=envelope)
+        if req.get("handoff")
+        else None
+    )
     return {
+        "envelope": envelope.to_dict(),
         "handoff": ho,
         "tail_gpu_s": sum(c["gpu_s"] for c in per_chunk),
         "tail_wait_s": sum(c["wait_s"] for c in per_chunk),
@@ -666,7 +1212,9 @@ def run_single(args):
     hi = args.hi if args.hi is not None else args.layers
     model, caches, local, n_layers, load_s = load_stage(args.model, lo, hi, args.prune)
     stage = Stage(model, caches, local, n_layers)
-    print(f"[single] layers {lo}:{hi} of {n_layers} loaded in {load_s:.1f}s", flush=True)
+    print(
+        f"[single] layers {lo}:{hi} of {n_layers} loaded in {load_s:.1f}s", flush=True
+    )
 
     results = []
     for tokens in args.tokens:
@@ -713,7 +1261,9 @@ def run_single(args):
         results.append(res)
         print(json.dumps(res), flush=True)
         _reset_caches(stage, args.model)
-    _dump(args, {"role": "single", "lo": lo, "hi": hi, "load_s": load_s, "runs": results})
+    _dump(
+        args, {"role": "single", "lo": lo, "hi": hi, "load_s": load_s, "runs": results}
+    )
 
 
 def _dump(args, obj):
@@ -727,10 +1277,14 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--role", choices=["head", "tail", "single"], required=True)
     p.add_argument("--model", required=True)
-    p.add_argument("--split", type=int, default=23, help="first layer of the tail stage")
+    p.add_argument(
+        "--split", type=int, default=23, help="first layer of the tail stage"
+    )
     p.add_argument("--layers", type=int, default=45)
     p.add_argument("--lo", type=int, default=0, help="single-role: first layer")
-    p.add_argument("--hi", type=int, default=None, help="single-role: end layer (exclusive)")
+    p.add_argument(
+        "--hi", type=int, default=None, help="single-role: end layer (exclusive)"
+    )
     p.add_argument("--tokens", type=int, nargs="+", default=[8192])
     p.add_argument("--chunk", type=int, default=2048)
     p.add_argument("--seed", type=int, default=0)
@@ -750,6 +1304,18 @@ def main(argv=None):
         help="comma separated ip:port per rank, e.g. 10.0.0.1:39400,10.0.0.2:39401",
     )
     p.add_argument("--connect-timeout", type=float, default=1800.0)
+    p.add_argument("--io-timeout", type=float, default=120.0)
+    p.add_argument(
+        "--model-sha256", default=os.environ.get("MLX_VLM_PIPELINE_MODEL_SHA256")
+    )
+    p.add_argument(
+        "--source-revision", default=os.environ.get("MLX_VLM_PIPELINE_SOURCE_REVISION")
+    )
+    p.add_argument(
+        "--stop-file",
+        default=os.environ.get("MLX_VLM_PIPELINE_STOP_FILE"),
+        help="tail-local cooperative cancellation file; checked at I/O/chunk boundaries",
+    )
     p.add_argument("--out", default=None)
     p.add_argument("--no-prune", dest="prune", action="store_false")
     p.add_argument(
@@ -758,6 +1324,8 @@ def main(argv=None):
         help="after prefill, ship stage B's caches back to stage A and time it",
     )
     args = p.parse_args(argv)
+    if not math.isfinite(args.io_timeout) or args.io_timeout <= 0 or args.depth < 1:
+        p.error("io-timeout and queue depth must be positive")
 
     mx.random.seed(args.seed)
     if args.role != "single" and args.transport == "ring":
