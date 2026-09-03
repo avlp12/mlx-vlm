@@ -572,9 +572,17 @@ def pipeline_bypass_reason(
 
     if any(padded(c) for c in cache):
         return "cache_padding_metadata"
-    # KVCache.state dereferences keys.shape even before the first forward.
-    # The typed empty() contract is safe for cold KV/CacheList entries.
-    if any(not c.empty() for c in cache):
+
+    # state dereferences fresh KV keys; empty() checks only the first slot of
+    # composite caches. Inspect every typed component and its offset instead.
+    def populated(c):
+        if type(c) is CacheList:
+            return any(populated(child) for child in c.caches)
+        if type(c) is ArraysCache:
+            return any(value is not None for value in c.cache)
+        return c.keys is not None or c.values is not None or c.offset != 0
+
+    if any(populated(c) for c in cache):
         return "populated_prompt_cache"
     return None
 

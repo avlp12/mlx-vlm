@@ -505,3 +505,32 @@ def test_exact_schema_matches_real_tiny_glm_bf16_prefill():
     # still work from the retained architecture before any payload is received.
     lm.model.layers[1:] = [None, None]
     _require_state_meta(meta, expected_state_meta(model, e))
+
+
+@pytest.mark.parametrize("kind", ["indexer_only", "recurrent_only", "offset_only"])
+def test_partial_cache_is_never_admitted_as_cold(kind):
+    from mlx_vlm.pipeline_runtime import pipeline_bypass_reason
+
+    if kind == "indexer_only":
+        c = CacheList(KVCache(), KVCache())
+        a = mx.ones((1, 1, 2, 2))
+        c[1].state = (a, a)
+    elif kind == "recurrent_only":
+        c = ArraysCache(2)
+        c[1] = mx.ones((1, 1, 2, 2))
+    else:
+        c = KVCache()
+        c.offset = 2
+    assert (
+        pipeline_bypass_reason(
+            ladder=False,
+            capture=False,
+            warm=False,
+            pixel_values=None,
+            mask=None,
+            cache=[c],
+            input_ids=mx.array([[1, 2]]),
+            kv_quantized=False,
+        )
+        == "populated_prompt_cache"
+    )
