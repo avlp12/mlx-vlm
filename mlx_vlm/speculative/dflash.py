@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -7,9 +8,12 @@ import mlx.nn as nn
 from .common import (
     _batch_acceptance_must_be_uniform,
     _dflash_block_total,
+    _record_batch_round,
+    _record_draft_seconds,
     _record_per_row_rollback,
     _record_speculative_round,
     _record_uniform_clamp,
+    _record_verify_seconds,
     _reset_per_row_rollback,
     _reset_uniform_clamp,
     _speculative_walk,
@@ -20,6 +24,8 @@ from .common import (
 
 
 _ADAPTIVE_K_ENV = None
+_BATCHED_DRAFT_ENV = None
+_ROUND_TIMERS_ENV = None
 # Default width policy: a FIXED verify block total, at the drafter's trained
 # width.  0 disables it and falls through to the legacy threshold ladder.
 _FIXED_WIDTH_ENV = None
@@ -27,6 +33,99 @@ _ROUND_FIXED = None
 _ROUND_COST = None
 _ADAPTIVE_K_WINDOW = None
 _ADAPTIVE_K_MINROUNDS = None
+
+
+def batched_draft_enabled() -> bool:
+    """``MLX_VLM_DFLASH_BATCHED_DRAFT`` -- one draft call for the whole batch.
+
+    Read ONCE and reported in the server's own speculative log line, because a
+    knob that changes the shape of every draft round and is invisible in the log
+    is the same failure mode as the width default that silently resolved to 3
+    (law 23).
+
+    Default ON.  The gate for that default is discrete, not statistical: the
+    batched path must propose the SAME TOKEN IDS as the row-wise path for every
+    row, on ragged contexts, in ``tests/test_dflash_batched_draft.py``.  Draft
+    tokens are integers, so "same" there means equal, not close -- a float
+    difference that never flips an argmax is not a behaviour change, and one
+    that does flip an argmax fails the test.
+    """
+    global _BATCHED_DRAFT_ENV
+    if _BATCHED_DRAFT_ENV is None:
+        _BATCHED_DRAFT_ENV = os.environ.get(
+            "MLX_VLM_DFLASH_BATCHED_DRAFT", "1"
+        ).lower() in ("1", "true", "yes", "on")
+    return _BATCHED_DRAFT_ENV
+
+
+def _round_timers_enabled() -> bool:
+    """``MLX_VLM_DFLASH_ROUND_TIMERS=1`` -- split the round into draft/verify.
+
+    OFF by default and deliberately perturbing when on: the split is only
+    meaningful if each half is waited for, so the timing arm forces an
+    ``mx.eval`` between the draft and the verify that the untimed path does not
+    do.  Read the arms against each OTHER, never against an untimed run.
+    """
+    global _ROUND_TIMERS_ENV
+    if _ROUND_TIMERS_ENV is None:
+        _ROUND_TIMERS_ENV = os.environ.get(
+            "MLX_VLM_DFLASH_ROUND_TIMERS", "0"
+        ).lower() in ("1", "true", "yes", "on")
+    return _ROUND_TIMERS_ENV
+
+
+def _batched_draft_context(
+    hidden_by_orig: List[mx.array], active_idx: List[int]
+) -> Tuple[mx.array, List[int]]:
+    """Stack the active rows' committed contexts into one right-padded block.
+
+    Rows commit different numbers of tokens per round the moment per-row
+    rollback keeps ragged accepts, so the stack is rectangular only after
+    padding.  RIGHT padding (real rows first) is what lets the batched cache
+    move each row's new pad into one shared left prefix with a single roll.
+    """
+    segments = [hidden_by_orig[orig] for orig in active_idx]
+    lengths = [int(segment.shape[1]) for segment in segments]
+    width = max(lengths)
+    if min(lengths) == width:
+        return mx.concatenate(segments, axis=0), lengths
+    padded = [
+        (
+            segment
+            if length == width
+            else mx.concatenate(
+                [
+                    segment,
+                    mx.zeros(
+                        (segment.shape[0], width - length, segment.shape[2]),
+                        dtype=segment.dtype,
+                    ),
+                ],
+                axis=1,
+            )
+        )
+        for segment, length in zip(segments, lengths)
+    ]
+    return mx.concatenate(padded, axis=0), lengths
+
+
+def _use_batched_draft(draft_model, greedy_sampling: bool, positioned: bool) -> bool:
+    """Is the batched draft path both enabled and SAFE for this round loop?
+
+    Safe means the per-row draft is reproducible independently of the order the
+    rows are drafted in.  Greedy is (argmax has no state).  A positioned sampler
+    is (its randomness is keyed by row and position).  A plain stochastic sampler
+    is NOT: it draws from one RNG stream in row order, so batching would change
+    which draw each row gets.  That case keeps the row-wise path.
+    """
+    if not batched_draft_enabled():
+        return False
+    if not (greedy_sampling or positioned):
+        return False
+    supports = getattr(draft_model, "supports_batched_draft", None)
+    if not callable(supports) or not supports():
+        return False
+    return callable(getattr(draft_model, "make_batched_cache", None))
 
 
 def _fixed_width() -> int:
@@ -883,6 +982,7 @@ def _dflash_rounds(
             new_tokens = new_tokens_list[0]
             sampler_rng.target_sampled(sync_draft=not positioned_sampling)
         _record_speculative_round(draft_model, accepted, bs - 1)
+        _record_batch_round(draft_model, 1)
 
         if accepted < bs - 1:
             hidden = hidden[:, : accepted + 1, :]
@@ -963,8 +1063,21 @@ def _dflash_rounds_batch(
     deferred_walk = _dflash_deferred_walk_enabled(
         draft_model, greedy_sampling=greedy_sampling
     )
-    draft_caches = [draft_model.make_cache() for _ in range(B)]
-    _adopt_pretruncated_context(draft_model, draft_caches, target_hidden_offset)
+    batched_draft = _use_batched_draft(
+        draft_model, greedy_sampling, positioned_sampling
+    )
+    if batched_draft:
+        # ONE set of layer caches holding all B rows, instead of B sets holding
+        # one row each. Everything downstream that indexes ``draft_caches`` by
+        # active slot is gone with it: the batch IS the slot.
+        batched_caches = draft_model.make_batched_cache(B)
+        draft_caches = []
+        _adopt_pretruncated_context(draft_model, [batched_caches], target_hidden_offset)
+    else:
+        batched_caches = None
+        draft_caches = [draft_model.make_cache() for _ in range(B)]
+        _adopt_pretruncated_context(draft_model, draft_caches, target_hidden_offset)
+    timed = _round_timers_enabled()
 
     # Per-sequence state tracked by ORIGINAL index so the caller sees
     # stable indices in the yielded token lists.
@@ -989,9 +1102,12 @@ def _dflash_rounds_batch(
         b_active = [b[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
 
-        # Draft rowwise: the DFlash drafter cache is scalar-offset and has
-        # proven unsafe as a single batched cache on MLX/Metal. Target verify
-        # remains batched below.
+        # Draft rowwise unless the batched path is on: historically the DFlash
+        # drafter cache was scalar-offset, so B rows meant B sequential
+        # ``draft_block`` calls while the target verify next to it was already
+        # one batched forward. ``BatchDFlashKVCache`` gives the drafter the same
+        # per-row offsets and left padding the target's caches have, so the
+        # draft becomes one call too.
         def draft_active_rows():
             return mx.concatenate(
                 [
@@ -1016,9 +1132,35 @@ def _dflash_rounds_batch(
                 axis=0,
             )
 
+        def draft_batched_rows():
+            context, lengths = _batched_draft_context(hidden_by_orig, active_idx)
+            for cache_entry in batched_caches:
+                cache_entry.set_pending_lengths(lengths)
+            return draft_model.draft_block(
+                b_arr,
+                context,
+                batched_caches,
+                bs,
+                (
+                    _PositionedDraftSampler(
+                        sampler,
+                        row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                        positions=[emitted[active_idx[j]] for j in range(n_active)],
+                    )
+                    if not greedy_sampling and positioned_sampling
+                    else sampler
+                ),
+                token_dtype,
+            )
+
+        draft_started = time.perf_counter() if timed else 0.0
         draft_tokens = sampler_rng.draft_tokens(
-            draft_active_rows,
+            draft_batched_rows if batched_draft else draft_active_rows,
         )
+        if timed:
+            mx.eval(draft_tokens)
+            draft_finished = time.perf_counter()
+            _record_draft_seconds(draft_model, draft_finished - draft_started)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
@@ -1039,6 +1181,9 @@ def _dflash_rounds_batch(
             mx.async_eval(walk_packed if deferred_walk else target_tokens, hidden_full)
         else:
             mx.async_eval(hidden_full)
+        if timed:
+            mx.eval(walk_packed if (greedy_sampling and deferred_walk) else hidden_full)
+            _record_verify_seconds(draft_model, time.perf_counter() - draft_finished)
 
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
         if greedy_sampling and deferred_walk:
@@ -1108,6 +1253,7 @@ def _dflash_rounds_batch(
 
         for a in accepted_list:
             _record_speculative_round(draft_model, a, bs - 1)
+        _record_batch_round(draft_model, n_active)
 
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
@@ -1147,6 +1293,12 @@ def _dflash_rounds_batch(
             for c in prompt_cache:
                 if hasattr(c, "filter"):
                     c.filter(keep_mx)
+            if batched_draft:
+                # The batched draft cache is indexed by ACTIVE SLOT, so it has to
+                # shrink with the batch; the per-row caches were indexed by
+                # original row and did not.
+                for cache_entry in batched_caches:
+                    cache_entry.filter(keep_slots)
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
 

@@ -22,6 +22,7 @@ from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..reranker import RerankerKind, reranker_kind
+from ..speculative.utils import batched_draft_enabled
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -171,6 +172,52 @@ def _prefill_batch_refusal_counts() -> dict:
         return {}
 
 
+def _speculative_stats_snapshot() -> dict:
+    """The drafter's lifetime speculative receipts, or ``{"enabled": False}``.
+
+    ``clamped`` and ``per_row_kept`` are the two counters the ragged-rollback and
+    per-row-rollback branches added, and until this existed the only way to read
+    them off a RUNNING server was an in-process observer thread holding the live
+    drafter object (sweep11 L2 did exactly that). ``batch_rounds`` is what turns
+    the row-round total into rows/round -- the realised batch width, measured
+    rather than assumed from the request count.
+    """
+    generator = runtime.response_generator
+    drafter = getattr(generator, "draft_model", None) if generator else None
+    if drafter is None:
+        return {"enabled": False}
+    rounds = int(getattr(drafter, "speculative_total_rounds", 0) or 0)
+    batch_rounds = int(getattr(drafter, "speculative_total_batch_rounds", 0) or 0)
+    row_rounds = int(getattr(drafter, "speculative_total_row_rounds", 0) or 0)
+    drafted = int(getattr(drafter, "speculative_total_drafted", 0) or 0)
+    accepted = float(getattr(drafter, "speculative_total_accepted", 0.0) or 0.0)
+    snapshot = {
+        "enabled": True,
+        "kind": getattr(generator, "draft_kind", None),
+        "batched_draft": batched_draft_enabled(),
+        "rounds": rounds,
+        "batch_rounds": batch_rounds,
+        "row_rounds": row_rounds,
+        "drafted": drafted,
+        "accepted": accepted,
+        "clamped": int(getattr(drafter, "speculative_total_clamped", 0) or 0),
+        "per_row_kept": int(
+            getattr(drafter, "speculative_total_per_row_kept", 0) or 0
+        ),
+        "rows_per_round": (row_rounds / batch_rounds) if batch_rounds else None,
+        "width": (drafted / rounds + 1.0) if rounds else None,
+    }
+    draft_seconds = getattr(drafter, "speculative_draft_seconds", None)
+    if draft_seconds is not None:
+        # Only present when MLX_VLM_DFLASH_ROUND_TIMERS is on; the untimed path
+        # never sets the attribute, so its absence is not a zero.
+        snapshot["draft_seconds"] = float(draft_seconds)
+        snapshot["verify_seconds"] = float(
+            getattr(drafter, "speculative_verify_seconds", 0.0) or 0.0
+        )
+    return snapshot
+
+
 def _server_runtime_snapshot() -> dict:
     registry = _model_cache_registry()
     default_cache = registry.for_kind("text_generation")
@@ -231,6 +278,10 @@ def _server_runtime_snapshot() -> dict:
         # repeated it -- its inserts, hits, evictions and resident bytes were
         # reachable only from inside the process until this line existed.
         "vault": _vault_stats_snapshot(),
+        # The speculative receipts, for the same reason APC and the vault are
+        # here: a counter reachable only from inside the process is a counter
+        # nobody can read while the thing it measures is running.
+        "speculative": _speculative_stats_snapshot(),
         # Prefill batches the admission policy refused to build, by reason.
         # ``right_pad_kda`` is the throughput a linear-attention model pays for
         # correctness: rows with unequal suffix lengths cannot share a

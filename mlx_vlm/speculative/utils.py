@@ -11,10 +11,13 @@ from .common import (
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
+    speculative_clamp_since,
+    speculative_clamp_snapshot,
     speculative_stats_since,
     speculative_stats_snapshot,
 )
 from .dflash import (
+    batched_draft_enabled,
     _dflash_committed_hidden_segments,
     _dflash_next_block_size,
     _dflash_rounds,
@@ -39,6 +42,9 @@ from .mtp import (
 
 __all__ = [
     "PrefillHiddenAccumulator",
+    "batched_draft_enabled",
+    "speculative_clamp_since",
+    "speculative_clamp_snapshot",
     "_MTPVerifyResult",
     "_dflash_block_total",
     "_dflash_committed_hidden_segments",

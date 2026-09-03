@@ -341,6 +341,68 @@ def _record_speculative_round(
     ) + int(draft_count)
 
 
+def _record_batch_round(draft_model: nn.Module, rows: int) -> None:
+    """One BATCH round happened, over ``rows`` active rows.
+
+    ``speculative_total_rounds`` counts ROW-rounds (``_record_speculative_round``
+    fires once per active row), so it alone cannot say whether a log line came
+    from eight rows sharing one round or one row over eight rounds. This is the
+    denominator that separates them, and it is what makes ``rows/round`` in the
+    server log a measurement rather than a guess at the realised batch.
+    """
+    draft_model.speculative_total_batch_rounds = (
+        getattr(draft_model, "speculative_total_batch_rounds", 0) + 1
+    )
+    draft_model.speculative_total_row_rounds = (
+        getattr(draft_model, "speculative_total_row_rounds", 0) + int(rows)
+    )
+
+
+def _record_draft_seconds(draft_model: nn.Module, seconds: float) -> None:
+    """Wall clock inside the DRAFT half of a round (opt-in timing arm)."""
+    draft_model.speculative_draft_seconds = (
+        getattr(draft_model, "speculative_draft_seconds", 0.0) + float(seconds)
+    )
+
+
+def _record_verify_seconds(draft_model: nn.Module, seconds: float) -> None:
+    """Wall clock inside the VERIFY half of a round (opt-in timing arm)."""
+    draft_model.speculative_verify_seconds = (
+        getattr(draft_model, "speculative_verify_seconds", 0.0) + float(seconds)
+    )
+
+
+def speculative_clamp_snapshot(draft_model: nn.Module) -> Tuple[int, int, int, int]:
+    """Capture the lifetime clamp / per-row / batch-round counters for diffing.
+
+    These are the two receipts the ragged-rollback and per-row-rollback branches
+    added -- ``clamped`` and ``per-row kept`` -- plus the batch/row round split
+    that turns them into per-round rates. They were maintained on the served path
+    but reachable only from inside the process; L2 (sweep11) had to read them off
+    the live drafter object with an observer thread.
+    """
+    return (
+        int(getattr(draft_model, "speculative_total_clamped", 0) or 0),
+        int(getattr(draft_model, "speculative_total_per_row_kept", 0) or 0),
+        int(getattr(draft_model, "speculative_total_batch_rounds", 0) or 0),
+        int(getattr(draft_model, "speculative_total_row_rounds", 0) or 0),
+    )
+
+
+def speculative_clamp_since(
+    draft_model: nn.Module, snapshot: Tuple[int, int, int, int]
+) -> Tuple[int, int, int, int]:
+    """``clamped, per-row kept, batch rounds, row rounds`` since ``snapshot``."""
+    clamped0, kept0, batch0, rows0 = snapshot
+    current = speculative_clamp_snapshot(draft_model)
+    return (
+        current[0] - clamped0,
+        current[1] - kept0,
+        current[2] - batch0,
+        current[3] - rows0,
+    )
+
+
 def speculative_stats_snapshot(draft_model: nn.Module) -> Tuple[int, float, int]:
     """Capture the drafter's lifetime round counters for later diffing."""
     return (

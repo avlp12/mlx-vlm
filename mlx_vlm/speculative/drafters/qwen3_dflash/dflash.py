@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 from ....models.activations import swiglu
 from ....models.cache import BufferedRotatingKVCache, KVCache, RotatingKVCache
+from .batched_cache import BatchDFlashKVCache
 from ....models.rope_utils import initialize_rope
 from .config import DFlashConfig
 
@@ -61,6 +62,19 @@ def _build_rope(config: DFlashConfig):
     )
 
 
+def _advance_context_offset(cache, skip: int) -> None:
+    """``cache.offset += skip`` for a scalar cache; the same for a batched one.
+
+    A batched cache also has to move the per-row count of REAL rows in the block
+    being handed in, because the rows dropped off the front were real rows.
+    """
+    consume = getattr(cache, "consume_context_prefix", None)
+    if callable(consume):
+        consume(skip)
+    else:
+        cache.offset += skip
+
+
 class DFlashAttention(nn.Module):
     def __init__(self, config: DFlashConfig, layer_idx: int):
         super().__init__()
@@ -84,6 +98,11 @@ class DFlashAttention(nn.Module):
     def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache: KVCache):
         B, L, _ = x.shape
         S = x_ctx.shape[1]
+        # A batched cache carries per-row offsets and a per-row real-row count
+        # for THIS block; a scalar cache carries neither and every row of a
+        # scalar cache is the same row.  The two differ only in what is fed to
+        # ``rope`` and whether the pad columns need masking out.
+        batched = getattr(cache, "dflash_batched", False)
         if self.is_sliding:
             if self.sliding_window is None:
                 raise ValueError(
@@ -94,7 +113,10 @@ class DFlashAttention(nn.Module):
                 skip = S - keep_ctx
                 x_ctx = x_ctx[:, skip:]
                 S = x_ctx.shape[1]
-                cache.offset += skip
+                if batched:
+                    cache.consume_context_prefix(skip)
+                else:
+                    cache.offset += skip
 
         # Project context and proposal separately so only context KV
         queries = self.q_proj(x)
@@ -115,16 +137,22 @@ class DFlashAttention(nn.Module):
         prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(
             0, 2, 1, 3
         )
-        queries = rope(queries, offset=cache.offset + S)
+        # The proposal sits immediately past this row's OWN context, which for a
+        # right-padded batched block is ``offset + real_rows``, not ``offset + S``.
+        query_offset = cache.query_offset(S) if batched else cache.offset + S
+        queries = rope(queries, offset=query_offset)
         ctx_keys = rope(ctx_keys, offset=cache.offset)
-        prop_keys = rope(prop_keys, offset=cache.offset + S)
+        prop_keys = rope(prop_keys, offset=query_offset)
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
         # DFlash denoises the whole proposed block at once, so draft-block
         # self-attention is intentionally non-causal. Sliding layers already
         # limit resident prefix context through the rotating cache above.
-        mask = None
+        # The only thing a batched round has to exclude is the pad columns that
+        # made ragged per-row contexts rectangular; with no ragged rows the mask
+        # is None and this is byte for byte the row-wise call.
+        mask = cache.context_mask(L) if batched else None
         o = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
@@ -231,6 +259,41 @@ class DFlashDraftModel(nn.Module):
                 caches.append(KVCache())
         return caches
 
+    def supports_batched_draft(self) -> bool:
+        """Can B rows share ONE draft_block call and ONE set of caches?
+
+        The arithmetic always could -- ``_hidden``, the layer stack and the
+        candidate selector are shape-polymorphic in B.  What has to be true is
+        that every layer's cache has a batched counterpart with per-row offsets:
+        a plain ``KVCache`` (full attention) and a windowed sliding layer both
+        do, a ``draft_window_size`` ``BufferedRotatingKVCache`` does not, because
+        its buffered ring is not the concat cache this batched variant mirrors.
+        """
+        window = getattr(self.config, "draft_window_size", None)
+        if window is not None and int(window) > 0:
+            return False
+        types = self.config.layer_types or []
+        return bool(types) and all(
+            layer_type in ("full_attention", "sliding_attention")
+            for layer_type in types
+        )
+
+    def make_batched_cache(self, batch_size: int) -> List[KVCache]:
+        """One cache per LAYER, each holding all ``batch_size`` rows."""
+        if not self.supports_batched_draft():
+            raise RuntimeError(
+                f"{type(self).__name__} does not support a batched draft cache."
+            )
+        caches = []
+        for layer_type in self.config.layer_types:
+            max_size = (
+                int(self.config.sliding_window) - 1
+                if layer_type == "sliding_attention"
+                else None
+            )
+            caches.append(BatchDFlashKVCache(batch_size, max_size=max_size))
+        return caches
+
     def reset(self, target_model) -> List[KVCache]:
         self.bind(target_model)
         self.accept_lens = []
@@ -297,7 +360,7 @@ class DFlashDraftModel(nn.Module):
             return
         # zip against self.layers: never touch a cache entry no layer owns.
         for _, c in zip(self.layers, cache):
-            c.offset += skip
+            _advance_context_offset(c, skip)
 
     def _uniform_ctx_keep(self) -> Optional[int]:
         """Context positions every layer will keep, or ``None`` if they differ.
@@ -335,7 +398,7 @@ class DFlashDraftModel(nn.Module):
             return target_hidden
         # zip against self.layers: never touch a cache entry no layer owns.
         for _, c in zip(self.layers, cache):
-            c.offset += skip
+            _advance_context_offset(c, skip)
         return target_hidden[:, skip:]
 
     def _hidden(

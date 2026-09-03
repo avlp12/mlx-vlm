@@ -47,6 +47,7 @@ from ..sample_utils import (
 )
 from ..speculative.utils import (
     PrefillHiddenAccumulator,
+    batched_draft_enabled,
     make_speculative_prompt_cache,
     prefill_capture_kwargs,
     prefill_context_keep,
@@ -54,6 +55,8 @@ from ..speculative.utils import (
     run_speculative_server_rounds,
     speculative_hidden_state,
     speculative_prefill_kwargs,
+    speculative_clamp_since,
+    speculative_clamp_snapshot,
     speculative_stats_since,
     speculative_stats_snapshot,
 )
@@ -2572,6 +2575,13 @@ class ResponseGenerator:
                     return False
 
                 spec_snapshot = speculative_stats_snapshot(drafter)
+                # The clamp / per-row receipts are maintained on this path but
+                # were printed only by the library generate path
+                # (`_format_speculative_stats`, one non-test caller). Reading
+                # them off the live drafter object needed an in-process observer
+                # thread; snapshot-and-diff them here instead so a server log is
+                # a complete receipt for a batched speculative run.
+                clamp_snapshot = speculative_clamp_snapshot(drafter)
 
                 def spec_summary():
                     return speculative_stats_since(drafter, spec_snapshot)
@@ -2651,9 +2661,14 @@ class ResponseGenerator:
                 rounds, accepted, drafted = spec_summary()
                 if rounds:
                     mean_a = (accepted + rounds) / rounds
+                    clamped, per_row_kept, batch_rounds, row_rounds = (
+                        speculative_clamp_since(drafter, clamp_snapshot)
+                    )
                     logger.info(
                         "Speculative decode: kind=%s batch=%d tokens=%d "
-                        "accept=%.2f rounds=%d drafted=%s width=%.2f",
+                        "accept=%.2f rounds=%d drafted=%s width=%.2f "
+                        "clamped=%d per_row_kept=%d rows/round=%.2f "
+                        "batched_draft=%s",
                         draft_kind,
                         B,
                         sum(len(token_lists[u]) for u in uids),
@@ -2666,6 +2681,23 @@ class ResponseGenerator:
                         # is how a default that resolved to 3 instead of 8 shipped
                         # unnoticed: every other field looked healthy.
                         (drafted / rounds + 1.0) if drafted is not None else float("nan"),
+                        # Tokens a ragged round gave back to make the batch
+                        # rollback rectangular, and tokens it KEPT because the
+                        # target could roll back per row. `clamped 0` next to a
+                        # non-zero `per_row_kept` is the per-row build's receipt;
+                        # the pair was measurable only from inside the process
+                        # until this line carried it.
+                        clamped,
+                        per_row_kept,
+                        # ROWS per BATCH round. `rounds` above counts row-rounds
+                        # (one per active row per round), so on its own it cannot
+                        # tell eight rows sharing a round from one row taking
+                        # eight, which is the ratio every batched throughput
+                        # number is divided by.
+                        (row_rounds / batch_rounds) if batch_rounds else float("nan"),
+                        # Read once at import of the round loop (law 23): the
+                        # draft half of a batched round is either one call or B.
+                        "on" if batched_draft_enabled() else "off",
                     )
 
                 # Finalize any remaining
