@@ -220,6 +220,8 @@ def _expand_tree(obj: Any) -> Any:
 def _eval_tree(obj: Any, out: List[mx.array]) -> None:
     if isinstance(obj, mx.array):
         out.append(obj)
+    elif isinstance(obj, StateFragment):
+        _eval_tree(obj.payload, out)
     elif _is_alias(obj):
         return
     elif isinstance(obj, (tuple, list)):
