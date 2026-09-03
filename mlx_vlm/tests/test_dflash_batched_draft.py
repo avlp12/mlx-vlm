@@ -698,3 +698,39 @@ def test_the_round_timers_are_off_by_default_and_readable(monkeypatch):
         assert dflash_utils._round_timers_enabled() is True
     finally:
         dflash_utils._ROUND_TIMERS_ENV = None
+
+
+def test_the_log_reports_the_path_taken_not_the_knob(monkeypatch):
+    """A stochastic sampler keeps the row-wise draft with the knob ON.
+
+    A log line that printed the SETTING would then say ``batched_draft=on`` for a
+    round that drafted row by row -- the exact failure mode law 23 exists for.
+    The round loop records its own decision and the log reads that.
+    """
+    import inspect
+
+    from mlx_vlm.server import generation
+
+    src = inspect.getsource(generation)
+    assert '"speculative_batched_draft"' in src, (
+        "the log must read the effective decision off the drafter"
+    )
+
+    from mlx_vlm.tests.test_dflash_ragged_rollback import _tiny_glm5_next_target
+
+    mx.random.seed(29)
+    target_lm = _tiny_glm5_next_target()
+    mx.eval(target_lm.parameters())
+    _reset_env_memo()
+    monkeypatch.setenv("MLX_VLM_DFLASH_BATCHED_DRAFT", "1")
+    try:
+        drafter = _e2e_drafter(target_lm, seed=6)
+        _run_batch_rounds(target_lm, drafter, 2, 8, walk=_RaggedWalk([[2, 0]]))
+        assert drafter.speculative_batched_draft is True
+        monkeypatch.setenv("MLX_VLM_DFLASH_BATCHED_DRAFT", "0")
+        _reset_env_memo()
+        drafter = _e2e_drafter(target_lm, seed=6)
+        _run_batch_rounds(target_lm, drafter, 2, 8, walk=_RaggedWalk([[2, 0]]))
+        assert drafter.speculative_batched_draft is False
+    finally:
+        _reset_env_memo()

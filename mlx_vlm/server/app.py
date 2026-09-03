@@ -195,6 +195,9 @@ def _speculative_stats_snapshot() -> dict:
         "enabled": True,
         "kind": getattr(generator, "draft_kind", None),
         "batched_draft": batched_draft_enabled(),
+        "batched_draft_effective": getattr(
+            drafter, "speculative_batched_draft", None
+        ),
         "rounds": rounds,
         "batch_rounds": batch_rounds,
         "row_rounds": row_rounds,

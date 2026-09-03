@@ -1066,6 +1066,10 @@ def _dflash_rounds_batch(
     batched_draft = _use_batched_draft(
         draft_model, greedy_sampling, positioned_sampling
     )
+    # The KNOB is not the answer: a stochastic unpositioned sampler keeps the
+    # row-wise path with the knob on. Record what this loop actually did, so the
+    # server log reports the path taken and not the setting requested.
+    draft_model.speculative_batched_draft = bool(batched_draft)
     if batched_draft:
         # ONE set of layer caches holding all B rows, instead of B sets holding
         # one row each. Everything downstream that indexes ``draft_caches`` by

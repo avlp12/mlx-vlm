@@ -2695,9 +2695,21 @@ class ResponseGenerator:
                         # eight, which is the ratio every batched throughput
                         # number is divided by.
                         (row_rounds / batch_rounds) if batch_rounds else float("nan"),
-                        # Read once at import of the round loop (law 23): the
-                        # draft half of a batched round is either one call or B.
-                        "on" if batched_draft_enabled() else "off",
+                        # The PATH TAKEN, not the knob: a stochastic
+                        # unpositioned sampler keeps the row-wise draft with the
+                        # knob on, and a log that reported the setting would say
+                        # the opposite of what ran (law 23). The round loop
+                        # records its own decision; the knob is the fallback for
+                        # a drafter whose loop never ran.
+                        (
+                            "on"
+                            if getattr(
+                                drafter,
+                                "speculative_batched_draft",
+                                batched_draft_enabled(),
+                            )
+                            else "off"
+                        ),
                     )
 
                 # Finalize any remaining
