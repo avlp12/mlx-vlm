@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 
+from . import harvest_provenance as _harvest_prov
 from .apc_adapters import Capability, StateFragment
 
 __all__ = [
@@ -131,6 +132,7 @@ def _rebuild(node: Any, arrays: Sequence[mx.array]) -> Any:
 
 def plan_fragments(
     fragments: Sequence[StateFragment],
+    harvest_provenance: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[mx.array]]:
     """Manifest for a ladder rung plus the flat uint8 view of every array.
 
@@ -149,6 +151,14 @@ def plan_fragments(
         "offsets": [],
         "version": 1,
     }
+    # Harvest provenance (L1b-1) rides in the manifest, so the disk header and
+    # the peer-wire manifest carry the same fact in the same place -- the two
+    # formats are the same bytes by construction and this keeps them the same
+    # METADATA too.  Omitted entirely when unknown, so a manifest from a caller
+    # that does not know its batch width is byte-identical to what it was.
+    prov = _harvest_prov.normalise(harvest_provenance)
+    if prov is not None:
+        manifest["harvest_provenance"] = prov
     off = 0
     for a, f in zip(arrays, flat):
         n = int(f.size)
@@ -162,9 +172,10 @@ def plan_fragments(
 
 def pack_fragments(
     fragments: Sequence[StateFragment],
+    harvest_provenance: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], mx.array]:
     """Flatten a ladder rung into (manifest, one contiguous uint8 payload)."""
-    manifest, flat = plan_fragments(fragments)
+    manifest, flat = plan_fragments(fragments, harvest_provenance)
     payload = mx.concatenate(flat) if flat else mx.zeros((0,), dtype=mx.uint8)
     mx.eval(payload)
     return manifest, payload

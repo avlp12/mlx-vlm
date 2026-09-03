@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from .. import apc as _apc
 from .. import context_vault as _context_vault
+from .. import harvest_provenance as _harvest_prov
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -1145,6 +1146,12 @@ class PromptProgress:
     prompt_tps: float = 0.0
     prompt_time: float = 0.0
     cached_tokens: int = 0
+    # Width of the prefill batch this row's warm prefix was HARVESTED in, or
+    # ``None`` when the prefix has no recorded provenance.  Rides next to
+    # ``cached_tokens`` because that is the number it qualifies: 3,091 cached
+    # tokens taken out of a B=2 prefill and 3,091 taken out of a B=1 prefill are
+    # the same count and, measured, not the same cache (L1b-1).
+    cached_from_width: Optional[int] = None
 
 
 def _sample_with_positions(
@@ -1964,16 +1971,24 @@ class PromptProcessingBatch:
         self._prompt_time_s = 0.0
         self._prompt_tokens_per_row: List[int] = []
         self._cached_tokens_per_row: List[int] = []
+        self._cached_from_width_per_row: List[Optional[int]] = []
         for idx, suffix_len in enumerate(lengths):
             full_input_ids = None
             prefix_len = 0
+            harvest_width = None
             if idx < len(self._apc_meta) and self._apc_meta[idx] is not None:
                 full_input_ids = self._apc_meta[idx].get("full_input_ids")
                 prefix_len = int(self._apc_meta[idx].get("prefix_len") or 0)
+                harvest_width = _harvest_prov.batch_width_of(
+                    self._apc_meta[idx].get("harvest_provenance")
+                )
             self._prompt_tokens_per_row.append(
                 len(full_input_ids) if full_input_ids is not None else suffix_len
             )
             self._cached_tokens_per_row.append(prefix_len)
+            self._cached_from_width_per_row.append(
+                harvest_width if prefix_len > 0 else None
+            )
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
@@ -2297,6 +2312,39 @@ class PromptProcessingBatch:
     def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
         return _apc.snapshot_prompt_cache_row(self.prompt_cache, batch_idx)
 
+    def _harvest_provenance(self, batch_idx: int) -> dict:
+        """Where row ``batch_idx``'s snapshot is being taken FROM.
+
+        The width is ``len(self._prompt_uids)`` -- the width of the prefill
+        batch as admitted -- and not ``len(self.uids)``, which the decode loop
+        shortens as rows finish.  A snapshot's provenance is a property of the
+        forward that produced it, so it must not move when a sibling row exits.
+
+        L1b-1 measured this width to be the CARRIER of a bit difference in the
+        KDA recurrent snapshot: an equal-suffix, zero-padding B=2 batch
+        (``right_pad_per_row=[0, 0]``) poisons the entry to the same sha as a
+        right-padded one, so the pads are recorded as evidence rather than as
+        the cause.
+        """
+        right_pad = 0
+        if self._right_pad_per_row is not None and batch_idx < len(
+            self._right_pad_per_row
+        ):
+            right_pad = int(self._right_pad_per_row[batch_idx] or 0)
+        left_pad = 0
+        if batch_idx < len(self._left_padding_per_row):
+            left_pad = int(self._left_padding_per_row[batch_idx] or 0)
+        # ``_prompt_uids`` is absent on a hand-built batch (several tests build
+        # one with ``__new__`` and set only what the method under test reads);
+        # ``uids`` is the honest fallback there and identical before any row
+        # finishes, which for a PREFILL batch is always.
+        width = len(getattr(self, "_prompt_uids", None) or self.uids) or 1
+        return _harvest_prov.make(
+            width,
+            right_pad=right_pad,
+            left_pad=left_pad,
+        )
+
     def _store_apc_exact_checkpoints(self) -> None:
         if self._apc_manager is None or self._apc_mode != "exact":
             return
@@ -2315,6 +2363,7 @@ class PromptProcessingBatch:
                 meta["full_input_ids"][:checkpoint_len],
                 prompt_cache,
                 extra_hash=meta.get("extra_hash", 0),
+                harvest_provenance=self._harvest_provenance(batch_idx),
             )
             meta["checkpoint_done"] = True
 
@@ -2343,12 +2392,15 @@ class PromptProcessingBatch:
                 row_cache = self._apc_prompt_cache_for_store(batch_idx)
                 if row_cache is not None:
                     full_ids = meta.get("full_input_ids") or []
+                    provenance = self._harvest_provenance(batch_idx)
                     for r in landed:
                         try:
-                            self._vault.insert(
+                            _context_vault.insert_checkpoint(
+                                self._vault,
                                 full_ids,
                                 int(r),
                                 _context_vault.capture_fragments(row_cache, int(r)),
+                                harvest_provenance=provenance,
                             )
                         except Exception:  # noqa: BLE001 - storing is best-effort
                             pass
@@ -2490,11 +2542,13 @@ class PromptProcessingBatch:
                 prompt_tps=prompt_tokens / self._prompt_time_s,
                 prompt_time=self._prompt_time_s,
                 cached_tokens=cached_tokens,
+                cached_from_width=cached_from_width,
             )
-            for uid, prompt_tokens, cached_tokens in zip(
+            for uid, prompt_tokens, cached_tokens, cached_from_width in zip(
                 self._prompt_uids,
                 self._prompt_tokens_per_row,
                 self._cached_tokens_per_row,
+                self._cached_from_width_per_row,
             )
         ]
 
@@ -2698,6 +2752,7 @@ class PromptProcessingBatch:
                 for batch_idx, meta in enumerate(self._apc_meta):
                     if meta is None:
                         continue
+                    provenance = self._harvest_provenance(batch_idx)
                     if self._apc_mode == "exact":
                         prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                         if prompt_cache is not None:
@@ -2705,6 +2760,7 @@ class PromptProcessingBatch:
                                 meta["full_input_ids"],
                                 prompt_cache,
                                 extra_hash=meta.get("extra_hash", 0),
+                                harvest_provenance=provenance,
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
@@ -2716,6 +2772,7 @@ class PromptProcessingBatch:
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
                             blocks_in_use=meta.get("apc_blocks", []),
+                            harvest_provenance=provenance,
                         )
             except Exception as e:
                 logger.warning("APC harvest failed during batched prefill: %s", e)
@@ -3013,12 +3070,25 @@ class BatchGenerator:
             max_prefix_tokens=len(ids_list) - 1,
         )
 
-    def _apc_pick_for(self, sequence) -> Optional[dict]:
+    def _apc_pick_for(self, sequence, serve_batch_width: int = 1) -> Optional[dict]:
         """Look up a warm prefix for ``sequence`` -- APC first, then the vault.
 
         Returns a plan dict with matched blocks + suffix metadata when there is
         a usable hit, else None.  The vault only ever *deepens* the answer: see
         ``_vault_pick_for``.
+
+        ``serve_batch_width`` is the width of the window being admitted, which
+        is what this generator can know BEFORE the picks decide the batch.  It
+        is read only by the ``MLX_VLM_APC_SERVE_B1_FROM_B1_ONLY`` policy, and
+        only when it is 1.  Note the one-sided approximation this makes and the
+        direction it errs in: ``_apply_right_pad_policy`` can narrow a 2-row
+        window to 1 row AFTER the lookups have run, so a request that ends up
+        served alone may have been looked up as width 2 and may therefore have
+        accepted a wider entry.  The reverse -- a width-1 window growing -- cannot
+        happen.  So the knob is a guarantee about what a SOLO ADMISSION accepts,
+        not about every prefill that happens to end up with one row in it.  The
+        default of a keyword makes an unbound duck-typed caller
+        (``test_session_restore._Gen``) keep working.
         """
         vault = getattr(self, "vault", None)
         if self.apc_manager is None and vault is None:
@@ -3034,6 +3104,7 @@ class BatchGenerator:
                 extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
                 apc_mode=getattr(self, "apc_mode", "block"),
                 safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
+                serve_batch_width=int(serve_batch_width),
                 suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(
                     ids_list, pl
                 ),
@@ -3125,6 +3196,12 @@ class BatchGenerator:
             "full_input_ids": list(ids_list),
             "source": ("vault-session"
                        if hit_tier is _context_vault.VaultTier.SESSION else "vault"),
+            # A vault rung carries its own harvest provenance (it travels ON the
+            # checkpoint), so a vault-served warm start reports the width it was
+            # captured at exactly as an APC-served one does.
+            "harvest_provenance": _harvest_prov.normalise(
+                getattr(hit, "harvest_provenance", None)
+            ),
         }
 
     def _vault_rungs_for(self, ids_list, prefix_len: int) -> List[int]:
@@ -3260,7 +3337,10 @@ class BatchGenerator:
         if self.apc_manager is None and getattr(self, "vault", None) is None:
             return None
 
-        picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
+        picks: List[Optional[dict]] = [
+            self._apc_pick_for(s, serve_batch_width=len(sequences))
+            for s in sequences
+        ]
         any_warm = any(p is not None for p in picks)
         if not any_warm:
             return None  # caller falls back to cold-only path
@@ -3386,6 +3466,13 @@ class BatchGenerator:
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
                 "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
                 "vault_rungs": self._vault_rungs_for(full_ids[i], prefix_lens[i]),
+                # Where the entry SERVING this row was harvested (not where this
+                # row's own snapshot will be taken -- that is computed at store
+                # time from the batch actually built).  Reported by
+                # ``prompt_progress`` and thence by the server's prefill line.
+                "harvest_provenance": (
+                    picks[i].get("harvest_provenance") if picks[i] else None
+                ),
             }
             for i in range(len(sequences))
         ]

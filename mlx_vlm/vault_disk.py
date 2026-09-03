@@ -105,6 +105,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 
+from . import harvest_provenance as _harvest_prov
 from .apc_adapters import ADAPTER_SCHEMA_VERSION, StateFragment, dedup_enabled
 from .context_vault import VaultCheckpoint, VaultTier
 from .context_vault_wire import _DTYPES, plan_fragments, unpack_fragments
@@ -651,6 +652,7 @@ def _header_refusal(
     tier: Optional[str] = None,
     expect_prompt_sha: Optional[str] = None,
     file_size: Optional[int] = None,
+    require_harvest_provenance: bool = True,
 ) -> Optional[str]:
     """Named reason to refuse, or ``None`` to accept. Never raises.
 
@@ -681,6 +683,16 @@ def _header_refusal(
         return "tokenizer_mismatch"
     if header.get("flags_hash") != flags_hash:
         return "flags_mismatch"
+    if require_harvest_provenance and not _harvest_prov.is_complete(
+        {f: header.get(f) for f in _harvest_prov.FIELDS}
+    ):
+        # An entry that cannot say where it came from is refused, not assumed
+        # clean.  Blobs written before this field existed land here, and that is
+        # the intended outcome: the cost is one cold prefill, and the thing being
+        # avoided is a warm start that is bit-different from the cold run with
+        # nothing on the entry to say so (L1b-1).  ``MLX_VLM_VAULT_DISK_PERSIST_MIN_WIDTH=0``
+        # relaxes both halves of the policy together.
+        return "harvest_provenance_missing"
     if tier is not None and header.get("tier") != tier:
         return "tier_mismatch"
     if expect_prompt_sha is not None and header.get("prompt_sha256") != expect_prompt_sha:
@@ -919,6 +931,15 @@ class DiskPrefixVault:
             if depth <= 0 or len(toks) != depth:
                 self.stats.bump("disk_save_skips")
                 return False
+            if not _harvest_prov.may_persist(
+                getattr(checkpoint, "harvest_provenance", None)
+            ):
+                # The durability gate, enforced at the queue rather than only at
+                # the caller: ``_offload`` is not the only way into this method
+                # (a test, a future session-offload hook, a peer sync), and a
+                # gate that only one caller honours is not a gate.
+                self.stats.record_refusal("harvest_width_not_durable")
+                return False
             tier = getattr(checkpoint, "tier", VaultTier.PREFILL)
             tier_s = tier.value if isinstance(tier, VaultTier) else str(tier)
             sha = prompt_prefix_sha(toks, depth)
@@ -992,7 +1013,10 @@ class DiskPrefixVault:
         reason: str,
     ) -> None:
         t0 = time.perf_counter()
-        manifest, flats = plan_fragments(checkpoint.fragments)
+        provenance = _harvest_prov.normalise(
+            getattr(checkpoint, "harvest_provenance", None)
+        )
+        manifest, flats = plan_fragments(checkpoint.fragments, provenance)
         if flats:
             mx.eval(flats)
         payload_nbytes = int(manifest["total_bytes"])
@@ -1026,6 +1050,16 @@ class DiskPrefixVault:
             "arrays": manifest["offsets"],
             "tree": manifest["tree"],
         }
+        # L1b-1: the header carries WHERE the rung was harvested alongside WHAT
+        # it is.  The design doc already said headers carry tier/session/shape
+        # flags because "a session rung served to a prefill query is a fluent
+        # wrong answer"; a rung harvested inside a batched prefill and restored
+        # into a solo request is the same class of wrong answer, one layer down,
+        # and until this field existed nothing on disk could tell them apart.
+        # Five flat fields rather than a nested object so a header can be
+        # grepped and an index record can copy one of them.
+        base.update(provenance or {})
+        base["harvest_provenance_complete"] = provenance is not None
 
         # The header records the offsets it is itself followed by, so serialise
         # until the reserved area stops growing (two passes in practice).
@@ -1088,6 +1122,7 @@ class DiskPrefixVault:
                 "bytes": int(size),
                 "created_at": float(header["created_at"]),
                 "last_used": time.time(),
+                "harvest_batch_width": _harvest_prov.batch_width_of(provenance),
             }
             self._enforce_cap_locked(protect=key)
             self._write_index_locked()
@@ -1187,6 +1222,13 @@ class DiskPrefixVault:
             tier=tier,
             expect_prompt_sha=expect_prompt_sha,
             file_size=size,
+            # One knob relaxes both halves: a deployment that has opted out of
+            # the persist gate has said it does not want provenance enforced,
+            # and enforcing it only on the read side would strand every blob it
+            # just wrote.
+            require_harvest_provenance=(
+                _harvest_prov.persist_max_harvest_width() > 0
+            ),
         )
         if reason is not None:
             self.stats.record_refusal(reason)
@@ -1297,6 +1339,13 @@ class DiskPrefixVault:
                 frags,
                 tier=tier,
                 session_id=str(header.get("session_id", "")),
+                # Carry the provenance back onto the RAM rung.  Without this a
+                # restore-then-evict cycle would launder a width-1 entry into an
+                # unknown-provenance one and the durability gate would then
+                # refuse to re-persist the very blob it just read.
+                harvest_provenance={
+                    f: header.get(f) for f in _harvest_prov.FIELDS
+                },
             )
             cp = vault.lookup(list(tokens), tier=tier)
             if cp is None or int(cp.prefix_len) < depth:

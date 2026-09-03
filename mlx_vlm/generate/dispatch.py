@@ -13,6 +13,7 @@ from transformers import PreTrainedTokenizer
 from .. import apc as _apc
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from .. import context_vault as _vault_mod
+from .. import harvest_provenance as _harvest_prov
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
@@ -811,6 +812,12 @@ def stream_generate(
 
     # Prompt cache reuse: skip common prefix from previous turn
     reused_prefix_len = 0
+    # Harvest width of the APC exact entry that supplies the warm prefix, or
+    # ``None`` when the prefix came from somewhere with no provenance (the
+    # per-turn ``PromptCacheState``, a block-mode hit, an old disk shard) or
+    # from nowhere at all.  Reported as ``cached_from_width=`` on the server's
+    # own prefill log line -- law 23, the receipt is the server's own.
+    cached_from_width: Optional[int] = None
     full_input_ids_list = input_ids.flatten().tolist()
     apc_blocks_in_use: List[_apc.APCBlock] = []
     apc_extra_hash = 0
@@ -893,6 +900,9 @@ def stream_generate(
             safe_lookup_min=apc_safe_prefix_lookup_min,
             suffix_is_text_only=_apc_suffix_is_text_only,
             prefix_has_media=_apc_prefix_has_media_tokens,
+            # This generate path serves exactly one request per call, so the
+            # prefill it is about to run is B=1 by construction.
+            serve_batch_width=1,
         )
         if plan is not None:
             plen = plan["prefix_len"]
@@ -901,6 +911,9 @@ def stream_generate(
             primed = _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
             if primed:
                 reused_prefix_len = plen
+                cached_from_width = _harvest_prov.batch_width_of(
+                    plan.get("harvest_provenance")
+                )
                 input_ids = input_ids[:, plen:]
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
@@ -1034,6 +1047,7 @@ def stream_generate(
                     full_input_ids_list[:prefix_len],
                     prompt_cache,
                     extra_hash=apc_extra_hash,
+                    harvest_provenance=_harvest_prov.make(1),
                 )
 
         if _vault is not None and _vault_boundaries:
@@ -1050,10 +1064,12 @@ def stream_generate(
                     return
                 abs_len = _base + prefix_len
                 try:
-                    _vault.insert(
+                    _vault_mod.insert_checkpoint(
+                        _vault,
                         full_input_ids_list,
                         abs_len,
                         _vault_mod.capture_fragments(prompt_cache, abs_len),
+                        harvest_provenance=_harvest_prov.make(1),
                     )
                 except Exception:  # noqa: BLE001 - storing is best-effort
                     pass
@@ -1093,6 +1109,7 @@ def stream_generate(
                             full_input_ids_list,
                             tracked_cache,
                             extra_hash=apc_extra_hash,
+                            harvest_provenance=_harvest_prov.make(1),
                         )
                     except Exception as e:
                         logger.warning("APC exact-cache store failed: %s", e)
@@ -1122,6 +1139,7 @@ def stream_generate(
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
                 cached_tokens=reused_prefix_len,
+                cached_from_width=cached_from_width,
             )
         else:
             # generate_step exhausted its budget without stopping_criteria firing.
@@ -1141,6 +1159,7 @@ def stream_generate(
                 generation_tps=0.0,
                 peak_memory=mx.get_peak_memory() / 1e9,
                 cached_tokens=reused_prefix_len,
+                cached_from_width=cached_from_width,
                 finish_reason="length",
             )
             return
@@ -1157,6 +1176,7 @@ def stream_generate(
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
             cached_tokens=reused_prefix_len,
+            cached_from_width=cached_from_width,
             finish_reason=finish_reason,
         )
 
@@ -1305,6 +1325,7 @@ def generate(
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
         cached_tokens=last_response.cached_tokens,
+        cached_from_width=getattr(last_response, "cached_from_width", None),
         finish_reason=last_response.finish_reason,
         diffusion_canvas_tokens=last_response.diffusion_canvas_tokens,
         diffusion_denoising_steps=last_response.diffusion_denoising_steps,

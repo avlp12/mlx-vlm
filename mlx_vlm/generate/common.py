@@ -229,6 +229,9 @@ class GenerationResult:
     generation_tps: float = 0.0
     peak_memory: float = 0.0
     cached_tokens: int = 0
+    # Width of the prefill batch the served warm prefix was HARVESTED in, or
+    # ``None`` when the prefix has no recorded provenance (L1b-1).
+    cached_from_width: Optional[int] = None
     finish_reason: Optional[str] = None
     diffusion_canvas_tokens: int = 0
     diffusion_denoising_steps: int = 0

@@ -56,6 +56,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import mlx.core as mx
 import numpy as np
 
+from . import harvest_provenance as _prov
 from ._stream_cleanup import clear_mlx_streams
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
@@ -542,6 +543,14 @@ class APCExactCacheEntry:
     extra_hash: int
     prompt_cache: List[Any]
     last_used: float
+    # WHERE this snapshot was taken: the width of the prefill batch it was
+    # harvested inside, that row's own pads, the tree that produced it and when.
+    # ``None`` means unknown provenance -- an entry restored from a disk shard
+    # written by a build older than this field, or one stored by a caller that
+    # did not name its batch.  Unknown is a *distinct* state from width 1 and
+    # every policy in ``harvest_provenance`` treats it as such, because the one
+    # measured failure (L1b-1) is an entry that looks exactly like a good one.
+    provenance: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -580,12 +589,24 @@ class _DiskLayerMajorSnapshot:
     segment_count: int
 
 
+def _exact_provenance_from_metadata(metadata: dict) -> Optional[Dict[str, Any]]:
+    """Decode ``harvest_provenance`` out of an exact shard's metadata."""
+    raw = metadata.get("harvest_provenance")
+    if not raw:
+        return None
+    try:
+        return _prov.normalise(json.loads(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 @dataclass(frozen=True)
 class _DiskExactCacheSnapshot:
     cache_hash: int
     token_ids: Tuple[int, ...]
     extra_hash: int
     prompt_cache: List[Any]
+    provenance: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1293,6 +1314,7 @@ class DiskBlockStore:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        require_harvest_width_1: bool = False,
     ) -> Optional[Tuple[int, int]]:
         token_tuple = tuple(int(t) for t in token_ids)
         max_len = len(token_tuple) - 1
@@ -1327,9 +1349,37 @@ class DiskBlockStore:
                 or token_tuple[:prefix_len] != stored_tokens
             ):
                 continue
+            if require_harvest_width_1:
+                # The B=1-only determinism policy applied to the DISK tier.  A
+                # shard written before this field existed carries no width, and
+                # unknown is refused rather than assumed: the whole point of
+                # L1b-1 is that a poisoned entry is indistinguishable from a
+                # clean one by anything except its provenance.
+                if _prov.batch_width_of(
+                    _exact_provenance_from_metadata(metadata)
+                ) != 1:
+                    continue
             if best is None or prefix_len > best[1]:
                 best = (int(cache_hash), prefix_len)
         return best
+
+    def exact_harvest_provenance(self, cache_hash: int) -> Optional[dict]:
+        """Provenance recorded on a stored exact shard, or ``None``.
+
+        Header-only read; no payload touched.  ``None`` for a shard written by a
+        build that predates the field, which is a real state and not an error.
+        """
+        with self._index_lock:
+            path = self._exact_index.get(int(cache_hash))
+        if path is None:
+            return None
+        parsed = self._open_shard_header(path)
+        if parsed is None:
+            return None
+        _tensor_entries, metadata, _data_start = parsed
+        if metadata.get("layout") != "exact_cache_v1":
+            return None
+        return _exact_provenance_from_metadata(metadata)
 
     def load_exact_cache(
         self,
@@ -2403,6 +2453,8 @@ class DiskBlockStore:
         token_ids: Sequence[int],
         extra_hash: int,
         prompt_cache: Sequence[Any],
+        *,
+        harvest_provenance: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Schedule an exact prompt-cache snapshot write.
 
@@ -2417,6 +2469,7 @@ class DiskBlockStore:
             token_ids=token_tuple,
             extra_hash=int(extra_hash),
             prompt_cache=list(prompt_cache),
+            provenance=_prov.normalise(harvest_provenance),
         )
         self._enqueue_exact_snapshot(snapshot)
 
@@ -2662,6 +2715,15 @@ class DiskBlockStore:
             "num_entries": str(len(snapshot.prompt_cache)),
             "store_id": self._exact_id_for(snapshot.cache_hash),
         }
+        # Harvest provenance rides in the safetensors metadata, so a shard
+        # written by this build can be told apart from one written before the
+        # field existed WITHOUT reading a byte of payload -- ``find_exact_prefix``
+        # already opens only the header, and that is where the serve-time policy
+        # needs the answer.
+        if snapshot.provenance is not None:
+            metadata["harvest_provenance"] = json.dumps(
+                snapshot.provenance, separators=(",", ":"), sort_keys=True
+            )
         arrays: dict[str, mx.array] = {}
         for i, c in enumerate(snapshot.prompt_cache):
             if not self._snapshot_exact_cache_entry(c, f"c{i}", arrays, metadata):
@@ -2998,13 +3060,29 @@ class APCManager:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        require_harvest_width_1: bool = False,
+        provenance_out: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return an exact-prefix prompt-cache snapshot for custom caches.
 
         Mixed architectures such as Nemotron-H use recurrent SSM state in
         addition to attention KV. That state is not block-concatenable, so the
         safe reuse unit is an exact prompt-cache snapshot at a prefix boundary.
+
+        ``require_harvest_width_1`` is the serve half of the L1b-1 policy: only
+        entries harvested inside a B=1 prefill are eligible, so the answer is the
+        longest strict prefix *among width-1 entries* and a cold prefill when
+        there is none.  It never falls back to a wider entry -- "deepest wins" is
+        precisely the wrong tiebreak when depth is what the poison rides in on.
+
+        ``provenance_out``, when given, is filled in place with the provenance of
+        the entry that served (or left empty on a miss), so the caller can report
+        ``cached_from_width`` without a second lookup and without a
+        last-lookup attribute that two request threads would race on.
         """
+        if provenance_out is not None:
+            provenance_out.clear()
+
         disk = self.disk
         if self._exact_cache_max <= 0 and disk is None:
             return None, 0
@@ -3017,6 +3095,8 @@ class APCManager:
 
         source_cache: Optional[List[Any]] = None
         prefix_len = 0
+        served_provenance: Optional[Dict[str, Any]] = None
+        refused_width = 0
         with self.lock:
             best_key: Optional[int] = None
             best_entry: Optional[APCExactCacheEntry] = None
@@ -3031,6 +3111,14 @@ class APCManager:
                         continue
                     if token_tuple[:candidate_len] != entry.token_ids:
                         continue
+                    if (
+                        require_harvest_width_1
+                        and _prov.batch_width_of(entry.provenance) != 1
+                    ):
+                        # Skipped, not preferred-against: the scan simply never
+                        # sees it, so the winner is the deepest WIDTH-1 entry.
+                        refused_width += 1
+                        continue
                     if best_entry is None or candidate_len > len(best_entry.token_ids):
                         best_key = key
                         best_entry = entry
@@ -3040,6 +3128,7 @@ class APCManager:
                     best_entry.last_used = time.time()
                     prefix_len = len(best_entry.token_ids)
                     source_cache = best_entry.prompt_cache
+                    served_provenance = best_entry.provenance
 
         can_try_disk = disk is not None and prefix_len < max_len
         if can_try_disk and self._disk_min_free_ram_bytes > 0:
@@ -3058,6 +3147,7 @@ class APCManager:
                 extra_hash=extra_hash,
                 max_prefix_tokens=max_prefix_tokens,
                 min_prefix_tokens=max(min_prefix_tokens, prefix_len),
+                require_harvest_width_1=require_harvest_width_1,
             )
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
@@ -3082,6 +3172,11 @@ class APCManager:
                         # happen outside the manager lock. If clear()/reset_stats()
                         # races here, the restored tensors are still valid; only
                         # the hit counter lands in the new stats window.
+                        disk_provenance = None
+                        try:
+                            disk_provenance = disk.exact_harvest_provenance(cache_hash)
+                        except Exception:  # noqa: BLE001 - provenance is metadata
+                            disk_provenance = None
                         if self._exact_cache_max > 0:
                             storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
                             if storage_copy is not None:
@@ -3100,6 +3195,7 @@ class APCManager:
                                                 extra_hash=int(extra_hash),
                                                 prompt_cache=storage_copy,
                                                 last_used=time.time(),
+                                                provenance=disk_provenance,
                                             )
                                         )
                                         self._exact_cache.move_to_end(promote_key)
@@ -3108,15 +3204,29 @@ class APCManager:
                                             > self._exact_cache_max
                                         ):
                                             self._exact_cache.popitem(last=False)
+                                if provenance_out is not None and disk_provenance:
+                                    provenance_out.update(disk_provenance)
                                 return prompt_cache, disk_prefix_len
                         with self.lock:
                             self.stats.exact_hits += 1
                             self.stats.disk_hits += 1
                             self.stats.hits += 1
                             self.stats.matched_tokens += disk_prefix_len
+                        if provenance_out is not None and disk_provenance:
+                            provenance_out.update(disk_provenance)
                         return prompt_cache, disk_prefix_len
 
         if source_cache is None:
+            if refused_width:
+                # A named miss, not a silent one: a deployment that turns the
+                # determinism knob on and loses its hit rate should be able to
+                # read WHY off the metrics surface.
+                with self.lock:
+                    self.stats.record_reject(
+                        "serve_b1_from_b1_only",
+                        candidates_refused=refused_width,
+                        token_len=len(token_tuple),
+                    )
             return None, 0
         prompt_cache = _clone_prompt_cache_for_apc(
             source_cache,
@@ -3128,6 +3238,8 @@ class APCManager:
             self.stats.exact_hits += 1
             self.stats.hits += 1
             self.stats.matched_tokens += prefix_len
+        if provenance_out is not None and served_provenance:
+            provenance_out.update(served_provenance)
         return prompt_cache, prefix_len
 
     def store_exact_cache(
@@ -3136,8 +3248,18 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        harvest_provenance: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``harvest_provenance`` names the prefill this snapshot was taken inside
+        (see :mod:`mlx_vlm.harvest_provenance`).  It is recorded on the RAM
+        entry and, when the disk mirror is on, in the shard metadata.  A store
+        with no provenance still stores -- an entry whose origin is unknown is a
+        legitimate state and refusing it would turn a caller that has not been
+        updated into a silent cache-off -- but it will not be made DURABLE while
+        ``MLX_VLM_VAULT_DISK_PERSIST_MIN_WIDTH`` is at its default.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
@@ -3160,6 +3282,7 @@ class APCManager:
                 )
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+        provenance = _prov.normalise(harvest_provenance)
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
@@ -3168,6 +3291,7 @@ class APCManager:
                     extra_hash=int(extra_hash),
                     prompt_cache=copied,
                     last_used=time.time(),
+                    provenance=provenance,
                 )
                 self._exact_cache.move_to_end(key)
                 while len(self._exact_cache) > self._exact_cache_max:
@@ -3180,15 +3304,40 @@ class APCManager:
                 ok=True,
                 token_len=len(token_tuple),
                 layers=len(copied),
+                harvest_batch_width=_prov.width_key(provenance),
             )
         if self.disk is not None:
-            try:
-                self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
+            # DURABILITY GATE (L1b-1).  A RAM entry dies with the process, so a
+            # batch-harvested one poisons at most this process's later solo
+            # serves.  A disk shard outlives the process and is shared by every
+            # process pointed at the directory, so by default only a width-1
+            # harvest is allowed to become durable.  The skip is counted, not
+            # silent, and the RAM store above already happened -- the request
+            # keeps its warm start, it just does not get to persist it.
+            if not _prov.may_persist(provenance):
                 with self.lock:
-                    self.stats.disk_writes += 1
-                stored = True
-            except Exception as e:
-                logger.warning("APC exact disk save scheduling failed: %s", e)
+                    self.stats.record_reject(
+                        "harvest_width_not_durable",
+                        harvest_batch_width=_prov.width_key(provenance),
+                        persist_max_harvest_width=(
+                            _prov.persist_max_harvest_width()
+                        ),
+                        token_len=len(token_tuple),
+                    )
+            else:
+                try:
+                    self.disk.save_exact_cache(
+                        key,
+                        token_tuple,
+                        extra_hash,
+                        copied,
+                        harvest_provenance=provenance,
+                    )
+                    with self.lock:
+                        self.stats.disk_writes += 1
+                    stored = True
+                except Exception as e:
+                    logger.warning("APC exact disk save scheduling failed: %s", e)
         if stored:
             with self.lock:
                 self.stats.exact_stores += 1
@@ -3326,6 +3475,7 @@ class APCManager:
         *,
         extra_hash: int = 0,
         skip_first_n_tokens: int = 0,
+        harvest_provenance: Optional[Dict[str, Any]] = None,
     ) -> List[APCBlock]:
         """Slice ``layer_keys`` / ``layer_values`` into block_size chunks and
         store any new full blocks beyond ``skip_first_n_tokens``.
@@ -3365,6 +3515,7 @@ class APCManager:
                         extra_hash=int(extra_hash),
                         prompt_cache=copied,
                         last_used=time.time(),
+                        provenance=_prov.normalise(harvest_provenance),
                     )
                     self._exact_cache.move_to_end(key)
                     while len(self._exact_cache) > self._exact_cache_max:
@@ -3468,6 +3619,23 @@ class APCManager:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
             snap["resident_bytes"] = self._resident_bytes_locked()
+            # L1b-1: the census of resident exact entries BY THE BATCH WIDTH
+            # THEY WERE HARVESTED AT.  A deployment cannot otherwise tell that
+            # its warm prefixes came out of batched prefills -- the entries are
+            # indistinguishable by token count, hit rate or age, which is exactly
+            # how the defect stayed invisible for two measurement sessions.
+            # ``"unknown"`` is a real bucket, not an error: it is what an entry
+            # restored from a pre-provenance disk shard honestly is.
+            by_width: Dict[Any, int] = {}
+            for entry in self._exact_cache.values():
+                k = _prov.width_key(entry.provenance)
+                by_width[k] = by_width.get(k, 0) + 1
+            snap["exact_entries"] = len(self._exact_cache)
+            snap["exact_entries_by_harvest_width"] = {
+                str(k): v for k, v in sorted(by_width.items(), key=lambda kv: str(kv[0]))
+            }
+            snap["serve_b1_from_b1_only"] = _prov.serve_b1_from_b1_only()
+            snap["persist_max_harvest_width"] = _prov.persist_max_harvest_width()
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
@@ -4101,6 +4269,7 @@ def harvest_blocks_from_batch_cache(
     batch_idx: Optional[int] = None,
     extra_hash: int = 0,
     skip_first_n_tokens: int = 0,
+    harvest_provenance: Optional[Dict[str, Any]] = None,
 ) -> List[APCBlock]:
     """Harvest full blocks from a prompt cache and store them.
 
@@ -4125,6 +4294,7 @@ def harvest_blocks_from_batch_cache(
         layer_values,
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
+        harvest_provenance=harvest_provenance,
     )
 
 
@@ -4137,6 +4307,7 @@ def commit_prefix_blocks(
     extra_hash: int = 0,
     skip_first_n_tokens: int = 0,
     blocks_in_use: Sequence[APCBlock] = (),
+    harvest_provenance: Optional[Dict[str, Any]] = None,
 ) -> List[APCBlock]:
     """Harvest one (row of a) prompt cache into hashed blocks, store them, then release the in-use prefix blocks together with the new ones. Shared block-mode commit for both generate paths."""
     new_blocks = harvest_blocks_from_batch_cache(
@@ -4146,6 +4317,7 @@ def commit_prefix_blocks(
         batch_idx=batch_idx,
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
+        harvest_provenance=harvest_provenance,
     )
     apc_manager.release(list(blocks_in_use) + new_blocks)
     return new_blocks
@@ -4185,15 +4357,33 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    serve_batch_width: int = 1,
 ) -> Optional[dict]:
-    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
+    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply.
+
+    ``serve_batch_width`` is the width of the prefill batch this request is
+    about to be admitted into.  It is only ever *read* -- the plan is the same
+    plan it was -- except when ``MLX_VLM_APC_SERVE_B1_FROM_B1_ONLY`` is on and
+    the width is 1, in which case exact entries harvested inside a wider prefill
+    are not eligible (L1b-1).  The returned plan carries
+    ``harvest_provenance``: the provenance of the entry that will serve, or
+    ``None`` for a block-mode or unknown-provenance hit, so the caller can put
+    ``cached_from_width=`` in the server's own log line.
+    """
     n = len(ids_list)
     if not ids_list or n < 2:
         return None
 
+    require_w1 = int(serve_batch_width) == 1 and _prov.serve_b1_from_b1_only()
+
     if apc_mode == "exact":
+        exact_prov: Dict[str, Any] = {}
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=safe_lookup_min,
+            require_harvest_width_1=require_w1,
+            provenance_out=exact_prov,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4204,6 +4394,7 @@ def apc_lookup_plan(
                 "prefix_len": exact_prefix_len,
                 "extra_hash": extra_hash,
                 "full_input_ids": list(ids_list),
+                "harvest_provenance": _prov.normalise(exact_prov),
             }
         return None
 
@@ -4214,11 +4405,14 @@ def apc_lookup_plan(
         prefix_len = 0
     exact_cache = None
     exact_prefix_len = 0
+    block_exact_prov: Dict[str, Any] = {}
     if prefix_len < n:
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=max(prefix_len, safe_lookup_min),
+            require_harvest_width_1=require_w1,
+            provenance_out=block_exact_prov,
         )
     warm_cache = None
     disk_prefix_len = 0
@@ -4252,6 +4446,7 @@ def apc_lookup_plan(
             "prefix_len": exact_prefix_len,
             "extra_hash": extra_hash,
             "full_input_ids": list(ids_list),
+            "harvest_provenance": _prov.normalise(block_exact_prov),
         }
     if 0 < prefix_len < n:
         if not suffix_is_text_only(prefix_len):

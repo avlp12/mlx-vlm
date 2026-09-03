@@ -40,6 +40,7 @@ boundary re-pays 140.8 MiB regardless of depth.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -50,6 +51,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 
+from . import harvest_provenance as _harvest_prov
 from .apc_adapters import (
     Capability,
     StateFragment,
@@ -118,6 +120,55 @@ def vault_budget_bytes() -> int:
 # log: capture_session has five early returns and none of them spoke, so from
 # outside a disabled feature and a broken one are the same picture. That is the
 # same failure the APC default had, built into my own code while fixing theirs.
+_INSERT_TAKES_PROVENANCE: Dict[Any, bool] = {}
+
+
+def insert_checkpoint(
+    vault: Any,
+    tokens: Sequence[int],
+    prefix_len: int,
+    fragments: Any,
+    *,
+    harvest_provenance: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> bool:
+    """``vault.insert`` that degrades to the pre-provenance signature.
+
+    ``ContextVault`` is not the only object that reaches these call sites: the
+    server-wiring tests pass a duck-typed vault whose ``insert`` takes exactly
+    three positional arguments, and the storing side is wrapped in a
+    best-effort ``except``, so handing it an unexpected keyword would not raise
+    -- it would silently store NOTHING.  A silent cache-off is the one failure
+    mode a cache change must not introduce, so the capability is inspected
+    (once per function object) rather than discovered by exception.
+    """
+    fn = getattr(vault, "insert", None)
+    if fn is None:
+        return False
+    key = getattr(getattr(fn, "__func__", fn), "__code__", fn)
+    takes = _INSERT_TAKES_PROVENANCE.get(key)
+    if takes is None:
+        try:
+            params = inspect.signature(fn).parameters
+            takes = "harvest_provenance" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            takes = False
+        _INSERT_TAKES_PROVENANCE[key] = takes
+    if takes:
+        return bool(
+            fn(
+                tokens,
+                prefix_len,
+                fragments,
+                harvest_provenance=harvest_provenance,
+                **kwargs,
+            )
+        )
+    return bool(fn(tokens, prefix_len, fragments, **kwargs))
+
+
 SESSION_SKIPS: Dict[str, int] = {}
 _SKIP_LOCK = threading.Lock()
 
@@ -403,6 +454,14 @@ class VaultCheckpoint:
     # DEEPEST rung first and degrade to the prefill ladder instead of to cold.
     session_id: str = ""
     expires_at: Optional[float] = None
+    # WHERE this rung was captured: the width of the prefill batch, that row's
+    # pads, the tree, the time (see :mod:`mlx_vlm.harvest_provenance`).  Travels
+    # ON the checkpoint for the same reason ``origin`` and ``tier`` do -- a rung
+    # reaches the disk writer, the peer wire and ``restore_into`` without ever
+    # being looked up again, and the one thing a consumer cannot recompute is
+    # what the batch looked like when the snapshot was taken.  ``None`` means
+    # unknown, which is a distinct state from width 1 (L1b-1).
+    harvest_provenance: Optional[Dict[str, Any]] = None
 
     def expired(self, now: Optional[float] = None) -> bool:
         if self.expires_at is None:
@@ -638,6 +697,15 @@ class ContextVault:
         cp = node.checkpoint
         if disk is None or cp is None:
             return
+        if not _harvest_prov.may_persist(getattr(cp, "harvest_provenance", None)):
+            # L1b-1 durability gate.  Losing this rung costs one cold prefill on
+            # a later process; writing it costs a warm start that is bit-different
+            # from the cold run and survives every restart.  Counted by name.
+            try:
+                disk.stats.record_refusal("harvest_width_not_durable")
+            except Exception:  # noqa: BLE001 - a counter must not fail an evict
+                pass
+            return
         try:
             toks = self._tokens_for_node(node)
             if toks is None:
@@ -710,8 +778,15 @@ class ContextVault:
         tier: VaultTier = VaultTier.PREFILL,
         session_id: str = "",
         ttl_s: Optional[float] = None,
+        harvest_provenance: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Store the cache state as of ``prefix_len`` tokens of ``tokens``."""
+        """Store the cache state as of ``prefix_len`` tokens of ``tokens``.
+
+        ``harvest_provenance`` names the prefill this rung was captured inside.
+        It is recorded and carried; it does not gate the RAM insert.  It gates
+        only DURABILITY -- see ``_offload`` -- because a RAM rung dies with the
+        process and a disk blob does not.
+        """
         if fragments is None:
             with self._lock:
                 self.stats.rejected_unsupported += 1
@@ -738,6 +813,7 @@ class ContextVault:
                 tier=tier,
                 session_id=session_id,
                 expires_at=(time.monotonic() + ttl_s) if ttl_s else None,
+                harvest_provenance=_harvest_prov.normalise(harvest_provenance),
             )
             self._resident += nbytes
             self._rungs += 1

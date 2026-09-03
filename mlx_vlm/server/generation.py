@@ -90,6 +90,22 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+def _cached_from_width_str(response) -> str:
+    """``cached_from_width=`` field for the prefill log line.
+
+    ``-`` rather than ``0`` or ``None`` for "no warm prefix, or a warm prefix
+    with no recorded provenance", because 1 is a meaningful value here and a
+    zero would read like one.
+    """
+    width = getattr(response, "cached_from_width", None)
+    if width is None:
+        return "-"
+    try:
+        return str(int(width))
+    except (TypeError, ValueError):
+        return "-"
+
+
 def _notify_queues(queues, *items):
     for queue in queues:
         for item in items:
@@ -1679,12 +1695,19 @@ class ResponseGenerator:
         if prompt_time <= 0 and prompt_tps > 0:
             prompt_time = prompt_tokens / prompt_tps
         info["prefill_processed"] = prompt_tokens
+        # ``cached_from_width`` qualifies ``cached_tokens``: the width of the
+        # prefill batch the served entry was HARVESTED in.  Measured (L1b-1) to
+        # change the bits of the warm start, so a log line that reports how many
+        # tokens were reused without reporting where they were captured is a
+        # receipt that cannot distinguish the two runs it is describing.
+        # ``-`` means no warm prefix or no recorded provenance.
         logger.info(
             "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
-            "elapsed=%.3fs rate=%.1f tok/s",
+            "cached_from_width=%s elapsed=%.3fs rate=%.1f tok/s",
             info.get("request_id", uid),
             prompt_tokens,
             cached_tokens,
+            _cached_from_width_str(prompt_response),
             prompt_time,
             prompt_tps,
         )
@@ -2327,10 +2350,11 @@ class ResponseGenerator:
                 prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
                 logger.info(
                     "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
-                    "elapsed=%.3fs rate=%.1f tok/s",
+                    "cached_from_width=%s elapsed=%.3fs rate=%.1f tok/s",
                     log_state.get("request_id", uid),
                     prompt_tokens,
                     int(getattr(result, "cached_tokens", 0) or 0),
+                    _cached_from_width_str(result),
                     prompt_tokens / prompt_tps if prompt_tps > 0 else 0.0,
                     prompt_tps,
                 )
@@ -2518,7 +2542,8 @@ class ResponseGenerator:
                     )
                     logger.info(
                         "Prefill completed: request=%s prompt_tokens=%d "
-                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
+                        "cached_tokens=0 cached_from_width=- "
+                        "elapsed=%.3fs rate=%.1f tok/s",
                         stream_infos[uid].get("request_id", uid),
                         prompt_tokens,
                         prompt_elapsed,

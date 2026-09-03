@@ -4868,6 +4868,60 @@ def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     assert payload["server"]["apc"] == {"enabled": False}
 
 
+def test_metrics_endpoint_reports_exact_entries_by_harvest_width(
+    client, monkeypatch
+):
+    """The apc block on /metrics and /v1/metrics carries the harvest census.
+
+    Finding L1b-1: an APC exact entry harvested inside a B>=2 prefill serves
+    later SOLO requests a bit-different warm start, and nothing about the entry
+    -- token count, hit rate, age -- distinguishes it from a clean one.  A
+    deployment that cannot read the census off its own metrics surface cannot
+    tell which kind it is holding.
+    """
+    import mlx.core as mx
+
+    from mlx_vlm import harvest_provenance as HP
+    from mlx_vlm.apc import APCManager
+    from mlx_vlm.models.cache import ArraysCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "8")
+    manager = APCManager(num_blocks=8, block_size=16)
+
+    def store(ids, width):
+        c = ArraysCache(size=1)
+        c[0] = mx.zeros((1, 2, len(ids), 8))
+        manager.store_exact_cache(
+            ids,
+            [c],
+            harvest_provenance=None if width is None else HP.make(width),
+        )
+
+    store(list(range(0, 64)), 1)
+    store(list(range(100, 164)), 2)
+    store(list(range(200, 264)), None)
+
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server.runtime, "apc_manager", manager)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
+
+    for path in ("/metrics", "/v1/metrics"):
+        payload = client.get(path).json()
+        apc = payload["server"]["apc"]
+        assert apc["enabled"] is True
+        assert apc["exact_entries"] == 3
+        assert apc["exact_entries_by_harvest_width"] == {
+            "1": 1, "2": 1, "unknown": 1
+        }
+        assert apc["serve_b1_from_b1_only"] is False
+        assert apc["persist_max_harvest_width"] == 1
+
+    # the same census also rides on the dedicated cache endpoint
+    stats = client.get("/v1/cache/stats").json()
+    assert stats["exact_entries_by_harvest_width"]["2"] == 1
+
+
 def test_metrics_store_logs_request_lifecycle(caplog):
     caplog.set_level(logging.INFO, logger="mlx_vlm.server")
     metrics = server.ServerMetricsStore()

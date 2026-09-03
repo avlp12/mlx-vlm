@@ -33,7 +33,16 @@ from mlx_vlm.context_vault import (
 )
 from mlx_vlm.context_vault_wire import pack_fragments, plan_fragments
 from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_vlm import harvest_provenance as HP
 from mlx_vlm import vault_disk as VD
+
+# Every rung inserted below declares a B=1 harvest, because the DEFAULT
+# durability policy (L1b-1) persists only width-1 rungs and refuses to restore a
+# blob whose header carries no provenance.  These tests are about the blob
+# format, the cap and the races, so they say where their rungs came from and
+# then never think about it again; ``TestHarvestProvenance`` at the bottom of
+# this file is where the policy itself is exercised, in both directions.
+_HARVEST_W1 = HP.make(1)
 
 KDA_LAYERS = 3
 DSA_LAYERS = 2
@@ -166,7 +175,7 @@ class TestRoundTripIdentity(DiskVaultTestCase):
         dv = self.mkvault()
         toks = tokens_for(24)
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
-        self.assertTrue(vault.insert(toks, 24, frags_at(24, seed=3)))
+        self.assertTrue(vault.insert(toks, 24, frags_at(24, seed=3), harvest_provenance=_HARVEST_W1))
         cp = vault.lookup(toks)
 
         self.assertTrue(dv.save_async(toks, cp))
@@ -193,7 +202,7 @@ class TestRoundTripIdentity(DiskVaultTestCase):
         toks = tokens_for(20, base=77)
         frags = frags_at(20, seed=5)
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
-        vault.insert(toks, 20, frags)
+        vault.insert(toks, 20, frags, harvest_provenance=_HARVEST_W1)
         cp = vault.lookup(toks)
         dv.save_async(toks, cp)
         dv.flush(30.0)
@@ -209,7 +218,7 @@ class TestRoundTripIdentity(DiskVaultTestCase):
         dv_a = self.mkvault()
         toks = tokens_for(16, base=5)
         v = ContextVault("ident-A", budget_bytes=1 << 30)
-        v.insert(toks, 16, frags_at(16, seed=9))
+        v.insert(toks, 16, frags_at(16, seed=9), harvest_provenance=_HARVEST_W1)
         cp = v.lookup(toks)
         dv_a.save_async(toks, cp)
         dv_a.flush(30.0)
@@ -237,7 +246,7 @@ class TestRoundTripIdentity(DiskVaultTestCase):
         dv = self.mkvault()
         toks = tokens_for(18, base=31)
         v = ContextVault("ident-A", budget_bytes=1 << 30)
-        v.insert(toks, 18, frags_at(18, seed=11))
+        v.insert(toks, 18, frags_at(18, seed=11), harvest_provenance=_HARVEST_W1)
         cp = v.lookup(toks)
         dv.save_async(toks, cp)
         dv.flush(30.0)
@@ -262,7 +271,7 @@ class TestRefusals(DiskVaultTestCase):
         dv = self.mkvault(identity=identity, **kw)
         toks = tokens_for(14, base=400)
         v = ContextVault(identity, budget_bytes=1 << 30)
-        v.insert(toks, 14, frags_at(14, seed=13))
+        v.insert(toks, 14, frags_at(14, seed=13), harvest_provenance=_HARVEST_W1)
         cp = v.lookup(toks)
         dv.save_async(toks, cp)
         dv.flush(30.0)
@@ -392,9 +401,9 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
 
         toks_a = tokens_for(12, base=100)
         toks_b = tokens_for(12, base=900)
-        vault.insert(toks_a, 12, frags_at(12, seed=21))
+        vault.insert(toks_a, 12, frags_at(12, seed=21), harvest_provenance=_HARVEST_W1)
         want = flat_arrays(vault.lookup(toks_a).fragments)
-        vault.insert(toks_b, 12, frags_at(12, seed=22))
+        vault.insert(toks_b, 12, frags_at(12, seed=22), harvest_provenance=_HARVEST_W1)
 
         self.assertEqual(vault.stats.evictions, 1, "the cap must have bitten")
         self.assertIsNone(vault.lookup(toks_a), "and A must be gone from RAM")
@@ -421,7 +430,7 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
         vault.disk = dv
         toks = tokens_for(12, base=100)
-        vault.insert(toks, 12, frags_at(12, seed=23))
+        vault.insert(toks, 12, frags_at(12, seed=23), harvest_provenance=_HARVEST_W1)
         cp = vault.lookup(toks)
         dv.save_async(toks, cp)
         dv.flush(30.0)
@@ -442,7 +451,7 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
         vault.disk = dv
         toks = tokens_for(24, base=100)
-        vault.insert(toks, 8, frags_at(8, seed=24))
+        vault.insert(toks, 8, frags_at(8, seed=24), harvest_provenance=_HARVEST_W1)
         cp8 = vault.lookup(toks)
         dv.save_async(toks, cp8)
         dv.flush(30.0)
@@ -455,7 +464,7 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
         dv = self.mkvault()
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
         toks = tokens_for(12, base=600)
-        vault.insert(toks, 12, frags_at(12, seed=25))
+        vault.insert(toks, 12, frags_at(12, seed=25), harvest_provenance=_HARVEST_W1)
         dv.save_async(toks, vault.lookup(toks))
         dv.flush(30.0)
         self.assertIsNone(dv.best_record(toks, VaultTier.PREFILL, strict=True))
@@ -466,13 +475,13 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
         vault.disk = dv
         toks = tokens_for(10, base=222)
-        vault.insert(toks, 10, frags_at(10, seed=26))
+        vault.insert(toks, 10, frags_at(10, seed=26), harvest_provenance=_HARVEST_W1)
         dv.flush(5.0)
         self.assertEqual(len(dv.records()), 0, "default policy: save on eviction only")
 
         dv.save_on_insert = True
         toks2 = tokens_for(10, base=333)
-        vault.insert(toks2, 10, frags_at(10, seed=27))
+        vault.insert(toks2, 10, frags_at(10, seed=27), harvest_provenance=_HARVEST_W1)
         self.assertTrue(dv.flush(30.0))
         self.assertEqual(len(dv.records()), 1)
 
@@ -480,7 +489,7 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
         dv = self.mkvault()
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
         toks = tokens_for(10, base=444)
-        vault.insert(toks, 10, frags_at(10, seed=28))
+        vault.insert(toks, 10, frags_at(10, seed=28), harvest_provenance=_HARVEST_W1)
         cp = vault.lookup(toks)
         self.assertTrue(dv.save_async(toks, cp))
         dv.flush(30.0)
@@ -492,7 +501,7 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
         dv = self.mkvault()
         toks = tokens_for(12, base=555)
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
-        vault.insert(toks, 12, frags_at(12, seed=29))
+        vault.insert(toks, 12, frags_at(12, seed=29), harvest_provenance=_HARVEST_W1)
         dv.save_async(toks, vault.lookup(toks))
         dv.flush(30.0)
         dv.close()
@@ -507,7 +516,7 @@ class TestEvictSaveRestoreCycle(DiskVaultTestCase):
         dv = self.mkvault()
         toks = tokens_for(12, base=666)
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
-        vault.insert(toks, 12, frags_at(12, seed=30))
+        vault.insert(toks, 12, frags_at(12, seed=30), harvest_provenance=_HARVEST_W1)
         dv.save_async(toks, vault.lookup(toks))
         dv.flush(30.0)
         dv.close()
@@ -527,7 +536,7 @@ class TestDiskCapLRU(DiskVaultTestCase):
         probe = self.mkvault()
         toks0 = tokens_for(12, base=10)
         v0 = ContextVault("ident-A", budget_bytes=1 << 30)
-        v0.insert(toks0, 12, frags_at(12, seed=41))
+        v0.insert(toks0, 12, frags_at(12, seed=41), harvest_provenance=_HARVEST_W1)
         probe.save_async(toks0, v0.lookup(toks0))
         probe.flush(30.0)
         entry_bytes = probe.records()[0]["bytes"]
@@ -541,7 +550,7 @@ class TestDiskCapLRU(DiskVaultTestCase):
         for i in range(3):
             toks = tokens_for(12, base=1000 * (i + 1))
             v = ContextVault("ident-A", budget_bytes=1 << 30)
-            v.insert(toks, 12, frags_at(12, seed=50 + i))
+            v.insert(toks, 12, frags_at(12, seed=50 + i), harvest_provenance=_HARVEST_W1)
             dv.save_async(toks, v.lookup(toks))
             self.assertTrue(dv.flush(30.0))
             keys.append(dv.records()[-1]["key"])
@@ -557,7 +566,7 @@ class TestDiskCapLRU(DiskVaultTestCase):
         probe = self.mkvault()
         t0 = tokens_for(12, base=10)
         v0 = ContextVault("ident-A", budget_bytes=1 << 30)
-        v0.insert(t0, 12, frags_at(12, seed=61))
+        v0.insert(t0, 12, frags_at(12, seed=61), harvest_provenance=_HARVEST_W1)
         probe.save_async(t0, v0.lookup(t0))
         probe.flush(30.0)
         entry_bytes = probe.records()[0]["bytes"]
@@ -570,7 +579,7 @@ class TestDiskCapLRU(DiskVaultTestCase):
         for i in range(2):
             toks = tokens_for(12, base=2000 * (i + 1))
             v = ContextVault("ident-A", budget_bytes=1 << 30)
-            v.insert(toks, 12, frags_at(12, seed=70 + i))
+            v.insert(toks, 12, frags_at(12, seed=70 + i), harvest_provenance=_HARVEST_W1)
             dv.save_async(toks, v.lookup(toks))
             dv.flush(30.0)
             token_sets.append(toks)
@@ -584,7 +593,7 @@ class TestDiskCapLRU(DiskVaultTestCase):
         time.sleep(0.02)
         toks3 = tokens_for(12, base=9000)
         v3 = ContextVault("ident-A", budget_bytes=1 << 30)
-        v3.insert(toks3, 12, frags_at(12, seed=72))
+        v3.insert(toks3, 12, frags_at(12, seed=72), harvest_provenance=_HARVEST_W1)
         dv.save_async(toks3, v3.lookup(toks3))
         self.assertTrue(dv.flush(30.0))
 
@@ -619,7 +628,7 @@ class TestBlobLayout(DiskVaultTestCase):
         for i in range(3):
             toks = tokens_for(12, base=3000 * (i + 1))
             v = ContextVault("ident-A", budget_bytes=1 << 30)
-            v.insert(toks, 12, frags_at(12, seed=80 + i))
+            v.insert(toks, 12, frags_at(12, seed=80 + i), harvest_provenance=_HARVEST_W1)
             dv.save_async(toks, v.lookup(toks))
             dv.flush(30.0)
         self.assertEqual(len(dv.entry_files()), 3, "3 entries -> 3 files, not 3 x N")
@@ -633,7 +642,7 @@ class TestBlobLayout(DiskVaultTestCase):
         dv = self.mkvault()
         toks = tokens_for(64, base=4000)
         v = ContextVault("ident-A", budget_bytes=1 << 30)
-        v.insert(toks, 64, frags_at(64, seed=90))
+        v.insert(toks, 64, frags_at(64, seed=90), harvest_provenance=_HARVEST_W1)
         cp = v.lookup(toks)
         dv.save_async(toks, cp)
         dv.flush(30.0)
@@ -659,7 +668,7 @@ class TestBlobLayout(DiskVaultTestCase):
         frags = big_fragment(payload)
         v = ContextVault("ident-A", budget_bytes=1 << 30)
         toks = tokens_for(8, base=5000)
-        self.assertTrue(v.insert(toks, 8, frags))
+        self.assertTrue(v.insert(toks, 8, frags, harvest_provenance=_HARVEST_W1))
         dv.save_async(toks, v.lookup(toks))
         self.assertTrue(dv.flush(60.0))
 
@@ -693,7 +702,7 @@ class TestBlobLayout(DiskVaultTestCase):
         dv = self.mkvault(nocache=True)
         toks = tokens_for(12, base=6000)
         v = ContextVault("ident-A", budget_bytes=1 << 30)
-        v.insert(toks, 12, frags_at(12, seed=95))
+        v.insert(toks, 12, frags_at(12, seed=95), harvest_provenance=_HARVEST_W1)
         dv.save_async(toks, v.lookup(toks))
         dv.flush(30.0)
         self.assertTrue(dv.last_nocache_applied, "write fd took F_NOCACHE")
@@ -720,7 +729,7 @@ class TestConcurrency(DiskVaultTestCase):
         # Entry A is already durable; entry B is a large write we start first.
         toks_a = tokens_for(12, base=7000)
         va = ContextVault("ident-A", budget_bytes=1 << 30)
-        va.insert(toks_a, 12, frags_at(12, seed=101))
+        va.insert(toks_a, 12, frags_at(12, seed=101), harvest_provenance=_HARVEST_W1)
         cp_a = va.lookup(toks_a)
         want_a = payload_bytes(cp_a.fragments)
         dv.save_async(toks_a, cp_a)
@@ -728,7 +737,7 @@ class TestConcurrency(DiskVaultTestCase):
 
         toks_b = tokens_for(8, base=8000)
         vb = ContextVault("ident-A", budget_bytes=1 << 30)
-        vb.insert(toks_b, 8, big_fragment(24 << 20))
+        vb.insert(toks_b, 8, big_fragment(24 << 20), harvest_provenance=_HARVEST_W1)
         cp_b = vb.lookup(toks_b)
 
         errors = []
@@ -763,7 +772,7 @@ class TestConcurrency(DiskVaultTestCase):
         dv = self.mkvault()
         toks = tokens_for(12, base=8500)
         v = ContextVault("ident-A", budget_bytes=1 << 30)
-        v.insert(toks, 12, frags_at(12, seed=103))
+        v.insert(toks, 12, frags_at(12, seed=103), harvest_provenance=_HARVEST_W1)
         dv.save_async(toks, v.lookup(toks))
         dv.flush(30.0)
 
@@ -791,7 +800,7 @@ class TestConcurrency(DiskVaultTestCase):
         dv = self.mkvault()
         v = ContextVault("ident-A", budget_bytes=1 << 30)
         toks = tokens_for(8, base=8800)
-        v.insert(toks, 8, big_fragment(48 << 20))
+        v.insert(toks, 8, big_fragment(48 << 20), harvest_provenance=_HARVEST_W1)
         cp = v.lookup(toks)
         t0 = time.perf_counter()
         dv.save_async(toks, cp)
@@ -855,7 +864,7 @@ class TestEnvAndWiring(DiskVaultTestCase):
         vault = ContextVault("ident-A", budget_bytes=1)
         self.assertIsNone(vault.disk)
         toks = tokens_for(12, base=9100)
-        vault.insert(toks, 12, frags_at(12, seed=110))
+        vault.insert(toks, 12, frags_at(12, seed=110), harvest_provenance=_HARVEST_W1)
         # Budget of 1 byte: the rung is refused, nothing raises, no disk touched.
         self.assertEqual(vault.rungs, 0)
 
@@ -875,8 +884,8 @@ class TestEnvAndWiring(DiskVaultTestCase):
         vault = ContextVault("ident-A", budget_bytes=1 << 30)
         a = tokens_for(30, base=1)
         b = a[:10] + [777] * 20
-        vault.insert(a, 20, frags_at(20, seed=120))
-        vault.insert(b, 25, frags_at(25, seed=121))
+        vault.insert(a, 20, frags_at(20, seed=120), harvest_provenance=_HARVEST_W1)
+        vault.insert(b, 25, frags_at(25, seed=121), harvest_provenance=_HARVEST_W1)
         seen = []
         for node in vault._iter_nodes():
             if node.checkpoint is not None:

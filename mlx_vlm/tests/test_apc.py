@@ -10,6 +10,14 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_vlm import apc as apc_module
+from mlx_vlm import harvest_provenance as harvest_provenance_module
+
+# Every store in this file declares a B=1 harvest.  Not decoration: the disk
+# mirror is gated on provenance (L1b-1 -- a batch-harvested entry that becomes
+# durable outlives the process that mis-took it), and these tests exercise the
+# mirror.  ``mlx_vlm/tests/test_apc_harvest_provenance.py`` covers the gate
+# itself, in both directions.
+_HARVEST_W1 = harvest_provenance_module.make(1)
 from mlx_vlm.apc import (
     APCManager,
     DiskBlockStore,
@@ -559,7 +567,7 @@ def test_exact_cache_supports_mixed_kv_and_arrays_cache():
     arrays[0] = mx.ones((1, 3, 4))
     arrays[1] = mx.ones((1, 2, 3)) * 3
 
-    assert manager.store_exact_cache(token_ids, [arrays, kv], extra_hash=7)
+    assert manager.store_exact_cache(token_ids, [arrays, kv], extra_hash=7, harvest_provenance=_HARVEST_W1)
     warm, matched_tokens = manager.lookup_exact_cache(
         token_ids + [999],
         extra_hash=7,
@@ -612,6 +620,7 @@ def test_exact_cache_supports_rotating_and_chunked_kv_cache():
         token_ids,
         [kv, rotating, chunked],
         extra_hash=13,
+        harvest_provenance=_HARVEST_W1,
     )
     warm, matched_tokens = manager.lookup_exact_cache(
         token_ids + [999],
@@ -651,7 +660,7 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
 
     disk = DiskBlockStore(tmp_path, namespace="exact")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [arrays, kv], extra_hash=11)
+    assert manager.store_exact_cache(token_ids, [arrays, kv], extra_hash=11, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     assert disk.num_exact_indexed == 1
     manager.close()
@@ -693,7 +702,7 @@ def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
 
     disk = DiskBlockStore(tmp_path, namespace="rotating-exact")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [kv, rotating], extra_hash=17)
+    assert manager.store_exact_cache(token_ids, [kv, rotating], extra_hash=17, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     manager.close()
 
@@ -939,7 +948,7 @@ def test_exact_disk_hit_is_promoted_to_memory(tmp_path, monkeypatch):
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     disk = DiskBlockStore(tmp_path, namespace="promotion")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [kv], extra_hash=3)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=3, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     manager.close()
 
@@ -983,7 +992,7 @@ def test_exact_disk_hit_promotion_skipped_when_memory_disabled(tmp_path, monkeyp
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     disk = DiskBlockStore(tmp_path, namespace="nopromo")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [kv], extra_hash=5)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=5, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     manager.close()
 
@@ -1024,8 +1033,8 @@ def test_exact_disk_hit_promotion_lru_eviction(tmp_path, monkeypatch):
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     disk = DiskBlockStore(tmp_path, namespace="lru-evict")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids_a, [_make_kv(1, 20)], extra_hash=0)
-    assert manager.store_exact_cache(token_ids_b, [_make_kv(2, 20)], extra_hash=0)
+    assert manager.store_exact_cache(token_ids_a, [_make_kv(1, 20)], extra_hash=0, harvest_provenance=_HARVEST_W1)
+    assert manager.store_exact_cache(token_ids_b, [_make_kv(2, 20)], extra_hash=0, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     manager.close()
 
@@ -1080,7 +1089,7 @@ def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     disk = DiskBlockStore(tmp_path, namespace="priority")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [_make_kv(7)], extra_hash=0)
+    assert manager.store_exact_cache(token_ids, [_make_kv(7)], extra_hash=0, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     manager.close()
 
@@ -1090,7 +1099,7 @@ def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
     disk = DiskBlockStore(tmp_path, namespace="priority")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
     kv_mem = _make_kv(99)
-    manager.store_exact_cache(token_ids, [kv_mem], extra_hash=0)
+    manager.store_exact_cache(token_ids, [kv_mem], extra_hash=0, harvest_provenance=_HARVEST_W1)
     assert manager.stats_snapshot()["exact_stores"] == 1
 
     # Lookup must come from memory (no disk hit).
@@ -1123,7 +1132,7 @@ def test_exact_disk_hit_promotion_clone_is_independent_of_returned_cache(
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     disk = DiskBlockStore(tmp_path, namespace="clone-independence")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [kv], extra_hash=0)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=0, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     manager.close()
 
@@ -1167,7 +1176,7 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     disk = DiskBlockStore(tmp_path, namespace="extra-hash")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [kv], extra_hash=42)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=42, harvest_provenance=_HARVEST_W1)
     disk._q.join()
     manager.close()
 
@@ -1213,12 +1222,12 @@ def test_a_short_first_prompt_does_not_store_a_one_token_snapshot():
     prefix_len = apc_module.adjust_prefix_to_text_suffix_boundary(short, desired, [])
 
     assert prefix_len == 0
-    assert not manager.store_exact_cache(short[:1], _tiny_exact_cache(short[:1]))
+    assert not manager.store_exact_cache(short[:1], _tiny_exact_cache(short[:1]), harvest_provenance=_HARVEST_W1)
 
 
 def test_a_short_prompt_cannot_poison_later_lookups():
     manager = APCManager(num_blocks=8, block_size=16)
-    manager.store_exact_cache([1], _tiny_exact_cache([1]))
+    manager.store_exact_cache([1], _tiny_exact_cache([1]), harvest_provenance=_HARVEST_W1)
 
     later = list(range(1, 400))
     cache, reused = manager.lookup_exact_cache(later)
@@ -1231,7 +1240,7 @@ def test_a_useful_prefix_is_still_stored():
     manager = APCManager(num_blocks=8, block_size=16)
     tokens = list(range(1, 200))
 
-    assert manager.store_exact_cache(tokens[:128], _tiny_exact_cache(tokens[:128]))
+    assert manager.store_exact_cache(tokens[:128], _tiny_exact_cache(tokens[:128]), harvest_provenance=_HARVEST_W1)
 
     cache, reused = manager.lookup_exact_cache(tokens)
     assert cache is not None
