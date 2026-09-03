@@ -651,6 +651,18 @@ def _prime_cached_prefix_rope_state(
     return True
 
 
+def _prompt_cache_is_empty(prompt_cache: Any) -> bool:
+    """Require affirmative emptiness before treating a caller cache as cold.
+
+    An absent/zero offset or size does not prove that recurrent caches are
+    empty. Unknown cache types must opt in through the cache ``empty`` API.
+    """
+    try:
+        return all(c.empty() is True for c in prompt_cache)
+    except Exception:  # an opaque cache must not prevent generation
+        return False
+
+
 def _cache_fully_retained(c: Any) -> bool:
     """Whether ``c`` still holds its whole sequence from position 0.
 
@@ -1024,6 +1036,22 @@ def stream_generate(
     else:
         tokenizer.thinking_budget_criteria = None
 
+    # A raw caller cache may already contain tokens absent from this request.
+    # Keep it for generation, but do not give shared captures (or the next
+    # PromptCacheState) an incomplete token key and falsely cold provenance.
+    # A selected prefix hit above establishes token identity; its provenance
+    # may still be unknown and is propagated by _harvest_prov.make.
+    capture_prefix_known = (
+        reused_prefix_len > 0
+        or "prompt_cache" not in kwargs
+        or _prompt_cache_is_empty(kwargs["prompt_cache"])
+    )
+    if prompt_cache_state is not None and not capture_prefix_known:
+        # It may alias the caller cache, which generation is about to extend.
+        # Clear stale identity even if generation is interrupted or yields no tokens.
+        prompt_cache_state.cache = None
+        prompt_cache_state.token_ids = None
+
     # Ensure we have a prompt_cache we can track for reuse.
     if "prompt_cache" not in kwargs:
         kwargs["prompt_cache"] = cache.make_prompt_cache(
@@ -1039,7 +1067,12 @@ def stream_generate(
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
         exact_checkpoint = None
-        if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
+        if (
+            capture_prefix_known
+            and apc_manager is not None
+            and apc_mode == "exact"
+            and reused_prefix_len == 0
+        ):
             exact_checkpoint_len = _apc.adjust_prefix_to_text_suffix_boundary(
                 full_input_ids_list,
                 len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
@@ -1059,7 +1092,7 @@ def stream_generate(
                     ),
                 )
 
-        if _vault is not None and _vault_boundaries:
+        if capture_prefix_known and _vault is not None and _vault_boundaries:
             # One hook, many boundaries: the APC exact store (if any) keeps its
             # single rung, and every vault rung is stored on the way past it.
             _apc_cb, _apc_len = exact_checkpoint, exact_checkpoint_len
@@ -1111,7 +1144,8 @@ def stream_generate(
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
                 if (
-                    apc_manager is not None
+                    capture_prefix_known
+                    and apc_manager is not None
                     and apc_mode == "exact"
                     and reused_prefix_len == 0
                 ):
@@ -1195,14 +1229,14 @@ def stream_generate(
 
         # Save cache state for potential reuse on next turn
         all_ids: Optional[List[int]] = None
-        if prompt_cache_state is not None:
+        if prompt_cache_state is not None and capture_prefix_known:
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
             prompt_cache_state.update(all_ids, tracked_cache)
 
         # APC: harvest new blocks from the post-generation KV state.
-        if apc_manager is not None and apc_mode == "block":
+        if capture_prefix_known and apc_manager is not None and apc_mode == "block":
             try:
                 if all_ids is None:
                     all_ids = full_input_ids_list + [
@@ -1215,6 +1249,9 @@ def stream_generate(
                     extra_hash=apc_extra_hash,
                     skip_first_n_tokens=reused_prefix_len,
                     blocks_in_use=apc_blocks_in_use,
+                    harvest_provenance=_harvest_prov.make(
+                        1, prefix_len=reused_prefix_len, parent=cached_provenance
+                    ),
                 )
             except Exception as e:
                 logger.warning("APC store failed: %s", e)
