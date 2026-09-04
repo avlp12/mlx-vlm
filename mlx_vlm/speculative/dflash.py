@@ -43,17 +43,14 @@ def batched_draft_enabled() -> bool:
     is the same failure mode as the width default that silently resolved to 3
     (law 23).
 
-    Default ON.  The gate for that default is discrete, not statistical: the
-    batched path must propose the SAME TOKEN IDS as the row-wise path for every
-    row, on ragged contexts, in ``tests/test_dflash_batched_draft.py``.  Draft
-    tokens are integers, so "same" there means equal, not close -- a float
-    difference that never flips an argmax is not a behaviour change, and one
-    that does flip an argmax fails the test.
+    Default OFF. Live same-build comparisons changed accepted-token counts
+    between the row-wise and batched paths. Keep the batched path available
+    through an explicit opt-in while that behavior difference is investigated.
     """
     global _BATCHED_DRAFT_ENV
     if _BATCHED_DRAFT_ENV is None:
         _BATCHED_DRAFT_ENV = os.environ.get(
-            "MLX_VLM_DFLASH_BATCHED_DRAFT", "1"
+            "MLX_VLM_DFLASH_BATCHED_DRAFT", "0"
         ).lower() in ("1", "true", "yes", "on")
     return _BATCHED_DRAFT_ENV
 
