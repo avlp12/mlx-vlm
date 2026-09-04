@@ -367,15 +367,17 @@ def _reset_env_memo():
     dflash_utils._BATCHED_DRAFT_ENV = None
 
 
-def test_the_knob_is_read_once_and_defaults_on(monkeypatch):
+def test_the_knob_is_read_once_and_defaults_off(monkeypatch):
+    # Default OFF since 2026-09-05 (R33): live same-build comparisons changed
+    # accepted-token counts between the row-wise and batched paths.
     _reset_env_memo()
     monkeypatch.delenv("MLX_VLM_DFLASH_BATCHED_DRAFT", raising=False)
     try:
-        assert dflash_utils.batched_draft_enabled() is True
-        monkeypatch.setenv("MLX_VLM_DFLASH_BATCHED_DRAFT", "0")
-        assert dflash_utils.batched_draft_enabled() is True, "must be memoized"
-        _reset_env_memo()
         assert dflash_utils.batched_draft_enabled() is False
+        monkeypatch.setenv("MLX_VLM_DFLASH_BATCHED_DRAFT", "1")
+        assert dflash_utils.batched_draft_enabled() is False, "must be memoized"
+        _reset_env_memo()
+        assert dflash_utils.batched_draft_enabled() is True
     finally:
         _reset_env_memo()
 
