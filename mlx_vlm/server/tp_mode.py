@@ -650,6 +650,12 @@ def launch_worker(model_path: str, hosts: List[str]) -> subprocess.Popen:
     budget = os.environ.get("MLX_VLM_GLM5_TP_PEER_VAULT_BUDGET_GB", "")
     if budget:
         extra += f" MLX_VLM_GLM5_VAULT_BUDGET_GB={budget}"
+    # This experimental boolean must never interpolate an arbitrary local value
+    # into the remote shell.  Forward only the canonical enabled literal.
+    if os.environ.get("MLX_VLM_GLM5_GDN_PREFIX_CAPTURE", "").lower() in (
+        "1", "true", "yes", "on"
+    ):
+        extra += " MLX_VLM_GLM5_GDN_PREFIX_CAPTURE=1"
     inner = (
         f"cd {src} && MLX_VLM_GLM5_FUSED_KDA=1 PYTHONPATH={src} "
         f"{ENV_HOSTS}='{','.join(hosts)}' {ENV_RANK}=1 "

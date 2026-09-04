@@ -470,10 +470,12 @@ _TY_CANDIDATES = (32, 16, 8, 4)
 
 
 def _kernel(kind: str = "base"):
-    """``kind`` in {"base", "capture", "qproj"}; ``None`` if Metal is unavailable.
+    """Return a named KDA kernel, or ``None`` when Metal is unavailable.
 
-    Three objects rather than one: mx.fast.metal_kernel derives the function
-    signature from input_names/output_names, so each variant needs its own.
+    Each ABI gets its own object because ``mx.fast.metal_kernel`` derives its
+    function signature from input and output names.  In particular,
+    ``block_capture`` must never change the default ``block`` ABI: the latter
+    is the default-on production verify route.
     """
     global _KERNEL_TRIED
     if not _KERNEL_TRIED:
@@ -507,6 +509,16 @@ def _kernel(kind: str = "base"):
                 header=_HEADER,
                 source=_qproj_source(_SOURCE),
             )
+    # Capture carries two O(S) outputs and is default-off.  Do not compile it
+    # while merely preparing the default decode/verify kernels.
+    if kind == "block_capture" and kind not in _KERNELS and mx.metal.is_available():
+        _KERNELS["block_capture"] = mx.fast.metal_kernel(
+            name="glm5_kda_verify_block_capture",
+            input_names=_BLOCK_INPUT_NAMES,
+            output_names=_BLOCK_CAPTURE_OUTPUT_NAMES,
+            header=_HEADER,
+            source=_BLOCK_CAPTURE_SOURCE,
+        )
     return _KERNELS.get(kind)
 
 
@@ -520,13 +532,14 @@ def _probe_launch(kind, ty, dt, st, num_heads, head_dim, conv_kernel_size, bits,
     per-pipeline threadgroup limit is exercised here rather than mid-forward."""
     h, d, k = num_heads, head_dim, conv_kernel_size
     zeros = lambda shape, dtype: mx.zeros(shape, dtype=dtype)  # noqa: E731
+    steps = 2 if kind == "block_capture" else 1
     args = dict(
-        q_in=zeros((1, 1, h * d), dt),
-        k_in=zeros((1, 1, h * d), dt),
-        v_in=zeros((1, 1, h * d), dt),
+        q_in=zeros((1, steps, h * d), dt),
+        k_in=zeros((1, steps, h * d), dt),
+        v_in=zeros((1, steps, h * d), dt),
         conv_state=zeros((1, k - 1, 3 * h * d), dt),
         conv_w=zeros((3 * h * d, k, 1), dt),
-        b=zeros((1, 1, h), dt),
+        b=zeros((1, steps, h), dt),
         A_log=zeros((h,), mx.float32),
         dt_bias=zeros((h * d,), mx.float32),
         state=zeros((1, h, d, d), st),
@@ -541,30 +554,41 @@ def _probe_launch(kind, ty, dt, st, num_heads, head_dim, conv_kernel_size, bits,
         args["gate"] = None
         qproj = (zeros((1, 1, d), dt), proj, zeros((1, 1, d), dt), proj)
     else:
-        args["a"] = zeros((1, 1, h * d), dt)
-        args["gate"] = zeros((1, 1, h * d), dt)
+        args["a"] = zeros((1, steps, h * d), dt)
+        args["gate"] = zeros((1, steps, h * d), dt)
         qproj = None
-    outs = fused_kda_decode_step(
-        args["q_in"],
-        args["k_in"],
-        args["v_in"],
-        args["conv_state"],
-        args["conv_w"],
-        args["a"],
-        args["b"],
-        args["A_log"],
-        args["dt_bias"],
-        args["state"],
-        args["gate"],
-        args["o_weight"],
+    common = dict(
         num_heads=h,
         head_dim=d,
         conv_kernel_size=k,
         lower_bound=-5.0,
         norm_eps=1e-5,
         ty=ty,
-        qproj=qproj,
     )
+    if kind == "block_capture":
+        outs = fused_kda_verify_block_capture(
+            args["q_in"], args["k_in"], args["v_in"], args["conv_state"],
+            args["conv_w"], args["a"], args["b"], args["A_log"],
+            args["dt_bias"], args["state"], args["gate"], args["o_weight"],
+            **common,
+        )
+    else:
+        outs = fused_kda_decode_step(
+            args["q_in"],
+            args["k_in"],
+            args["v_in"],
+            args["conv_state"],
+            args["conv_w"],
+            args["a"],
+            args["b"],
+            args["A_log"],
+            args["dt_bias"],
+            args["state"],
+            args["gate"],
+            args["o_weight"],
+            **common,
+            qproj=qproj,
+        )
     mx.eval(outs)
 
 
@@ -1130,6 +1154,133 @@ _BLOCK_INPUT_NAMES = [
     "nsteps",
 ]
 
+# The default verify ABI exposes only the final recurrence/window state.  The
+# optional GDN rollback capture ABI additionally writes the state and convolution
+# window after every non-final token.  It is deliberately a separate kernel:
+# production's default ``block`` route therefore keeps its name, output arity,
+# dispatch arguments, and allocation graph unchanged when the experiment is off.
+_BLOCK_CAPTURE_INSERTION = """    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ---------------------------------------------------------------- epilogue
+"""
+_BLOCK_CAPTURE_WRITES = """    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Optional rollback receipt: after token t, record the same recurrent state
+    // and oldest-to-newest conv window a singleton decode would retain.  The
+    // final token remains in state_out/conv_state_out, so this array is S-1 long.
+    if (t + 1u < S) {
+      const size_t ps_base =
+          (((size_t)b * (size_t)(S - 1u) + (size_t)t) * (size_t)H + (size_t)h)
+          * (size_t)D * (size_t)D;
+      for (int j = 0; j < NDV; ++j) {
+        uint dv = ty + (uint)TY * (uint)j;
+        for (int i = 0; i < NDK; ++i) {
+          prefix_state[ps_base + (size_t)dv * (size_t)D + NDK * lane + i] =
+              static_cast<ST>(st[j][i]);
+        }
+      }
+      for (uint idx = tid; idx < KM1 * 3u * (uint)D; idx += NT) {
+        uint slot = idx / (3u * (uint)D);
+        uint r    = idx - slot * 3u * (uint)D;
+        uint part = r / (uint)D;
+        uint d    = r - part * (uint)D;
+        uint c    = part * QKVD + h * (uint)D + d;
+        const size_t pc_base =
+            (((size_t)b * (size_t)(S - 1u) + (size_t)t) * (size_t)KM1
+             + (size_t)slot) * (size_t)CDIM;
+        prefix_conv[pc_base + c] =
+            twin[((t + 1u + slot) % KM1) * 3u * (uint)D + r];
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- epilogue
+"""
+if _BLOCK_CAPTURE_INSERTION not in _BLOCK_SOURCE:  # fail at import, never silently omit capture
+    raise RuntimeError("KDA block capture insertion point missing")
+_BLOCK_CAPTURE_SOURCE = _BLOCK_SOURCE.replace(
+    _BLOCK_CAPTURE_INSERTION, _BLOCK_CAPTURE_WRITES, 1
+)
+_BLOCK_CAPTURE_OUTPUT_NAMES = _BLOCK_OUTPUT_NAMES + ["prefix_state", "prefix_conv"]
+
+
+def _fused_kda_verify_block(
+    q_in: mx.array,
+    k_in: mx.array,
+    v_in: mx.array,
+    conv_state: mx.array,
+    conv_w: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    gate: mx.array,
+    o_weight: mx.array,
+    *,
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    lower_bound: float,
+    norm_eps: float,
+    mask: Optional[mx.array] = None,
+    ty: int = 32,
+    capture_prefix: bool = False,
+) -> Tuple[mx.array, ...]:
+    """The whole S-token KDA block in one launch.  S is runtime, not templated.
+
+    Shapes mirror the S=1 entry point with the singleton time axis widened:
+    ``q_in/k_in/v_in/a/gate`` are ``[B, S, H*D]``, ``b`` is ``[B, S, H]``, and the
+    optional ``mask`` is ``[B, S]`` bool -- the eager path zeroes the pre-conv
+    input per (row, token), and so does the kernel.
+
+    Returns ``(y, state_out, conv_state_out, q, k, v)``.  ``y`` is ``[B, S, H*D]``,
+    exactly what the eager path hands to ``o_proj``; ``conv_state_out`` is the last
+    K-1 pre-conv rows, i.e. the eager ``conv_input[:, -(K-1):, :]``; and q/k/v are
+    the post-conv, post-L2-norm ``[B, S, H, D]`` tensors ``gdn_sink`` carries for
+    speculative rollback.  They are emitted unconditionally because the verify
+    path always carries a sink.  ``capture_prefix=True`` selects a different
+    kernel ABI and appends ``prefix_state`` and ``prefix_conv``.  It is kept
+    private so the production function's signature and output arity remain
+    unchanged.
+
+    One threadgroup per (batch row, head), same as S=1 -- so B>1 x S>1 needs no
+    new machinery, only a ``[B, S]`` mask instead of ``[B]``.
+    """
+    H, D, K = num_heads, head_dim, conv_kernel_size
+    B, S = q_in.shape[0], q_in.shape[1]
+    dt = q_in.dtype
+    if mask is None:
+        valid = mx.ones((B * S,), dtype=mx.bool_)
+    else:
+        valid = mask.reshape(B * S)
+    kernel = _kernel("block_capture" if capture_prefix else "block")
+    output_shapes = [(B, S, H * D), state.shape, conv_state.shape] + [(B, S, H, D)] * 3
+    output_dtypes = [dt, state.dtype, dt, dt, dt, dt]
+    if capture_prefix:
+        output_shapes += [
+            (B, S - 1, H, D, D),
+            (B, S - 1, K - 1, 3 * H * D),
+        ]
+        output_dtypes += [state.dtype, dt]
+    return kernel(
+        inputs=[
+            q_in, k_in, v_in, conv_state, conv_w, a, b, A_log, dt_bias, state,
+            gate, o_weight,
+            float(lower_bound), float(head_dim**-0.5), float(norm_eps), valid,
+            int(S),
+        ],
+        template=[
+            ("T", dt), ("ST", state.dtype), ("H", num_heads), ("D", head_dim),
+            ("K", conv_kernel_size), ("TY", ty),
+        ],
+        grid=(32, ty, B * num_heads),
+        threadgroup=(32, ty, 1),
+        output_shapes=output_shapes,
+        output_dtypes=output_dtypes,
+    )
+
 
 def fused_kda_verify_block(
     q_in: mx.array,
@@ -1153,23 +1304,7 @@ def fused_kda_verify_block(
     mask: Optional[mx.array] = None,
     ty: int = 32,
 ) -> Tuple[mx.array, ...]:
-    """The whole S-token KDA block in one launch.  S is runtime, not templated.
-
-    Shapes mirror the S=1 entry point with the singleton time axis widened:
-    ``q_in/k_in/v_in/a/gate`` are ``[B, S, H*D]``, ``b`` is ``[B, S, H]``, and the
-    optional ``mask`` is ``[B, S]`` bool -- the eager path zeroes the pre-conv
-    input per (row, token), and so does the kernel.
-
-    Returns ``(y, state_out, conv_state_out, q, k, v)``.  ``y`` is ``[B, S, H*D]``,
-    exactly what the eager path hands to ``o_proj``; ``conv_state_out`` is the last
-    K-1 pre-conv rows, i.e. the eager ``conv_input[:, -(K-1):, :]``; and q/k/v are
-    the post-conv, post-L2-norm ``[B, S, H, D]`` tensors ``gdn_sink`` carries for
-    speculative rollback.  They are emitted unconditionally because the verify
-    path always carries a sink.
-
-    One threadgroup per (batch row, head), same as S=1 -- so B>1 x S>1 needs no
-    new machinery, only a ``[B, S]`` mask instead of ``[B]``.
-    """
+    """Default-on verify block ABI: six outputs, exactly as before."""
     H, D, K = num_heads, head_dim, conv_kernel_size
     B, S = q_in.shape[0], q_in.shape[1]
     dt = q_in.dtype
@@ -1194,4 +1329,35 @@ def fused_kda_verify_block(
         output_shapes=[(B, S, H * D), state.shape, conv_state.shape]
         + [(B, S, H, D)] * 3,
         output_dtypes=[dt, state.dtype, dt, dt, dt, dt],
+    )
+
+
+def fused_kda_verify_block_capture(
+    q_in: mx.array,
+    k_in: mx.array,
+    v_in: mx.array,
+    conv_state: mx.array,
+    conv_w: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    gate: mx.array,
+    o_weight: mx.array,
+    *,
+    num_heads: int,
+    head_dim: int,
+    conv_kernel_size: int,
+    lower_bound: float,
+    norm_eps: float,
+    mask: Optional[mx.array] = None,
+    ty: int = 32,
+) -> Tuple[mx.array, ...]:
+    """Experimental S>1 capture ABI with per-prefix KDA state and conv windows."""
+    return _fused_kda_verify_block(
+        q_in, k_in, v_in, conv_state, conv_w, a, b, A_log, dt_bias, state,
+        gate, o_weight, num_heads=num_heads, head_dim=head_dim,
+        conv_kernel_size=conv_kernel_size, lower_bound=lower_bound,
+        norm_eps=norm_eps, mask=mask, ty=ty, capture_prefix=True,
     )
