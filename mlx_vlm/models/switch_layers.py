@@ -8,6 +8,9 @@ import numpy as np
 from .activations import swiglu
 
 _SEG_ALIGN_ENV = None
+_DENSE_PREFILL_ENV = None
+_DENSE_MIN_ROWS_ENV = None
+_DENSE_MAX_BYTES_ENV = None
 
 
 def _moe_segment_align() -> int:
@@ -69,6 +72,115 @@ def _moe_segment_align() -> int:
                 n = 0
         _SEG_ALIGN_ENV = max(0, n)
     return _SEG_ALIGN_ENV
+
+
+def _moe_dense_prefill_enabled() -> bool:
+    """``MLX_VLM_GLM5_MOE_DENSE_PREFILL=1`` -- dense bf16 gather_mm over the SELECTED
+    experts of a chunk, instead of the quantized ``gather_qmm`` kernel.  Default OFF.
+
+    WHY.  ``gather_qmm``'s quantized kernel is built for a handful of rows per expert
+    (decode: 1 row/expert; small verify blocks). At long-prefill chunk sizes (8k+ tokens),
+    GLM-5.3-Flash's 288-expert/top-8 router sends far more rows to each touched expert, and
+    L7-a's receipts (rows-per-expert p10 ~35-41 at chunk 8192) suggest the quantized-gather
+    kernel's per-tile overhead stops paying for itself. Dequantizing to bf16 once per layer
+    per chunk and running a dense ``gather_mm`` trades a transient dequant buffer for a
+    kernel with none of that per-row quantized overhead -- profitable only when there are
+    enough rows/expert to amortize the dequant, hence MIN_ROWS below.
+
+    NOT YET MEASURED END TO END: this toggle ships with CPU correctness tests only (see
+    tests/test_glm5_moe_dense_prefill.py). No GPU timing exists yet -- see the report for
+    the L7-b harness command that would produce it.
+    """
+    global _DENSE_PREFILL_ENV
+    if _DENSE_PREFILL_ENV is None:
+        v = os.environ.get("MLX_VLM_GLM5_MOE_DENSE_PREFILL", "0").strip().lower()
+        _DENSE_PREFILL_ENV = v in ("1", "true", "yes", "on")
+    return _DENSE_PREFILL_ENV
+
+
+def _moe_dense_min_rows() -> int:
+    """Average rows/expert (``indices.size / num_experts``) below which the dense path
+    declines and falls back to ``gather_qmm``. Default 32."""
+    global _DENSE_MIN_ROWS_ENV
+    if _DENSE_MIN_ROWS_ENV is None:
+        try:
+            n = int(os.environ.get("MLX_VLM_GLM5_MOE_DENSE_MIN_ROWS", "32"))
+        except ValueError:
+            n = 32
+        _DENSE_MIN_ROWS_ENV = max(0, n)
+    return _DENSE_MIN_ROWS_ENV
+
+
+def _moe_dense_max_bytes() -> int:
+    """Byte cap on the transient dequantized (bf16) expert-weight buffer for ONE
+    projection (gate_proj, up_proj, or down_proj individually -- not the sum of the
+    three). Default 16 GiB. If the selected experts for a layer would exceed this, the
+    dense path declines for that call and falls back to ``gather_qmm``."""
+    global _DENSE_MAX_BYTES_ENV
+    if _DENSE_MAX_BYTES_ENV is None:
+        try:
+            n = int(os.environ.get("MLX_VLM_GLM5_MOE_DENSE_MAX_BYTES", str(16 * (1024**3))))
+        except ValueError:
+            n = 16 * (1024**3)
+        _DENSE_MAX_BYTES_ENV = max(0, n)
+    return _DENSE_MAX_BYTES_ENV
+
+
+def _dense_selected_expert_gather_mm(
+    x, ql, indices, sorted_indices, max_bytes, dtype=mx.bfloat16
+):
+    """Dequantize only the experts present in ``indices`` to ``dtype`` and run a dense
+    ``gather_mm`` against them, remapping ``indices`` into the compact expert-major
+    buffer. Returns ``None`` (caller must fall back to ``gather_qmm``) if the transient
+    buffer would exceed ``max_bytes``.
+
+    COSTS ONE HOST SYNC (the same class of sync ``_segment_align_order`` already pays):
+    the set of unique experts is data-dependent, so it cannot be derived on the GPU.
+
+    ``dtype`` defaults to bf16 (the production path, matched to Metal's gather_mm).
+    Tests pass ``mx.float32`` explicitly: mlx 0.32.1's CPU backend for ``gather_mm``
+    ("GatherMM::eval") only implements float32 -- bf16 raises RuntimeError on CPU. That
+    is a pre-existing mlx CPU-backend restriction (SwitchLinear's own non-quantized
+    gather_mm call, used by e.g. the gemma4 MoE, hits the same wall on CPU); it is not
+    something this lever can or should work around, so bf16 numerics/timing on Metal
+    remain UNVERIFIED by these CPU-only tests.
+    """
+    idx_np = np.array(indices, copy=False).reshape(-1)  # <- the sync
+    uniq = np.unique(idx_np)
+    n_uniq = int(uniq.shape[0])
+
+    out_dims = ql.output_dims
+    in_dims = ql.input_dims
+    itemsize = 4 if dtype == mx.float32 else 2
+    bytes_needed = n_uniq * out_dims * in_dims * itemsize  # ONE projection matrix
+    if bytes_needed > max_bytes:
+        return None
+
+    uniq_mx = mx.array(uniq.astype(np.uint32))
+    biases = ql.get("biases")
+    w = mx.dequantize(
+        ql["weight"][uniq_mx],
+        scales=ql["scales"][uniq_mx],
+        biases=biases[uniq_mx] if biases is not None else None,
+        group_size=ql.group_size,
+        bits=ql.bits,
+        mode=ql.mode,
+        dtype=dtype,
+    )
+
+    local_of = np.zeros(ql.num_experts, dtype=np.uint32)
+    local_of[uniq] = np.arange(n_uniq, dtype=np.uint32)
+    remapped = mx.array(local_of[idx_np]).reshape(indices.shape)
+
+    y = mx.gather_mm(
+        x.astype(dtype),
+        w.swapaxes(-1, -2),
+        rhs_indices=remapped,
+        sorted_indices=sorted_indices,
+    )
+    if "bias" in ql:
+        y = y + mx.expand_dims(ql["bias"][indices], -2)
+    return y.astype(x.dtype)
 
 
 def _segment_align_order(sorted_indices, num_experts, align):
@@ -174,6 +286,19 @@ class QuantizedSwitchLinear(nn.Module):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False):
+        # S>1 guard is implicit: decode (S=1, indices.size == top_k) and speculative
+        # verify (S<=8, indices.size <= 8*top_k) both leave rows_per_expert far below
+        # MIN_ROWS's default of 32 for a 288-expert router, so this branch costs those
+        # paths nothing but one Python-side division -- no host sync unless the average
+        # already clears the bar.
+        if _moe_dense_prefill_enabled() and indices.size >= 2:
+            rows_per_expert = indices.size / max(self.num_experts, 1)
+            if rows_per_expert >= _moe_dense_min_rows():
+                dense = _dense_selected_expert_gather_mm(
+                    x, self, indices, sorted_indices, _moe_dense_max_bytes()
+                )
+                if dense is not None:
+                    return dense
         x = mx.gather_qmm(
             x,
             self["weight"],
