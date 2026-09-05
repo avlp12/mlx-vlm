@@ -680,9 +680,30 @@ def test_the_runtime_snapshot_exposes_the_speculative_counters(monkeypatch):
 def test_the_runtime_snapshot_says_disabled_without_a_drafter(monkeypatch):
     import sys
 
+    from mlx_vlm.models.glm5_next import language as glm5_language
+
     app_module = sys.modules["mlx_vlm.server.app"]
     monkeypatch.setattr(app_module.runtime, "response_generator", None, raising=False)
-    assert app_module._speculative_stats_snapshot() == {"enabled": False}
+    # Isolate from any GDN rollback/selection activity other test modules in
+    # this same process may have driven -- these counters are process-global
+    # lifetime state (module scope, not per-instance), by design (see
+    # gdn_capture_counters_snapshot's docstring), so a zeros assertion needs
+    # an explicit reset rather than assuming a fresh process.
+    glm5_language._reset_gdn_capture_counters_for_test()
+    snapshot = app_module._speculative_stats_snapshot()
+    # "gdn" is present even with no drafter attached: the GDN prefix-capture
+    # counters are process-global module state on glm5_next.language, not
+    # drafter state, so they read back regardless of whether a drafter is
+    # attached (see _gdn_capture_stats_snapshot's docstring).
+    assert snapshot.keys() == {"enabled", "gdn"}
+    assert snapshot["enabled"] is False
+    assert snapshot["gdn"] == {
+        "gdn_capture_selected_calls": 0,
+        "gdn_capture_fallback_calls": 0,
+        "gdn_replay_rollbacks": 0,
+        "gdn_gather_rollbacks": 0,
+        "gdn_capture_env": int(glm5_language._FUSED_KDA_GDN_PREFIX_CAPTURE),
+    }
 
 
 def test_the_round_timers_are_off_by_default_and_readable(monkeypatch):

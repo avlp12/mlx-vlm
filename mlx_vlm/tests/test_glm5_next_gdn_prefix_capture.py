@@ -462,3 +462,225 @@ def test_capture_entry_state_dtype_schema_is_fail_loud():
         glm5_language.LanguageModel.rollback_speculative_cache(
             _owner(), [cache], [tuple(values)], 1, 3
         )
+
+
+# --------------------------------------------------------------------------
+# Lifetime GDN engagement counters (gdn_capture_selected_calls /
+# gdn_capture_fallback_calls / gdn_replay_rollbacks / gdn_gather_rollbacks /
+# gdn_capture_env).  These are process-global module state (see
+# ``gdn_capture_counters_snapshot``'s docstring for why), so every test below
+# resets them first for isolation from whatever the rest of this file (or
+# another test module collected into the same process) already drove.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_gdn_counters():
+    glm5_language._reset_gdn_capture_counters_for_test()
+    yield
+    glm5_language._reset_gdn_capture_counters_for_test()
+
+
+def test_gdn_capture_env_counter_reads_the_module_flag(monkeypatch):
+    monkeypatch.setattr(glm5_language, "_FUSED_KDA_GDN_PREFIX_CAPTURE", False)
+    assert glm5_language.gdn_capture_counters_snapshot()["gdn_capture_env"] == 0
+    monkeypatch.setattr(glm5_language, "_FUSED_KDA_GDN_PREFIX_CAPTURE", True)
+    assert glm5_language.gdn_capture_counters_snapshot()["gdn_capture_env"] == 1
+
+
+def test_gdn_counters_start_at_zero_after_reset():
+    assert glm5_language.gdn_capture_counters_snapshot() == {
+        "gdn_capture_selected_calls": 0,
+        "gdn_capture_fallback_calls": 0,
+        "gdn_replay_rollbacks": 0,
+        "gdn_gather_rollbacks": 0,
+        "gdn_capture_env": int(glm5_language._FUSED_KDA_GDN_PREFIX_CAPTURE),
+    }
+
+
+def test_gdn_gather_rollbacks_counts_captured_receipt_consumption():
+    entry, final_state, final_conv = _entry(batch=2)
+    cache = _cache(final_state, final_conv)
+    with patch.object(
+        glm5_language,
+        "gated_delta_update",
+        side_effect=AssertionError("captured prefix must not replay gated_delta"),
+    ):
+        glm5_language.LanguageModel.rollback_speculative_cache(
+            _owner(), [cache], [entry], [2, 0], 3
+        )
+    snapshot = glm5_language.gdn_capture_counters_snapshot()
+    assert snapshot["gdn_gather_rollbacks"] == 1
+    assert snapshot["gdn_replay_rollbacks"] == 0
+
+
+def test_gdn_replay_rollbacks_counts_legacy_receipt_consumption():
+    entry, final_state, final_conv = _entry()
+    legacy = entry[:11]
+    cache = _cache(final_state, final_conv)
+
+    def replay(*args, **kwargs):
+        return mx.zeros((1, 2, H, D)), mx.full((1, H, D, D), 999.0)
+
+    with patch.object(glm5_language, "gated_delta_update", side_effect=replay):
+        glm5_language.LanguageModel.rollback_speculative_cache(
+            _owner(), [cache], [legacy], 1, 3
+        )
+    snapshot = glm5_language.gdn_capture_counters_snapshot()
+    assert snapshot["gdn_replay_rollbacks"] == 1
+    assert snapshot["gdn_gather_rollbacks"] == 0
+
+
+def test_gdn_rollback_counters_accumulate_across_multiple_calls():
+    legacy_entry, legacy_final_state, legacy_final_conv = _entry(batch=1)
+    legacy = legacy_entry[:11]
+    captured_entry, captured_final_state, captured_final_conv = _entry(batch=2)
+
+    def replay(*args, **kwargs):
+        return mx.zeros((1, 2, H, D)), mx.full((1, H, D, D), 999.0)
+
+    with patch.object(glm5_language, "gated_delta_update", side_effect=replay):
+        glm5_language.LanguageModel.rollback_speculative_cache(
+            _owner(),
+            [_cache(legacy_final_state, legacy_final_conv)],
+            [legacy],
+            1,
+            3,
+        )
+        glm5_language.LanguageModel.rollback_speculative_cache(
+            _owner(),
+            [_cache(legacy_final_state, legacy_final_conv)],
+            [legacy],
+            1,
+            3,
+        )
+    with patch.object(
+        glm5_language,
+        "gated_delta_update",
+        side_effect=AssertionError("captured prefix must not replay gated_delta"),
+    ):
+        glm5_language.LanguageModel.rollback_speculative_cache(
+            _owner(),
+            [_cache(captured_final_state, captured_final_conv)],
+            [captured_entry],
+            [2, 0],
+            3,
+        )
+    snapshot = glm5_language.gdn_capture_counters_snapshot()
+    assert snapshot["gdn_replay_rollbacks"] == 2
+    assert snapshot["gdn_gather_rollbacks"] == 1
+
+
+def _fused_kda_block_fake_self(*, ready):
+    """A minimal stand-in for ``Glm5NextLinearAttention`` -- just the attributes
+    ``_fused_kda_block`` reads -- so the capture-selection counters can be
+    exercised without building a real layer/config or touching Metal."""
+    fg = SimpleNamespace(
+        f_b_proj=lambda x: mx.zeros((1, 2, H * D)),
+        A_log=mx.zeros((H, 1), dtype=mx.float32),
+        dt_bias=mx.zeros((H, D), dtype=mx.float32),
+        safe_gate_lower_bound=-5.0,
+    )
+    return SimpleNamespace(
+        forget_gate=fg,
+        g_b_proj=lambda x: mx.zeros((1, 2, H * D)),
+        num_heads=H,
+        head_dim=D,
+        conv_kernel_size=K,
+        conv1d=SimpleNamespace(weight=mx.zeros((3 * H * D, K, 1))),
+        o_norm=SimpleNamespace(weight=mx.zeros(D), eps=1e-5),
+        o_proj=lambda y: y,
+        _fused_kda_ty=1,
+        _fused_kda_prefix_capture_ty=2,
+        _fused_kda_prefix_capture_ready=lambda *a, **k: ready,
+    )
+
+
+def _fake_verify_block(*args, **kwargs):
+    return (
+        mx.zeros((1, 2, H, D)),  # y
+        mx.zeros((1, H, D, D)),  # state_out
+        mx.zeros((1, K - 1, C)),  # conv_state_out
+        mx.zeros((1, 2, H, D)),  # q_s
+        mx.zeros((1, 2, H, D)),  # k_s
+        mx.zeros((1, 2, H, D)),  # v_s
+    )
+
+
+def _fake_verify_block_capture(*args, **kwargs):
+    return _fake_verify_block(*args, **kwargs) + (
+        mx.zeros((1, 1, H, D, D)),  # prefix_states (S - 1 = 1)
+        mx.zeros((1, 1, K - 1, C)),  # prefix_convs
+    )
+
+
+def _fused_kda_block_call_args(cache, gdn_sink):
+    # q_o/k_o/v_o/fa_o/ga_o are [B, S, H*D] here (as ``__call__`` produces them
+    # via ``q_proj`` etc, before ``_fused_kda_block`` reshapes ``a``/``gate``
+    # to [B, S, H, D] itself) -- ``_fused_kda_block`` unpacks ``B, S, _ =
+    # q_o.shape``, so this must stay 3-D.
+    q_o = k_o = v_o = fa_o = ga_o = mx.zeros((1, 2, H * D))
+    b_o = mx.zeros((1, 2, H))
+    mixed = mx.zeros((1, 2, C))
+    return (q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, None, mixed)
+
+
+def test_fused_kda_block_counts_capture_selected_when_ready():
+    with patch.object(glm5_language, "_FUSED_KDA_GDN_PREFIX_CAPTURE", True), patch.object(
+        glm5_language, "fused_kda_verify_block", side_effect=AssertionError(
+            "ready capture must not fall back to the default kernel"
+        )
+    ), patch.object(
+        glm5_language, "fused_kda_verify_block_capture", side_effect=_fake_verify_block_capture
+    ):
+        cache = _cache(mx.zeros((1, H, D, D)), mx.zeros((1, K - 1, C)))
+        gdn_sink = []
+        glm5_language.Glm5NextLinearAttention._fused_kda_block(
+            _fused_kda_block_fake_self(ready=True),
+            *_fused_kda_block_call_args(cache, gdn_sink),
+        )
+    snapshot = glm5_language.gdn_capture_counters_snapshot()
+    assert snapshot["gdn_capture_selected_calls"] == 1
+    assert snapshot["gdn_capture_fallback_calls"] == 0
+    assert len(gdn_sink[0]) == glm5_language._GDN_PREFIX_FIELDS
+
+
+def test_fused_kda_block_counts_capture_fallback_when_probe_not_ready():
+    with patch.object(glm5_language, "_FUSED_KDA_GDN_PREFIX_CAPTURE", True), patch.object(
+        glm5_language, "fused_kda_verify_block", side_effect=_fake_verify_block
+    ), patch.object(
+        glm5_language,
+        "fused_kda_verify_block_capture",
+        side_effect=AssertionError("a not-ready probe must not select the capture kernel"),
+    ):
+        cache = _cache(mx.zeros((1, H, D, D)), mx.zeros((1, K - 1, C)))
+        gdn_sink = []
+        glm5_language.Glm5NextLinearAttention._fused_kda_block(
+            _fused_kda_block_fake_self(ready=False),
+            *_fused_kda_block_call_args(cache, gdn_sink),
+        )
+    snapshot = glm5_language.gdn_capture_counters_snapshot()
+    assert snapshot["gdn_capture_selected_calls"] == 0
+    assert snapshot["gdn_capture_fallback_calls"] == 1
+    assert len(gdn_sink[0]) == glm5_language._GDN_LEGACY_FIELDS
+
+
+def test_fused_kda_block_leaves_capture_counters_untouched_when_env_off():
+    with patch.object(glm5_language, "_FUSED_KDA_GDN_PREFIX_CAPTURE", False), patch.object(
+        glm5_language, "fused_kda_verify_block", side_effect=_fake_verify_block
+    ), patch.object(
+        glm5_language,
+        "fused_kda_verify_block_capture",
+        side_effect=AssertionError("capture must not run with the env flag off"),
+    ):
+        cache = _cache(mx.zeros((1, H, D, D)), mx.zeros((1, K - 1, C)))
+        gdn_sink = []
+        glm5_language.Glm5NextLinearAttention._fused_kda_block(
+            # ``ready`` should never even be consulted with the env off, since
+            # ``_fused_kda_prefix_capture_enabled`` short-circuits first.
+            _fused_kda_block_fake_self(ready=True),
+            *_fused_kda_block_call_args(cache, gdn_sink),
+        )
+    snapshot = glm5_language.gdn_capture_counters_snapshot()
+    assert snapshot["gdn_capture_selected_calls"] == 0
+    assert snapshot["gdn_capture_fallback_calls"] == 0

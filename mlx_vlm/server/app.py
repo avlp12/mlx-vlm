@@ -172,6 +172,28 @@ def _prefill_batch_refusal_counts() -> dict:
         return {}
 
 
+def _gdn_capture_stats_snapshot() -> dict:
+    """The GLM5-next GDN prefix-capture engagement counters, or ``{}``.
+
+    These live as process-global module state in
+    ``models/glm5_next/language.py`` (34 KDA layers per forward share one
+    capture decision path, so the counters are aggregated there rather than
+    per layer instance), not on the drafter object -- so unlike the rest of
+    this snapshot they read back the same whether or not a drafter is
+    attached.  That matters for exactly the paired A/B this exists for: the
+    capture env var and kernel path do not vary with whether speculative
+    decoding is on.  Defensive for the same reason every other stats read
+    here is: a stats read must never fail a health/metrics endpoint, and a
+    non-glm5_next model simply has nothing to import.
+    """
+    try:
+        from ..models.glm5_next.language import gdn_capture_counters_snapshot
+
+        return gdn_capture_counters_snapshot()
+    except Exception:  # noqa: BLE001 - observability must not break the endpoint
+        return {}
+
+
 def _speculative_stats_snapshot() -> dict:
     """The drafter's lifetime speculative receipts, or ``{"enabled": False}``.
 
@@ -181,11 +203,15 @@ def _speculative_stats_snapshot() -> dict:
     drafter object (sweep11 L2 did exactly that). ``batch_rounds`` is what turns
     the row-round total into rows/round -- the realised batch width, measured
     rather than assumed from the request count.
+
+    ``"gdn"`` is the GLM5-next fused-KDA prefix-capture counter sub-dict (see
+    ``_gdn_capture_stats_snapshot``); it is included in both branches below
+    since it does not depend on a drafter being attached.
     """
     generator = runtime.response_generator
     drafter = getattr(generator, "draft_model", None) if generator else None
     if drafter is None:
-        return {"enabled": False}
+        return {"enabled": False, "gdn": _gdn_capture_stats_snapshot()}
     rounds = int(getattr(drafter, "speculative_total_rounds", 0) or 0)
     batch_rounds = int(getattr(drafter, "speculative_total_batch_rounds", 0) or 0)
     row_rounds = int(getattr(drafter, "speculative_total_row_rounds", 0) or 0)
@@ -209,6 +235,7 @@ def _speculative_stats_snapshot() -> dict:
         ),
         "rows_per_round": (row_rounds / batch_rounds) if batch_rounds else None,
         "width": (drafted / rounds + 1.0) if rounds else None,
+        "gdn": _gdn_capture_stats_snapshot(),
     }
     draft_seconds = getattr(drafter, "speculative_draft_seconds", None)
     if draft_seconds is not None:

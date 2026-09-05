@@ -123,6 +123,47 @@ _FUSED_KDA_GDN_PREFIX_CAPTURE = os.environ.get(
     "MLX_VLM_GLM5_GDN_PREFIX_CAPTURE", "0"
 ).lower() in ("1", "true", "yes", "on")
 
+# Lifetime GDN prefix-capture engagement counters.  Module-level, not per-layer:
+# a forward touches all 34 KDA layers through the same capture decision path in
+# ``_fused_kda_block``, and a caller (``server/app.py::_speculative_stats_snapshot``)
+# wants the aggregate across every layer and every call, not one counter object
+# per layer instance that would need separately summing.  Each increment is a
+# single dict write under a lock -- negligible next to a kernel dispatch -- and
+# none of them touch a numerical path; they only observe which branch a call
+# already took.
+_GDN_CAPTURE_COUNTERS_LOCK = threading.Lock()
+_GDN_CAPTURE_COUNTERS = {
+    "gdn_capture_selected_calls": 0,
+    "gdn_capture_fallback_calls": 0,
+    "gdn_replay_rollbacks": 0,
+    "gdn_gather_rollbacks": 0,
+}
+
+
+def _gdn_counter_incr(name: str) -> None:
+    with _GDN_CAPTURE_COUNTERS_LOCK:
+        _GDN_CAPTURE_COUNTERS[name] += 1
+
+
+def gdn_capture_counters_snapshot() -> dict:
+    """Lifetime GDN prefix-capture counters plus the capture env flag as read.
+
+    Read by ``server/app.py::_speculative_stats_snapshot`` for the ``"gdn"``
+    sub-dict.  Safe to call with no drafter or model loaded -- the counters
+    simply read back as zero.
+    """
+    with _GDN_CAPTURE_COUNTERS_LOCK:
+        snapshot = dict(_GDN_CAPTURE_COUNTERS)
+    snapshot["gdn_capture_env"] = int(_FUSED_KDA_GDN_PREFIX_CAPTURE)
+    return snapshot
+
+
+def _reset_gdn_capture_counters_for_test() -> None:
+    """Test-only: zero the lifetime counters.  Never called from production code."""
+    with _GDN_CAPTURE_COUNTERS_LOCK:
+        for key in _GDN_CAPTURE_COUNTERS:
+            _GDN_CAPTURE_COUNTERS[key] = 0
+
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
@@ -1206,11 +1247,21 @@ class Glm5NextLinearAttention(nn.Module):
         a = fg.f_b_proj(fa_o)
         gate = self.g_b_proj(ga_o)
         entry_state = cache[1]
-        capture_prefix = _fused_kda_prefix_capture_enabled(gdn_sink, S, B)
+        capture_eligible = _fused_kda_prefix_capture_enabled(gdn_sink, S, B)
+        capture_prefix = capture_eligible
         if capture_prefix and not self._fused_kda_prefix_capture_ready(
             q_o.dtype, entry_state.dtype
         ):
             capture_prefix = False
+        if capture_eligible:
+            # Verify this call actually took the capture kernel vs. fell back
+            # to the default verify kernel because the probe (or the shape/env
+            # gate re-checked here) said the capture ABI is not ready.
+            _gdn_counter_incr(
+                "gdn_capture_selected_calls"
+                if capture_prefix
+                else "gdn_capture_fallback_calls"
+            )
         if capture_prefix:
             (
                 y,
@@ -3181,8 +3232,10 @@ class LanguageModel(nn.Module):
                     # selects each row independently, using the existing final
                     # cache for the full row and a prefix receipt for the other.
                     # No gated-delta replay is allowed on this path.
+                    _gdn_counter_incr("gdn_gather_rollbacks")
                     c[1], c[0] = payload
                     continue
+                _gdn_counter_incr("gdn_replay_rollbacks")
                 entry = payload
                 (
                     q_,
