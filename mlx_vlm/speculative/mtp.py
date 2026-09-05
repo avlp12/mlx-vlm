@@ -10,13 +10,35 @@ from ..models import cache
 from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
+    _record_draft_seconds,
     _record_speculative_round,
+    _record_verify_seconds,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
     _SpeculativeSamplerRNG,
     generation_stream,
 )
+
+_MTP_ROUND_TIMERS_ENV = None
+
+
+def _mtp_round_timers_enabled() -> bool:
+    """``MLX_VLM_MTP_ROUND_TIMERS=1`` -- split the batched MTP round into a
+    draft half and a verify half for timing (mirrors
+    ``dflash._round_timers_enabled``).
+
+    OFF by default and deliberately perturbing when on: the split is only
+    meaningful if each half is waited for, so the timing arm forces an
+    ``mx.eval`` between the draft and the verify that the untimed path does
+    not do.  Read the arms against each OTHER, never against an untimed run.
+    """
+    global _MTP_ROUND_TIMERS_ENV
+    if _MTP_ROUND_TIMERS_ENV is None:
+        _MTP_ROUND_TIMERS_ENV = os.environ.get(
+            "MLX_VLM_MTP_ROUND_TIMERS", "0"
+        ).lower() in ("1", "true", "yes", "on")
+    return _MTP_ROUND_TIMERS_ENV
 
 
 @dataclass
@@ -1040,6 +1062,7 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    prompt_tokens: Optional[mx.array] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1049,6 +1072,16 @@ def _mtp_rounds_batch(
     snapshot) instead of multi-layer hidden capture, ``draft_block`` is
     autoregressive, and the per-round ``shared_kv`` snapshot is normalized
     back to the unbatched prefix-valid layout before each drafter rebind.
+
+    The server dispatches every batch size here (unlike DFlash, which keeps
+    a dedicated B=1 loop), so this function -- not just ``_mtp_rounds`` --
+    owns priming a NoPE-MLA drafter's own cache from the prompt.
+    ``prompt_tokens``, when given, is used to do that at B=1 only (see the
+    priming block below); B>1 is left unprimed for now (documented there).
+    Set ``MLX_VLM_MTP_ROUND_TIMERS=1`` to accumulate
+    ``speculative_draft_seconds``/``speculative_verify_seconds`` on
+    ``draft_model`` (surfaced by ``_speculative_stats_snapshot``), mirroring
+    ``MLX_VLM_DFLASH_ROUND_TIMERS``.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -1071,6 +1104,35 @@ def _mtp_rounds_batch(
         enabled=not greedy_sampling
         and not _sampler_supports_positioned_target(sampler),
     )
+
+    # Prime the drafter's own cache from the prompt, exactly as the offline
+    # B=1 path does (see the priming block in ``_mtp_rounds``): the server
+    # dispatches EVERY batch size to this function, including B=1, and
+    # ``reset()`` above just wiped the drafter's cache. A NoPE-MLA drafter
+    # (e.g. GLM-5-Next's nextn head) has no other way to see anything before
+    # the just-sampled bonus token, so without this call round 0 (and every
+    # round until the cache has organically refilled) drafts blind to the
+    # prompt. Only B=1 is primed here: ``prefill_from_target_hidden`` shifts
+    # and embeds the WHOLE per-row prompt in one forward, and doing that
+    # correctly for a left-padded, per-row-length batch would need a
+    # per-row-length-aware slice this drafter's cache does not expose today
+    # -- left as a follow-up (see
+    # docs/drafts/sweep11/UPSTREAM_MTP_REASSESSMENT_2026-09-03.md, ADAPT-1).
+    # ``prompt_tokens``/``hidden`` come from the same prefill capture the
+    # offline path reads (``speculative_hidden_state`` / the server's
+    # ``_run_chunked_speculative_prefill``), so no new capture plumbing is
+    # needed -- this was purely a threading gap.
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if B == 1 and callable(prefill_draft) and prompt_tokens is not None:
+        sampler_rng.draft_call(
+            prefill_draft,
+            prompt_tokens,
+            hidden,
+            first_bonus,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+        )
 
     # First-round hidden: prefill output may have shape [B, L, H]; reduce
     # to a single slot per row (last prompt token's hidden — see comment in
@@ -1103,6 +1165,7 @@ def _mtp_rounds_batch(
     )
     if pause_ctl is not None:
         pause_ctl._drafter = draft_model
+    timed = _mtp_round_timers_enabled()
 
     while len(active_idx) > 0:
         remaining = [
@@ -1133,6 +1196,7 @@ def _mtp_rounds_batch(
 
         # Draft (autoregressive K-step). hidden / shared_kv state was set
         # via set_shared_kv above; the drafter pulls it from there.
+        draft_started = time.perf_counter() if timed else 0.0
         draft_tokens = sampler_rng.draft_tokens(
             _mtp_draft_block_active,
             draft_model,
@@ -1144,6 +1208,10 @@ def _mtp_rounds_batch(
             positions_active,
             greedy_sampling=greedy_sampling,
         )
+        if timed:
+            mx.eval(draft_tokens)
+            draft_finished = time.perf_counter()
+            _record_draft_seconds(draft_model, draft_finished - draft_started)
 
         # Verify
         with mx.stream(generation_stream):
@@ -1156,6 +1224,9 @@ def _mtp_rounds_batch(
                 sample_target_tokens=greedy_sampling,
             )
             hidden_full = verify.hidden  # [B_active, bs, H]
+        if timed:
+            mx.eval(hidden_full)
+            _record_verify_seconds(draft_model, time.perf_counter() - draft_finished)
 
         # Walk per-row
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]

@@ -212,8 +212,11 @@ def _speculative_stats_snapshot() -> dict:
     }
     draft_seconds = getattr(drafter, "speculative_draft_seconds", None)
     if draft_seconds is not None:
-        # Only present when MLX_VLM_DFLASH_ROUND_TIMERS is on; the untimed path
-        # never sets the attribute, so its absence is not a zero.
+        # Only present when the active kind's round-timer env var is on
+        # (MLX_VLM_DFLASH_ROUND_TIMERS for dflash, MLX_VLM_MTP_ROUND_TIMERS
+        # for mtp -- both write the same attribute names via the shared
+        # ``_record_draft_seconds``/``_record_verify_seconds`` helpers); the
+        # untimed path never sets the attribute, so its absence is not a zero.
         snapshot["draft_seconds"] = float(draft_seconds)
         snapshot["verify_seconds"] = float(
             getattr(drafter, "speculative_verify_seconds", 0.0) or 0.0

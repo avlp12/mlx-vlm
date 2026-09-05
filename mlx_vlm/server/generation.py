@@ -48,6 +48,7 @@ from ..sample_utils import (
 from ..speculative.utils import (
     PrefillHiddenAccumulator,
     batched_draft_enabled,
+    chunk_capture_kwargs_for,
     make_speculative_prompt_cache,
     prefill_capture_kwargs,
     prefill_context_keep,
@@ -247,14 +248,14 @@ def _run_chunked_speculative_prefill(
     # HERE and not to the dict the chunking policy sees, so the policy decision is
     # byte-for-byte what it was.
     capture_kwargs = prefill_capture_kwargs(lm, speculative_kwargs)
-    # Only a per-layer capture (``capture_layer_ids``) survives being split across
-    # chunks and stitched back.  MTP's ``return_hidden`` capture is a single
-    # pre-final-norm hidden whose consumer wants the LAST token only
-    # (``_mtp_rounds`` reads ``hidden_states[-1]``), and its chunk loop is already
-    # correct without it -- so it stays off the chunks, exactly as before.
-    chunk_capture_kwargs = (
-        capture_kwargs if capture_kwargs.get("capture_layer_ids") else {}
-    )
+    # Only a per-layer capture (``capture_layer_ids``), or MTP's ``return_hidden``
+    # with the server-priming window on (``mtp_prime_window()``), survives being
+    # split across chunks and stitched back -- see ``chunk_capture_kwargs_for``.
+    # With the window off, MTP's chunk loop only ever needed the LAST prompt
+    # token's hidden (``_mtp_rounds``/``_mtp_rounds_batch`` read
+    # ``hidden_states[-1]``), which any single forward already gives it, so the
+    # capture stays off the chunks in that case -- exactly as before priming.
+    chunk_capture_kwargs = chunk_capture_kwargs_for(capture_kwargs)
     accumulator = PrefillHiddenAccumulator(keep=hidden_context_keep)
 
     if (

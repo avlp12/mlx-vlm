@@ -31,6 +31,7 @@ from .mtp import (
     _mtp_draft_block_active,
     _mtp_draft_hidden,
     _mtp_next_block_size,
+    _mtp_round_timers_enabled,
     _mtp_rounds,
     _mtp_rounds_batch,
     _mtp_shared_kv_from_prompt_cache,
@@ -58,6 +59,7 @@ __all__ = [
     "_mtp_draft_block_active",
     "_mtp_draft_hidden",
     "_mtp_next_block_size",
+    "_mtp_round_timers_enabled",
     "_mtp_rounds",
     "_mtp_rounds_batch",
     "_mtp_shared_kv_from_prompt_cache",
@@ -67,9 +69,11 @@ __all__ = [
     "_speculative_walk_batch_deferred_greedy",
     "_speculative_walk_batch_uniform_acceptance",
     "_speculative_walk_deferred_greedy",
+    "chunk_capture_kwargs_for",
     "format_speculative_stats",
     "get_speculative_rounds_batch",
     "make_speculative_prompt_cache",
+    "mtp_prime_window",
     "prefill_capture_kwargs",
     "prefill_context_keep",
     "prefill_context_offset",
@@ -161,12 +165,40 @@ def prefill_context_trim_enabled() -> bool:
     Deliberately not memoized, for the reason recorded in
     ``drafters/qwen3_dflash/dflash.py``: a first-call memo is a test hazard and one
     ``os.environ`` lookup per *request* is free.
+
+    DFlash only.  See :func:`mtp_prime_window` for the analogous MTP knob --
+    they are deliberately independent switches (:func:`prefill_context_keep`
+    explains why).
     """
     return os.environ.get("MLX_VLM_SPEC_PREFILL_CTX_TRIM", "1") not in (
         "0",
         "false",
         "False",
     )
+
+
+def mtp_prime_window() -> int:
+    """Trailing prompt rows an MTP drafter is primed on, across chunk boundaries.
+
+    ``0`` disables the carry: the chunk loop stops asking for ``return_hidden``
+    on intermediate chunks, exactly as it did before server priming existed, so
+    ``prefill_from_target_hidden`` only ever sees whatever a single (unchunked,
+    or last-chunk-only) forward captured -- i.e. the pre-fix behaviour.
+
+    Capped at 2048 by default rather than left unbounded, because
+    ``Glm5NextMTPDraftModel._mask_for`` builds a DENSE ``[S, S]`` boolean
+    attention mask (``create_attention_mask(..., return_array=True)`` ->
+    ``create_causal_mask``) whenever it primes on S>1 tokens: the mask is
+    O(S^2), so at the 2048 default it stays a single-digit-MB allocation, while
+    an unbounded prime on a 131k-token prompt would try to build a mask with
+    ~1.7*10^10 elements instead -- gigabytes for a boolean array, and the whole
+    point of the cap is to never get there.
+
+    Deliberately not memoized, for the same reason as
+    :func:`prefill_context_trim_enabled`: a first-call memo is a test hazard and
+    one ``os.environ`` lookup per *request* is free.
+    """
+    return int(os.environ.get("MLX_VLM_MTP_PRIME_WINDOW", "2048"))
 
 
 def prefill_context_keep(draft_kind: str, drafter) -> Optional[int]:
@@ -177,8 +209,27 @@ def prefill_context_keep(draft_kind: str, drafter) -> Optional[int]:
     draft layer reads the whole context, so nothing may be hoisted in front of
     it).  The drafter is the only thing that knows this -- see
     ``DFlashDraftModel.prefill_context_keep``.
+
+    ``mtp`` is handled separately from ``dflash`` and does NOT consult
+    :func:`prefill_context_trim_enabled`.  That switch guards a
+    correctness-preserving OPTIMIZATION for dflash: the drafter's own contract
+    says it only ever reads its trailing K rows, so keeping just those rows
+    changes nothing the drafter can see, and turning the switch off simply
+    forgoes the memory saving.  For MTP there is no such contract -- the
+    drafter has no declared window of its own, ``mtp_prime_window()`` chooses
+    one for it -- so the window IS the feature (server priming across chunk
+    boundaries), not an optional trim on top of an already-correct wider
+    context.  Gating it on a dflash-focused kill switch would mean a deployment
+    that flips ``MLX_VLM_SPEC_PREFILL_CTX_TRIM=0`` for dflash reasons silently
+    also loses MTP prompt priming; ``MLX_VLM_MTP_PRIME_WINDOW=0`` is the
+    dedicated off switch for that instead.
     """
-    if draft_kind != "dflash" or drafter is None:
+    if drafter is None:
+        return None
+    if draft_kind == "mtp":
+        window = mtp_prime_window()
+        return window if window > 0 else None
+    if draft_kind != "dflash":
         return None
     if not prefill_context_trim_enabled():
         return None
@@ -187,6 +238,36 @@ def prefill_context_keep(draft_kind: str, drafter) -> Optional[int]:
         return None
     keep = fn()
     return None if keep is None else int(keep)
+
+
+def chunk_capture_kwargs_for(prefill_capture_kwargs: dict) -> dict:
+    """The capture kwargs an intermediate chunk of a chunked prefill must carry.
+
+    Only two captures survive being split across chunk boundaries and stitched
+    back together on the time axis by :class:`PrefillHiddenAccumulator`:
+
+    * a per-layer capture (``capture_layer_ids`` -- dflash/eagle3): each chunk's
+      per-layer ``[B, chunk_len, D]`` pieces concatenate cleanly along axis 1.
+    * MTP's ``return_hidden``, but ONLY when :func:`mtp_prime_window` is on.
+      When it is off, MTP's original (pre-priming) consumer wants the LAST
+      prompt token's hidden only, which any single forward already gives it
+      without paying for a capture on every chunk -- so the capture stays off
+      the chunks in that case, exactly as before server priming existed.
+
+    ``return_shared_kv`` never rides a chunk regardless: it is only consumed
+    off the FINAL prefill forward (the live target KV state prefill hands to
+    the round loop), and the model returns ``shared_kv_states = {}`` for MTP
+    whether or not the kwarg rides a given forward (see
+    ``Glm5NextModel.__call__`` in ``models/glm5_next/language.py``) -- so
+    asking for it on a chunk would be a forward-kwarg for no benefit.
+    """
+    if not prefill_capture_kwargs:
+        return {}
+    if prefill_capture_kwargs.get("capture_layer_ids"):
+        return prefill_capture_kwargs
+    if prefill_capture_kwargs.get("return_hidden") and mtp_prime_window() > 0:
+        return {"return_hidden": True}
+    return {}
 
 
 def prefill_context_offset(outputs) -> int:
@@ -427,6 +508,7 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            prompt_tokens=prompt_tokens,
         )
         return
 

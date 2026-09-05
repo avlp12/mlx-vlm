@@ -146,12 +146,26 @@ class Glm5NextMTPDraftModel(nn.Module):
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
     ) -> None:
-        if input_ids.shape[1] == 0:
+        if input_ids.shape[1] == 0 or hidden.shape[1] == 0:
             return
         if isinstance(bonus_token, int):
             bonus = mx.array([[bonus_token]], dtype=token_dtype)
         else:
             bonus = bonus_token[:, None].astype(token_dtype)
+
+        # ``input_ids`` is the WHOLE prompt; ``hidden`` is the target's capture of
+        # (at most) the trailing ``mtp_prime_window()`` prompt rows -- a chunked
+        # prefill only carries ``return_hidden`` across chunks up to that window
+        # (see ``speculative.utils.chunk_capture_kwargs_for`` /
+        # ``PrefillHiddenAccumulator``), so on a prompt longer than the window
+        # ``hidden.shape[1] < input_ids.shape[1]``.  The two are aligned by the
+        # TAIL, not the head: the bonus token is the next-token prediction that
+        # follows the LAST prompt token, so priming on the last
+        # ``min(len(input_ids), len(hidden))`` prompt positions keeps that
+        # alignment regardless of which side is shorter.
+        n = min(int(input_ids.shape[1]), int(hidden.shape[1]))
+        input_ids = input_ids[:, -n:]
+        hidden = hidden[:, -n:, :]
 
         shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
         h = self._forward_tokens(shifted, hidden[:, : shifted.shape[1], :], token_dtype)

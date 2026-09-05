@@ -58,8 +58,11 @@ from mlx_vlm.speculative.dflash import _adopt_pretruncated_context
 from mlx_vlm.speculative.drafters.dflash2 import DFlash2DraftModel, ModelConfig
 from mlx_vlm.speculative.utils import (
     PrefillHiddenAccumulator,
+    chunk_capture_kwargs_for,
+    mtp_prime_window,
     prefill_context_keep,
     prefill_context_offset,
+    speculative_hidden_state,
 )
 
 CAPTURE_IDS = [0, 1]
@@ -497,10 +500,37 @@ def test_the_trim_has_a_kill_switch(monkeypatch):
 
 
 def test_only_dflash_offers_a_trim():
+    """dflash's trim is drafter-published; eagle3/lookup never trim.
+
+    ``mtp`` is deliberately NOT in this loop: it has its own window
+    (``mtp_prime_window()``, exercised separately below), independent of the
+    dflash-only kill switch this trim reads.
+    """
     model = _drafter()
-    for kind in ("mtp", "eagle3", "lookup"):
+    for kind in ("eagle3", "lookup"):
         assert prefill_context_keep(kind, model) is None
     assert prefill_context_keep("dflash", None) is None
+
+
+def test_mtp_offers_its_own_window_not_the_dflash_trim(monkeypatch):
+    """MTP's context window is ``mtp_prime_window()``, gated by its own env only.
+
+    Any non-``None`` drafter qualifies (unlike dflash, MTP publishes no
+    per-drafter contract) and ``MLX_VLM_SPEC_PREFILL_CTX_TRIM=0`` -- the
+    dflash-focused kill switch -- must NOT also disable it.
+    """
+    model = _drafter()
+    assert prefill_context_keep("mtp", model) == mtp_prime_window()
+    assert prefill_context_keep("mtp", None) is None
+
+    monkeypatch.setenv("MLX_VLM_SPEC_PREFILL_CTX_TRIM", "0")
+    assert prefill_context_keep("mtp", model) == mtp_prime_window()
+
+    monkeypatch.setenv("MLX_VLM_MTP_PRIME_WINDOW", "0")
+    assert prefill_context_keep("mtp", model) is None
+
+    monkeypatch.setenv("MLX_VLM_MTP_PRIME_WINDOW", "64")
+    assert prefill_context_keep("mtp", model) == 64
 
 
 def test_a_drafter_that_cannot_adopt_an_offset_is_a_loud_error():
@@ -680,6 +710,31 @@ def test_the_accumulator_never_trims_inside_the_loop():
     assert stitched[0].reshape(-1).tolist() == [7.0, 8.0, 9.0, 10.0, 11.0]
 
 
+def test_accumulator_stitches_two_mtp_shaped_chunks_to_one_element_list():
+    """MTP's capture is a ONE-element ``hidden_states`` list (the pre-final-norm
+    hidden, ``Glm5NextModel.__call__``'s ``hidden_sink``), unlike dflash/eagle3's
+    per-layer list.  The accumulator must not assume more than one layer and
+    must keep returning a one-element list after stitching two chunks and
+    trimming to a ``keep`` smaller than their combined width.
+    """
+    keep = 3
+    acc = PrefillHiddenAccumulator(keep=keep)
+    chunk_a = mx.arange(8, dtype=mx.float32).reshape(1, 4, 2)  # rows 0..3
+    chunk_b = mx.arange(8, 16, dtype=mx.float32).reshape(1, 4, 2)  # rows 4..7
+    acc.append(_Captured([chunk_a]))
+    acc.append(_Captured([chunk_b]))
+    stitched, offset = acc.finish()
+    assert len(stitched) == 1
+    assert stitched[0].shape == (1, keep, 2)
+    assert offset == 8 - keep == 5
+    # Trailing `keep` rows of the 8-row concatenation are rows 5, 6, 7.
+    assert stitched[0][0, :, 0].tolist() == [10.0, 12.0, 14.0]
+    # speculative_hidden_state("mtp", ...) reads hidden_states[-1] -- confirm
+    # that still yields the same one-element window.
+    out = _Captured(stitched)
+    assert speculative_hidden_state("mtp", out) is stitched[-1]
+
+
 def test_the_accumulator_releases_chunks_it_can_prove_are_outside_the_window():
     """Whole aged-out chunks are dropped so the loop's own retention is bounded."""
     keep = 5
@@ -773,11 +828,87 @@ def test_the_policy_leaves_the_other_drafters_where_they_were():
     )
 
 
-def test_mtp_capture_is_not_carried_into_the_chunks():
-    """MTP's ``return_hidden`` capture must stay off the chunk loop.
+def test_chunk_capture_kwargs_for_dflash_and_eagle3_pass_through():
+    """A per-layer capture (dflash/eagle3) rides every chunk unchanged."""
+    kwargs = {"capture_layer_ids": [0, 1], "capture_gdn_states": False}
+    assert chunk_capture_kwargs_for(kwargs) is kwargs
 
-    Its consumer reads ``hidden_states[-1]`` and wants the LAST token; stitching
-    would hand it the whole prompt.  Its chunk loop is already correct as it is.
+
+def test_chunk_capture_kwargs_for_lookup_and_empty_is_empty():
+    assert chunk_capture_kwargs_for({}) == {}
+
+
+def test_chunk_capture_kwargs_for_mtp_follows_the_window(monkeypatch):
+    """MTP rides ``return_hidden`` only, and only while the window is on.
+
+    ``return_shared_kv`` never rides a chunk (see ``chunk_capture_kwargs_for``'s
+    docstring: nothing consumes a chunk's transient shared-KV, and the model
+    returns ``{}`` for it regardless).
+    """
+    full = {"return_hidden": True, "return_shared_kv": True}
+    assert chunk_capture_kwargs_for(full) == {"return_hidden": True}
+
+    monkeypatch.setenv("MLX_VLM_MTP_PRIME_WINDOW", "0")
+    assert chunk_capture_kwargs_for(full) == {}
+
+    monkeypatch.setenv("MLX_VLM_MTP_PRIME_WINDOW", "64")
+    assert chunk_capture_kwargs_for(full) == {"return_hidden": True}
+
+
+def test_mtp_capture_stays_off_the_chunks_when_the_window_is_disabled(monkeypatch):
+    """``MLX_VLM_MTP_PRIME_WINDOW=0`` reproduces the pre-priming behaviour.
+
+    Its consumer then reads ``hidden_states[-1]`` and wants only the LAST
+    prompt token, which any single forward already gives it, so the capture
+    has no reason to ride the earlier chunks.
+    """
+    monkeypatch.setenv("MLX_VLM_MTP_PRIME_WINDOW", "0")
+    seen = []
+    lm = _lm()
+
+    class _Spy:
+        supports_capture_gdn_states = True
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            seen.append(dict(kwargs))
+            return self.inner(inputs, cache=cache, **kwargs)
+
+    spy = _Spy(lm)
+    prompt = _prompt(PROMPT)
+    out, _ = server_generation._run_chunked_speculative_prefill(
+        spy,
+        prompt,
+        lm.model.embed_tokens(prompt),
+        lm.make_cache(),
+        {},
+        {"return_hidden": True, "return_shared_kv": True},
+        prefill_step_size=CHUNK,
+        generation_stream=STREAM,
+        hidden_context_keep=prefill_context_keep("mtp", lm),
+    )
+    assert len(seen) > 1
+    for kwargs in seen[:-1]:
+        assert "return_hidden" not in kwargs
+    assert seen[-1]["return_hidden"] is True
+    assert out.hidden_states[-1].shape[1] == 1
+
+
+def test_mtp_capture_is_carried_into_every_chunk_when_the_window_is_on():
+    """Regression: server priming (commit 752cf0c3) needs the WHOLE prompt.
+
+    752cf0c3 primes the B=1 server drafter from the prefill's captured hidden,
+    but under APC exact chunking the old rule (capture only the final,
+    one-token, chunk) handed the drafter a one-row context and crashed on
+    concatenation as soon as the primed prompt did not match that width.  With
+    the window on, every chunk must carry ``return_hidden``, and every chunk
+    but the FINAL one must not carry ``return_shared_kv`` -- see
+    ``chunk_capture_kwargs_for``: nothing consumes an intermediate chunk's
+    transient shared-KV, only the final forward's live state matters.  The
+    stitched capture must cover ``min(prompt_len, window)`` rows, not just the
+    last chunk's.
     """
     seen = []
     lm = _lm()
@@ -803,12 +934,16 @@ def test_mtp_capture_is_not_carried_into_the_chunks():
         {"return_hidden": True, "return_shared_kv": True},
         prefill_step_size=CHUNK,
         generation_stream=STREAM,
+        hidden_context_keep=prefill_context_keep("mtp", lm),
     )
     assert len(seen) > 1
+    for kwargs in seen:
+        assert kwargs["return_hidden"] is True
     for kwargs in seen[:-1]:
-        assert "return_hidden" not in kwargs
-    assert seen[-1]["return_hidden"] is True
-    assert out.hidden_states[-1].shape[1] == 1
+        assert "return_shared_kv" not in kwargs
+    assert seen[-1]["return_shared_kv"] is True
+    assert len(out.hidden_states) == 1
+    assert out.hidden_states[0].shape[1] == min(PROMPT, mtp_prime_window())
 
 
 # --------------------------------------------- 7. the non-server generator (ar.py)
