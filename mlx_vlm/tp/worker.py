@@ -38,7 +38,14 @@ ENV_WORKER_MODEL = "MLX_VLM_GLM5_TP_WORKER_MODEL"
 # Bumped whenever the wire layout below changes.  Both ranks check it in
 # preflight over a vector whose width never changes, so a version skew is a
 # clean refusal instead of a shape-mismatched collective that hangs.
-PROTO_VERSION = 3
+#
+# 3 -> 4: wire layout unchanged, but rank 1's half of the per-verb echo
+# agreement (contribute -_LAST_SHAPE, not zeros) was fixed here.  A fixed
+# rank 0 paired with an unfixed rank 1 must be refused at formation -- the
+# old rank 1 contributes zeros, which reproduces rank 0's view instead of
+# cancelling it, so the very first verb with a nonzero epoch reads as a
+# disagreement and every TP serve dies on op2.
+PROTO_VERSION = 4
 
 OP_EXIT, OP_MAKE_CACHE, OP_FORWARD = 0, 1, 2
 OP_ROLLBACK = 3         # speculative round rejected: roll my own shard back
@@ -398,7 +405,15 @@ def _ctrl_recv() -> Ctrl:
     # the NameError had never fired -- but it would have fired on the first run
     # that set MLX_VLM_GLM5_TP_CTRL_IDLE_S, i.e. exactly the vault-hang
     # reproduction this bound exists for.
-    contrib = mx.zeros((1, HEADER + n), dtype=mx.int32)
+    #
+    # Rank 1's HALF of the per-verb echo agreement: -its own view of the
+    # previous verb's shape, in the reserved slots.  Contributing plain zeros
+    # made the sum equal rank 0's view instead of the DIFFERENCE, so the first
+    # verb with a nonzero epoch read as a disagreement and every TP serve died
+    # on op2.
+    _row = [0] * (HEADER + n)
+    _row[HEADER + n - ECHO_WORDS:] = [-int(v) for v in _LAST_SHAPE]
+    contrib = mx.array([_row], dtype=mx.int32)
     bound = _ctrl_idle_bound()
 
     # THE UNLOCK.  _ctrl_idle_bound ships at 0 because a TIME-ONLY bound cannot
@@ -411,7 +426,7 @@ def _ctrl_recv() -> Ctrl:
         out = all_sum(contrib)          # unchanged legacy behaviour
         with driving():
             mx.eval(out)
-        return decode(out[0].tolist())
+        return _decode_checked(out[0].tolist(), n)
 
     # on_fire runs in the watcher thread, which is the only thread that can act:
     # this one is about to be stuck inside the collective with no way back.
@@ -422,12 +437,12 @@ def _ctrl_recv() -> Ctrl:
         out = all_sum(contrib)
         with driving():
             mx.eval(out)
-    # Decode strictly only where it was already strict.  Turning the shape-drift
-    # check on for the previously-unbounded path would be a behaviour change
-    # smuggled inside a liveness patch; the asymmetry between decode() here and
-    # _decode_checked() on the bounded path is real and is raised separately.
+    # Both paths now decode strictly: rank 1 must record _LAST_SHAPE on every
+    # verb it decodes, or the very next contribution it makes (-_LAST_SHAPE)
+    # is stale and the echo agreement drifts regardless of which wait path was
+    # taken to get here.
     row = out[0].tolist()
-    return _decode_checked(row, n) if bound > 0 else decode(row)
+    return _decode_checked(row, n)
 
 
 def _hb_stall_probe():
@@ -457,7 +472,7 @@ def _decode_checked(row, n):
             f"completes size-mismatched collectives silently, so this check is "
             f"carried in the control message rather than left to the transport.")
     msg = decode(row)
-    _LAST_SHAPE[:] = [int(msg.b), int(msg.s), int(msg.epoch)]
+    _LAST_SHAPE[:] = [int(msg.batch), int(msg.seqlen), int(msg.epoch)]
     return msg
 
 

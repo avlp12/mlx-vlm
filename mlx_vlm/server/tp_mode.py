@@ -367,6 +367,8 @@ class MirroredLanguageModel:
 
     # ------------------------------------------------------------ the forward
     def __call__(self, inputs=None, cache=None, **kw):
+        if self._closed:
+            raise TPUnavailable("TP mirror already released its peer")
         embeds = kw.get("inputs_embeds")
         if inputs is None:
             raise TPUnavailable("TP mode needs token ids to mirror a forward")
@@ -547,7 +549,7 @@ class MirroredLanguageModel:
             return ok
 
     # --------------------------------------------------------------- teardown
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         """Stop rank 1, release the wired limit, and drop the shard.
 
         Ordered, because the order is the point.  Announce EXIT first so the
@@ -557,15 +559,25 @@ class MirroredLanguageModel:
         ``mx.clear_cache()`` can actually return the memory.  A shutdown that
         skips the last step is what left 183 GiB resident while the next load
         started, and froze the box.
+
+        Returns whether EXIT was actually sent *this call*.  Idempotent, but
+        NOT a no-op on repeat: a mirror already marked ``_closed`` (typically
+        by ``_release_peer`` after a failed announce) must still run its local
+        teardown here -- otherwise the wire context and ``self._lm`` are never
+        dropped, and the caller's ``gc.collect()`` frees nothing.  The bool
+        return lets the caller log "peer told to exit" only when that is
+        actually what happened, instead of unconditionally.
         """
         with self._lock:
-            if self._closed:
-                return
+            already_closed = self._closed
             self._closed = True
-            try:
-                _ctrl_send(OP_EXIT, self._epoch, None)
-            except Exception:  # teardown must never mask the real error
-                logger.warning("tp: EXIT broadcast failed", exc_info=True)
+            exit_sent = False
+            if not already_closed:
+                try:
+                    _ctrl_send(OP_EXIT, self._epoch, None)
+                    exit_sent = True
+                except Exception:  # teardown must never mask the real error
+                    logger.warning("tp: EXIT broadcast failed", exc_info=True)
             if self._watchdog is not None:
                 self._watchdog.stop()
                 self._watchdog = None
@@ -584,6 +596,7 @@ class MirroredLanguageModel:
                 except Exception:
                     pass
                 self._atexit_hook = None
+            return exit_sent
 
 
 def _force_same_graph(out) -> None:
@@ -839,9 +852,14 @@ def shutdown_tp(model) -> bool:
     Called from the server's unload path, so that dropping a model group also
     stops the peer instead of leaving it blocked in a collective with a shard
     resident.
+
+    Returns whether EXIT was actually sent to the peer this call -- NOT
+    merely whether ``model`` was TP-mirrored.  ``shutdown()`` always runs its
+    local teardown (idempotently), but a mirror already closed (e.g. by
+    ``_release_peer`` after a failed announce) sends no further EXIT, and the
+    caller's "peer told to exit" log line should not claim otherwise.
     """
     lm = getattr(model, "language_model", model)
     if not isinstance(lm, MirroredLanguageModel):
         return False
-    lm.shutdown()
-    return True
+    return lm.shutdown()
