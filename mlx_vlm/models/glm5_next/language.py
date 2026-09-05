@@ -114,8 +114,20 @@ _FUSED_KDA_BLOCK = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+# 2026-09-05 operator-approved serving defaults (GLM-5.3-Flash campaign): the
+# three decode-path flags below were opt-in since they landed (I808/I817) and the
+# campaign's final serving recipe (PA733) always exported them, but the code
+# default stayed OFF -- so a plain `python -m mlx_vlm.server` ran the unfused
+# KDA path.  Measured on the p512/gen64 served rail, B=1 greedy, outputs
+# byte-identical to the unfused path: 31.35 -> 33.52 (fused KDA) -> 34.16
+# (+QPROJ) -> 34.22 tok/s (+IDX_FAST), +9.2 %.  Set the variable to 0 to
+# restore the old path.  Receipts: bench/hwdossier/receipts/sweep11/
+# L18_KDA_ENV_20260905 (private campaign repo).
+_DEFAULT_ON_FLAGS = ("MLX_VLM_GLM5_FUSED_KDA", "MLX_VLM_GLM5_FUSED_KDA_QPROJ", "MLX_VLM_GLM5_IDX_FAST")
 
 
 def _fused_kda_qproj_enabled() -> bool:
@@ -125,7 +137,7 @@ def _fused_kda_qproj_enabled() -> bool:
     # and this one is measured at rounding scale instead.
     global _FUSED_KDA_QPROJ_ENV
     if _FUSED_KDA_QPROJ_ENV is None:
-        _FUSED_KDA_QPROJ_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA_QPROJ")
+        _FUSED_KDA_QPROJ_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA_QPROJ", "1")
     return _FUSED_KDA_QPROJ_ENV
 
 
@@ -148,7 +160,7 @@ def _idx_fast_enabled() -> bool:
     # until it has live mileage; the bypass regime and prefill are untouched.
     global _IDX_FAST_ENV
     if _IDX_FAST_ENV is None:
-        _IDX_FAST_ENV = _env_flag("MLX_VLM_GLM5_IDX_FAST")
+        _IDX_FAST_ENV = _env_flag("MLX_VLM_GLM5_IDX_FAST", "1")
     return _IDX_FAST_ENV
 
 
@@ -358,7 +370,7 @@ def _fused_kda_enabled() -> bool:
     # so it stays behind a flag until it has live mileage.
     global _FUSED_KDA_ENV
     if _FUSED_KDA_ENV is None:
-        _FUSED_KDA_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA")
+        _FUSED_KDA_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA", "1")
     return _FUSED_KDA_ENV
 
 
