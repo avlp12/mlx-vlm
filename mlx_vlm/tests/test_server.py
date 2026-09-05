@@ -8434,3 +8434,16 @@ class TestReranking:
         loaded = server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert loaded == (model, processor, model.config)
+
+
+def test_draft_block_size_for_mtp_defaults_to_three(monkeypatch):
+    # 2026-09-05 operator-approved serving default: MTP block 3 unless pinned.
+    from mlx_vlm.server import generation as server_generation
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_BLOCK_SIZE", raising=False)
+    assert server_generation._draft_block_size_for("mtp") == 3
+    assert server_generation._draft_block_size_for("dflash") is None
+    assert server_generation._draft_block_size_for(None) is None
+    monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "2")
+    assert server_generation._draft_block_size_for("mtp") == 2
+    assert server_generation._draft_block_size_for("dflash") == 2

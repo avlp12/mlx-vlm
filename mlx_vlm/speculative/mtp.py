@@ -492,15 +492,23 @@ def _mtp_adaptive_depth_enabled() -> bool:
 
 
 def _mtp_pause_disabled() -> bool:
-    """MLX_VLM_MTP_NO_PAUSE=1 -- keep the adaptive pause controller out of the
-    way.  It exists so an MTP round is never slower than plain decoding, which
-    is right for serving but makes the drafter unmeasurable: on a workload it
-    dislikes it asks for empty blocks, so a requested rollout depth never
-    actually runs and every depth reports the same numbers.  Measurement only.
+    """MLX_VLM_MTP_NO_PAUSE -- keep the adaptive pause controller out of the
+    way.  The controller exists so an MTP round is never slower than plain
+    decoding, but it also pins the block to the drafter's CONFIGURED size
+    (``block_total()`` returns ``self.configured`` outside adaptive depth), so
+    a requested rollout depth never actually runs and every depth reports the
+    same numbers.
+
+    DEFAULT FLIPPED TO ON (pause disabled) 2026-09-05 by operator approval on
+    the GLM-5.3-Flash campaign, together with the block-3 MTP serving default
+    (server/generation.py DEFAULT_MTP_DRAFT_BLOCK_SIZE): the measured block-3
+    rounds are faster than plain decoding on every workload tried (code,
+    prose, p512/gen64), so the never-lose gate was costing the requested
+    depth for nothing.  Set MLX_VLM_MTP_NO_PAUSE=0 to restore the controller.
     """
     global _MTP_NO_PAUSE
     if _MTP_NO_PAUSE is None:
-        _MTP_NO_PAUSE = os.environ.get("MLX_VLM_MTP_NO_PAUSE", "0").lower() in (
+        _MTP_NO_PAUSE = os.environ.get("MLX_VLM_MTP_NO_PAUSE", "1").lower() in (
             "1", "true", "yes", "on"
         )
     return _MTP_NO_PAUSE

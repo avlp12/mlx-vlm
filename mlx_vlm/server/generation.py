@@ -91,6 +91,29 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+# Operator-approved serving default (2026-09-05, GLM-5.3-Flash campaign): the
+# native MTP drafter runs at block 3 (two chained nextn drafts + bonus) unless
+# MLX_VLM_DRAFT_BLOCK_SIZE / --draft-block-size says otherwise.  Measured on the
+# p512/gen64 rail with the server path primed from the prompt: block 2 36.22
+# -> block 3 40.19 tok/s (+11 %), code +8.8 %, prose +17 %; verify-width and
+# rollback KL gates (S=2/3/4/8) all pass at ~0.0006 nats, top-1 1.000.
+# Receipts: bench/hwdossier/receipts/sweep11/L9B_MTP_DEPTH_20260905,
+# L9C_VERIFY_WIDTH_20260905 (private campaign repo).  Other drafters keep
+# their checkpoint-configured block.
+DEFAULT_MTP_DRAFT_BLOCK_SIZE = 3
+
+
+def _draft_block_size_for(draft_kind):
+    """Explicit env/CLI pin wins; else the MTP serving default; else ``None``
+    (the drafter's configured block, resolved by ``_dflash_block_total``)."""
+    pinned = _get_draft_block_size_from_env()
+    if pinned is not None:
+        return pinned
+    if draft_kind == "mtp":
+        return DEFAULT_MTP_DRAFT_BLOCK_SIZE
+    return None
+
+
 def _cached_from_width_str(response) -> str:
     """``cached_from_width=`` field for the prefill log line.
 
@@ -2177,7 +2200,7 @@ class ResponseGenerator:
                             vault=getattr(self, "vault", None),
                             draft_model=self.draft_model,
                             draft_kind=self.draft_kind,
-                            draft_block_size=_get_draft_block_size_from_env(),
+                            draft_block_size=_draft_block_size_for(self.draft_kind),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=self._effective_prefill_step_size(),
                         )
@@ -2413,7 +2436,7 @@ class ResponseGenerator:
         prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = make_sampler(temp=0)
-        draft_block_size = _get_draft_block_size_from_env()
+        draft_block_size = _draft_block_size_for(draft_kind)
 
         while not self._stop:
             pending = []
