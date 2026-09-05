@@ -164,6 +164,24 @@ def _idx_fast_enabled() -> bool:
     return _IDX_FAST_ENV
 
 
+# L13 (2026-09-05): compile the KDA "glue" -- the pure-array ops between the
+# in-projection and gated_delta_update (conv1d activation, gate reshapes,
+# q/k l2norm) and between the recurrence and o_proj (gating norm, o_proj) --
+# for the EAGER S>1 path only. Decode (S=1) already runs the fused KDA kernel
+# (fused_kda_decode_step) and returns before this code is reached; this flag
+# must never touch that path, hence the explicit S>1 guard at the call site
+# rather than relying on it being unreachable. Default OFF: unverified on GPU,
+# see mlx_vlm/tests/test_glm5_next_hc_compile.py for CPU parity coverage.
+_KDA_GLUE_COMPILE_ENV = None
+
+
+def _kda_glue_compile_enabled() -> bool:
+    global _KDA_GLUE_COMPILE_ENV
+    if _KDA_GLUE_COMPILE_ENV is None:
+        _KDA_GLUE_COMPILE_ENV = _env_flag("MLX_VLM_GLM5_KDA_GLUE_COMPILE", "1")  # default ON 2026-09-05 (operator-approved micro bundle; =0 restores)
+    return _KDA_GLUE_COMPILE_ENV
+
+
 _MLA_ABSORB_MULTI_ENV = None
 
 
@@ -955,6 +973,45 @@ class Glm5NextLinearAttention(nn.Module):
         self._fused_kda_qproj = None
         self._fused_kda_ty = None
         self._fused_kda_qproj_ty = None
+        # MLX_VLM_GLM5_KDA_GLUE_COMPILE: lazily-built per-instance compiled
+        # callables for the eager (S>1 / prefill) glue, same idiom as
+        # Glm5NextDecoderLayer._attn_pre_c / _ffn_c below -- weights differ
+        # per KDA layer instance (34 of them), so the cache is a bound-method
+        # `mx.compile` per instance, not one shared module-level function.
+        self._kda_glue_pre_c = None
+        self._kda_glue_post_c = None
+
+    def _kda_glue_pre(self, conv_input: mx.array, fa_o: mx.array):
+        """Pure-array glue between the in-projection and gated_delta_update.
+
+        Conv1d + its submodule weight is closure-captured (frozen at
+        inference, same contract as Glm5NextDecoderLayer._attn_prologue's
+        capture of self.attn_hc/self.input_layernorm). Does NOT touch
+        cache[0]: the cache write of conv_input's tail already happened in
+        the caller, using conv_input itself, before this runs.
+        """
+        conv_out = nn.silu(self.conv1d(conv_input))
+        q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
+        B, S = q.shape[0], q.shape[1]
+        q = q.reshape(B, S, self.num_heads, self.head_dim)
+        k = k.reshape(B, S, self.num_heads, self.head_dim)
+        v = v.reshape(B, S, self.num_heads, self.head_dim)
+        a = self.forget_gate.f_b_proj(fa_o).reshape(B, S, self.num_heads, self.head_dim)
+        in_dtype = q.dtype
+        q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(in_dtype)
+        k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
+        return q, k, v, a
+
+    def _kda_glue_post(self, out: mx.array, ga_o: mx.array):
+        """Pure-array glue between gated_delta_update and the layer output.
+
+        No cache/state touched here either -- state advance happens in the
+        caller after gated_delta_update returns, before this is called.
+        """
+        B, S = out.shape[0], out.shape[1]
+        gate = self.g_b_proj(ga_o).reshape(B, S, self.num_heads, self.head_dim)
+        out = self.o_norm(out, gate).reshape(B, S, -1)
+        return self.o_proj(out)
 
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
@@ -1352,18 +1409,18 @@ class Glm5NextLinearAttention(nn.Module):
         conv_input = mx.concatenate([conv_state, mixed], axis=1)
         if cache is not None:
             cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
-
-        q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
-        q = q.reshape(B, S, self.num_heads, self.head_dim)
-        k = k.reshape(B, S, self.num_heads, self.head_dim)
-        v = v.reshape(B, S, self.num_heads, self.head_dim)
-
         fg = self.forget_gate
-        a = fg.f_b_proj(fa_o).reshape(B, S, self.num_heads, self.head_dim)
-        in_dtype = q.dtype
-        q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(in_dtype)
-        k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
+        # KDA glue compile: eager S>1 path only (prefill). Decode (S=1)
+        # already returned above via _fused_kda_step/_fused_kda_block; the
+        # S>1 guard here is belt-and-suspenders so this flag can never touch
+        # that path even if fused KDA is disabled and S==1 somehow reaches
+        # here.
+        if S > 1 and _kda_glue_compile_enabled():
+            if self._kda_glue_pre_c is None:
+                self._kda_glue_pre_c = mx.compile(self._kda_glue_pre)
+            q, k, v, a = self._kda_glue_pre_c(conv_input, fa_o)
+        else:
+            q, k, v, a = self._kda_glue_pre(conv_input, fa_o)
 
         state = cache[1] if cache is not None else None
         A_log = fg.A_log.reshape(self.num_heads, 1)
@@ -1404,9 +1461,11 @@ class Glm5NextLinearAttention(nn.Module):
             cache[1] = state
             cache.advance(S)
 
-        gate = self.g_b_proj(ga_o).reshape(B, S, self.num_heads, self.head_dim)
-        out = self.o_norm(out, gate).reshape(B, S, -1)
-        return self.o_proj(out)
+        if S > 1 and _kda_glue_compile_enabled():
+            if self._kda_glue_post_c is None:
+                self._kda_glue_post_c = mx.compile(self._kda_glue_post)
+            return self._kda_glue_post_c(out, ga_o)
+        return self._kda_glue_post(out, ga_o)
 
 
 def _batch_row_valid(cache, B, lo, n):
