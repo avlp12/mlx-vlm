@@ -60,6 +60,14 @@ logger = logging.getLogger("mlx_vlm.generate")
 DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
 
+# L17 step timers hook. None (default) means the server has not installed a
+# collector -- every call site below is a single ``STEP_TIMERS is not None``
+# global load, so ar.py stays free of any import from mlx_vlm.server. The
+# server sets this to a `_StepTimers`-like object (a `.record(bucket, secs)`
+# method is the whole contract) at import time when
+# MLX_VLM_SERVER_STEP_TIMERS=1 (see mlx_vlm/server/generation.py).
+STEP_TIMERS = None
+
 
 def _get_batch_cache_eval_interval() -> int:
     raw = os.environ.get("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL")
@@ -1289,6 +1297,12 @@ class GenerationBatch:
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
 
+        # L17 model_fwd_plus_eval: covers the forward pass through the final
+        # mx.eval() of this step, in BOTH the fused-greedy fast path (return
+        # below) and the general path (returns at the bottom of this method).
+        # off by default (STEP_TIMERS is None) -- one global load per step.
+        _fwd_t0 = time.perf_counter() if STEP_TIMERS is not None else None
+
         sampled = self._fused_greedy_step(inputs, fwd_kwargs)
         if sampled is not None:
             self._next_tokens = sampled
@@ -1297,6 +1311,8 @@ class GenerationBatch:
             self._next_top_lp = None
             mx.async_eval(self._next_tokens)
             mx.eval(inputs)
+            if _fwd_t0 is not None:
+                STEP_TIMERS.record("model_fwd_plus_eval", time.perf_counter() - _fwd_t0)
             return inputs.tolist(), None, None, None
 
         output = self._language_model(
@@ -1326,6 +1342,10 @@ class GenerationBatch:
                         )
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
+
+        # L17 sampling_sync: logits post-processing + sampling through the
+        # async_eval() dispatch below. Nested inside model_fwd_plus_eval.
+        _samp_t0 = time.perf_counter() if STEP_TIMERS is not None else None
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = _sample_with_positions(
@@ -1360,6 +1380,8 @@ class GenerationBatch:
             self._next_top_lp = None
 
         mx.async_eval(*eval_targets)
+        if _samp_t0 is not None:
+            STEP_TIMERS.record("sampling_sync", time.perf_counter() - _samp_t0)
 
         if self._current_lps is not None:
             to_eval = [inputs, self._current_lps]
@@ -1368,6 +1390,8 @@ class GenerationBatch:
             mx.eval(*to_eval)
             top_idx_list = prev_top_idx.tolist() if prev_top_idx is not None else None
             top_lp_list = prev_top_lp.tolist() if prev_top_lp is not None else None
+            if _fwd_t0 is not None:
+                STEP_TIMERS.record("model_fwd_plus_eval", time.perf_counter() - _fwd_t0)
             return (
                 inputs.tolist(),
                 self._current_lps.tolist(),
@@ -1376,6 +1400,8 @@ class GenerationBatch:
             )
         else:
             mx.eval(inputs)
+            if _fwd_t0 is not None:
+                STEP_TIMERS.record("model_fwd_plus_eval", time.perf_counter() - _fwd_t0)
             return inputs.tolist(), None, None, None
 
     def _eval_pending_state(self):
@@ -1539,6 +1565,8 @@ class GenerationBatch:
         keep = []
         responses = []
         forced_next_tokens = [None] * len(self.uids)
+        # L17 stop_check: per-uid stop-criteria / thinking-budget / length loop.
+        _sc_t0 = time.perf_counter() if STEP_TIMERS is not None else None
         for i in range(len(self.uids)):
             finish_reason = None
             self._num_tokens[i] += 1
@@ -1572,6 +1600,8 @@ class GenerationBatch:
                     top_logprobs=top_lp,
                 )
             )
+        if _sc_t0 is not None:
+            STEP_TIMERS.record("stop_check", time.perf_counter() - _sc_t0)
 
         has_forced_next_tokens = any(token is not None for token in forced_next_tokens)
         if has_forced_next_tokens:
@@ -3832,12 +3862,15 @@ class BatchGenerator:
                 self._cache_eval_interval > 0
                 and self._steps_counter % self._cache_eval_interval == 0
             ):
+                _ce_t0 = time.perf_counter() if STEP_TIMERS is not None else None
                 cache_states = getattr(self._generation_batch, "cache_states", None)
                 if callable(cache_states):
                     mx.eval(cache_states())
                 else:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
+                if _ce_t0 is not None:
+                    STEP_TIMERS.record("cache_evict", time.perf_counter() - _ce_t0)
             if yield_after_decode:
                 return prompt_responses, generation_responses
 
