@@ -28,6 +28,12 @@ from .fused_kda import (
     fused_kda_supported,
     fused_kda_verify_block,
 )
+from .fused_kda_prefill import (
+    fused_kda_prefill,
+    fused_kda_prefill_probe,
+    fused_kda_prefill_supported,
+    prefill_geometry,
+)
 from .qmv_custom import DEFAULT_GEOMETRY, maybe_qmv, qmv_applicable
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
@@ -116,6 +122,57 @@ _FUSED_KDA_BLOCK = os.environ.get(
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+# --------------------------------------------------------------------------- #
+# MLX_VLM_GLM5_FUSED_KDA_PREFILL: the S>1 PREFILL kernel (fused_kda_prefill.py).
+#
+# Default OFF.  It is a different bet from the verify-block kernel it shares its
+# arithmetic with: at S<=8 the glue is launch-bound and fusing removes ~33
+# dependent dispatches per layer, but at S=8192 those same 33 launches cost 0.5 ms
+# against a measured ~59 ms per layer -- the prefill glue is BANDWIDTH-bound, and
+# what fusing removes is a dozen [1, S, H*D] round trips.  Different physics, so
+# the block kernel's receipt does not transfer and this ships behind its own flag
+# until L7-b has run both arms.
+_FUSED_KDA_PREFILL_ENV = None
+
+# Value-axis threadgroup split.  Empty (the default) means
+# fused_kda_prefill.prefill_geometry picks NV = head_dim / TY, which reproduces
+# gated_delta_kernel's one-thread-per-(key lane, value row) partition -- the
+# eager recurrence's own thread count, which a one-threadgroup-per-head kernel
+# would cut by NV.  NV=1 selects the maximally fused arm instead (the gated
+# RMSNorm stays in the kernel, one launch per layer, but H threadgroups at B=1).
+# Both are bit-identical; which is faster is a measurement.
+_FUSED_KDA_PREFILL_NV = os.environ.get("MLX_VLM_GLM5_FUSED_KDA_PREFILL_NV", "")
+
+# Chunk width bounds.  The lower bound keeps the S=1 and verify-block paths
+# untouched; the upper bound is 0 (no cap) because S is a runtime scalar -- one
+# pipeline serves every chunk width, so a cap would buy nothing but a fallback.
+_FUSED_KDA_PREFILL_MIN_S = int(
+    os.environ.get("MLX_VLM_GLM5_FUSED_KDA_PREFILL_MIN_S", "2")
+)
+_FUSED_KDA_PREFILL_MAX_S = int(
+    os.environ.get("MLX_VLM_GLM5_FUSED_KDA_PREFILL_MAX_S", "0")
+)
+
+# Batch cap.  B=1 is the width parity has been run to and the only width prefill
+# takes on the served rail; the kernel's source does not mention B (only grid.z
+# and the buffer extents do), so raising this is a parity run, not a code change.
+_FUSED_KDA_PREFILL_MAX_BATCH = int(
+    os.environ.get("MLX_VLM_GLM5_FUSED_KDA_PREFILL_MAX_BATCH", "1")
+)
+
+
+def _fused_kda_prefill_enabled() -> bool:
+    global _FUSED_KDA_PREFILL_ENV
+    if _FUSED_KDA_PREFILL_ENV is None:
+        _FUSED_KDA_PREFILL_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA_PREFILL", "0")
+    return _FUSED_KDA_PREFILL_ENV
+
+
+def _fused_kda_prefill_nv() -> Optional[int]:
+    v = _FUSED_KDA_PREFILL_NV.strip()
+    return int(v) if v else None
 
 
 # 2026-09-05 operator-approved serving defaults (GLM-5.3-Flash campaign): the
@@ -973,6 +1030,8 @@ class Glm5NextLinearAttention(nn.Module):
         self._fused_kda_qproj = None
         self._fused_kda_ty = None
         self._fused_kda_qproj_ty = None
+        self._fused_kda_prefill = None
+        self._fused_kda_prefill_geom = None
         # MLX_VLM_GLM5_KDA_GLUE_COMPILE: lazily-built per-instance compiled
         # callables for the eager (S>1 / prefill) glue, same idiom as
         # Glm5NextDecoderLayer._attn_pre_c / _ffn_c below -- weights differ
@@ -1214,6 +1273,129 @@ class Glm5NextLinearAttention(nn.Module):
             self._fused_kda_ty = ty
         return True
 
+    def _fused_kda_prefill_ready(self, dtype=None, state_dtype=None) -> bool:
+        """Config-level capability + the device probe, resolved once per module.
+
+        Separate from ``_fused_kda_ready``: this is a different pipeline with its
+        own register pressure (the value-axis split changes NDV), so it can be
+        declined -- or run at a smaller threadgroup -- independently of the decode
+        kernel, and a shared readiness flag would let one answer stand in for the
+        other.
+        """
+        if self._fused_kda_prefill is None:
+            if dtype is None:
+                return False
+            supported = _fused_kda_prefill_enabled() and fused_kda_prefill_supported(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                conv_kernel_size=self.conv_kernel_size,
+                lower_bound=self.forget_gate.safe_gate_lower_bound,
+            )
+            geom = None
+            if supported:
+                geom = fused_kda_prefill_probe(
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
+                    conv_kernel_size=self.conv_kernel_size,
+                    dtype=dtype,
+                    state_dtype=state_dtype,
+                    nv=_fused_kda_prefill_nv(),
+                )
+            self._fused_kda_prefill_geom = geom
+            self._fused_kda_prefill = geom is not None
+        return self._fused_kda_prefill
+
+    def _fused_kda_prefill_eligible(self, B, S, mask, cache, gdn_sink, ref) -> bool:
+        """Per-call preconditions for the prefill kernel.
+
+        Deliberately a third predicate rather than a widened
+        ``_fused_kda_block_eligible``: that one caps S at a width the verify
+        parity matrix has been run to, and relaxing a cap in place is how an
+        untested width reaches a kernel.  The two are disjoint by construction --
+        the block path is checked first and returns for S in [2, MAX_WIDTH].
+        """
+        if not _fused_kda_prefill_enabled():
+            return False
+        if S < _FUSED_KDA_PREFILL_MIN_S:
+            return False
+        if _FUSED_KDA_PREFILL_MAX_S and S > _FUSED_KDA_PREFILL_MAX_S:
+            return False
+        if B < 1 or B > _FUSED_KDA_PREFILL_MAX_BATCH:
+            return False
+        # A speculative capture needs the post-conv q/k/v of every position.  At
+        # prefill width that is 3 x [B, S, H, D] of pure transient, so the kernel
+        # does not emit it and a call carrying a sink falls back instead.
+        if gdn_sink is not None:
+            return False
+        if mask is not None and (mask.dtype != mx.bool_ or mask.shape != (B, S)):
+            return False
+        if cache is None or cache[0] is None or cache[1] is None:
+            return False
+        H, D, K = self.num_heads, self.head_dim, self.conv_kernel_size
+        if cache[0].shape != (B, K - 1, 3 * H * D):
+            return False
+        if cache[1].shape != (B, H, D, D):
+            return False
+        fg = self.forget_gate
+        if fg.A_log.dtype != mx.float32 or fg.dt_bias.dtype != mx.float32:
+            return False
+        if fg.A_log.size != H or fg.dt_bias.size != H * D:
+            return False
+        dt = ref.dtype
+        if not (
+            self.conv1d.weight.dtype == dt
+            and self.o_norm.weight.dtype == dt
+            and cache[0].dtype == dt
+            and self.conv1d.weight.shape == (3 * H * D, K, 1)
+            and self.o_norm.weight.size == D
+        ):
+            return False
+        return self._fused_kda_prefill_ready(dt, cache[1].dtype)
+
+    def _fused_kda_prefill_step(
+        self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, mask
+    ) -> mx.array:
+        """The whole prefill chunk's KDA in one launch per layer (two at NV>1).
+
+        What it replaces is the same glue the verify block replaces -- conv
+        window concat/slice/copy, silu, the two fp32 L2 norms, the beta sigmoid,
+        the hand-rolled gated RMSNorm -- but for a different reason: at S=8192
+        each of those materialises a [B, S, H*D] tensor, so the saving is the
+        round trips, not the launches.
+        """
+        fg = self.forget_gate
+        H, D = self.num_heads, self.head_dim
+        B, S, _ = q_o.shape
+        nv, ty = self._fused_kda_prefill_geom
+        a = fg.f_b_proj(fa_o)
+        gate = self.g_b_proj(ga_o)
+        y, state_out, conv_state_out = fused_kda_prefill(
+            q_o,
+            k_o,
+            v_o,
+            cache[0],
+            self.conv1d.weight,
+            a,
+            b_o,
+            fg.A_log,
+            fg.dt_bias,
+            cache[1],
+            gate,
+            self.o_norm.weight,
+            num_heads=H,
+            head_dim=D,
+            conv_kernel_size=self.conv_kernel_size,
+            lower_bound=fg.safe_gate_lower_bound,
+            norm_eps=self.o_norm.eps,
+            mask=mask if (mask is not None and mask.dtype == mx.bool_) else None,
+            nv=nv,
+            ty=ty,
+        )
+        cache[0] = conv_state_out
+        cache[1] = state_out
+        cache.advance(S)
+        return self.o_proj(y.reshape(B, S, -1))
+
     def _fused_kda_block(
         self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask, mixed
     ) -> mx.array:
@@ -1396,6 +1578,10 @@ class Glm5NextLinearAttention(nn.Module):
         ):
             return self._fused_kda_block(
                 q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask, mixed
+            )
+        if self._fused_kda_prefill_eligible(B, S, mask, cache, gdn_sink, q_o):
+            return self._fused_kda_prefill_step(
+                q_o, k_o, v_o, fa_o, ga_o, b_o, cache, mask
             )
         if mask is not None and mask.dtype == mx.bool_:
             mixed = mx.where(mask[..., None], mixed, 0)
