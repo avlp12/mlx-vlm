@@ -74,7 +74,9 @@ from mlx_vlm.speculative.utils import (
     _mtp_draft_block_active,
     _mtp_draft_hidden,
     _mtp_next_block_size,
+    _mtp_round_timers_enabled,
     _mtp_rounds,
+    _mtp_rounds_batch,
     _mtp_shared_kv_from_prompt_cache,
     _mtp_verify_target,
     _speculative_walk,
@@ -1744,6 +1746,7 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     monkeypatch.setattr(speculative_utils, "_mtp_rounds_batch", fake_batch)
     monkeypatch.setattr(speculative_utils, "_mtp_rounds", fake_single)
 
+    prompt_tokens = mx.array([[7, 8, 9]], dtype=mx.int32)
     result = list(
         speculative_utils.run_speculative_server_rounds(
             SimpleNamespace(language_model=SimpleNamespace()),
@@ -1758,6 +1761,7 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
             token_dtype=mx.int32,
             greedy_sampling=False,
             row_ids=[0],
+            prompt_tokens=prompt_tokens,
         )
     )
 
@@ -1765,6 +1769,207 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     assert calls
     assert calls[0][2]["first_bonus"].tolist() == [2]
     assert calls[0][2]["row_ids"] == [0]
+    # ADAPT-1: the server must thread the prompt down into the batch round
+    # loop -- it is the only place that can prime a NoPE-MLA drafter's own
+    # cache, since the server dispatches EVERY batch size (including B=1)
+    # here instead of a dedicated singleton path.
+    assert calls[0][2]["prompt_tokens"] is prompt_tokens
+
+
+class _PrimingDraft:
+    """Minimal MTP drafter mock recording ``prefill_from_target_hidden`` calls.
+
+    ``max_tokens`` in the tests below is chosen so ``_mtp_next_block_size``
+    immediately returns <= 1 and the round loop body never runs -- isolating
+    the priming call (which happens once, before the loop) from the rest of
+    the batched round machinery.
+    """
+
+    supports_greedy_draft_argmax = True
+
+    def __init__(self):
+        self.config = SimpleNamespace(block_size=2)
+        self.accept_lens = []
+        self.draft_lens = []
+        self.prime_calls = []
+
+    def reset(self, model, left_padding=None):
+        pass
+
+    def set_shared_kv(self, *args, **kwargs):
+        pass
+
+    def prefill_from_target_hidden(
+        self, input_ids, hidden, bonus_token, sampler, token_dtype, **kwargs
+    ):
+        self.prime_calls.append((input_ids, hidden, bonus_token))
+
+
+def test_mtp_rounds_batch_primes_drafter_from_prompt_at_b1():
+    draft = _PrimingDraft()
+    lm = SimpleNamespace(rollback_speculative_cache=lambda *a: None)
+    hidden = mx.ones((1, 4, 2), dtype=mx.float32)
+    prompt_tokens = mx.array([[10, 11, 12, 13]], dtype=mx.int32)
+
+    list(
+        _mtp_rounds_batch(
+            SimpleNamespace(language_model=lm),
+            draft,
+            [SimpleNamespace(offset=0)],
+            hidden,
+            {},
+            first_bonus=mx.array([1], dtype=mx.int32),
+            max_tokens=1,
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            draft_block_size=None,
+            token_dtype=mx.int32,
+            greedy_sampling=True,
+            prompt_tokens=prompt_tokens,
+        )
+    )
+
+    # Root cause (server-side native MTP never primes the drafter): the
+    # server dispatches B=1 to this batch loop, not a dedicated singleton
+    # path, so priming has to happen here -- mirroring what ``_mtp_rounds``
+    # already does offline.
+    assert len(draft.prime_calls) == 1
+    called_ids, called_hidden, called_bonus = draft.prime_calls[0]
+    assert called_ids is prompt_tokens
+    assert called_hidden is hidden
+    assert called_bonus.tolist() == [1]
+
+
+def test_mtp_rounds_batch_skips_priming_for_batch_gt_1():
+    draft = _PrimingDraft()
+    lm = SimpleNamespace(rollback_speculative_cache=lambda *a: None)
+    hidden = mx.ones((2, 4, 2), dtype=mx.float32)
+    prompt_tokens = mx.array([[10, 11, 12, 13], [20, 21, 22, 23]], dtype=mx.int32)
+
+    list(
+        _mtp_rounds_batch(
+            SimpleNamespace(language_model=lm),
+            draft,
+            [SimpleNamespace(offset=0)],
+            hidden,
+            {},
+            first_bonus=mx.array([1, 2], dtype=mx.int32),
+            max_tokens=1,
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            draft_block_size=None,
+            token_dtype=mx.int32,
+            greedy_sampling=True,
+            row_ids=[0, 1],
+            prompt_tokens=prompt_tokens,
+        )
+    )
+
+    # Documented scope limit: B>1 priming is not implemented (would need a
+    # per-row-length-aware slice this drafter's cache does not expose), so
+    # nothing should be primed for a batch of 2.
+    assert draft.prime_calls == []
+
+
+def test_mtp_rounds_batch_primes_once_not_per_round():
+    draft = _PrimingDraft()
+    lm = SimpleNamespace(rollback_speculative_cache=lambda *a: None)
+    hidden = mx.ones((1, 1, 2), dtype=mx.float32)
+    prompt_tokens = mx.array([[7, 8]], dtype=mx.int32)
+
+    verify = speculative_utils._MTPVerifyResult(
+        hidden=mx.zeros((1, 2, 2), dtype=mx.float32),
+        shared_kv_states={},
+        target_tokens=mx.array([[5, 9]], dtype=mx.int32),
+        gdn_states=None,
+    )
+
+    with (
+        patch.object(mtp_utils, "_mtp_verify_target", return_value=verify),
+        patch.object(
+            mtp_utils,
+            "_mtp_draft_block_active",
+            return_value=mx.array([[5]], dtype=mx.int32),
+        ),
+        patch.object(
+            mtp_utils, "_speculative_walk_batch", return_value=([1], [[5, 9]])
+        ),
+    ):
+        # block_size=2 (1 draft token/round) and max_tokens=5 forces exactly
+        # two rounds (emitted 1 -> 3 -> 5) before the row finishes.
+        list(
+            _mtp_rounds_batch(
+                SimpleNamespace(language_model=lm),
+                draft,
+                [SimpleNamespace(offset=0)],
+                hidden,
+                {},
+                first_bonus=mx.array([1], dtype=mx.int32),
+                max_tokens=5,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                draft_block_size=2,
+                token_dtype=mx.int32,
+                greedy_sampling=True,
+                prompt_tokens=prompt_tokens,
+            )
+        )
+
+    assert len(draft.prime_calls) == 1
+
+
+def test_mtp_rounds_batch_round_timers_off_by_default_and_on_when_enabled(
+    monkeypatch,
+):
+    draft = _PrimingDraft()
+    lm = SimpleNamespace(rollback_speculative_cache=lambda *a: None)
+    hidden = mx.ones((1, 1, 2), dtype=mx.float32)
+
+    verify = speculative_utils._MTPVerifyResult(
+        hidden=mx.zeros((1, 2, 2), dtype=mx.float32),
+        shared_kv_states={},
+        target_tokens=mx.array([[5, 9]], dtype=mx.int32),
+        gdn_states=None,
+    )
+
+    def run():
+        with (
+            patch.object(mtp_utils, "_mtp_verify_target", return_value=verify),
+            patch.object(
+                mtp_utils,
+                "_mtp_draft_block_active",
+                return_value=mx.array([[5]], dtype=mx.int32),
+            ),
+            patch.object(
+                mtp_utils, "_speculative_walk_batch", return_value=([1], [[5, 9]])
+            ),
+        ):
+            list(
+                _mtp_rounds_batch(
+                    SimpleNamespace(language_model=lm),
+                    draft,
+                    [SimpleNamespace(offset=0)],
+                    hidden,
+                    {},
+                    first_bonus=mx.array([1], dtype=mx.int32),
+                    max_tokens=3,
+                    sampler=lambda logits: mx.argmax(logits, axis=-1),
+                    draft_block_size=2,
+                    token_dtype=mx.int32,
+                    greedy_sampling=True,
+                )
+            )
+
+    # Default (env unset / False): the timing attributes are never set.
+    monkeypatch.setattr(mtp_utils, "_mtp_round_timers_enabled", lambda: False)
+    run()
+    assert not hasattr(draft, "speculative_draft_seconds")
+    assert not hasattr(draft, "speculative_verify_seconds")
+
+    # Opt-in: mirrors MLX_VLM_DFLASH_ROUND_TIMERS -- accumulates wall-clock
+    # seconds for the draft and verify halves onto the drafter, which is
+    # exactly what ``_speculative_stats_snapshot`` (server/app.py) reads.
+    monkeypatch.setattr(mtp_utils, "_mtp_round_timers_enabled", lambda: True)
+    run()
+    assert draft.speculative_draft_seconds >= 0.0
+    assert draft.speculative_verify_seconds >= 0.0
 
 
 def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):

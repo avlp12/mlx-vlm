@@ -31,6 +31,7 @@ from .mtp import (
     _mtp_draft_block_active,
     _mtp_draft_hidden,
     _mtp_next_block_size,
+    _mtp_round_timers_enabled,
     _mtp_rounds,
     _mtp_rounds_batch,
     _mtp_shared_kv_from_prompt_cache,
@@ -58,6 +59,7 @@ __all__ = [
     "_mtp_draft_block_active",
     "_mtp_draft_hidden",
     "_mtp_next_block_size",
+    "_mtp_round_timers_enabled",
     "_mtp_rounds",
     "_mtp_rounds_batch",
     "_mtp_shared_kv_from_prompt_cache",
@@ -427,6 +429,7 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            prompt_tokens=prompt_tokens,
         )
         return
 
