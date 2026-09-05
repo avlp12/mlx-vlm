@@ -235,6 +235,13 @@ _RANK0_ONLY_KWARGS = {
     "mask": "accepted and ignored by glm5_next",
     # Read by the prefill driver, never by the model.
     "n_to_process": "not read by the model",
+    # Prefill-leg memory knob (speculative.utils.prefill_capture_kwargs): asks
+    # the model NOT to retain the sequence-shaped KDA rollback stash it would
+    # otherwise build alongside a per-layer capture.  It changes what is kept,
+    # not what is computed or reduced -- rank 1 simply keeps (or drops) its own
+    # stash; the collective sequence is identical.  Verified 2026-09-05 when the
+    # L3 tp_spec arm was refused on exactly this key.
+    "capture_gdn_states": "prefill stash retention only; no collective",
     # Slice the lm_head output only; lm_head is replicated, no collective.
     "num_logits_to_keep": "slices replicated lm_head output",
     "logits_to_keep": "slices replicated lm_head output",
