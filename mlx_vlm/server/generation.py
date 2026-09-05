@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from .. import apc as _apc
 from .. import context_vault as _context_vault
 from .._stream_cleanup import clear_mlx_streams
+from ..generate import ar as _ar
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -80,6 +81,54 @@ DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
+
+# L17: per-bucket step timers for the B=1 server decode path (default OFF).
+# Read exactly once at import so the flag check on every hot-path site is a
+# single global load + branch (`if _STEP_TIMERS:` / `if STEP_TIMERS is not
+# None:` in ar.py) rather than an os.environ lookup.
+_STEP_TIMERS = os.environ.get("MLX_VLM_SERVER_STEP_TIMERS") == "1"
+
+
+class _StepTimers:
+    """Accumulates wall-time sum + count per named bucket (perf_counter)."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._buckets: dict = {}
+
+    def record(self, bucket: str, elapsed_s: float) -> None:
+        with self._lock:
+            entry = self._buckets.get(bucket)
+            if entry is None:
+                self._buckets[bucket] = [elapsed_s, 1]
+            else:
+                entry[0] += elapsed_s
+                entry[1] += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                bucket: {
+                    "sum_s": sum_s,
+                    "count": count,
+                    "ms_per": (sum_s / count * 1000.0) if count else 0.0,
+                }
+                for bucket, (sum_s, count) in self._buckets.items()
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buckets.clear()
+
+
+# Singleton shared by every instrumentation site (generation.py's own
+# queue_poll/batch_next_total/detok_emit buckets, and the ar.py buckets it
+# installs into ``ar.STEP_TIMERS`` below). Always constructed -- cheap -- but
+# only ever written to when ``_STEP_TIMERS`` is True, so it stays empty
+# (snapshot() returns {}) with the flag off.
+_step_timers = _StepTimers()
+if _STEP_TIMERS:
+    _ar.STEP_TIMERS = _step_timers
 
 
 class PromptTooLongError(ValueError):
@@ -572,6 +621,10 @@ class ServerMetricsStore:
         self._decode_time_total_s = 0.0
         self._last_request_at: Optional[float] = None
         self._last_error: Optional[dict] = None
+        # L17: reset() also clears the shared step-timers singleton so a
+        # metrics reset gives an ablation run a clean slate. No-op (empty
+        # dict already) when MLX_VLM_SERVER_STEP_TIMERS is unset.
+        _step_timers.reset()
 
     def begin_request(self, *, endpoint: str, model: str, stream: bool):
         with self._lock:
@@ -642,6 +695,9 @@ class ServerMetricsStore:
         )
 
     def snapshot(self) -> dict:
+        # L17: step_timers has its own lock (_StepTimers._lock), independent
+        # of self._lock below -- read outside the critical section.
+        step_timers = _step_timers.snapshot()
         with self._lock:
             latest = dict(self._latest) if self._latest is not None else None
             recent = [dict(item) for item in list(self._recent)[-METRICS_RECENT_LIMIT:]]
@@ -684,6 +740,7 @@ class ServerMetricsStore:
                     "last_request_at": last_request_at,
                     "last_error": last_error,
                 },
+                "step_timers": step_timers,
             }
 
 
@@ -1183,6 +1240,40 @@ class _TokenIterator:
         if getattr(item, "finish_reason", None):
             self._ended = True
         return item
+
+    def next_batch(self, max_items: int = 32):
+        """L17 R3 helper for MLX_VLM_SERVER_BATCHED_EMIT=1.
+
+        Blocks for exactly one token (same as ``__next__``), then drains
+        whatever is *already* queued on the same ``_rqueue`` -- non-blocking
+        -- up to ``max_items`` total. Returns ``(tokens, terminal)`` where
+        ``tokens`` is the list of real items (never containing the ``None``
+        end sentinel or an exception instance) and ``terminal`` is one of:
+        ``None`` (batch stopped because the queue was momentarily empty or
+        ``max_items`` was hit -- call again for more), ``"stop"`` (natural
+        end of stream), or an ``Exception`` (propagate after emitting
+        ``tokens``). May raise, exactly like ``__next__``, if the very first
+        (blocking) item ends the stream or is itself an exception.
+        """
+        tokens = [next(self)]
+        terminal = None
+        while len(tokens) < max_items and not self._ended:
+            try:
+                item = self._rqueue.get_nowait()
+            except QueueEmpty:
+                break
+            if item is None:
+                self._ended = True
+                terminal = "stop"
+                break
+            if isinstance(item, Exception):
+                self._ended = True
+                terminal = item
+                break
+            if getattr(item, "finish_reason", None):
+                self._ended = True
+            tokens.append(item)
+        return tokens, terminal
 
     def close(self):
         with self._lock:
@@ -2119,6 +2210,8 @@ class ResponseGenerator:
         max_num_seqs = get_max_num_seqs()
 
         while not (self._stop and not active and self.requests.empty()):
+            # L17 queue_poll: request-queue poll through cancellation drain.
+            _qp_t0 = time.perf_counter() if _STEP_TIMERS else None
             new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
@@ -2146,6 +2239,8 @@ class ResponseGenerator:
 
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
+                if _qp_t0 is not None:
+                    _step_timers.record("queue_poll", time.perf_counter() - _qp_t0)
                 if cancelled and batch_gen is not None:
                     for uid in cancelled:
                         if uid in active:
@@ -2804,7 +2899,14 @@ class ResponseGenerator:
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
-        prompt_responses, responses = batch_gen.next(**kwargs)
+        # L17 batch_next_total: wall time of one BatchGenerator.next() call
+        # (prefill admission + one decode step).
+        if _STEP_TIMERS:
+            _bn_t0 = time.perf_counter()
+            prompt_responses, responses = batch_gen.next(**kwargs)
+            _step_timers.record("batch_next_total", time.perf_counter() - _bn_t0)
+        else:
+            prompt_responses, responses = batch_gen.next(**kwargs)
         self._log_prefill_progress(batch_gen, active)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
@@ -2815,6 +2917,9 @@ class ResponseGenerator:
         if not responses:
             return
 
+        # L17 detok_emit: detokenize + stream + queue-put for the whole
+        # responses list of this step (one sample per _step() call).
+        _de_t0 = time.perf_counter() if _STEP_TIMERS else None
         for r in responses:
             if r.uid not in active:
                 continue
@@ -2904,6 +3009,8 @@ class ResponseGenerator:
             if r.finish_reason is not None:
                 rqueue.put(None)
                 del active[r.uid]
+        if _de_t0 is not None:
+            _step_timers.record("detok_emit", time.perf_counter() - _de_t0)
 
     def _stream_text(self, info: dict, token: int, finish_reason: Optional[str]) -> str:
         """Convert one generated token into a streaming text segment."""
