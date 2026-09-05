@@ -415,7 +415,16 @@ PRE_FIX_CACHE = {
 
 @pytest.mark.parametrize("step", [None] + STEPS)
 @pytest.mark.parametrize("fixture", ["B2", "B3"])
-def test_the_prompt_cache_is_what_the_pre_fix_build_wrote(fixture, step):
+def test_the_prompt_cache_is_what_the_pre_fix_build_wrote(fixture, step, monkeypatch):
+    # The digests above were recorded on the UNFUSED KDA path.  Since 2026-09-05
+    # the fused kernel is the default (rounding-level differences in the cache
+    # bytes, selection/argmax/singleton agreement unaffected -- see the other
+    # tests in this file), so pin the path this chunked-select regression test is
+    # actually about.
+    import mlx_vlm.models.glm5_next.language as _lang
+
+    monkeypatch.setenv("MLX_VLM_GLM5_FUSED_KDA", "0")
+    monkeypatch.setattr(_lang, "_FUSED_KDA_ENV", None)
     suffixes = B2_SUFFIX if fixture == "B2" else B3_SUFFIX
     _, arrays, _ = _run(step, suffixes)
     assert _cache_digest(arrays)[:16] == PRE_FIX_CACHE[(DEV, fixture, step)]
