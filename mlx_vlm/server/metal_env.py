@@ -11,11 +11,13 @@ repo).  Caveat recorded there and in models/glm5_next/language.py:91: 2048 MB
 buffers cost 7.5 % at B=16 in an earlier batched measurement; 1024 at B>1 is
 not yet measured, so batched deployments should re-check or pin the env.
 
-This module must stay free of ``mlx`` imports: it runs BEFORE the package (and
-therefore Metal) is imported, from ``mlx_vlm/server/__main__.py``.  MLX reads
-both variables lazily on first Metal use, so setting them here is early enough
-for ``python -m mlx_vlm.server``; an embedding process that already touched
-Metal keeps whatever it had.
+This module must stay free of ``mlx`` imports.  NOTE (measured 2026-09-05):
+``python -m mlx_vlm.server`` imports the package -- and initialises Metal --
+before ``server/__main__.py`` runs, so setting the variables there is too late
+(a served greedy rail showed no gain).  ``__main__`` therefore re-execs the
+interpreter once with the variables set when they are absent
+(``needs_reexec``); an embedding process that already touched Metal keeps
+whatever it had, and a process that pins either variable is never re-exec'd.
 """
 
 import os
@@ -46,3 +48,14 @@ def apply_default_metal_buffer_env(environ=None):
 def describe_metal_buffer_env(environ=None) -> str:
     env = os.environ if environ is None else environ
     return ", ".join(f"{k}={env.get(k, '<unset>')}" for k, _ in _KEYS)
+
+
+REEXEC_MARK = "MLX_VLM_SERVER_METAL_ENV_APPLIED"
+
+
+def needs_reexec(environ=None) -> bool:
+    """True when neither limit is set and this process has not re-exec'd yet."""
+    env = os.environ if environ is None else environ
+    if env.get(REEXEC_MARK):
+        return False
+    return all(not env.get(k) for k, _ in _KEYS)

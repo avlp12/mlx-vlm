@@ -38,3 +38,10 @@ def test_module_does_not_import_mlx():
     src = open(metal_env.__file__).read()
     assert "import mlx" not in src
     del sys
+
+
+def test_needs_reexec_only_when_both_absent_and_not_marked():
+    assert metal_env.needs_reexec({}) is True
+    assert metal_env.needs_reexec({"MLX_MAX_MB_PER_BUFFER": "2048"}) is False
+    assert metal_env.needs_reexec({"MLX_MAX_OPS_PER_BUFFER": "100"}) is False
+    assert metal_env.needs_reexec({metal_env.REEXEC_MARK: "1"}) is False

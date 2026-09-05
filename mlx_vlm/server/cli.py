@@ -45,13 +45,6 @@ def _apply_apc_env(args, env) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
-    # Effective Metal command-buffer limits (server default 1024/50000 unless
-    # pinned by the environment; applied in server/__main__.py before mlx import).
-    from .metal_env import describe_metal_buffer_env
-
-    logging.getLogger(__name__).info(
-        "Metal command buffers: %s", describe_metal_buffer_env()
-    )
     parser.add_argument(
         "--host",
         type=str,
@@ -384,6 +377,11 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     logger.setLevel(log_level)
+    # Effective Metal command-buffer limits (server default 1024/50000 unless
+    # pinned by the environment; applied by the re-exec in server/__main__.py).
+    from .metal_env import describe_metal_buffer_env
+
+    logger.info("Metal command buffers: %s", describe_metal_buffer_env())
 
     uvicorn.run(
         "mlx_vlm.server:app",
