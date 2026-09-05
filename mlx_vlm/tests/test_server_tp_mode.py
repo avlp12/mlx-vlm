@@ -726,6 +726,29 @@ def test_unset_passthrough_vars_are_not_forwarded_as_empty(monkeypatch):
     assert "MLX_VLM_GLM5_GATHER_MIN_CONTEXT=65536" in seen["cmd"][4]
 
 
+def test_gdn_prefix_capture_passthrough_is_omitted_unset_and_forwarded_set(monkeypatch):
+    os.environ[T.ENV_HOSTS] = "10.0.0.1,10.0.0.2"
+    monkeypatch.delenv("MLX_VLM_GLM5_GDN_PREFIX_CAPTURE", raising=False)
+    seen = {}
+
+    class P:
+        def __init__(self, cmd):
+            seen["cmd"] = cmd
+
+    monkeypatch.setattr(T.subprocess, "Popen", P)
+    T.launch_worker("/m", T.tp_hosts())
+    assert "MLX_VLM_GLM5_GDN_PREFIX_CAPTURE" not in seen["cmd"][4]
+
+    monkeypatch.setenv("MLX_VLM_GLM5_GDN_PREFIX_CAPTURE", "1")
+    T.launch_worker("/m", T.tp_hosts())
+    assert "MLX_VLM_GLM5_GDN_PREFIX_CAPTURE=1" in seen["cmd"][4]
+
+    for value in ("0", "false", "not-a-bool; echo unsafe"):
+        monkeypatch.setenv("MLX_VLM_GLM5_GDN_PREFIX_CAPTURE", value)
+        T.launch_worker("/m", T.tp_hosts())
+        assert "MLX_VLM_GLM5_GDN_PREFIX_CAPTURE" not in seen["cmd"][4]
+
+
 def test_no_passthrough_var_is_ever_emitted_empty(monkeypatch):
     """The general form: nothing may reach the worker as NAME= ."""
     os.environ[T.ENV_HOSTS] = "10.0.0.1,10.0.0.2"

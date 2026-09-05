@@ -27,6 +27,7 @@ from .fused_kda import (
     fused_kda_qproj_supported,
     fused_kda_supported,
     fused_kda_verify_block,
+    fused_kda_verify_block_capture,
 )
 from .qmv_custom import DEFAULT_GEOMETRY, maybe_qmv, qmv_applicable
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
@@ -113,9 +114,30 @@ _FUSED_KDA_BLOCK = os.environ.get(
     "MLX_VLM_GLM5_FUSED_KDA_BLOCK", "1"
 ).lower() in ("1", "true", "yes", "on")
 
+# Experimental only.  The default production verify kernel returns exactly six
+# outputs and keeps the existing eleven-field rollback sink.  When explicitly
+# enabled, an S>1 verify with a sink uses a distinct kernel ABI that additionally
+# captures state/window prefixes, allowing ragged rollback to avoid recurrence
+# replay.  This must remain off until a separately reviewed measurement enables it.
+_FUSED_KDA_GDN_PREFIX_CAPTURE = os.environ.get(
+    "MLX_VLM_GLM5_GDN_PREFIX_CAPTURE", "0"
+).lower() in ("1", "true", "yes", "on")
+
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _fused_kda_prefix_capture_enabled(
+    gdn_sink, sequence_length: int, batch_size: int
+) -> bool:
+    """Whether this call may select the experimentally covered capture ABI."""
+    return bool(
+        _FUSED_KDA_GDN_PREFIX_CAPTURE
+        and gdn_sink is not None
+        and 2 <= int(sequence_length) <= 8
+        and 1 <= int(batch_size) <= 2
+    )
 
 
 def _fused_kda_qproj_enabled() -> bool:
@@ -943,6 +965,8 @@ class Glm5NextLinearAttention(nn.Module):
         self._fused_kda_qproj = None
         self._fused_kda_ty = None
         self._fused_kda_qproj_ty = None
+        self._fused_kda_prefix_capture = None
+        self._fused_kda_prefix_capture_ty = None
 
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
@@ -1145,6 +1169,21 @@ class Glm5NextLinearAttention(nn.Module):
             self._fused_kda_ty = ty
         return True
 
+    def _fused_kda_prefix_capture_ready(self, dtype, state_dtype) -> bool:
+        """Probe the opt-in capture ABI independently of the default block ABI."""
+        if self._fused_kda_prefix_capture is None:
+            ty = fused_kda_probe(
+                kind="block_capture",
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                conv_kernel_size=self.conv_kernel_size,
+                dtype=dtype,
+                state_dtype=state_dtype,
+            )
+            self._fused_kda_prefix_capture_ty = ty
+            self._fused_kda_prefix_capture = ty is not None
+        return bool(self._fused_kda_prefix_capture)
+
     def _fused_kda_block(
         self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache, gdn_sink, mask, mixed
     ) -> mx.array:
@@ -1167,27 +1206,64 @@ class Glm5NextLinearAttention(nn.Module):
         a = fg.f_b_proj(fa_o)
         gate = self.g_b_proj(ga_o)
         entry_state = cache[1]
-        y, state_out, conv_state_out, q_s, k_s, v_s = fused_kda_verify_block(
-            q_o,
-            k_o,
-            v_o,
-            cache[0],
-            self.conv1d.weight,
-            a,
-            b_o,
-            fg.A_log,
-            fg.dt_bias,
-            entry_state,
-            gate,
-            self.o_norm.weight,
-            num_heads=H,
-            head_dim=D,
-            conv_kernel_size=self.conv_kernel_size,
-            lower_bound=fg.safe_gate_lower_bound,
-            norm_eps=self.o_norm.eps,
-            mask=mask if (mask is not None and mask.dtype == mx.bool_) else None,
-            ty=self._fused_kda_ty,
-        )
+        capture_prefix = _fused_kda_prefix_capture_enabled(gdn_sink, S, B)
+        if capture_prefix and not self._fused_kda_prefix_capture_ready(
+            q_o.dtype, entry_state.dtype
+        ):
+            capture_prefix = False
+        if capture_prefix:
+            (
+                y,
+                state_out,
+                conv_state_out,
+                q_s,
+                k_s,
+                v_s,
+                prefix_states,
+                prefix_convs,
+            ) = fused_kda_verify_block_capture(
+                q_o,
+                k_o,
+                v_o,
+                cache[0],
+                self.conv1d.weight,
+                a,
+                b_o,
+                fg.A_log,
+                fg.dt_bias,
+                entry_state,
+                gate,
+                self.o_norm.weight,
+                num_heads=H,
+                head_dim=D,
+                conv_kernel_size=self.conv_kernel_size,
+                lower_bound=fg.safe_gate_lower_bound,
+                norm_eps=self.o_norm.eps,
+                mask=mask if (mask is not None and mask.dtype == mx.bool_) else None,
+                ty=self._fused_kda_prefix_capture_ty,
+            )
+        else:
+            y, state_out, conv_state_out, q_s, k_s, v_s = fused_kda_verify_block(
+                q_o,
+                k_o,
+                v_o,
+                cache[0],
+                self.conv1d.weight,
+                a,
+                b_o,
+                fg.A_log,
+                fg.dt_bias,
+                entry_state,
+                gate,
+                self.o_norm.weight,
+                num_heads=H,
+                head_dim=D,
+                conv_kernel_size=self.conv_kernel_size,
+                lower_bound=fg.safe_gate_lower_bound,
+                norm_eps=self.o_norm.eps,
+                mask=mask if (mask is not None and mask.dtype == mx.bool_) else None,
+                ty=self._fused_kda_ty,
+            )
         if gdn_sink is not None:
             # Same eleven members the eager path stashes, in the same order, so
             # rollback_speculative_cache cannot tell which path produced them.
@@ -1198,20 +1274,25 @@ class Glm5NextLinearAttention(nn.Module):
                 if (mask is not None and mask.dtype == mx.bool_)
                 else mixed
             )
+            entry = (
+                q_s,
+                k_s,
+                v_s,
+                a.reshape(B, S, H, D),
+                b_o,
+                fg.A_log.reshape(H, 1),
+                fg.dt_bias.reshape(H, D),
+                entry_state,
+                mx.concatenate([cache[0], masked], axis=1),
+                self.conv_kernel_size,
+                fg.safe_gate_lower_bound,
+            )
+            # The legacy eleven fields remain byte-for-byte in their original
+            # positions.  Only the opt-in block-capture kernel appends the two
+            # prefix receipts; rollback treats any other extended arity as an
+            # error instead of silently replaying a malformed capture.
             gdn_sink.append(
-                (
-                    q_s,
-                    k_s,
-                    v_s,
-                    a.reshape(B, S, H, D),
-                    b_o,
-                    fg.A_log.reshape(H, 1),
-                    fg.dt_bias.reshape(H, D),
-                    entry_state,
-                    mx.concatenate([cache[0], masked], axis=1),
-                    self.conv_kernel_size,
-                    fg.safe_gate_lower_bound,
-                )
+                entry + ((prefix_states, prefix_convs) if capture_prefix else ())
             )
         cache[0] = conv_state_out
         cache[1] = state_out
@@ -2653,6 +2734,157 @@ def give_back_sparse_cache_rows(cache, extra: mx.array) -> None:
     indexer_cache._no_pad = False
 
 
+_GDN_LEGACY_FIELDS = 11
+_GDN_PREFIX_FIELDS = 13
+
+
+def _captured_gdn_prefix_state(entry, final_state, final_conv, accepted_list, block_size):
+    """Return per-row rollback state from an opt-in fused-block receipt.
+
+    ``None`` means the pre-feature eleven-field receipt, so the established
+    gated-delta replay remains the compatibility path.  Any extended receipt
+    must be exactly the two-field extension produced by
+    ``fused_kda_verify_block_capture``; accepting a partially shaped capture
+    would silently mix a stale KDA state with a newly trimmed MLA cache.
+    """
+    if not isinstance(entry, tuple):
+        raise ValueError("GDN rollback receipt must be a tuple")
+    if len(entry) == _GDN_LEGACY_FIELDS:
+        return None
+    if len(entry) != _GDN_PREFIX_FIELDS:
+        raise ValueError(
+            "GDN rollback receipt has an unsupported extended arity "
+            f"{len(entry)} (expected {_GDN_LEGACY_FIELDS} or {_GDN_PREFIX_FIELDS})"
+        )
+
+    q, k, v, a, b, A_log, dt_bias, entry_state, conv_input, K, _lb, prefix_states, prefix_convs = entry
+    if not isinstance(K, int) or K < 2:
+        raise ValueError("GDN prefix receipt has invalid convolution kernel size")
+    if getattr(final_state, "ndim", None) != 4 or getattr(final_conv, "ndim", None) != 3:
+        raise ValueError("GDN prefix receipt requires final [B,H,D,D] state and [B,K-1,C] window")
+    B, H, D, D2 = final_state.shape
+    if D != D2 or final_conv.shape[0] != B or final_conv.shape[1] != K - 1:
+        raise ValueError("GDN prefix receipt final cache shapes are inconsistent")
+    q_shape = getattr(q, "shape", None)
+    S = q_shape[1] if isinstance(q_shape, tuple) and len(q_shape) >= 2 else None
+    if not isinstance(S, int) or S < 2 or int(block_size) != S:
+        raise ValueError("GDN prefix receipt block size does not match captured sequence")
+    expected_q = (B, S, H, D)
+    if any(getattr(item, "shape", None) != expected_q for item in (q, k, v, a)):
+        raise ValueError("GDN prefix receipt q/k/v/a shapes are malformed")
+    if getattr(b, "shape", None) != (B, S, H):
+        raise ValueError("GDN prefix receipt beta shape is malformed")
+    if getattr(A_log, "shape", None) != (H, 1) or getattr(dt_bias, "shape", None) != (H, D):
+        raise ValueError("GDN prefix receipt gate parameter shapes are malformed")
+    if getattr(entry_state, "shape", None) != final_state.shape:
+        raise ValueError("GDN prefix receipt entry-state shape is malformed")
+    if getattr(conv_input, "shape", None) != (B, K - 1 + S, final_conv.shape[2]):
+        raise ValueError("GDN prefix receipt convolution input shape is malformed")
+    if getattr(prefix_states, "shape", None) != (B, S - 1, H, D, D):
+        raise ValueError("GDN prefix receipt state-prefix shape is malformed")
+    if getattr(prefix_convs, "shape", None) != (
+        B,
+        S - 1,
+        K - 1,
+        final_conv.shape[2],
+    ):
+        raise ValueError("GDN prefix receipt convolution-prefix shape is malformed")
+    if getattr(prefix_states, "dtype", None) != final_state.dtype:
+        raise ValueError("GDN prefix receipt state-prefix dtype is malformed")
+    if getattr(prefix_convs, "dtype", None) != final_conv.dtype:
+        raise ValueError("GDN prefix receipt convolution-prefix dtype is malformed")
+    activation_dtype = final_conv.dtype
+    if any(
+        getattr(item, "dtype", None) != activation_dtype
+        for item in (q, k, v, a, b, conv_input, prefix_convs)
+    ):
+        raise ValueError("GDN prefix receipt activation dtype is malformed")
+    if getattr(A_log, "dtype", None) != mx.float32 or getattr(dt_bias, "dtype", None) != mx.float32:
+        raise ValueError("GDN prefix receipt gate parameter dtype is malformed")
+    if (
+        getattr(entry_state, "dtype", None) != final_state.dtype
+        or getattr(prefix_states, "dtype", None) != final_state.dtype
+    ):
+        raise ValueError("GDN prefix receipt state dtype is malformed")
+    if len(accepted_list) != B or any(a_i < 0 or a_i >= S for a_i in accepted_list):
+        raise ValueError("GDN prefix receipt accepted counts are out of range")
+
+    # Prefix slot t is the state after token t.  Gather one prefix state/window
+    # per row, then select the existing final cache for full-accept rows.  Do not
+    # concatenate a final slot onto every trajectory here: at B>1 that materialises
+    # another O(B*S*H*D*D) graph merely to read B selected entries.
+    positions = mx.array(accepted_list, dtype=mx.int32)
+    prefix_positions = mx.minimum(positions, S - 2)
+    state_indices = mx.broadcast_to(
+        prefix_positions[:, None, None, None, None], (B, 1, H, D, D)
+    )
+    prefix_state = mx.take_along_axis(prefix_states, state_indices, axis=1).squeeze(1)
+    conv_indices = mx.broadcast_to(
+        prefix_positions[:, None, None, None], (B, 1, K - 1, final_conv.shape[2])
+    )
+    prefix_conv = mx.take_along_axis(prefix_convs, conv_indices, axis=1).squeeze(1)
+    full = positions == S - 1
+    states = mx.where(full[:, None, None, None], final_state, prefix_state)
+    convs = mx.where(full[:, None, None], final_conv, prefix_conv)
+    return states, convs
+
+
+def _prepare_gdn_rollback_entry(
+    entry, final_state, final_conv, accepted_list, block_size
+):
+    """Validate one KDA receipt without mutating its cache.
+
+    Rollback owns KDA and sparse caches together.  A receipt error discovered
+    after an earlier KDA layer was replayed would otherwise leave one layer at
+    a prefix while the remaining KDA and sparse layers still describe the end
+    of the speculative block.  Build all selections first, then apply them.
+    """
+    if not isinstance(entry, tuple):
+        raise ValueError("GDN rollback receipt must be a tuple")
+    if len(entry) == _GDN_PREFIX_FIELDS:
+        return ("captured", _captured_gdn_prefix_state(
+            entry, final_state, final_conv, accepted_list, block_size
+        ))
+    if len(entry) != _GDN_LEGACY_FIELDS:
+        raise ValueError(
+            "GDN rollback receipt has an unsupported extended arity "
+            f"{len(entry)} (expected {_GDN_LEGACY_FIELDS} or {_GDN_PREFIX_FIELDS})"
+        )
+
+    (
+        q, k, v, a, b, A_log, dt_bias, entry_state, conv_input, K, _lb,
+    ) = entry
+    if not isinstance(K, int) or K < 2:
+        raise ValueError("GDN legacy receipt has invalid convolution kernel size")
+    if getattr(final_state, "ndim", None) != 4 or getattr(final_conv, "ndim", None) != 3:
+        raise ValueError("GDN legacy receipt requires final [B,H,D,D] state and [B,K-1,C] window")
+    B, H, D, D2 = final_state.shape
+    if D != D2 or final_conv.shape[0] != B or final_conv.shape[1] != K - 1:
+        raise ValueError("GDN legacy receipt final cache shapes are inconsistent")
+    q_shape = getattr(q, "shape", None)
+    S = q_shape[1] if isinstance(q_shape, tuple) and len(q_shape) >= 2 else None
+    if not isinstance(S, int) or S < 1 or int(block_size) != S:
+        raise ValueError("GDN legacy receipt block size does not match sequence")
+    expected_q = (B, S, H, D)
+    if any(getattr(item, "shape", None) != expected_q for item in (q, k, v, a)):
+        raise ValueError("GDN legacy receipt q/k/v/a shapes are malformed")
+    if getattr(b, "shape", None) != (B, S, H):
+        raise ValueError("GDN legacy receipt beta shape is malformed")
+    if getattr(A_log, "shape", None) != (H, 1) or getattr(dt_bias, "shape", None) != (H, D):
+        raise ValueError("GDN legacy receipt gate parameter shapes are malformed")
+    # A fresh ArraysCache starts its recurrence from None.  That is the shipped
+    # gated_delta_update zero-init contract, so legacy receipts must retain it.
+    if entry_state is not None and getattr(entry_state, "shape", None) != final_state.shape:
+        raise ValueError("GDN legacy receipt entry-state shape is malformed")
+    if getattr(conv_input, "shape", None) != (
+        B, K - 1 + S, final_conv.shape[2]
+    ):
+        raise ValueError("GDN legacy receipt convolution input shape is malformed")
+    if len(accepted_list) != B or any(a_i < 0 or a_i >= S for a_i in accepted_list):
+        raise ValueError("GDN legacy receipt accepted counts are out of range")
+    return ("replay", entry)
+
+
 class LanguageModel(nn.Module):
     # The STATIC declaration: with no further information, assume this model's
     # rollback cannot represent per-row accept counts, so the speculative loops
@@ -2897,6 +3129,27 @@ class LanguageModel(nn.Module):
                 "accepts to the batch minimum before rollback -- see "
                 "speculative/common.py::_batch_acceptance_must_be_uniform."
             )
+
+        # Do not alter a single cache until every KDA receipt has passed schema
+        # validation and (for capture receipts) its per-row selection has been
+        # built.  Sparse MLA/indexer caches are deliberately included in the
+        # later apply phase, so a malformed final KDA receipt cannot leave a
+        # prefix of the model rolled back.
+        array_caches = [c for c in caches if isinstance(c, ArraysCache)]
+        if not isinstance(gdn_states, (list, tuple)):
+            raise ValueError("GDN rollback receipts must be a list or tuple")
+        if len(gdn_states) != len(array_caches):
+            raise ValueError(
+                "GDN rollback receipt count does not match ArraysCache count "
+                f"({len(gdn_states)} != {len(array_caches)})"
+            )
+        prepared_gdn = [
+            _prepare_gdn_rollback_entry(
+                entry, cache[1], cache[0], accepted_list, block_size
+            )
+            for cache, entry in zip(array_caches, gdn_states)
+        ]
+
         trim = block_size - (max_a + 1)
         extra_arr = mx.array(extra, dtype=mx.int32) if ragged else None
         # Per-row KDA replay length as the [B, T] mask the shipped gated-delta
@@ -2920,10 +3173,30 @@ class LanguageModel(nn.Module):
                 # rolled-back recurrent state, and slice the conv window to match.
                 # ``n`` is the batch maximum; ``kda_mask`` stops each row at its own
                 # length, and the conv window is gathered per row for the same reason.
-                q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state, conv_input, K, lb = (
-                    gdn_states[gdn_idx]
-                )
+                kind, payload = prepared_gdn[gdn_idx]
                 gdn_idx += 1
+                if kind == "captured":
+                    # The opt-in fused S>1 capture recorded post-token state and
+                    # window directly.  In a ragged [full, reject] block this
+                    # selects each row independently, using the existing final
+                    # cache for the full row and a prefix receipt for the other.
+                    # No gated-delta replay is allowed on this path.
+                    c[1], c[0] = payload
+                    continue
+                entry = payload
+                (
+                    q_,
+                    k_,
+                    v_,
+                    a_,
+                    b_,
+                    A_log_,
+                    dt_bias_,
+                    init_state,
+                    conv_input,
+                    K,
+                    lb,
+                ) = entry
                 n = max_a + 1
                 _, state_n = gated_delta_update(
                     q_[:, :n],
