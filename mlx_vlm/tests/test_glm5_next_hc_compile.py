@@ -210,10 +210,15 @@ def _kda_layer(config, seed=0):
     return _randomize(glm5.Glm5NextLinearAttention(config), seed=seed)
 
 
-def test_kda_glue_compile_default_off(monkeypatch):
+def test_kda_glue_compile_default_on(monkeypatch):
+    # Default ON since 2026-09-05 (operator-approved micro bundle); "0" restores.
     monkeypatch.delenv("MLX_VLM_GLM5_KDA_GLUE_COMPILE", raising=False)
     glm5._KDA_GLUE_COMPILE_ENV = None
+    assert glm5._kda_glue_compile_enabled() is True
+    monkeypatch.setenv("MLX_VLM_GLM5_KDA_GLUE_COMPILE", "0")
+    glm5._KDA_GLUE_COMPILE_ENV = None
     assert glm5._kda_glue_compile_enabled() is False
+    glm5._KDA_GLUE_COMPILE_ENV = None
 
 
 def test_kda_glue_compile_env_enables(monkeypatch):

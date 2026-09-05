@@ -178,7 +178,7 @@ _KDA_GLUE_COMPILE_ENV = None
 def _kda_glue_compile_enabled() -> bool:
     global _KDA_GLUE_COMPILE_ENV
     if _KDA_GLUE_COMPILE_ENV is None:
-        _KDA_GLUE_COMPILE_ENV = _env_flag("MLX_VLM_GLM5_KDA_GLUE_COMPILE")
+        _KDA_GLUE_COMPILE_ENV = _env_flag("MLX_VLM_GLM5_KDA_GLUE_COMPILE", "1")  # default ON 2026-09-05 (operator-approved micro bundle; =0 restores)
     return _KDA_GLUE_COMPILE_ENV
 
 
