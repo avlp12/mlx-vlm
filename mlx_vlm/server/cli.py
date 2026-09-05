@@ -379,9 +379,12 @@ def main():
     logger.setLevel(log_level)
     # Effective Metal command-buffer limits (server default 1024/50000 unless
     # pinned by the environment; applied by the re-exec in server/__main__.py).
-    from .metal_env import describe_metal_buffer_env
+    from .metal_env import describe_metal_buffer_env, metal_env_warning
 
     logger.info("Metal command buffers: %s", describe_metal_buffer_env())
+    _metal_env_warning = metal_env_warning()
+    if _metal_env_warning:
+        logger.warning(_metal_env_warning)
 
     uvicorn.run(
         "mlx_vlm.server:app",

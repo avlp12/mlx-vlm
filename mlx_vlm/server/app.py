@@ -1455,6 +1455,17 @@ async def unload_model_endpoint(request: Request):
 
 
 def main():
+    # This is the target of the `mlx_vlm.server` console script and of
+    # `from mlx_vlm.server import main`, both of which bypass
+    # `server/__main__.py` (and its re-exec) entirely -- by the time this
+    # function runs, `mlx.core` is already imported at module scope above.
+    # Re-exec anyway: it restarts the interpreter, so the fresh process sees
+    # the default Metal command-buffer env before it imports anything. Must
+    # run before any Metal-touching work below. See server/metal_env.py.
+    from .metal_env import maybe_reexec_with_metal_env
+
+    maybe_reexec_with_metal_env("mlx_vlm.server")
+
     from .cli import main as cli_main
 
     cli_main()
