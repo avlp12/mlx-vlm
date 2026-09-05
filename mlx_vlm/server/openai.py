@@ -4,6 +4,7 @@ import binascii
 import gc
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -85,6 +86,13 @@ from .schemas import (
 )
 
 logger = logging.getLogger("mlx_vlm.server")
+
+# L17 R3: default OFF, read once at import. Batches the per-token
+# asyncio.to_thread() round-trip in the ResponseGenerator streaming path
+# (stream_generator, chat completions) into one blocking get + a
+# non-blocking drain of whatever else is already queued.
+_SERVER_BATCHED_EMIT = os.environ.get("MLX_VLM_SERVER_BATCHED_EMIT") == "1"
+_SERVER_BATCHED_EMIT_MAX_ITEMS = 32
 
 _INHERIT_ADAPTER = None
 get_cached_model = None
@@ -1847,10 +1855,45 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             except StopIteration:
                                 return None
 
+                        def _next_batch():
+                            try:
+                                return token_iter.next_batch(
+                                    _SERVER_BATCHED_EMIT_MAX_ITEMS
+                                )
+                            except StopIteration:
+                                return [], "stop"
+
+                        # L17 R3 batched-emit state (only mutated/read when
+                        # _SERVER_BATCHED_EMIT is on; off by default the loop
+                        # below is byte-identical to before this change).
+                        _pending_tokens: list = []
+                        _pending_ended = False
+                        _pending_error = None
+
                         while True:
-                            token = await asyncio.to_thread(_next_token)
-                            if token is None:
-                                break
+                            if _SERVER_BATCHED_EMIT:
+                                if not _pending_tokens:
+                                    if _pending_ended:
+                                        if _pending_error is not None:
+                                            raise _pending_error
+                                        break
+                                    _pending_tokens, _terminal = await asyncio.to_thread(
+                                        _next_batch
+                                    )
+                                    if _terminal == "stop":
+                                        _pending_ended = True
+                                    elif isinstance(_terminal, Exception):
+                                        _pending_ended = True
+                                        _pending_error = _terminal
+                                    if not _pending_tokens:
+                                        if _pending_error is not None:
+                                            raise _pending_error
+                                        break
+                                token = _pending_tokens.pop(0)
+                            else:
+                                token = await asyncio.to_thread(_next_token)
+                                if token is None:
+                                    break
                             output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             chunk_rate = metrics.record_chunk(token)

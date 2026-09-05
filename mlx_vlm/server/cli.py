@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import sys
 
 import uvicorn
 
@@ -41,6 +42,18 @@ def _apply_apc_env(args, env) -> None:
     entries = getattr(args, "apc_exact_entries", None)
     if entries is not None:
         env["APC_EXACT_CACHE_ENTRIES"] = str(int(entries))
+
+
+def _parse_switch_interval(raw: str):
+    """L17 R3 companion knob parsing, split out so it is unit-testable
+    without going through argparse/uvicorn. Returns the parsed float, or
+    None (and logs a warning) if ``raw`` is not a valid float.
+    """
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid MLX_VLM_SWITCH_INTERVAL=%r", raw)
+        return None
 
 
 def main():
@@ -384,6 +397,17 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     logger.setLevel(log_level)
+
+    # L17 R3 companion knob: default unset (Python's default switch
+    # interval, unchanged). MLX_VLM_SWITCH_INTERVAL=<seconds float> lets an
+    # ablation raise sys.setswitchinterval() so the batched-emit thread pool
+    # handoff (asyncio.to_thread) competes less with the GPU-thread's GIL
+    # needs during B=1 decode.
+    switch_interval_raw = os.environ.get("MLX_VLM_SWITCH_INTERVAL")
+    if switch_interval_raw is not None:
+        switch_interval = _parse_switch_interval(switch_interval_raw)
+        if switch_interval is not None:
+            sys.setswitchinterval(switch_interval)
 
     uvicorn.run(
         "mlx_vlm.server:app",
