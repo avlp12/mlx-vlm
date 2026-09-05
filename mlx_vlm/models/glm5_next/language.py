@@ -178,7 +178,7 @@ _KDA_GLUE_COMPILE_ENV = None
 def _kda_glue_compile_enabled() -> bool:
     global _KDA_GLUE_COMPILE_ENV
     if _KDA_GLUE_COMPILE_ENV is None:
-        _KDA_GLUE_COMPILE_ENV = _env_flag("MLX_VLM_GLM5_KDA_GLUE_COMPILE", "1")  # default ON 2026-09-05 (operator-approved micro bundle; =0 restores)
+        _KDA_GLUE_COMPILE_ENV = _env_flag("MLX_VLM_GLM5_KDA_GLUE_COMPILE")  # default OFF again 2026-09-06: ON cut DFlash2 acceptance 4.82->3.27/round (68.3->47.7 tok/s), see campaign ledger I1310
     return _KDA_GLUE_COMPILE_ENV
 
 

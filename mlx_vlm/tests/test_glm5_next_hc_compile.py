@@ -210,12 +210,10 @@ def _kda_layer(config, seed=0):
     return _randomize(glm5.Glm5NextLinearAttention(config), seed=seed)
 
 
-def test_kda_glue_compile_default_on(monkeypatch):
-    # Default ON since 2026-09-05 (operator-approved micro bundle); "0" restores.
+def test_kda_glue_compile_default_off(monkeypatch):
+    # Default OFF (reverted 2026-09-06): the compiled glue changed the target's
+    # verify-forward numerics enough to drop DFlash2 acceptance 4.82 -> 3.27/round.
     monkeypatch.delenv("MLX_VLM_GLM5_KDA_GLUE_COMPILE", raising=False)
-    glm5._KDA_GLUE_COMPILE_ENV = None
-    assert glm5._kda_glue_compile_enabled() is True
-    monkeypatch.setenv("MLX_VLM_GLM5_KDA_GLUE_COMPILE", "0")
     glm5._KDA_GLUE_COMPILE_ENV = None
     assert glm5._kda_glue_compile_enabled() is False
     glm5._KDA_GLUE_COMPILE_ENV = None
