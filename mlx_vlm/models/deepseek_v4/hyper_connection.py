@@ -1,9 +1,28 @@
 # Copyright (c) 2026 Apple Inc.
 
+import os
 from typing import Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+
+# L13 (2026-09-05): whole-block mx.compile fusion for the HyperConnection
+# norm/mix/inject path.  Default OFF -- unverified on GPU, this module has no
+# GPU here to measure on (see mlx_vlm/tests/test_glm5_next_hc_compile.py for
+# the CPU parity/shape coverage this toggle gets).  Same `_env_flag`-style
+# read-once-cache-in-a-global pattern as glm5_next/language.py; duplicated
+# rather than imported because language.py imports THIS module (importing back
+# would cycle).
+_HC_COMPILE_ENV = None
+
+
+def _hc_compile_enabled() -> bool:
+    global _HC_COMPILE_ENV
+    if _HC_COMPILE_ENV is None:
+        _HC_COMPILE_ENV = os.environ.get(
+            "MLX_VLM_GLM5_HC_COMPILE", "0"
+        ).lower() in ("1", "true", "yes", "on")
+    return _HC_COMPILE_ENV
 
 
 def _make_hc_sinkhorn_collapse_kernel():
@@ -319,6 +338,74 @@ def _hc_ops(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     return (pre[..., None] * y).sum(axis=2).astype(x.dtype), post, comb
 
 
+def _hc_preamble_impl(x: mx.array, fn_t: mx.array, norm_eps: float):
+    """Pre-norm + mixing matmul: the part of ``HyperConnection.__call__`` that
+    runs unconditionally, before the GPU-kernel/ops branch.  Pure elementwise
+    cast, a flatten, an RMSNorm and one matmul against the (frozen) mixing
+    weight -- no reshape whose target size depends on a *value* read out of a
+    traced shape, so this is a `shapeless=True` candidate: recompiling on
+    B/L changes is not required, only on ndim/dtype changes.
+    """
+    y = x.astype(mx.float32)
+    z = mx.fast.rms_norm(y.flatten(-2), None, norm_eps)
+    mixes = z @ fn_t
+    return y, mixes
+
+
+# Module-level cache: one compiled callable, shared by every HyperConnection
+# instance (attn_hc and ffn_hc across all 45 layers) -- the weights (fn_t) are
+# passed as an explicit input on every call, never captured, so nothing here
+# is instance-specific and a single compiled object is correct for all of
+# them. mx.compile's own internal shape cache handles the handful of distinct
+# (B, L) shapes seen (prefill chunk width + tail, plus decode S=1..8).
+_hc_preamble_compiled = mx.compile(_hc_preamble_impl, shapeless=True)
+
+
+def _hc_full_ops_impl(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
+    """Whole non-GPU-kernel HyperConnection body, one compiled unit: sigmoid
+    pre/post gates + comb softmax + sinkhorn iterations (same math as
+    ``_hc_split_sinkhorn_ops``, inlined here so it fuses with the final
+    reduction into ONE compiled graph) followed by the ``(pre * y).sum``
+    collapse. This is the "whole block" fusion the I964 note flags as never
+    tried -- I964 only compiled the sinkhorn sub-expression.
+
+    Not `shapeless`: ``comb`` is reshaped to ``(*mixes.shape[:-1], hc_mult,
+    hc_mult)``, a reshape whose target size is read from a traced shape value,
+    which is exactly the case shapeless compilation does not cover (matches
+    the existing `_hc_split_sinkhorn_ops` precedent, also plain `mx.compile`
+    for the same reason). Recompiles per distinct (B, L); acceptable per the
+    task brief since prefill only visits the 8192-token chunk shape plus one
+    tail shape.
+    """
+    mixes = mixes.astype(mx.float32)
+    scale = scale.astype(mx.float32)
+    base = base.astype(mx.float32)
+    pre_scale, post_scale, comb_scale = scale[0], scale[1], scale[2]
+
+    pre = mx.sigmoid(mixes[..., :hc_mult] * pre_scale + base[:hc_mult]) + eps
+    post = 2 * mx.sigmoid(
+        mixes[..., hc_mult : 2 * hc_mult] * post_scale + base[hc_mult : 2 * hc_mult]
+    )
+    comb = mixes[..., 2 * hc_mult :].reshape(
+        *mixes.shape[:-1], hc_mult, hc_mult
+    ) * comb_scale + base[2 * hc_mult :].reshape(hc_mult, hc_mult)
+    comb = mx.softmax(comb, axis=-1, precise=True) + eps
+    comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
+    for _ in range(max(sinkhorn_iters - 1, 0)):
+        comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
+        comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
+
+    xc = (pre[..., None] * y).sum(axis=2).astype(x.dtype)
+    return xc, post, comb
+
+
+# Module-level cache, same rationale as _hc_preamble_compiled: hc_mult and
+# sinkhorn_iters are plain python ints/floats (config-derived, identical
+# across all HyperConnection instances in one model), scale/base are the only
+# per-instance arrays and they are explicit inputs, not captured.
+_hc_full_ops_compiled = mx.compile(_hc_full_ops_impl)
+
+
 class HyperConnection(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -343,9 +430,13 @@ class HyperConnection(nn.Module):
         about one ulp of the output dtype, not bit-exactly.
         """
         B, L, H, D = x.shape
-        y = x.astype(mx.float32)
-        z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
+        hc_compile = _hc_compile_enabled()
+        if hc_compile:
+            y, mixes = _hc_preamble_compiled(x, self.fn.T, self.norm_eps)
+        else:
+            y = x.astype(mx.float32)
+            z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
+            mixes = z @ self.fn.T
 
         use_ops = (
             self.training
@@ -353,10 +444,16 @@ class HyperConnection(nn.Module):
             or not mx.metal.is_available()
         )
         if use_ops:
-            xc, post, comb = _hc_ops(
-                x, y, mixes, self.scale, self.base,
-                self.hc_mult, self.sinkhorn_iters, self.hc_eps,
-            )
+            if hc_compile:
+                xc, post, comb = _hc_full_ops_compiled(
+                    x, y, mixes, self.scale, self.base,
+                    self.hc_mult, self.sinkhorn_iters, self.hc_eps,
+                )
+            else:
+                xc, post, comb = _hc_ops(
+                    x, y, mixes, self.scale, self.base,
+                    self.hc_mult, self.sinkhorn_iters, self.hc_eps,
+                )
             # Same contract on the ops path, so a caller that hands us norm_w
             # gets a normed collapse whichever path ran.
             if norm_w is not None:
