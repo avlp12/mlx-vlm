@@ -299,8 +299,11 @@ The knee was verified to move with the gate — 32768 → knee at kv_len 32768,
 ## Long-context checklist
 
 * `MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD` caps `b * s` per announced forward,
-  not `s`. Default 8192; `DEFAULT_PREFILL_STEP_SIZE` is 2048, so B=1..4 chunked
-  prefill fits and **B=8 × 2048 = 16384 does not**. Raise it on **both** ranks
+  not `s`. Default 8192; `DEFAULT_PREFILL_STEP_SIZE` is 8192 since 2026-09-05
+  (it was 2048 when this section was written), so only **B=1** chunked prefill
+  fits at the default -- B=2 × 8192 = 16384 does not, and neither did the old
+  B=8 × 2048. Either lower `PREFILL_STEP_SIZE` for batched TP prefill or raise
+  the cap; if raising it, do so on **both** ranks
   (it is agreed in preflight, so a one-sided change is refused rather than
   hung).
 * `tp/glm5_next.py:103` sets `attn._fused_ready = False` after sharding, so the

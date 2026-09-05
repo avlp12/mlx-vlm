@@ -22,7 +22,19 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_PREFILL_STEP_SIZE = 2048
+# 8192 since 2026-09-05 (was 2048). Operator-approved default flip on the
+# GLM-5.3-Flash serving campaign: chunked prefill at 8192 raised single-box
+# prefill throughput +11.5 % (8k) / +6.9 % (32k) with peak memory +16 GiB
+# (181 -> 197 GiB, under the 243 GiB cap), and a 16k teacher-forced quality
+# gate against an UNCHUNKED reference showed 8192 is no farther from exact
+# than 2048 was (mean KL 0.0250 vs 0.0275 nats, both under the 0.042075 cap).
+# Receipts: bench/hwdossier/receipts/sweep11/L7B_PREFILL_CHUNK_20260905,
+# L7B2_CHUNK_QUALITY_20260905, L7B3_UNCHUNKED_REFERENCE_20260905 (private
+# campaign repo). Override per process with PREFILL_STEP_SIZE (server) or
+# --prefill-step-size (CLI). TP=2 mode caps b*s per forward at
+# MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD (default 8192), so only B=1 chunks
+# fit there at this size -- see mlx_vlm/tp/README_TP_SERVING.md.
+DEFAULT_PREFILL_STEP_SIZE = 8192
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
