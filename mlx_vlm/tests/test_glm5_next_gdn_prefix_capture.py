@@ -16,7 +16,20 @@ import textwrap
 import mlx.core as mx
 import pytest
 
-mx.set_default_device(mx.cpu)
+
+
+@pytest.fixture(autouse=True)
+def _cpu_default_device():
+    """These selector/contract tests intend the CPU device; pin it per test and
+    restore afterwards so importing this module never flips the process-wide
+    default device for other collected modules (which compare Metal kernels
+    against GPU eager references)."""
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous)
 
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.glm5_next import language as glm5_language
