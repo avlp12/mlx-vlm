@@ -1,8 +1,15 @@
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+
+# L17 R1: BatchKVCache.make_mask always builds a [B,1,1,T+1] bool array via
+# create_causal_mask, even at N==1 with no left padding -- a case the
+# non-batched KVCache.make_mask already answers with None (see
+# create_attention_mask below). Default OFF; read once at import.
+_BATCH_VACUOUS_MASK_NONE = os.environ.get("MLX_VLM_BATCH_VACUOUS_MASK_NONE") == "1"
 
 
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
@@ -1009,6 +1016,11 @@ class BatchKVCache(_BaseCache):
         self._idx = 0
 
         self._right_padding = None
+        # L17 R1: cheap (Python-side, no GPU sync) "every row's left_padding
+        # is exactly 0" flag, kept in sync by __init__/prepare/filter/extend/
+        # finalize. Only ever read by make_mask() under
+        # MLX_VLM_BATCH_VACUOUS_MASK_NONE=1; unused (and free) otherwise.
+        self._no_left_padding = not any(left_padding)
 
     def update_and_fetch(self, keys, values):
         prev = self._idx
@@ -1029,6 +1041,15 @@ class BatchKVCache(_BaseCache):
             else:
                 self.keys, self.values = new_k, new_v
 
+        # L17 R1 (skipped): a B==1 special-case that avoided this being an
+        # mx.array op was considered and dropped. `self.offset` (unlike
+        # `self._idx`, a private Python int) is a public per-row mx.array
+        # read directly by RoPE position-id code in dozens of
+        # mlx_vlm/models/*/language.py files; branching its update/type on
+        # B==1 here risks silently changing what those call sites see for
+        # single-row batches, for a saving that is one lazy elementwise add
+        # per step (no host sync) -- not the array-construction cost this
+        # lever targets. Left untouched.
         self.offset += keys.shape[2]
         self._idx += keys.shape[2]
         self.keys[..., prev : self._idx, :] = keys
@@ -1041,6 +1062,7 @@ class BatchKVCache(_BaseCache):
                 raise ValueError(
                     "Left padding can only be added to an empty BatchKVCache"
                 )
+            self._no_left_padding = self._no_left_padding and not any(left_padding)
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
             self.offset -= left_padding
@@ -1090,6 +1112,9 @@ class BatchKVCache(_BaseCache):
             self._pool = None
             self._fpool = None
             self._no_pad = False
+            # A branch we only enter when prepare() saw max(right_padding) > 0,
+            # so at least one row's left_padding just became strictly positive.
+            self._no_left_padding = False
 
     @property
     def state(self):
@@ -1103,6 +1128,11 @@ class BatchKVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values, self.offset, self.left_padding = v
         self._idx = self.keys.shape[2]
+        # L17 R1: state loads (session/APC restore) are rare relative to
+        # decode steps, so a one-time sync here to get an accurate flag is
+        # worth it rather than conservatively disabling the toggle for the
+        # rest of the restored session.
+        self._no_left_padding = bool(mx.all(self.left_padding == 0).item())
 
     def is_trimmable(self):
         return True
@@ -1114,6 +1144,20 @@ class BatchKVCache(_BaseCache):
         return n
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        if (
+            _BATCH_VACUOUS_MASK_NONE
+            and N == 1
+            and self._no_left_padding
+            and self._right_padding is None
+        ):
+            # Same contract as KVCache.make_mask -> create_attention_mask:
+            # None at N==1 with no window. Single-stream (non-batched) B=1
+            # decode already takes exactly this branch every step; this just
+            # extends it to the batched cache when there is truly no padding
+            # to mask out.
+            return create_attention_mask(
+                N, self._idx, return_array, kwargs.get("window_size")
+            )
         return create_causal_mask(
             N, offset=self._idx, left_padding=self.left_padding, **kwargs
         )
@@ -1138,6 +1182,13 @@ class BatchKVCache(_BaseCache):
                 self.values = self.values[..., min_left_pad:, :]
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
+        # L17 R1: no _no_left_padding update needed here. filter() only ever
+        # subsets rows and (above) uniformly subtracts the post-subset
+        # minimum -- it never adds padding. So if the flag was True (all
+        # rows exactly 0) coming in, a subset of zeros is still all zeros
+        # (min_left_pad stays 0, no-op) and it stays True; if it was False,
+        # leaving it False is the safe conservative choice (a false "still
+        # padded" costs perf, never correctness) without an extra sync.
 
     def extend(self, other):
         """
@@ -1146,7 +1197,23 @@ class BatchKVCache(_BaseCache):
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
+            # Neither side has keys, so update_and_fetch never ran on either
+            # (._idx == 0 for both) -- no padding is introduced by this
+            # concatenation, unlike the general path below.
+            self._no_left_padding = getattr(
+                self, "_no_left_padding", False
+            ) and getattr(other, "_no_left_padding", False)
             return
+
+        # A row shorter than max_idx gets `left = max_idx - c._idx` extra
+        # left padding below to right-justify it -- a plain Python int
+        # comparison, no sync -- so the merged flag also requires the two
+        # caches to have been equally far along before concatenation.
+        _no_left_padding = (
+            getattr(self, "_no_left_padding", False)
+            and getattr(other, "_no_left_padding", False)
+            and self._idx == other._idx
+        )
 
         max_idx = max(self._idx, other._idx)
         L1 = L2 = 0
@@ -1183,6 +1250,7 @@ class BatchKVCache(_BaseCache):
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx
+        self._no_left_padding = _no_left_padding
 
     def extract(self, idx):
         cache = KVCache()
