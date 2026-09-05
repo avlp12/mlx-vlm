@@ -24,6 +24,7 @@ from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
     PrefillHiddenAccumulator,
+    chunk_capture_kwargs_for,
     make_speculative_prompt_cache,
     prefill_capture_kwargs,
     prefill_context_keep,
@@ -350,9 +351,9 @@ def generate_step(
     # The chunk loop below must carry the SAME capture as the final forward, or
     # the drafter is handed a one-row context (issue #2096: ``chunk_kwargs`` was
     # built from ``kwargs`` only, so turning chunking on for a capturing drafter
-    # silently dropped the prompt).  Only a per-layer capture stitches back
-    # together -- see ``_run_chunked_speculative_prefill`` in server/generation.py
-    # for why MTP's ``return_hidden`` is deliberately excluded.
+    # silently dropped the prompt).  Only a per-layer capture, or MTP's
+    # ``return_hidden`` with the server-priming window on, stitches back
+    # together -- see ``chunk_capture_kwargs_for``.
     _prefill_capture_kwargs = (
         prefill_capture_kwargs(
             model.language_model if hasattr(model, "language_model") else model,
@@ -361,11 +362,7 @@ def generate_step(
         if speculative_prefill_capture_kwargs
         else {}
     )
-    _chunk_capture_kwargs = (
-        _prefill_capture_kwargs
-        if _prefill_capture_kwargs.get("capture_layer_ids")
-        else {}
-    )
+    _chunk_capture_kwargs = chunk_capture_kwargs_for(_prefill_capture_kwargs)
     target_hidden_offset = 0
     _prefill_hidden = PrefillHiddenAccumulator(
         keep=(
@@ -2082,12 +2079,13 @@ class PromptProcessingBatch:
                 self.model,
                 speculative_prefill_kwargs(draft_kind, draft_model),
             )
-            # Only a per-layer capture (``capture_layer_ids``) survives being split
-            # across chunks and stitched back on the time axis.  MTP's
-            # ``return_hidden`` capture is a single pre-final-norm hidden whose
-            # consumer wants the LAST token only, so it stays off the chunks.
-            if self._prefill_capture_kwargs.get("capture_layer_ids"):
-                self._chunk_capture_kwargs = self._prefill_capture_kwargs
+            # Only a per-layer capture (``capture_layer_ids``), or MTP's
+            # ``return_hidden`` with the server-priming window on, survives
+            # being split across chunks and stitched back on the time axis --
+            # see ``chunk_capture_kwargs_for``.
+            self._chunk_capture_kwargs = chunk_capture_kwargs_for(
+                self._prefill_capture_kwargs
+            )
 
         # ``prompt_tokens`` must be the WHOLE prompt, and on a warm row the prefill
         # input is only the suffix.  ``_build_mixed_prompt_batch`` records the whole

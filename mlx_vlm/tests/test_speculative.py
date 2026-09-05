@@ -1776,6 +1776,51 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     assert calls[0][2]["prompt_tokens"] is prompt_tokens
 
 
+def test_mtp_server_rounds_ignore_a_nonzero_target_hidden_offset(monkeypatch):
+    """``target_hidden_offset`` is a dflash concept ``run_speculative_server_rounds``
+    still accepts for MTP -- it must not raise on a nonzero value.
+
+    A long prompt now trims the server's hidden capture to ``mtp_prime_window()``
+    rows (``prefill_context_keep("mtp", ...)`` / ``PrefillHiddenAccumulator``),
+    so ``prefill_context_offset(out)`` can be nonzero for MTP requests exactly as
+    it already is for dflash.  MTP has no analogous use for it, though: alignment
+    for ``prefill_from_target_hidden`` is by the TRAILING shape of ``hidden`` vs
+    ``prompt_tokens`` (see ``Glm5NextMTPDraftModel.prefill_from_target_hidden``),
+    not by an absolute offset into the untrimmed prompt -- so this pins that the
+    value is accepted and silently unused, not forwarded to ``_mtp_rounds_batch``.
+    """
+    calls = []
+
+    def fake_batch(*args, **kwargs):
+        calls.append(kwargs)
+        yield [3], None
+
+    monkeypatch.setattr(speculative_utils, "_mtp_rounds_batch", fake_batch)
+
+    prompt_tokens = mx.array([[7, 8, 9]], dtype=mx.int32)
+    result = list(
+        speculative_utils.run_speculative_server_rounds(
+            SimpleNamespace(language_model=SimpleNamespace()),
+            SimpleNamespace(),
+            prompt_cache=[],
+            hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
+            shared_kv_states={},
+            draft_kind="mtp",
+            first_bonus=mx.array([2], dtype=mx.int32),
+            max_tokens=4,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            token_dtype=mx.int32,
+            greedy_sampling=False,
+            row_ids=[0],
+            prompt_tokens=prompt_tokens,
+            target_hidden_offset=917,
+        )
+    )
+
+    assert result == [([3], None)]
+    assert "target_hidden_offset" not in calls[0]
+
+
 class _PrimingDraft:
     """Minimal MTP drafter mock recording ``prefill_from_target_hidden`` calls.
 
@@ -1913,6 +1958,121 @@ def test_mtp_rounds_batch_primes_once_not_per_round():
         )
 
     assert len(draft.prime_calls) == 1
+
+
+class _ForwardTokensSpy:
+    """Records ``prefill_from_target_hidden``'s call into the real drafter body.
+
+    Bypasses ``_forward_tokens``/``_set_seed_from_hidden`` (which need a real
+    ``Glm5NextMTP`` block and MLA/indexer cache) so only the alignment logic --
+    the fix under test -- runs.  Called as
+    ``Glm5NextMTPDraftModel.prefill_from_target_hidden(spy, ...)``: an unbound
+    method is just a function, so any object with the right attributes works.
+    """
+
+    def __init__(self):
+        self.forward_calls = []
+        self.seed_calls = []
+
+    def _forward_tokens(self, tokens, hidden, token_dtype):
+        self.forward_calls.append((tokens, hidden, token_dtype))
+        B, S = tokens.shape
+        return mx.zeros((B, S, hidden.shape[-1]), dtype=mx.float32)
+
+    def _set_seed_from_hidden(self, hidden, sampler, greedy):
+        self.seed_calls.append((hidden, sampler, greedy))
+
+
+def test_prefill_from_target_hidden_aligns_on_the_trailing_tail_when_hidden_is_shorter():
+    """Regression for the server priming crash (752cf0c3 under APC chunking).
+
+    ``prompt_tokens`` is the WHOLE prompt (37 or 902 tokens in the field crash);
+    ``hidden`` was only the last un-carried chunk's rows (16). Carrying the
+    capture across chunks (``chunk_capture_kwargs_for``) fixes the common case,
+    but a prompt longer than ``mtp_prime_window()`` still leaves
+    ``hidden.shape[1] < input_ids.shape[1]`` -- the drafter itself must align by
+    the TAIL of both rather than raise on ``mx.concatenate``.
+    """
+    from mlx_vlm.speculative.drafters.glm5_next_mtp.glm5_next_mtp import (
+        Glm5NextMTPDraftModel,
+    )
+
+    spy = _ForwardTokensSpy()
+    prompt_len, hidden_len, hidden_dim = 37, 16, 4
+    input_ids = mx.arange(prompt_len, dtype=mx.int32)[None, :]
+    hidden = mx.arange(hidden_len * hidden_dim, dtype=mx.float32).reshape(
+        1, hidden_len, hidden_dim
+    )
+
+    Glm5NextMTPDraftModel.prefill_from_target_hidden(
+        spy,
+        input_ids,
+        hidden,
+        bonus_token=99,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+    )
+
+    assert len(spy.forward_calls) == 1
+    tokens, aligned_hidden, dtype = spy.forward_calls[0]
+    assert dtype == mx.int32
+    # Aligned tail width is min(37, 16) == 16 for both the shifted tokens and
+    # the hidden slice fed to ``_forward_tokens``.
+    assert tokens.shape == (1, hidden_len)
+    assert aligned_hidden.shape == (1, hidden_len, hidden_dim)
+    expected_tail = input_ids[:, -hidden_len:]
+    expected_shifted = mx.concatenate(
+        [expected_tail[:, 1:], mx.array([[99]], dtype=mx.int32)], axis=1
+    )
+    assert mx.array_equal(tokens, expected_shifted)
+    assert mx.array_equal(aligned_hidden, hidden[:, -hidden_len:, :])
+    assert len(spy.seed_calls) == 1
+
+
+def test_prefill_from_target_hidden_aligns_on_the_trailing_tail_when_hidden_is_longer():
+    """Symmetric case: a hidden wider than the prompt also aligns by the tail."""
+    from mlx_vlm.speculative.drafters.glm5_next_mtp.glm5_next_mtp import (
+        Glm5NextMTPDraftModel,
+    )
+
+    spy = _ForwardTokensSpy()
+    prompt_len, hidden_len, hidden_dim = 5, 9, 3
+    input_ids = mx.arange(prompt_len, dtype=mx.int32)[None, :]
+    hidden = mx.arange(hidden_len * hidden_dim, dtype=mx.float32).reshape(
+        1, hidden_len, hidden_dim
+    )
+
+    Glm5NextMTPDraftModel.prefill_from_target_hidden(
+        spy,
+        input_ids,
+        hidden,
+        bonus_token=7,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+    )
+
+    tokens, aligned_hidden, _ = spy.forward_calls[0]
+    assert tokens.shape == (1, prompt_len)
+    assert aligned_hidden.shape == (1, prompt_len, hidden_dim)
+    assert mx.array_equal(aligned_hidden, hidden[:, -prompt_len:, :])
+
+
+def test_prefill_from_target_hidden_is_a_noop_on_empty_hidden():
+    from mlx_vlm.speculative.drafters.glm5_next_mtp.glm5_next_mtp import (
+        Glm5NextMTPDraftModel,
+    )
+
+    spy = _ForwardTokensSpy()
+    Glm5NextMTPDraftModel.prefill_from_target_hidden(
+        spy,
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        mx.zeros((1, 0, 4), dtype=mx.float32),
+        bonus_token=1,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+    )
+    assert spy.forward_calls == []
+    assert spy.seed_calls == []
 
 
 def test_mtp_rounds_batch_round_timers_off_by_default_and_on_when_enabled(
