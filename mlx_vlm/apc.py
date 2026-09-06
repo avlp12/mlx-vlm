@@ -51,7 +51,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
@@ -3284,7 +3284,9 @@ class APCManager:
         *,
         extra_hash: int = 0,
         harvest_provenance: Optional[Dict[str, Any]] = None,
-        hidden_tail: Optional[List[Any]] = None,
+        hidden_tail: Optional[Union[List[Any], Callable[[], Optional[List[Any]]]]] = (
+            None
+        ),
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse.
 
@@ -3293,6 +3295,15 @@ class APCManager:
         and nothing else: it is never written to a disk shard, so a store that
         only reaches disk stores no tail, and the caller owns bounding it to the
         drafter's window before handing it over.
+
+        It may be a ZERO-ARGUMENT CALLABLE instead of a list, and the serving
+        caller passes one.  This method rejects on three conditions before it
+        has any use for a tail -- the prefix is shorter than
+        ``exact_cache_min_tokens``, the prompt cache will not clone, the RAM LRU
+        is disabled -- and building a tail is a per-layer copy plus an
+        ``mx.eval`` sync taken in the middle of a prefill.  The callable is
+        invoked only once the store is known to be going ahead into RAM, and
+        never under ``self.lock``.
 
         ``harvest_provenance`` names the prefill this snapshot was taken inside
         (see :mod:`mlx_vlm.harvest_provenance`).  It is recorded on the RAM
@@ -3325,6 +3336,14 @@ class APCManager:
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         provenance = _prov.normalise(harvest_provenance)
+        # Resolved HERE: past every rejection above, before the lock, and only
+        # when there is a RAM slot to put it in (the disk shard never carries
+        # one).  A caller that passed a callable pays for the tail exactly when
+        # the tail is going to be kept.
+        tail: Optional[List[Any]] = None
+        if self._exact_cache_max > 0:
+            resolved = hidden_tail() if callable(hidden_tail) else hidden_tail
+            tail = list(resolved) if resolved else None
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
@@ -3334,7 +3353,7 @@ class APCManager:
                     prompt_cache=copied,
                     last_used=time.time(),
                     provenance=provenance,
-                    hidden_tail=list(hidden_tail) if hidden_tail else None,
+                    hidden_tail=tail,
                 )
                 self._exact_cache.move_to_end(key)
                 while len(self._exact_cache) > self._exact_cache_max:

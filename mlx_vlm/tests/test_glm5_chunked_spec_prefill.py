@@ -1675,8 +1675,9 @@ def _warm_b1_batch(*, step, drafter, hidden_tail, prefix_len=B1_PREFIX):
     """
     lm = _lm()
     spy = _BatchSpy(lm)
-    ids = [B1_SUFFIX]
-    padded = _right_pad_prompts(ids, max_length=len(B1_SUFFIX))
+    suffix = B1_PROMPT[prefix_len:]
+    ids = [suffix]
+    padded = _right_pad_prompts(ids, max_length=len(suffix))
     batch = PromptProcessingBatch(
         model=spy,
         uids=[0],
@@ -1686,7 +1687,7 @@ def _warm_b1_batch(*, step, drafter, hidden_tail, prefix_len=B1_PREFIX):
         prompt_kwargs={},
         prefill_step_size=step,
         right_pad_per_row=[0],
-        suffix_lens=[len(B1_SUFFIX)],
+        suffix_lens=[len(suffix)],
         apc_meta=[
             {
                 "full_input_ids": B1_PROMPT,
@@ -1853,8 +1854,14 @@ def test_a_mismatched_stored_tail_is_declined_rather_than_joined(caplog):
 def test_a_cold_b1_prefill_stores_the_tail_it_will_need_when_warm():
     """The store side: ``_hidden_tail_for_store`` gates, and the accumulator copies.
 
-    Not a served-store test (that needs an ``APCManager``); it pins the four
-    conditions and the width, which is what the entry ends up carrying.
+    Not a served-store test (that needs an ``APCManager``); it pins the gates and
+    the width, which is what the entry ends up carrying.
+
+    CORRECTED 2026-09-06.  This asserted ``tail[0].shape[1] ==
+    batch._processed_prompt_columns`` -- the width in PADDED COLUMNS.  That is
+    only right because B=1 here carries no left padding; stated that way it
+    endorsed the bug the sibling B=2 test pins.  The contract is
+    ``min(keep, checkpoint_len)``: REAL tokens.
     """
     drafter = _StubDrafter(keep=B1_KEEP)
     lm = _lm()
@@ -1874,15 +1881,384 @@ def test_a_cold_b1_prefill_stores_the_tail_it_will_need_when_warm():
         batch.prompt_step()
 
     cold_meta = {"prefix_len": 0}
-    tail = batch._hidden_tail_for_store(0, cold_meta)
+    # B=1 with no left padding: real tokens == captured columns.
+    assert batch._left_padding_per_row == [0]
+    checkpoint_len = batch._processed_prompt_columns
+    tail = batch._hidden_tail_for_store(0, cold_meta, checkpoint_len)
     assert tail is not None
     assert len(tail) == len(CAPTURE_IDS)
-    # Bounded by the drafter's window; here the prompt is shorter, so it is the
-    # rows the chunk loop has captured so far.
-    assert tail[0].shape[1] == batch._processed_prompt_columns
+    assert tail[0].shape[1] == min(B1_KEEP, checkpoint_len)
     assert all(int(t.shape[0]) == 1 for t in tail)
-    # A warm row's own accumulator rows start at its prefix, so it stores nothing.
-    assert batch._hidden_tail_for_store(0, {"prefix_len": 7}) is None
+    # Never wider than the prefix the entry is about to claim.
+    assert batch._hidden_tail_for_store(0, cold_meta, 6)[0].shape[1] == 6
+    # A warm row with no incoming tail has nothing to chain onto its suffix.
+    assert batch._hidden_tail_for_store(0, {"prefix_len": 7}, checkpoint_len) is None
     # Neither does a drafter with no declared window.
     batch.draft_model = _StubDrafter(keep=None)
-    assert batch._hidden_tail_for_store(0, cold_meta) is None
+    assert batch._hidden_tail_for_store(0, cold_meta, checkpoint_len) is None
+
+
+def test_a_left_padded_cold_store_measures_the_tail_in_real_tokens():
+    """F3: the stored width is real tokens, not padded columns.
+
+    ``PrefillHiddenAccumulator`` counts CAPTURED COLUMNS, and in a ragged
+    left-padded batch the short row's leading columns are zero embeddings.
+    Bounding the tail by ``keep`` alone stored a window whose front was padding
+    and whose width exceeded the prefix the entry claims to cover -- measured on
+    this very fixture (rows of 24 and 40 tokens, left pads 16 and 0): both rows
+    stored width 32 while row 0 had only 16 real tokens processed.  The bound is
+    ``min(keep, checkpoint_len)``, and ``checkpoint_len`` is the row's own real
+    token count at the boundary.
+    """
+    drafter = _StubDrafter(keep=B1_KEEP)  # 64: wider than anything here
+    lm = _lm()
+    batch = PromptProcessingBatch(
+        model=lm,
+        uids=[0, 1],
+        input_ids=BATCH_ROWS,
+        max_tokens=[4, 4],
+        inputs_embeds=lm.model.embed_tokens(_left_pad_prompts(BATCH_ROWS)),
+        prompt_kwargs={},
+        prefill_step_size=BATCH_STEP,
+        draft_model=drafter,
+        draft_kind="dflash",
+    )
+    while batch.needs_processing():
+        batch.prompt_step()
+
+    assert batch._left_padding_per_row == [BATCH_S - len(BATCH_ROWS[0]), 0]
+    columns = batch._processed_prompt_columns
+    # This batch carries no ``apc_meta``, so the row's real-token count is
+    # computed here the way ``_row_real_tokens_processed`` computes it for a
+    # cold left-padded row: columns consumed minus that row's leading padding.
+    real = [columns - pad for pad in batch._left_padding_per_row]
+    assert real[0] < columns, "fixture: row 0 must carry left padding"
+
+    for row in range(2):
+        tail = batch._hidden_tail_for_store(row, {"prefix_len": 0}, real[row])
+        assert tail is not None, f"row {row}"
+        assert [int(t.shape[1]) for t in tail] == [real[row]] * len(CAPTURE_IDS), (
+            f"row {row}: stored {[int(t.shape[1]) for t in tail]} for "
+            f"{real[row]} real tokens ({columns} padded columns)"
+        )
+
+    # And the rows it kept are that row's own trailing rows, not the batch's.
+    per_layer = [
+        mx.concatenate([c[i] for c in spy_captures(batch)], axis=1)
+        for i in range(len(CAPTURE_IDS))
+    ]
+    tail0 = batch._hidden_tail_for_store(0, {"prefix_len": 0}, real[0])
+    for i, t in enumerate(tail0):
+        assert mx.array_equal(t, per_layer[i][0:1, -real[0] :]), f"layer {i}"
+
+
+def spy_captures(batch):
+    """Every chunk's per-layer capture, straight off the accumulator."""
+    return [list(layer) for layer in zip(*batch._prefill_hidden._layers)]
+
+
+def _cold_per_layer(*, drafter, rows=B1_PROMPT, step=BATCH_STEP):
+    """``(gen_batch, [per-layer [1, S, 128]])`` for one cold whole-prompt prefill.
+
+    The per-layer arrays come off the spy, so they are the FULL prompt even when
+    the accumulator trimmed ``gen_batch.hidden`` to the drafter's window --
+    which is exactly what a store cuts its tail out of.
+    """
+    gen_batch, spy, _ = _batch_prefill(step=step, drafter=drafter, rows=[rows])
+    per_layer = [
+        mx.concatenate([c[i] for c in spy.captures], axis=1)
+        for i in range(len(CAPTURE_IDS))
+    ]
+    return gen_batch, per_layer
+
+
+def _cold_rows(per_layer, start, stop):
+    """The cold capture's rows ``[start, stop)``, laid out as ``gen_batch.hidden``.
+
+    ``speculative_hidden_state("dflash", ...)`` concatenates the captured layers
+    on the FEATURE axis, so a comparison against ``gen_batch.hidden`` has to do
+    the same.
+    """
+    return mx.concatenate([h[:, start:stop] for h in per_layer], axis=-1)
+
+
+def test_the_offset_when_the_stored_tail_is_shorter_than_the_prefix():
+    """F1: the arithmetic both earlier offset tests left at ``start = 0``.
+
+    Geometry: a 40-token prompt served from a 30-token cached prefix with a
+    drafter window of 20.  The store bounded its tail at ``min(keep,
+    prefix_len) = 20`` rows -- STRICTLY FEWER than the prefix -- so row 0 of the
+    join sits at prompt position ``prefix_len - tail_rows = 10``, and the join
+    (20 + 10 = 30 rows) then loses another 10 off the front to the window.  The
+    offset must land on 20, which is both ``prefix_len - tail_rows + trimmed``
+    and the ``S - keep`` the cold arm reports -- the two readings agreeing is
+    the whole claim.
+    """
+    keep, prefix_len = 20, 30
+    drafter = _StubDrafter(keep=keep)
+    cold, per_layer = _cold_per_layer(drafter=drafter)
+
+    # The tail the store would have kept: rows [prefix_len - keep, prefix_len).
+    tail_rows = min(keep, prefix_len)
+    tail = [
+        mx.contiguous(h[:, prefix_len - tail_rows : prefix_len]) for h in per_layer
+    ]
+    assert tail_rows < prefix_len, "fixture: the tail must be shorter than the prefix"
+
+    gen_batch, _, _ = _warm_b1_batch(
+        step=BATCH_STEP, drafter=drafter, hidden_tail=tail, prefix_len=prefix_len
+    )
+
+    assert gen_batch.hidden.shape == (1, keep, len(CAPTURE_IDS) * 128)
+    assert gen_batch.target_hidden_offset == len(B1_PROMPT) - keep
+    assert cold.target_hidden_offset == len(B1_PROMPT) - keep
+
+    # The rows the join kept ARE the last ``keep`` prompt positions: positions
+    # 20..29 come from the stored tail, 30..39 from this prefill's own capture.
+    surviving_tail = prefix_len - (len(B1_PROMPT) - keep)
+    assert surviving_tail == 10
+    _assert_row_matches(
+        gen_batch.hidden[:, :surviving_tail],
+        _cold_rows(per_layer, len(B1_PROMPT) - keep, prefix_len),
+        "the surviving stored-tail rows are not prompt positions 20..29",
+    )
+
+
+class _RecordingApcManager:
+    """Records ``store_exact_cache`` calls, resolving a lazily-passed tail.
+
+    Mirrors what ``APCManager.store_exact_cache`` does with the callable: it is
+    invoked once, past the point where the store is going ahead.
+    """
+
+    def __init__(self):
+        self.stores = []
+
+    def store_exact_cache(self, token_ids, prompt_cache, **kw):
+        tail = kw.get("hidden_tail")
+        resolved = tail() if callable(tail) else tail
+        self.stores.append(
+            {
+                "token_ids": list(token_ids),
+                "hidden_tail": resolved,
+                "lazy": callable(tail),
+            }
+        )
+        return True
+
+    def release(self, blocks):  # pragma: no cover - never reached here
+        pass
+
+
+def _warm_chaining_batch(*, drafter, hidden_tail, prefix_len, checkpoint_len):
+    """A warm B=1 batch that reaches an APC exact checkpoint mid-suffix."""
+    lm = _lm()
+    suffix = B1_PROMPT[prefix_len:]
+    manager = _RecordingApcManager()
+    batch = PromptProcessingBatch(
+        model=lm,
+        uids=[0],
+        input_ids=[suffix],
+        max_tokens=[4],
+        inputs_embeds=lm.model.embed_tokens(
+            _right_pad_prompts([suffix], max_length=len(suffix))
+        ),
+        prompt_kwargs={},
+        prefill_step_size=BATCH_STEP,
+        right_pad_per_row=[0],
+        suffix_lens=[len(suffix)],
+        apc_mode="exact",
+        apc_manager=manager,
+        apc_meta=[
+            {
+                "full_input_ids": B1_PROMPT,
+                "prefix_len": prefix_len,
+                "hidden_tail": hidden_tail,
+                "checkpoint_len": checkpoint_len,
+                "extra_hash": 0,
+            }
+        ],
+        draft_model=drafter,
+        draft_kind="dflash",
+    )
+    # The snapshot machinery is not what this test is about; the driver only
+    # needs SOMETHING non-None back so it proceeds to the store.
+    batch._apc_prompt_cache_for_store = lambda i: ["snapshot"]
+    while batch.needs_processing():
+        batch.prompt_step()
+    return batch, manager
+
+
+def test_a_warm_store_chains_the_incoming_tail_onto_its_own_capture():
+    """F4: the tail survives past turn 1 of a conversation.
+
+    Turn 2 arrives warm on turn 1's 16-token entry and stores a DEEPER entry at
+    24 tokens.  ``lookup_exact_cache`` prefers the deepest entry, so if that
+    deeper store carried no tail the drafter would be back to suffix-only
+    priming from turn 2 onward -- the fix would work exactly once per
+    conversation.  The deeper entry's tail is the incoming tail followed by this
+    prefill's own captured rows, trimmed to the window from the end.
+    """
+    keep, prefix_len, checkpoint_len = B1_KEEP, B1_PREFIX, B1_PREFIX + BATCH_STEP
+    drafter = _StubDrafter(keep=keep)
+    incoming = _stored_hidden_tail(drafter=drafter, keep=keep, prefix_len=prefix_len)
+    assert incoming[0].shape == (1, prefix_len, 128)
+
+    batch, manager = _warm_chaining_batch(
+        drafter=drafter,
+        hidden_tail=incoming,
+        prefix_len=prefix_len,
+        checkpoint_len=checkpoint_len,
+    )
+
+    assert len(manager.stores) == 1, manager.stores
+    store = manager.stores[0]
+    assert store["lazy"], "the tail must be built lazily, not before the store"
+    assert store["token_ids"] == B1_PROMPT[:checkpoint_len]
+    tail = store["hidden_tail"]
+    assert tail is not None
+    own_rows = checkpoint_len - prefix_len
+    assert [int(t.shape[1]) for t in tail] == [
+        min(keep, checkpoint_len)
+    ] * len(CAPTURE_IDS)
+    # Front: the incoming tail, verbatim.  Back: this prefill's own rows AT THE
+    # CHECKPOINT -- the FIRST ``own_rows`` of the suffix capture, which is where
+    # the chunk loop was when the store fired.  (Reading them off the
+    # accumulator afterwards would give the last rows of the whole suffix, since
+    # the loop kept going once the checkpoint was passed.)
+    suffix_capture = [
+        mx.concatenate([c[i] for c in spy_captures(batch)], axis=1)
+        for i in range(len(CAPTURE_IDS))
+    ]
+    for i, t in enumerate(tail):
+        assert mx.array_equal(t[:, :prefix_len], incoming[i]), f"layer {i} head"
+        assert mx.array_equal(
+            t[:, prefix_len:], suffix_capture[i][:, :own_rows]
+        ), f"layer {i} own rows"
+
+
+def test_a_warm_store_trims_the_chain_to_the_drafter_window():
+    """The chain is bounded the same way everything else is: ``keep`` from the end."""
+    keep, prefix_len, checkpoint_len = 20, B1_PREFIX, B1_PREFIX + BATCH_STEP
+    drafter = _StubDrafter(keep=keep)
+    incoming = _stored_hidden_tail(drafter=drafter, keep=keep, prefix_len=prefix_len)
+
+    _, manager = _warm_chaining_batch(
+        drafter=drafter,
+        hidden_tail=incoming,
+        prefix_len=prefix_len,
+        checkpoint_len=checkpoint_len,
+    )
+
+    tail = manager.stores[0]["hidden_tail"]
+    assert [int(t.shape[1]) for t in tail] == [min(keep, checkpoint_len)] * 2
+    # Trimmed off the FRONT of the incoming tail, so the join stays contiguous
+    # in prompt position: the head is the incoming tail's LAST rows.
+    head_rows = keep - (checkpoint_len - prefix_len)
+    for i, t in enumerate(tail):
+        assert mx.array_equal(t[:, :head_rows], incoming[i][:, -head_rows:]), i
+
+
+def test_a_warm_store_without_an_incoming_tail_stores_none():
+    """Refusing is fail-safe: that entry simply warms as it did before."""
+    drafter = _StubDrafter(keep=B1_KEEP)
+    _, manager = _warm_chaining_batch(
+        drafter=drafter,
+        hidden_tail=None,
+        prefix_len=B1_PREFIX,
+        checkpoint_len=B1_PREFIX + BATCH_STEP,
+    )
+    assert len(manager.stores) == 1
+    assert manager.stores[0]["hidden_tail"] is None
+
+
+def test_a_warm_store_refuses_an_incoming_tail_it_cannot_join():
+    """A tail from a different drafter's layer set is refused, not reshaped."""
+    drafter = _StubDrafter(keep=B1_KEEP)
+    incoming = _stored_hidden_tail(drafter=drafter, keep=B1_KEEP)
+    _, manager = _warm_chaining_batch(
+        drafter=drafter,
+        hidden_tail=incoming[:1],  # one captured layer, this prefill has two
+        prefix_len=B1_PREFIX,
+        checkpoint_len=B1_PREFIX + BATCH_STEP,
+    )
+    assert manager.stores[0]["hidden_tail"] is None
+
+
+# ------------------------------------------- the prepend's remaining refusals
+
+
+def _b1_tail_and_capture(keep=B1_KEEP):
+    drafter = _StubDrafter(keep=keep)
+    return drafter, _stored_hidden_tail(drafter=drafter, keep=keep)
+
+
+def _assert_prepend_refused(caplog, gen_batch, marker, *, width=None):
+    assert gen_batch.hidden.shape == (
+        1,
+        width if width is not None else len(B1_SUFFIX),
+        len(CAPTURE_IDS) * 128,
+    )
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("declining the stored APC hidden tail" in m for m in messages), messages
+    assert any(marker in m for m in messages), messages
+
+
+def test_a_stored_tail_with_the_wrong_dtype_is_declined(caplog):
+    drafter, tail = _b1_tail_and_capture()
+    wrong = [t.astype(mx.float16) for t in tail]
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.generate"):
+        gen_batch, _, _ = _warm_b1_batch(
+            step=BATCH_STEP, drafter=drafter, hidden_tail=wrong
+        )
+    _assert_prepend_refused(caplog, gen_batch, "shape or dtype")
+
+
+def test_a_stored_tail_with_the_wrong_feature_width_is_declined(caplog):
+    drafter, tail = _b1_tail_and_capture()
+    wrong = [mx.contiguous(t[..., :64]) for t in tail]
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.generate"):
+        gen_batch, _, _ = _warm_b1_batch(
+            step=BATCH_STEP, drafter=drafter, hidden_tail=wrong
+        )
+    _assert_prepend_refused(caplog, gen_batch, "shape or dtype")
+
+
+def test_a_stored_tail_whose_layers_disagree_on_length_is_declined(caplog):
+    drafter, tail = _b1_tail_and_capture()
+    wrong = [tail[0], mx.contiguous(tail[1][:, :-2])]
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.generate"):
+        gen_batch, _, _ = _warm_b1_batch(
+            step=BATCH_STEP, drafter=drafter, hidden_tail=wrong
+        )
+    _assert_prepend_refused(caplog, gen_batch, "disagree on length")
+
+
+def test_a_stored_tail_wider_than_the_cached_prefix_is_declined(caplog):
+    """A tail that claims more rows than the entry's prefix cannot be placed."""
+    drafter, tail = _b1_tail_and_capture()
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.generate"):
+        gen_batch, _, _ = _warm_b1_batch(
+            step=BATCH_STEP,
+            drafter=drafter,
+            hidden_tail=tail,  # 16 rows
+            prefix_len=B1_PREFIX - 4,  # ... against a 12-token prefix
+        )
+    _assert_prepend_refused(
+        caplog, gen_batch, "the cached prefix is only 12", width=len(B1_PROMPT) - 12
+    )
+
+
+def test_a_suffix_that_already_overflows_the_window_declines_the_tail(caplog):
+    """``offset != 0``: prepending in front of an already-trimmed capture would
+    put a hole in the middle of the drafter's context, so the tail is declined.
+    """
+    keep = 10  # narrower than the 24-row suffix
+    drafter = _StubDrafter(keep=keep)
+    tail = _stored_hidden_tail(drafter=drafter, keep=keep)
+    with caplog.at_level(logging.INFO, logger="mlx_vlm.generate"):
+        gen_batch, _, _ = _warm_b1_batch(
+            step=BATCH_STEP, drafter=drafter, hidden_tail=tail
+        )
+    assert gen_batch.target_hidden_offset == len(B1_SUFFIX) - keep
+    _assert_prepend_refused(caplog, gen_batch, "already overflowed", width=keep)

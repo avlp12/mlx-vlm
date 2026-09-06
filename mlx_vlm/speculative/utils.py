@@ -388,17 +388,45 @@ class PrefillHiddenAccumulator:
 
         Returns ``[]`` when nothing has been captured (no drafter, or a forward
         that carried no capture kwargs), which the caller reads as "no tail".
+
+        ONE ROW, and the narrowing happens FIRST.  The naive order -- stitch the
+        whole ``[B, S, D]`` batch on the time axis, then take one row and its
+        last ``k`` columns -- materialises B times the bytes the caller asked
+        for and O(S) of them where it wanted O(k).  So the row slice is applied
+        to each chunk piece before the concatenation, and whole leading pieces
+        that fall outside the window are skipped rather than concatenated and
+        then thrown away (the same arithmetic :meth:`_prune` uses to release
+        them).
+
+        NOT bounded by the prompt.  ``k`` counts CAPTURED rows, and for a
+        left-padded row the leading captured columns are padding, so a caller
+        that wants real tokens must pass a ``k`` it has already bounded by the
+        row's own real-token count -- see
+        ``PromptProcessingBatch._hidden_tail_for_store``, which bounds by
+        ``min(keep, checkpoint_len)``.  Left padding is at the FRONT, so a ``k``
+        within the row's real-token count is all real.
         """
         if self._layers is None:
             return []
+        want = None if k is None or int(k) <= 0 else int(k)
+        start = 0
+        if want is not None and self._widths:
+            resident = sum(self._widths)
+            while start < len(self._widths) - 1 and (
+                resident - self._widths[start] >= want
+            ):
+                resident -= self._widths[start]
+                start += 1
         out: List[mx.array] = []
         for slot in self._layers:
             if not slot:
                 return []
-            h = slot[0] if len(slot) == 1 else mx.concatenate(slot, axis=1)
-            h = h[row : row + 1]
-            if k is not None and 0 < int(k) < int(h.shape[1]):
-                h = h[:, -int(k) :]
+            pieces = [p[row : row + 1] for p in slot[start:]] or [
+                slot[-1][row : row + 1]
+            ]
+            h = pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=1)
+            if want is not None and want < int(h.shape[1]):
+                h = h[:, -want:]
             out.append(mx.contiguous(h))
         mx.eval(out)
         return out

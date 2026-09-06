@@ -171,9 +171,32 @@ def _sequence(uid, ids):
     return (uid, list(ids), 8, {"inputs_embeds": object()}, None, None)
 
 
-def _mixed_batch_generator(draft_kind):
+class _RecordingManager:
+    """Just enough APC manager to observe the blocks a refused batch releases."""
+
+    def __init__(self):
+        self.released = []
+
+    def release(self, blocks):
+        self.released.append(list(blocks))
+
+
+def _mixed_batch_generator(draft_kind, *, policy="stop"):
+    """A ``__new__``-built generator wired only for ``_build_mixed_prompt_batch``.
+
+    ``policy`` chooses what the stubbed ``_apply_right_pad_policy`` does:
+
+    * ``"stop"`` -- return ``(None, None)``, ending the builder immediately
+      after the policy.  Used to prove the builder REACHED the policy (i.e. was
+      not refused before it) without running the embed/cache machinery that a
+      stub model cannot serve.
+    * ``"pass"`` -- return its arguments unchanged, so the builder goes on to
+      compute ``right_pad_per_row`` and reach the dflash refusal.  Every test
+      using this shape must supply sequences that trip the refusal, because the
+      code after it needs real embeddings and a real model.
+    """
     gen = ar_mod.BatchGenerator.__new__(ar_mod.BatchGenerator)
-    gen.apc_manager = object()
+    gen.apc_manager = _RecordingManager()
     gen.vault = None
     gen.draft_kind = draft_kind
     gen.model = SimpleNamespace()
@@ -186,35 +209,67 @@ def _mixed_batch_generator(draft_kind):
         "prefix_len": 4,
         "warm_cache": object(),
         "extra_hash": 0,
-        "matched_blocks": [],
+        "matched_blocks": [(id(s), "blk")],
     }
 
     def fake_policy(sequences, picks):
         seen["right_pad_policy"] += 1
-        return None, None  # stop the builder right after the refusal check
+        if policy == "pass":
+            return sequences, picks
+        return None, None  # stop the builder right after the policy
 
     gen._apply_right_pad_policy = fake_policy
     return gen, seen
 
 
 class TestDflashWarmMultirowRefusal:
-    def test_multirow_warm_batch_is_refused_for_dflash(self, caplog):
+    def test_a_right_padded_multirow_warm_batch_is_refused_for_dflash(self, caplog):
+        """Unequal suffix lengths survive the policy -> genuine right padding."""
         ar_mod.reset_prefill_batch_refusal_counts()
-        gen, seen = _mixed_batch_generator("dflash")
+        gen, seen = _mixed_batch_generator("dflash", policy="pass")
         sequences = [_sequence(1, [1, 2, 3, 4, 5]), _sequence(2, [1, 2, 3, 4, 5, 6])]
 
         with caplog.at_level("INFO", logger=ar_mod.logger.name):
             assert gen._build_mixed_prompt_batch(sequences) is None
 
-        assert seen["right_pad_policy"] == 0, (
-            "the refusal must fire BEFORE the right-pad policy: the hazard is "
-            "the padding itself, not how the rows are grouped"
-        )
+        # CORRECTED 2026-09-06.  This used to assert the refusal fired BEFORE
+        # ``_apply_right_pad_policy``, which is the wrong ordering: the hazard
+        # is the padding, and whether padding exists is precisely what the
+        # policy decides.  Asking first meant that on GLM-5-Next -- where the
+        # policy admits only equal-suffix groups, so no surviving multi-row
+        # batch is ever padded -- every dflash warm multi-row batch was sent
+        # cold for a hazard that could not occur.
+        assert seen["right_pad_policy"] == 1
         counts = ar_mod.prefill_batch_refusal_counts()
         assert counts.get("dflash_warm_multirow") == 1
         assert counts.get("dflash_warm_multirow_rows_deferred") == 2
         assert "dflash_warm_multirow" in caplog.text
+        # And the blocks the picks acquired go back: a refused batch must not
+        # leak a reference per warm row.
+        assert len(gen.apc_manager.released) == 2
+        assert all(blocks for blocks in gen.apc_manager.released)
         ar_mod.reset_prefill_batch_refusal_counts()
+
+    def test_an_unpadded_multirow_warm_batch_is_kept_for_dflash(self, caplog):
+        """Equal suffix lengths -> ``right_pad_per_row`` all zeros -> no refusal.
+
+        This is the shape the shipped model actually produces: GLM-5-Next
+        declines right-padded prefill, so ``_apply_right_pad_policy`` has
+        already narrowed the batch to one suffix length by the time the builder
+        gets here.
+        """
+        ar_mod.reset_prefill_batch_refusal_counts()
+        gen, seen = _mixed_batch_generator("dflash")
+        sequences = [_sequence(1, [1, 2, 3, 4, 5]), _sequence(2, [9, 8, 7, 6, 5])]
+
+        with caplog.at_level("INFO", logger=ar_mod.logger.name):
+            assert gen._build_mixed_prompt_batch(sequences) is None
+
+        # None comes from the stubbed policy, not from the refusal.
+        assert seen["right_pad_policy"] == 1
+        assert "dflash_warm_multirow" not in ar_mod.prefill_batch_refusal_counts()
+        assert "dflash_warm_multirow" not in caplog.text
+        assert gen.apc_manager.released == []
 
     def test_single_warm_row_is_still_admitted_for_dflash(self, caplog):
         ar_mod.reset_prefill_batch_refusal_counts()

@@ -1098,6 +1098,49 @@ def _note_prefill_batch_refusal(reason: str, rows_deferred: int) -> None:
     ) + int(rows_deferred)
 
 
+def _hidden_tail_join_refusal(
+    tail: Sequence[mx.array],
+    reference: Sequence[mx.array],
+    prefix_len: int,
+) -> Optional[str]:
+    """Why a stored APC hidden tail cannot be joined onto ``reference``, or ``None``.
+
+    ``reference`` is this prefill's per-layer capture -- the thing the tail is
+    about to sit in front of, either to prime the drafter
+    (``PromptProcessingBatch._prepend_apc_hidden_tail``) or to be re-stored as
+    the deeper entry's tail (``_hidden_tail_for_store``).  Both need the same
+    answer, so both ask here.
+
+    A tail is captured for one drafter's target-layer set, at that drafter's
+    dtype and hidden width.  A mismatch means the entry was harvested under a
+    different drafter (or a different quantisation), and joining it would be
+    silently WRONG rather than merely short -- so it is named and refused
+    instead of being reshaped into agreement.
+    """
+    if not tail:
+        return "no stored tail"
+    if len(tail) != len(reference):
+        return (
+            f"the stored tail has {len(tail)} captured layers, this prefill "
+            f"has {len(reference)}"
+        )
+    if any(
+        int(t.shape[0]) != 1
+        or int(t.shape[-1]) != int(h.shape[-1])
+        or t.dtype != h.dtype
+        for t, h in zip(tail, reference)
+    ):
+        return "the stored tail's shape or dtype does not match this prefill's capture"
+    if len({int(t.shape[1]) for t in tail}) != 1:
+        return "the stored tail's layers disagree on length"
+    if int(tail[0].shape[1]) > int(prefix_len):
+        return (
+            f"the stored tail is {int(tail[0].shape[1])} rows but the cached "
+            f"prefix is only {int(prefix_len)}"
+        )
+    return None
+
+
 @dataclass
 class BatchStats:
     """
@@ -2399,11 +2442,24 @@ class PromptProcessingBatch:
                 prompt_cache,
                 extra_hash=meta.get("extra_hash", 0),
                 harvest_provenance=self._harvest_provenance(batch_idx),
-                hidden_tail=self._hidden_tail_for_store(batch_idx, meta),
+                # A CALLABLE, not a list.  ``store_exact_cache`` rejects on
+                # three conditions before it ever needs a tail (too few tokens,
+                # an unclonable cache, the RAM LRU disabled), and building one
+                # costs a per-layer copy plus an ``mx.eval`` sync in the middle
+                # of the prefill.  Deferring it means a rejected store pays
+                # nothing.  Bound to defaults so the closure cannot read a later
+                # iteration's row.
+                hidden_tail=(
+                    lambda i=batch_idx, m=meta, c=checkpoint_len: (
+                        self._hidden_tail_for_store(i, m, c)
+                    )
+                ),
             )
             meta["checkpoint_done"] = True
 
-    def _hidden_tail_for_store(self, batch_idx: int, meta: dict) -> Optional[list]:
+    def _hidden_tail_for_store(
+        self, batch_idx: int, meta: dict, checkpoint_len: int
+    ) -> Optional[list]:
         """The drafter's round-1 window over this checkpoint's tail, or ``None``.
 
         Stored beside the prompt-cache snapshot so a LATER warm request -- which
@@ -2411,23 +2467,49 @@ class PromptProcessingBatch:
         of its prompt -- can still prime the drafter on the whole window instead
         of on the 16-token suffix (I1312).
 
-        Four conditions, all of them about the tail being the thing it claims:
+        THE WIDTH IS ``min(keep, checkpoint_len)``, NOT ``keep``.  The
+        accumulator counts CAPTURED COLUMNS, and a cold row in a left-padded B>1
+        batch carries ``_left_padding_per_row[i]`` columns of padding in front of
+        its first real token.  Bounding by ``keep`` alone therefore stored a tail
+        whose leading rows were zero embeddings and whose width exceeded the
+        prefix it claims to cover -- measured on a ragged (40, 24)-token batch
+        with left pads (0, 16): both rows stored width 32 while the short row had
+        only 24 real tokens.  ``checkpoint_len`` IS the row's real-token count at
+        this boundary (it is what ``_row_real_tokens_processed`` was just checked
+        against), and left padding is at the FRONT, so the last
+        ``min(keep, checkpoint_len)`` captured columns are all real and the
+        stored width can never exceed the stored prefix.
 
-        * ``self._chunk_capture_kwargs`` non-empty: there is a hidden-reading
-          drafter and the capture rides every chunk, so the accumulator holds
-          rows and not just the final forward's.
-        * the row is COLD (``prefix_len == 0``): the accumulator's rows for a
-          warm row start at ``prefix_len``, so its "last k rows at the
-          checkpoint" would be a window with a hole in it.
-        * ``self._right_pad_per_row is None``: a right-padded row's trailing
-          capture rows are padding (the same objection ``_capture_refusal``
-          makes), and a cold row cannot be in a right-padded batch anyway
-          without a warm sibling to right-pad against.
-        * the drafter declares a finite window.  ``prefill_context_keep`` of
-          ``None`` means "no bound", and an unbounded tail is not a 16.8 MB MTP
-          window but the whole prompt's activations kept alive for the life of
-          the entry -- gigabytes on a 131k prompt.  Refusing to store is
-          fail-safe: that request warms exactly as it does today.
+        CHAINING (the warm case).  A warm row's own capture covers only its
+        suffix, so on its own it cannot furnish a window for the DEEPER entry it
+        is about to store -- and because ``lookup_exact_cache`` prefers the
+        deepest entry, a tail-less deeper entry silently retires the tail from
+        turn 2 of every conversation.  So when the row arrived carrying a usable
+        ``hidden_tail``, the new tail is that tail followed by this row's own
+        captured rows, trimmed to ``keep`` from the end: rows
+        ``checkpoint_len - w .. checkpoint_len - 1`` with
+        ``w = min(keep, len(incoming) + suffix_rows)``.  ``w <= checkpoint_len``
+        because ``len(incoming) <= prefix_len`` is checked before the join.
+
+        The refusals, all of them fail-safe (storing ``None`` leaves that entry
+        warming exactly as it does today):
+
+        * ``self._chunk_capture_kwargs`` empty: no hidden-reading drafter, or a
+          capture that does not ride the chunks, so the accumulator holds only
+          the final forward's rows.
+        * ``any(self._right_pad_per_row)``: a right-padded row's TRAILING
+          capture columns are padding -- the same objection ``_capture_refusal``
+          makes -- and the tail is exactly those columns.  ``[0]`` and
+          ``[0, 0]`` are not padding and are allowed through.
+        * the drafter declares no finite window (``prefill_context_keep`` is
+          ``None``).  An unbounded tail is not a 16.8 MB MTP window but the
+          whole prompt's activations kept alive for the life of the entry --
+          gigabytes on a 131k prompt.
+        * a warm row (``prefix_len > 0``) with no incoming tail, or one whose
+          incoming tail cannot be joined (``_hidden_tail_join_refusal``), or a
+          B > 1 warm row -- the tails are per row and the chain has to be built
+          per row, which is the same limitation ``_prepend_apc_hidden_tail``
+          records for the prepend.
 
         Every attribute is read through ``getattr``, as ``_harvest_provenance``
         does and for the same reason: several tests build this batch with
@@ -2436,9 +2518,8 @@ class PromptProcessingBatch:
         """
         if not getattr(self, "_chunk_capture_kwargs", None):
             return None
-        if getattr(self, "_right_pad_per_row", None) is not None:
-            return None
-        if int(meta.get("prefix_len", 0) or 0) != 0:
+        right_pad = getattr(self, "_right_pad_per_row", None)
+        if right_pad is not None and any(right_pad):
             return None
         keep = prefill_context_keep(
             getattr(self, "draft_kind", None), getattr(self, "draft_model", None)
@@ -2448,7 +2529,36 @@ class PromptProcessingBatch:
         accumulator = getattr(self, "_prefill_hidden", None)
         if accumulator is None:
             return None
-        return accumulator.tail(batch_idx, keep) or None
+        checkpoint_len = int(checkpoint_len)
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        own_rows = checkpoint_len - prefix_len
+        if own_rows <= 0:
+            return None
+        own = accumulator.tail(batch_idx, min(keep, own_rows))
+        if not own:
+            return None
+        if prefix_len == 0:
+            return own
+
+        # Warm row: chain the incoming tail in front of what this prefill saw.
+        if len(getattr(self, "_apc_meta", []) or []) != 1:
+            return None
+        incoming = meta.get("hidden_tail") or []
+        if _hidden_tail_join_refusal(incoming, own, prefix_len) is not None:
+            return None
+        need = keep - int(own[0].shape[1])
+        if need <= 0:
+            return own
+        head_rows = min(need, int(incoming[0].shape[1]))
+        chained = [
+            mx.contiguous(mx.concatenate([t[:, -head_rows:], o], axis=1))
+            for t, o in zip(incoming, own)
+        ]
+        # Evaluated for the same reason ``tail`` evaluates: this list is about
+        # to sit on a cache entry that outlives the request, and a lazy array
+        # there pins every intermediate of the prefill behind it.
+        mx.eval(chained)
+        return chained
 
     def _store_vault_checkpoints(self) -> None:
         """Store every vault rung this chunk landed on, per row.
@@ -2694,28 +2804,8 @@ class PromptProcessingBatch:
                 f"the suffix capture already overflowed the drafter's window "
                 f"(offset {offset}), so the stored tail would be trimmed away"
             )
-        elif len(tail) != len(stitched):
-            reason = (
-                f"the stored tail has {len(tail)} captured layers, this prefill "
-                f"has {len(stitched)}"
-            )
-        elif any(
-            int(t.shape[0]) != 1
-            or int(t.shape[-1]) != int(h.shape[-1])
-            or t.dtype != h.dtype
-            for t, h in zip(tail, stitched)
-        ):
-            reason = (
-                "the stored tail's shape or dtype does not match this prefill's "
-                "capture"
-            )
-        elif len({int(t.shape[1]) for t in tail}) != 1:
-            reason = "the stored tail's layers disagree on length"
-        elif int(tail[0].shape[1]) > prefix_len:
-            reason = (
-                f"the stored tail is {int(tail[0].shape[1])} rows but the cached "
-                f"prefix is only {prefix_len}"
-            )
+        else:
+            reason = _hidden_tail_join_refusal(tail, stitched, prefix_len)
         if reason is not None:
             logger.info(
                 "speculative prefill: declining the stored APC hidden tail for "
@@ -3549,49 +3639,6 @@ class BatchGenerator:
         if not any_warm:
             return None  # caller falls back to cold-only path
 
-        # A MULTI-ROW warm batch with a dflash drafter is refused outright, and
-        # the whole window goes cold.  Three facts, only the first of which is
-        # about padding:
-        #
-        # 1. A mixed batch is RIGHT-padded, and ``PromptProcessingBatch``
-        #    already declines the trailing-context TRIM for exactly that shape
-        #    (``_capture_refusal``, "the drafter's window is the trailing rows,
-        #    which are padding for a short row").  For MTP that refusal is
-        #    harmless -- ``mtp`` primes from ``hidden_states[-1]`` and its head
-        #    is NoPE-MLA -- but dflash CONSUMES the trailing rows as its
-        #    round-1 context (``_hidden`` -> ``fc`` -> ``hidden_norm`` over the
-        #    last ``sliding_window - 1`` rows), so a short row would be primed
-        #    on the zero embeddings that were padded onto it.  The refusal above
-        #    only stops the trim; nothing stops the drafter from reading those
-        #    rows.
-        # 2. The whole point of admitting a warm dflash row is APC, and at B=1
-        #    ``right_pad_per_row == [0]`` -- no padding exists, so the hazard in
-        #    (1) is vacuous and the B=1 warm row is admitted normally.  B=1 is
-        #    also the shape the served rail actually runs: the idle coalescing
-        #    window is 5 ms.
-        # 3. ``make_speculative_prompt_cache`` being bypassed on a warm batch
-        #    (see ``PromptProcessingBatch.__init__``, ``warm_cache is not None``
-        #    wins over the speculative constructor) is NOT a dflash-specific
-        #    hazard: that helper ignores ``draft_kind`` entirely and at B=1
-        #    returns a plain ``make_prompt_cache``.  Whatever it means for MTP
-        #    it means identically for dflash.
-        #
-        # Refusing rather than splitting keeps this to one branch; the rows are
-        # not deferred, they are served cold in the caller's LEFT-padded path,
-        # so nothing starves.
-        if getattr(self, "draft_kind", None) == "dflash" and len(sequences) > 1:
-            _note_prefill_batch_refusal("dflash_warm_multirow", len(sequences))
-            logger.info(
-                "prefill batch refusal dflash_warm_multirow: a dflash drafter "
-                "reads the TRAILING context rows of the prefill capture, which "
-                "on a right-padded mixed warm/cold batch are padding for the "
-                "short rows; declining the warm batch for %d row(s) and "
-                "serving them cold (left-padded). B=1 warm rows are unaffected "
-                "(right_pad_per_row == [0]).",
-                len(sequences),
-            )
-            return None
-
         sequences, picks = self._apply_right_pad_policy(sequences, picks)
         if sequences is None:
             return None  # caller falls back to cold-only (LEFT-padded) path
@@ -3610,6 +3657,61 @@ class BatchGenerator:
 
         max_suffix_len = max(suffix_lens)
         right_pad_per_row = [max_suffix_len - s for s in suffix_lens]
+
+        # A warm multi-row batch with a dflash drafter is refused when -- and
+        # ONLY when -- the batch is genuinely RIGHT-PADDED.
+        #
+        # 1. The hazard is the padding.  dflash CONSUMES the trailing rows of
+        #    the prefill capture as its round-1 context (``_hidden`` -> ``fc``
+        #    -> ``hidden_norm`` over the last ``sliding_window - 1`` rows), so a
+        #    short row would be primed on the zero embeddings padded onto it.
+        #    ``PromptProcessingBatch``'s ``_capture_refusal`` declines the
+        #    trailing-context TRIM for this shape but nothing stops the drafter
+        #    from reading those rows.  For MTP the whole question is moot --
+        #    it primes from ``hidden_states[-1]`` and its head is NoPE-MLA.
+        # 2. So the test is ``any(right_pad_per_row)``, not ``len(sequences) >
+        #    1``.  Asking the coarser question BEFORE ``_apply_right_pad_policy``
+        #    ran killed batches that had no padding in them at all: on a model
+        #    that declines right-padded prefill (GLM-5-Next -- KDA recurrent
+        #    state cannot be rolled, ``model_supports_right_padded_prefill`` is
+        #    False) that policy has ALREADY either admitted only an
+        #    equal-suffix-length group, or declined the mixed batch outright, so
+        #    every surviving multi-row batch has ``right_pad_per_row`` all
+        #    zeros.  Every dflash warm multi-row batch on the shipped model was
+        #    being sent cold for a hazard that could not occur.
+        # 3. ``make_speculative_prompt_cache`` being bypassed on a warm batch
+        #    (``PromptProcessingBatch.__init__``, ``warm_cache is not None``
+        #    wins over the speculative constructor) is NOT a dflash-specific
+        #    hazard: that helper ignores ``draft_kind`` entirely and at B=1
+        #    returns a plain ``make_prompt_cache``.
+        #
+        # Refusing rather than splitting keeps this to one branch; the rows are
+        # not deferred, they are served cold in the caller's LEFT-padded path,
+        # so nothing starves.  The APC blocks acquired by ``_apc_pick_for`` are
+        # released on the way out, as ``_vault_pick_for`` does when it retires a
+        # pick -- otherwise a refused batch leaks a reference per warm row.
+        if (
+            getattr(self, "draft_kind", None) == "dflash"
+            and len(sequences) > 1
+            and any(right_pad_per_row)
+        ):
+            _note_prefill_batch_refusal("dflash_warm_multirow", len(sequences))
+            logger.info(
+                "prefill batch refusal dflash_warm_multirow: a dflash drafter "
+                "reads the TRAILING context rows of the prefill capture, which "
+                "on a right-padded mixed warm/cold batch are padding for the "
+                "short rows; declining the warm batch for %d row(s) "
+                "(right_pad_per_row=%s) and serving them cold (left-padded). "
+                "An unpadded warm batch -- B=1, or every row at the same suffix "
+                "length -- is unaffected.",
+                len(sequences),
+                right_pad_per_row,
+            )
+            if self.apc_manager is not None:
+                for p in picks:
+                    if p is not None:
+                        self.apc_manager.release(p.get("matched_blocks", []))
+            return None
 
         # Source inputs_embeds: every row's prompt_kwargs holds the full-prompt
         # embeddings. Slice to suffix per-row, right-pad to max_suffix_len, stack.

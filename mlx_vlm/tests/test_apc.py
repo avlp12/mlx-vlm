@@ -1342,6 +1342,113 @@ def test_a_hidden_tail_does_not_change_exact_lru_eviction(monkeypatch):
     assert out == []
 
 
+def test_a_deeper_store_carries_its_own_chained_tail():
+    """Turn 2's deeper entry wins the lookup, so it has to bring a tail with it.
+
+    ``lookup_exact_cache`` returns the DEEPEST matching prefix.  A conversation
+    stores 128 tokens on turn 1 and 160 on turn 2; from turn 2 onward every
+    lookup lands on the 160-token entry, so a tail that only ever rode the first
+    store would be retired after one turn.  The driver builds the deeper tail by
+    chaining (``PromptProcessingBatch._hidden_tail_for_store``); this pins that
+    the store and the lookup carry the deeper one rather than the shallower.
+    """
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(1, 400))
+
+    assert manager.store_exact_cache(
+        tokens[:128],
+        _tiny_exact_cache(tokens[:128]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=_hidden_tail(64),
+    )
+    assert manager.store_exact_cache(
+        tokens[:160],
+        _tiny_exact_cache(tokens[:160]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=_hidden_tail(96),  # 64 chained rows + 32 of its own
+    )
+
+    out = []
+    cache, reused = manager.lookup_exact_cache(tokens, hidden_tail_out=out)
+    assert cache is not None
+    assert reused == 160, "the deepest entry must win"
+    assert [int(t.shape[1]) for t in out] == [96, 96]
+
+
+def test_a_lazily_supplied_hidden_tail_is_not_built_for_a_rejected_store():
+    """The tail is a per-layer copy plus an ``mx.eval``; a rejected store pays 0.
+
+    ``store_exact_cache`` rejects a too-short prefix before it has any use for a
+    window, and the serving caller passes a callable precisely so that rejection
+    costs nothing in the middle of a prefill.
+    """
+    manager = APCManager(num_blocks=8, block_size=16)
+    calls = []
+
+    def build():
+        calls.append(1)
+        return _hidden_tail(8)
+
+    short = [1, 2, 3]
+    assert not manager.store_exact_cache(
+        short[:1],
+        _tiny_exact_cache(short[:1]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=build,
+    )
+    assert calls == [], "the tail was built for a store that was rejected"
+
+    tokens = list(range(1, 200))
+    assert manager.store_exact_cache(
+        tokens[:128],
+        _tiny_exact_cache(tokens[:128]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=build,
+    )
+    assert calls == [1], "the tail must be built exactly once for a store that lands"
+
+    out = []
+    assert manager.lookup_exact_cache(tokens, hidden_tail_out=out)[1] == 128
+    assert [int(t.shape[1]) for t in out] == [8, 8]
+
+
+def test_a_disk_restored_entry_reports_no_hidden_tail(tmp_path, monkeypatch):
+    """Shards carry no tail, so a disk hit must leave the out-parameter EMPTY.
+
+    The tail is bf16 activations captured for one drafter's target-layer set,
+    not cache state -- a shard written under one drafter and read back under
+    another would be silently wrong.  So it is RAM-only, and a request served
+    from disk behaves exactly as it did before the tail existed.
+    """
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
+    tokens = list(range(1, 400))
+
+    disk = DiskBlockStore(tmp_path, namespace="tail-disk")
+    manager = APCManager(num_blocks=8, block_size=16, disk=disk)
+    assert manager.store_exact_cache(
+        tokens[:128],
+        _tiny_exact_cache(tokens[:128]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=_hidden_tail(32),
+    )
+    # In RAM it is there.
+    out = []
+    assert manager.lookup_exact_cache(tokens, hidden_tail_out=out)[1] == 128
+    assert [int(t.shape[1]) for t in out] == [32, 32]
+    disk._q.join()
+    manager.close()
+
+    # A fresh process: the entry can only come back off disk.
+    disk = DiskBlockStore(tmp_path, namespace="tail-disk")
+    manager = APCManager(num_blocks=8, block_size=16, disk=disk)
+    out = ["stale"]
+    cache, reused = manager.lookup_exact_cache(tokens, hidden_tail_out=out)
+    assert cache is not None and reused == 128
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    assert out == []
+    manager.close()
+
+
 def test_positive_desired_prefix_is_unchanged():
     tokens = list(range(1, 100))
 
