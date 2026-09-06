@@ -1,6 +1,7 @@
+import logging
 import os
 import time
-from typing import Any, Callable, Generator, List, Optional, Tuple
+from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -33,6 +34,17 @@ _ROUND_FIXED = None
 _ROUND_COST = None
 _ADAPTIVE_K_WINDOW = None
 _ADAPTIVE_K_MINROUNDS = None
+# Optional CONCAVE round-cost table and its normaliser; see _round_cost_table.
+# The sentinel is None ("not read yet"); an empty tuple means "read, and there
+# is no usable table", which is what keeps the default path off the new branch.
+_ROUND_MS_TABLE = None
+_ROUND_MS_DECODE = None
+_ROUND_MS_WARNED = False
+# Optional per-position survival numerator / width hysteresis; both default off.
+_SURVIVAL_NUMERATOR = None
+_WIDTH_DWELL = None
+
+_LOG = logging.getLogger(__name__)
 
 
 def batched_draft_enabled() -> bool:
@@ -293,6 +305,221 @@ def _round_cost_params():
     return _ROUND_FIXED, _ROUND_COST
 
 
+def _round_cost_table() -> Optional[Tuple[Tuple[float, ...], float]]:
+    """``MLX_VLM_DFLASH_ROUND_MS`` -- a measured, CONCAVE per-width round cost.
+
+    OFF by default; with the variable unset this returns ``None`` and
+    ``_dflash_block_size_for_hazard`` keeps the shipped linear denominator
+    ``fixed + cost*(W-1)`` bit for bit.
+
+    WHY A TABLE AT ALL.  The linear form cannot express the shape we actually
+    measure.  R20's ``charter_retake`` per-width p50 round wall clock is
+    33.51 43.40 53.13 57.74 68.36 75.38 72.50 ms for W=1..7 -- the marginal cost
+    of a drafted token FALLS from 9.9 ms (W1->W2) to 4.6 ms (W3->W4) and then
+    goes NEGATIVE at W=8, because the wider verify amortises a fixed launch cost
+    and lands on a better-shaped matmul.  A straight line fitted through that
+    undercharges W=6 (measured ratio 1.470 against the model's 1.502 at W=8, and
+    1.328 against 1.251 at W=6) and overcharges W=8, which is exactly the pair of
+    errors that pushes code-like workloads wide and prose-like workloads narrow.
+    R24 pre-registered that the cost model must become concave before any cap
+    change is argued from it.
+
+    FORMAT.  Comma-separated wall-clock milliseconds per verify block total,
+    W=1 first.  W=1 is the NO-DRAFT decode step, i.e. the round that proposes
+    nothing, so the first entry is the natural normaliser and is what
+    ``MLX_VLM_DFLASH_DECODE_MS`` defaults to.  The denominator handed to the
+    argmax is ``table[W] / decode_ms``, in the same decode-step units the linear
+    ``fixed``/``cost`` constants are expressed in -- so the two forms are
+    directly comparable and ``MLX_VLM_DFLASH_DECODE_MS`` is the only knob needed
+    to re-base a table measured on a different box.
+
+    VALIDATION.  At least two entries, every entry strictly positive.
+    Non-monotone is ACCEPTED ON PURPOSE: the W=8 dip is the measurement this
+    exists to carry, and rejecting it would reject the whole point.  A malformed
+    value is logged once and ignored, leaving the linear model in place -- a
+    typo in a cost table must not take the width policy down with it.
+    """
+    global _ROUND_MS_TABLE, _ROUND_MS_DECODE, _ROUND_MS_WARNED
+    if _ROUND_MS_TABLE is None:
+        raw = os.environ.get("MLX_VLM_DFLASH_ROUND_MS", "")
+        table: Tuple[float, ...] = ()
+        decode = 0.0
+        if raw.strip():
+            try:
+                vals = tuple(
+                    float(part) for part in raw.split(",") if part.strip() != ""
+                )
+            except (TypeError, ValueError):
+                vals = ()
+            if len(vals) >= 2 and all(v > 0.0 for v in vals):
+                table = vals
+                decode = vals[0]
+                raw_decode = os.environ.get("MLX_VLM_DFLASH_DECODE_MS", "")
+                if raw_decode.strip():
+                    try:
+                        d = float(raw_decode)
+                    except (TypeError, ValueError):
+                        d = 0.0
+                    if d > 0.0:
+                        decode = d
+                    elif not _ROUND_MS_WARNED:
+                        _ROUND_MS_WARNED = True
+                        _LOG.warning(
+                            "MLX_VLM_DFLASH_DECODE_MS=%r is not a positive number; "
+                            "using the W=1 entry %.4f ms instead",
+                            raw_decode,
+                            decode,
+                        )
+            elif not _ROUND_MS_WARNED:
+                _ROUND_MS_WARNED = True
+                _LOG.warning(
+                    "MLX_VLM_DFLASH_ROUND_MS=%r is malformed (need >=2 "
+                    "comma-separated positive milliseconds, W=1 first); "
+                    "ignoring it and keeping the linear round-cost model",
+                    raw,
+                )
+        _ROUND_MS_TABLE = table
+        _ROUND_MS_DECODE = decode
+    if not _ROUND_MS_TABLE:
+        return None
+    return _ROUND_MS_TABLE, _ROUND_MS_DECODE
+
+
+def _round_table_den(
+    width: int, table: Sequence[float], decode_ms: float, cost: float
+) -> float:
+    """Round cost at ``width``, in decode-step units, from a measured table.
+
+    Inside the table this is a lookup.  BEYOND it the linear form takes over
+    again, extrapolated from the last two entries -- a table is a measurement,
+    not a model, and it has nothing to say about widths nobody measured.
+
+    The extrapolated slope is guarded, and the guard is the W=8 dip's fault: the
+    last two entries can differ by a NEGATIVE amount, and extrapolating that
+    would make every further token cheaper than free and drive the argmax
+    straight to the cap.  A non-positive last-pair slope falls back to the mean
+    marginal cost across the whole table, and a table that falls end to end
+    falls back to the fitted ``cost``.
+    """
+    n = len(table)
+    if width <= n:
+        return table[width - 1] / decode_ms
+    slope = table[-1] - table[-2]
+    if slope <= 0.0:
+        slope = (table[-1] - table[0]) / (n - 1)
+    if slope <= 0.0:
+        slope = cost * decode_ms
+    return (table[-1] + slope * (width - n)) / decode_ms
+
+
+def _survival_numerator_enabled() -> bool:
+    """``MLX_VLM_DFLASH_SURVIVAL_NUMERATOR=1`` -- replace ``sum(p^j)`` with the
+    measured per-position survival curve.  OFF by default.
+
+    The denominator was the second fault; this is the first.  ``_dflash_hazard``
+    claims acceptance is a flat-hazard process and one scalar describes it, but
+    the implied p depends on the width it was measured at (code 0.8315 at W=4,
+    0.7852 at W=6, 0.7646 at W=8; p512g64 0.9896 / 0.9577 / 0.9139), which a
+    genuinely flat hazard cannot do, and R24's position curve shows the LAST
+    block position collapsing to 0.32.  A geometric numerator fitted at a narrow
+    width therefore returns a low p, which justifies narrowing again.
+
+    S_j is the empirical probability that a round accepted AT LEAST j tokens,
+    counted only over rounds that actually drafted j (so a round is not scored
+    on positions it never proposed -- the same right-censoring that
+    ``_dflash_hazard`` applies to the cut-short round), Laplace smoothed over the
+    same window.  E[accepted at width W] is then ``sum_{j<W} S_j`` with no shape
+    assumption at all; the geometric path is exactly this with S_j pinned to p^j.
+    """
+    global _SURVIVAL_NUMERATOR
+    if _SURVIVAL_NUMERATOR is None:
+        _SURVIVAL_NUMERATOR = os.environ.get(
+            "MLX_VLM_DFLASH_SURVIVAL_NUMERATOR", "0"
+        ).lower() in ("1", "true", "yes", "on")
+    return _SURVIVAL_NUMERATOR
+
+
+def _dflash_survival_curve(
+    draft_model: nn.Module, window: int
+) -> Optional[List[float]]:
+    """Per-position survival S_j over the recent window, Laplace smoothed.
+
+    ``S[j-1]`` is the smoothed fraction of rounds that drafted at least j tokens
+    and accepted at least j of them.  Positions nobody drafted are simply absent
+    from the curve, and the caller falls back to p^j there.
+    """
+    accept_lens = getattr(draft_model, "accept_lens", None) or []
+    draft_lens = getattr(draft_model, "draft_lens", None) or []
+    recent = [
+        (float(a), int(d))
+        for a, d in zip(accept_lens[-window:], draft_lens[-window:])
+        if int(d) > 0
+    ]
+    if not recent:
+        return None
+    curve: List[float] = []
+    for j in range(1, max(d for _, d in recent) + 1):
+        at_risk = sum(1 for _, d in recent if d >= j)
+        if at_risk <= 0:
+            break
+        kept = sum(1 for a, d in recent if d >= j and a > j - 1)
+        curve.append((kept + 0.5) / (at_risk + 1.0))
+    return curve or None
+
+
+def _width_dwell() -> int:
+    """``MLX_VLM_DFLASH_WIDTH_DWELL=N`` -- change width only after the argmax has
+    named the same new width for N consecutive rounds.  0 (the default) is the
+    current behaviour: follow the argmax every round.
+
+    This exists against a Jensen loss, not against noise for its own sake.  L21
+    measured adaptive-K at a MEAN width of 4.44 drafting 15% more tokens than
+    fixed w4 and accepting 3% FEWER -- a width mixture is not the same machine
+    as its mean width, because the drafter's cache and the verify's shape both
+    carry state across rounds.  Dwell buys the mixture back down toward a single
+    width without pinning it.
+    """
+    global _WIDTH_DWELL
+    if _WIDTH_DWELL is None:
+        try:
+            _WIDTH_DWELL = int(os.environ.get("MLX_VLM_DFLASH_WIDTH_DWELL", "0"))
+        except (TypeError, ValueError):
+            _WIDTH_DWELL = 0
+        if _WIDTH_DWELL < 0:
+            _WIDTH_DWELL = 0
+    return _WIDTH_DWELL
+
+
+def _dflash_dwell_width(draft_model: nn.Module, proposed: int) -> int:
+    """Hold the current width until ``proposed`` has held for the dwell count.
+
+    The held width is stored on the DRAFTER, which is the object whose cache the
+    mixture actually perturbs, and the counter resets whenever the argmax comes
+    back to the held width -- so a single stray round cannot spend the dwell.
+    """
+    dwell = _width_dwell()
+    if dwell <= 0:
+        return proposed
+    held = getattr(draft_model, "dflash_width_held", None)
+    if held is None or proposed == held:
+        draft_model.dflash_width_held = proposed
+        draft_model.dflash_width_pending = None
+        draft_model.dflash_width_pending_rounds = 0
+        return proposed
+    if getattr(draft_model, "dflash_width_pending", None) == proposed:
+        pending_rounds = getattr(draft_model, "dflash_width_pending_rounds", 0) + 1
+    else:
+        pending_rounds = 1
+    if pending_rounds >= dwell:
+        draft_model.dflash_width_held = proposed
+        draft_model.dflash_width_pending = None
+        draft_model.dflash_width_pending_rounds = 0
+        return proposed
+    draft_model.dflash_width_pending = proposed
+    draft_model.dflash_width_pending_rounds = pending_rounds
+    return held
+
+
 def _dflash_hazard(draft_model: nn.Module) -> Optional[float]:
     """Truncated-geometric MLE of the per-token acceptance hazard.
 
@@ -331,6 +558,7 @@ def _dflash_block_size_for_hazard(
     floor: int = 2,
     fixed: Optional[float] = None,
     cost: Optional[float] = None,
+    survival: Optional[Sequence[float]] = None,
 ) -> int:
     """argmax over block widths of (1 + E[accepted]) / round cost.
 
@@ -347,21 +575,44 @@ def _dflash_block_size_for_hazard(
     correspondingly shallower.  ``floor`` may be 1, which means "propose
     nothing" -- for MTP that is a plain decode step, and it is how the never-lose
     guarantee falls out of the same formula instead of needing a separate gate.
+
+    ``survival`` (opt-in, ``MLX_VLM_DFLASH_SURVIVAL_NUMERATOR=1``) replaces the
+    geometric ``p^j`` term at position j with the MEASURED S_j; see
+    ``_survival_numerator_enabled``.  ``MLX_VLM_DFLASH_ROUND_MS`` likewise
+    replaces the linear denominator with a measured per-width table, but only
+    when this is called for DFlash's own economics -- a caller that names
+    ``fixed`` AND ``cost`` (MTP's rollout depth) is describing a different
+    machine, and a DFlash round-cost table has nothing to say about it.  With
+    neither environment variable set the arithmetic below is unchanged.
     """
+    table = _round_cost_table() if (fixed is None and cost is None) else None
     if fixed is None or cost is None:
         f, c = _round_cost_params()
         fixed = f if fixed is None else fixed
         cost = c if cost is None else cost
+
+    if table is None:
+        def den(width: int) -> float:
+            return fixed + cost * (width - 1)
+    else:
+        ms, decode_ms = table
+
+        def den(width: int) -> float:
+            return _round_table_den(width, ms, decode_ms, cost)
+
+    n_surv = 0 if survival is None else len(survival)
     best, best_gain = floor, -1.0
     e = 0.0
     pk = 1.0
     if floor <= 1:
-        best_gain = 1.0 / fixed          # width 1 == propose nothing
+        best_gain = 1.0 / den(1)         # width 1 == propose nothing
         best = 1
     for width in range(2, cap + 1):
         pk *= p
-        e += pk                       # E[accepted] at width-1 drafted tokens
-        gain = (1.0 + e) / (fixed + cost * (width - 1))
+        # E[accepted] at width-1 drafted tokens: the measured survival at this
+        # position when there is one, the geometric shape when there is not.
+        e += survival[width - 2] if width - 1 <= n_surv else pk
+        gain = (1.0 + e) / den(width)
         if gain > best_gain:
             best_gain, best = gain, width
     return max(floor, min(cap, best))
@@ -522,10 +773,22 @@ def _dflash_next_block_size(
             floor = max(2, int(getattr(draft_model, "dflash_min_block_size", 2)))
             if _empirical_enabled():
                 f, c = _round_cost_params()
-                return _dflash_block_size_empirical(
+                chosen = _dflash_block_size_empirical(
                     draft_model, p, block_total, floor, f, c
                 )
-            return _dflash_block_size_for_hazard(p, block_total, floor=floor)
+            else:
+                survival = None
+                if _survival_numerator_enabled():
+                    survival = _dflash_survival_curve(
+                        draft_model, _ADAPTIVE_K_WINDOW or 16
+                    )
+                chosen = _dflash_block_size_for_hazard(
+                    p, block_total, floor=floor, survival=survival
+                )
+            # Hysteresis is a no-op unless MLX_VLM_DFLASH_WIDTH_DWELL is set;
+            # the budget clamp is re-applied because a held width predates the
+            # budget that is left now.
+            return max(floor, min(block_total, _dflash_dwell_width(draft_model, chosen)))
         if initial_block_size is not None:
             return min(block_total, max(2, int(initial_block_size)))
         return block_total
@@ -896,6 +1159,16 @@ def _dflash_rounds(
         hidden = prepare_target_hidden(hidden)
         mx.async_eval(hidden)
 
+    # Round timers, mirroring the batch loop.  MLX_VLM_DFLASH_ROUND_TIMERS was
+    # instrumented only in _dflash_rounds_batch, so on the SERVED single-sequence
+    # path it was a silent no-op: it neither perturbed the run nor produced a
+    # draft/verify split, and the ms/round the cost model is refitted from came
+    # from the one path the timers never covered.  Same contract as the batch
+    # loop -- off by default, and deliberately perturbing when on, because a
+    # split is only meaningful if each half is waited for.
+    timed = _round_timers_enabled()
+    draft_finished = 0.0
+
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
 
@@ -923,6 +1196,7 @@ def _dflash_rounds(
             if not greedy_sampling and positioned_sampling
             else sampler
         )
+        draft_started = time.perf_counter() if timed else 0.0
         draft_tokens = sampler_rng.draft_tokens(
             draft_model.draft_block,
             b,
@@ -934,6 +1208,10 @@ def _dflash_rounds(
             **draft_kwargs,
         )
         mx.async_eval(draft_tokens)
+        if timed:
+            mx.eval(draft_tokens)
+            draft_finished = time.perf_counter()
+            _record_draft_seconds(draft_model, draft_finished - draft_started)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
@@ -957,6 +1235,9 @@ def _dflash_rounds(
             mx.async_eval(walk_packed if deferred_walk else target_tokens, hidden)
         else:
             mx.async_eval(hidden)
+        if timed:
+            mx.eval(walk_packed if (greedy_sampling and deferred_walk) else hidden)
+            _record_verify_seconds(draft_model, time.perf_counter() - draft_finished)
 
         if greedy_sampling and deferred_walk:
             accepted, new_tokens = _speculative_walk_deferred_greedy(
