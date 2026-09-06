@@ -57,6 +57,8 @@ from .common import (
     _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
+    next_prefill_chunk,
+    prefill_logits_keep_kwargs,
     wired_limit,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
@@ -421,6 +423,22 @@ def generate_step(
             step_kwargs = {**kwargs, **_prefill_capture_kwargs}
         if getattr(model.language_model, "supports_logits_to_keep", False):
             step_kwargs = {**step_kwargs, "logits_to_keep": 1}
+        # L35(a).  This function serves BOTH the prefill forward (called once,
+        # below the chunk loop) and every decode step.  Only the prefill forward
+        # is ever wider than one column, and only when the prompt was NOT chunked
+        # -- the loop always hands this call a single token.  So the kwarg is
+        # decided from the actual width: decode steps and post-chunk prefills get
+        # the argument list they always got, and a wide unchunked prefill stops
+        # projecting the whole prompt into vocab space to read one row of it.
+        _keep_width = (
+            inputs_embeds.shape[1]
+            if inputs_embeds is not None
+            else (y.shape[-1] if y is not None and getattr(y, "ndim", 0) >= 1 else 1)
+        )
+        step_kwargs = {
+            **step_kwargs,
+            **prefill_logits_keep_kwargs(model.language_model, _keep_width),
+        }
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in step_kwargs:
@@ -559,7 +577,12 @@ def generate_step(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
             ) as pbar:
                 while inputs_embeds.shape[1] > 1:
-                    n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                    # L35(b).  ``min(step, remaining)`` unless the tail merge is
+                    # switched on, in which case a short final tail is folded
+                    # into the chunk before it (last grid cell only).
+                    n_to_process = next_prefill_chunk(
+                        inputs_embeds.shape[1] - 1, prefill_step_size
+                    )
                     # Land exactly on the next boundary. Vault boundaries are
                     # multiples of prefill_step_size, so this clamp is a no-op
                     # for them and the chunk decomposition -- and thus
@@ -2802,7 +2825,8 @@ class PromptProcessingBatch:
             return 0
 
         step = self.prefill_step_size or self._inputs_embeds.shape[1]
-        n = min(step, self._inputs_embeds.shape[1] - 1)
+        # L35(b): identical to ``min(step, remaining)`` with the merge off.
+        n = next_prefill_chunk(self._inputs_embeds.shape[1] - 1, step)
         checkpoint_col = self._next_apc_checkpoint_column()
         if checkpoint_col is not None:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
@@ -2985,6 +3009,14 @@ class PromptProcessingBatch:
         # capture kwargs -- the accumulator raises if the capture width moves.
         call_kwargs.update(self._prefill_capture_kwargs)
 
+        # L35(a): an UNCHUNKED batch prefill arrives here with the whole prompt
+        # and reads exactly one row per sequence out of the projection.  Withheld
+        # when right padding is in play: there the row a sequence needs is at
+        # ``width - 1 - right_pad[i]``, which a keep-1 slice would not contain.
+        if not (self._right_pad_per_row is not None and any(self._right_pad_per_row)):
+            call_kwargs.update(
+                prefill_logits_keep_kwargs(self.model, self._inputs_embeds.shape[1])
+            )
         output = self.model(
             self._input_ids,
             cache=self.prompt_cache,
