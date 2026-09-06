@@ -1090,6 +1090,120 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
     assert gen.draft_kind is None
 
 
+@pytest.mark.parametrize("finish_reason", ["length", "stop"])
+def test_admission_loop_auto_derives_a_session_id_with_no_header(
+    monkeypatch, finish_reason
+):
+    """LW3 multiturn thinking follow-up (2026-09-07): a plain
+    chat.completions request with no X-Session-Id header must still get an
+    end-of-turn session capture, via MLX_VLM_APC_SAVE_SESSION's default-ON
+    auto-derived id (context_vault.auto_session_id) -- for BOTH a truncated
+    response (finish_reason='length', e.g. max_tokens hit inside <think>)
+    and a completed one (finish_reason='stop'). Before this fix,
+    info["session_id"] stayed None with no header, and generation.py's own
+    guard (`if info.get("session_id"): capture_session(...) else:
+    record_session_skip("no_session_id_on_request")`) meant capture_session
+    was never even attempted, for either finish reason.
+    """
+
+    class FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = ""
+
+        def add_token(self, token):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            pass
+
+    class FakeBatchGenerator:
+        captured = []  # (uid, session_id) pairs capture_session was called with
+
+        def __init__(self, *args, **kwargs):
+            self.unprocessed_prompts = []
+            self.has_pending_prompts = False
+
+        def insert(self, *args, **kwargs):
+            return (1,)
+
+        def next(self, **kwargs):
+            return [], [
+                SimpleNamespace(
+                    uid=1,
+                    token=7,
+                    token_logprob=0.0,
+                    finish_reason=finish_reason,
+                )
+            ]
+
+        def capture_session(self, uid, session_id):
+            FakeBatchGenerator.captured.append((uid, session_id))
+            return True
+
+    FakeBatchGenerator.captured = []
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        hidden_size=5376,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(
+        server_generation,
+        "make_streaming_detokenizer",
+        lambda _processor: FakeDetokenizer(),
+    )
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
+        mx.array([[raw_inputs["token"]]], dtype=mx.int32),
+        {},
+    )
+
+    rqueue = Queue()
+    args = server.GenerationArguments(max_tokens=1)
+    assert args.session_id is None, "no header was set on this request"
+    gen.requests.put(
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"token": 1},
+            prompt_tokens=1,
+            args=args,
+        )
+    )
+    worker = Thread(target=gen._run, daemon=True)
+    worker.start()
+    try:
+        ctx = rqueue.get(timeout=1)
+        token = rqueue.get(timeout=1)
+        done = rqueue.get(timeout=1)
+    finally:
+        gen._stop = True
+        gen.requests.put(None)
+        worker.join(timeout=2)
+
+    assert isinstance(ctx, server.GenerationContext)
+    assert token.finish_reason == finish_reason
+    assert done is None
+    assert len(FakeBatchGenerator.captured) == 1, (
+        "capture_session must be called exactly once despite no explicit "
+        "session id on the request"
+    )
+    captured_uid, captured_session_id = FakeBatchGenerator.captured[0]
+    assert captured_uid == 1
+    assert captured_session_id, "the auto-derived id must be non-empty"
+    assert captured_session_id.startswith("auto:"), (
+        "an auto-derived id must be visibly distinguishable from an "
+        "operator-supplied one"
+    )
+
+
 def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
     gen = _unstarted_response_generator()
     gen.model = SimpleNamespace(language_model=SimpleNamespace())

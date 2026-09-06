@@ -60,14 +60,22 @@ class _Gen:
 
 
 def _isolate_session_env(testcase):
-    """Restore the session flags after the test.
+    """Restore the session flags after the test, with the session tier OFF.
 
     Leaking MLX_VLM_GLM5_VAULT_SESSION=1 out of a module makes a LATER module's
     duck-typed vault see a tier kwarg it has no parameter for -- which is how it
     was found: test_vault_server_wiring passed alone and failed in the full run.
+
+    ``session_tier_active()`` (2026-09-07) is ``session_capture_enabled() OR
+    apc_save_session_enabled()``, and the latter (MLX_VLM_APC_SAVE_SESSION)
+    defaults ON -- unlike the other two flags here, merely unsetting it does
+    NOT turn it off, so it is forced to "0" rather than popped. Every test in
+    this module that wants the session tier ON sets MLX_VLM_GLM5_VAULT_SESSION
+    itself, which the OR still honours.
     """
     saved = {k: os.environ.get(k)
-             for k in (V._ENV_SESSION, V._ENV_SESSION_DERIVED_ID)}
+             for k in (V._ENV_SESSION, V._ENV_SESSION_DERIVED_ID,
+                       V._ENV_APC_SAVE_SESSION)}
 
     def restore():
         for k, val in saved.items():
@@ -78,6 +86,7 @@ def _isolate_session_env(testcase):
     testcase.addCleanup(restore)
     for k in saved:
         os.environ.pop(k, None)
+    os.environ[V._ENV_APC_SAVE_SESSION] = "0"
 
 
 def pick_for(gen, ids, pick=None):

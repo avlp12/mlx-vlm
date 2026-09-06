@@ -3552,7 +3552,7 @@ class BatchGenerator:
         # lookup it replaces.
         _PREFILL_TIER = _context_vault.VaultTier.PREFILL
         tiers = [_PREFILL_TIER]
-        if _context_vault.session_capture_enabled():
+        if _context_vault.session_tier_active():
             tiers.append(_context_vault.VaultTier.SESSION)
         require_b1 = (serve_batch_width == 1 and _harvest_prov.serve_b1_from_b1_only())
         policy = {"require_harvest_width_1": True} if require_b1 else {}
@@ -3567,7 +3567,14 @@ class BatchGenerator:
                 cand = (vault.lookup(list(ids_list), **policy) if tier is _PREFILL_TIER
                         else vault.lookup(list(ids_list), tier=tier, **policy))
             except Exception:  # noqa: BLE001 - a vault fault must never fail a request
-                return pick
+                # Per-tier, not per-call: with session_tier_active() now
+                # default ON (2026-09-07), SESSION is tried after PREFILL on
+                # every lookup, including against duck-typed vault stand-ins
+                # in tests that predate the tier kwarg and only implement
+                # lookup(tokens). A fault -- or a missing kwarg -- on THAT
+                # tier must not discard a hit PREFILL already found; only
+                # this one tier's candidate is skipped.
+                continue
             if cand is None or (
                 require_b1 and not _harvest_prov.is_b1_eligible(
                     getattr(cand, "harvest_provenance", None))
@@ -4060,7 +4067,7 @@ class BatchGenerator:
             thinking_budget_criteria,
         ):
             self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc))
-            if _context_vault.session_capture_enabled():
+            if _context_vault.session_tier_active():
                 # Seed the session key with the EXACT prompt ids the model will
                 # see. Re-deriving them at completion from the request would
                 # re-tokenise and could disagree by a token; these are the ones.
@@ -4084,7 +4091,7 @@ class BatchGenerator:
         emitted chunk can cover several tokens while naming only the last one.
         See ``docs/vault_session_restore.md``.
         """
-        if not _context_vault.session_capture_enabled():
+        if not _context_vault.session_tier_active():
             return
         acc = self._session_tokens.get(uid)
         if acc is None:
@@ -4134,7 +4141,7 @@ class BatchGenerator:
         # False five different ways in silence, and the seven checks could only
         # report "nothing happened" -- which is indistinguishable from the
         # feature being switched off.
-        if not _context_vault.session_capture_enabled():
+        if not _context_vault.session_tier_active():
             _context_vault.record_session_skip("flag_off")
             return False
         if getattr(self, "vault", None) is None:

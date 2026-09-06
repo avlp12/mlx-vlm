@@ -208,7 +208,14 @@ class TestSkipReasonsAreNamed(unittest.TestCase):
         from mlx_vlm import context_vault as V
         self.V = V
         V.reset_session_skips()
-        saved = {k: os.environ.get(k) for k in (V._ENV_SESSION,)}
+        # 2026-09-07: session_tier_active() (what capture_session actually
+        # gates on) is session_capture_enabled() OR apc_save_session_enabled()
+        # -- the latter default ON (MLX_VLM_APC_SAVE_SESSION) -- so a
+        # "flag off" test needs BOTH cleared to land on the flag_off skip.
+        saved = {
+            k: os.environ.get(k)
+            for k in (V._ENV_SESSION, V._ENV_APC_SAVE_SESSION)
+        }
 
         def restore():
             for k, val in saved.items():
@@ -218,6 +225,7 @@ class TestSkipReasonsAreNamed(unittest.TestCase):
                     os.environ[k] = val
         self.addCleanup(restore)
         os.environ.pop(V._ENV_SESSION, None)
+        os.environ[V._ENV_APC_SAVE_SESSION] = "0"
 
     def test_no_vault_is_named(self):
         self.V.record_session_turn(None, [1, 2], [], completed=True, session_id="s")

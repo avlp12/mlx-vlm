@@ -2506,8 +2506,9 @@ class ResponseGenerator:
 
                     try:
                         thinking_budget_criteria = request.thinking_budget_criteria
+                        _prompt_ids_list = input_ids.squeeze(0).tolist()
                         (uid,) = batch_gen.insert(
-                            [input_ids.squeeze(0).tolist()],
+                            [_prompt_ids_list],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
                             logits_processors=[
@@ -2520,6 +2521,22 @@ class ResponseGenerator:
                         continue
 
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    # Conversation id for the vault's session tier. An explicit
+                    # id (X-Session-Id header, Responses previous_response_id
+                    # chain) always wins; absent that, MLX_VLM_APC_SAVE_SESSION
+                    # (default ON, size-capped) derives one from this request's
+                    # own prompt tokens so a plain multi-turn chat.completions
+                    # conversation -- no header at all -- still gets a session
+                    # rung captured at turn end (LW3 panel, 2026-09-07: without
+                    # this, capture_session always refused with
+                    # no_session_id_at_generator and every follow-up turn
+                    # re-prefilled + regenerated turn 1's own output from
+                    # scratch). None still means "do not capture".
+                    _session_id = getattr(args, "session_id", None)
+                    if not _session_id:
+                        _session_id = _context_vault.auto_session_id(
+                            _prompt_ids_list, tenant_id=getattr(args, "tenant_id", None)
+                        )
                     active[uid] = {
                         "rqueue": rqueue,
                         "streamer": _ServerTokenStreamer(
@@ -2529,10 +2546,7 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
-                        # Conversation id for the vault's session tier. None
-                        # means "do not capture" -- Chat Completions without an
-                        # X-Session-Id header, or the session tier switched off.
-                        "session_id": getattr(args, "session_id", None),
+                        "session_id": _session_id,
                         "spec_snapshot": (
                             speculative_stats_snapshot(self.draft_model)
                             if self.draft_model is not None
@@ -3137,10 +3151,21 @@ class ResponseGenerator:
             # (after remove() it finds no row and stores nothing rather than
             # storing something wrong). Best-effort by contract -- capture_session
             # never raises, and losing a rung only costs the next turn a cold
-            # prefill, which is the status quo.
+            # prefill, which is the status quo. The try/except is for a
+            # DIFFERENT failure than capture_session's own internal contract:
+            # a duck-typed batch_gen (test doubles predating this call site
+            # firing by default, now that MLX_VLM_APC_SAVE_SESSION auto-derives
+            # a session id) may not implement capture_session at all --
+            # AttributeError happens before capture_session's own body runs,
+            # so its internal never-raises contract cannot catch it.
             if r.finish_reason is not None:
                 if info.get("session_id"):
-                    batch_gen.capture_session(r.uid, session_id=info["session_id"])
+                    try:
+                        batch_gen.capture_session(
+                            r.uid, session_id=info["session_id"]
+                        )
+                    except Exception:  # noqa: BLE001 - session capture never fails a response
+                        pass
                 else:
                     # The guard that fires when the header never arrived. Named,
                     # because "no session id on the request" and "capture broke"

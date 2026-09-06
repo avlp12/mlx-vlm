@@ -79,6 +79,10 @@ __all__ = [
     "restore_fragments",
     "vault_budget_bytes",
     "vault_enabled",
+    "apc_save_session_enabled",
+    "apc_save_session_max_tokens",
+    "auto_session_id",
+    "session_tier_active",
 ]
 
 _ENV_ENABLE = "MLX_VLM_GLM5_VAULT"
@@ -87,10 +91,22 @@ _ENV_STRIDE = "MLX_VLM_GLM5_VAULT_STRIDE"
 _ENV_MAX_LADDER = "MLX_VLM_GLM5_VAULT_MAX_LADDER"
 _ENV_SESSION = "MLX_VLM_GLM5_VAULT_SESSION"
 _ENV_SESSION_DERIVED_ID = "MLX_VLM_GLM5_VAULT_SESSION_DERIVED_ID"
+# 2026-09-07 (LW3 multiturn thinking follow-up): a plain OpenAI chat.completions
+# multi-turn conversation carries no X-Session-Id header and no
+# previous_response_id chain, so `session_capture_enabled`/
+# `derived_session_id_allowed` above -- both default OFF, both requiring the
+# SERVER to mint a real conversation id -- never fire for it. This is a
+# separate, narrower, default-ON switch: it only ever derives an id when the
+# request supplied none (an explicit header always wins), and only up to a
+# token cap, so its blast radius is bounded and it never touches the
+# explicit-session-id path's behaviour.
+_ENV_APC_SAVE_SESSION = "MLX_VLM_APC_SAVE_SESSION"
+_ENV_APC_SAVE_SESSION_MAX_TOKENS = "MLX_VLM_APC_SAVE_SESSION_MAX_TOKENS"
 
 _DEFAULT_BUDGET_GB = 48.0
 _DEFAULT_STRIDE = 8192
 _DEFAULT_MAX_LADDER = 8
+_DEFAULT_APC_SAVE_SESSION_MAX_TOKENS = 24576
 
 # Explicit opt-out tokens for MLX_VLM_GLM5_VAULT. The vault defaults ON (an
 # unset variable, or any value other than one of these, keeps it on).
@@ -231,6 +247,106 @@ def derived_session_id_allowed() -> bool:
     where the collapse is harmless and understood.
     """
     return _env_truthy(_ENV_SESSION_DERIVED_ID)
+
+
+def apc_save_session_enabled() -> bool:
+    """True unless ``MLX_VLM_APC_SAVE_SESSION`` explicitly opts out. Default ON.
+
+    Governs ONLY the auto-derived fallback in :func:`auto_session_id` -- a
+    request that already supplies an explicit session id (X-Session-Id header,
+    or a Responses-API ``previous_response_id`` chain) is never affected by
+    this flag, and neither is ``session_capture_enabled``/
+    ``derived_session_id_allowed`` above, which this deliberately does not
+    replace: those remain their own (default-OFF) mechanism for a server that
+    mints its own real conversation ids. This flag exists because the common
+    case -- a stock OpenAI multi-turn chat.completions client that never sends
+    any session header at all -- had NO mechanism that fired: without an id,
+    ``capture_session`` (generate/ar.py) always refused with
+    ``no_session_id_at_generator``, so a turn-2 request re-prefilled its own
+    turn-1 prompt AND regenerated turn-1's reasoning/content from scratch
+    every time (measured on the LW3 panel, 2026-09-07: cached_tokens pinned at
+    the turn-1 prompt length while turn-2's prompt was 2-3x longer).
+    """
+    return not _env_opts_out(_ENV_APC_SAVE_SESSION)
+
+
+def apc_save_session_max_tokens() -> int:
+    """Token cap gating :func:`auto_session_id` (``MLX_VLM_APC_SAVE_SESSION_MAX_TOKENS``,
+    default 24576).
+
+    Bounds the auto-derived path's blast radius: since this fires by default,
+    with no operator having opted in the way an explicit session id implies,
+    a request whose OWN prompt already exceeds the cap is left with no
+    session id (as if the flag were off for it) rather than growing the
+    vault's session tier unboundedly off of ordinary traffic. The explicit-id
+    path above has no such cap -- an operator who wires a real session id is
+    assumed to have made that call deliberately.
+    """
+    try:
+        n = int(
+            os.environ.get(
+                _ENV_APC_SAVE_SESSION_MAX_TOKENS,
+                _DEFAULT_APC_SAVE_SESSION_MAX_TOKENS,
+            )
+        )
+    except (TypeError, ValueError):
+        n = _DEFAULT_APC_SAVE_SESSION_MAX_TOKENS
+    return max(0, n)
+
+
+def auto_session_id(
+    tokens: Sequence[int], tenant_id: Optional[str] = None
+) -> Optional[str]:
+    """Derive a session id for a request that supplied none.
+
+    Reuses :func:`session_id_for`'s exact hash (first 64 tokens -- stable
+    across every turn of one conversation, since those tokens are the shared
+    system-prompt/instruction prefix a follow-up turn resends unchanged) --
+    the collision risk documented on ``session_id_for``/
+    ``derived_session_id_allowed`` (many different conversations sharing one
+    system prompt land in the same eviction group) is UNCHANGED here, but it
+    is a fairness/eviction-granularity concern, never a correctness one: the
+    vault's lookup keys on the full token trie, never on ``session_id`` (see
+    ``ContextVault.lookup``/``_walk``), so two different conversations
+    colliding on this id can never serve one's cache to the other's prompt --
+    at worst one's rung gets evicted a little sooner under memory pressure.
+    ``tenant_id``, when the caller has one (``GenArgs.tenant_id``), is mixed
+    in to shrink that collision further across tenants sharing a template.
+    The ``"auto:"`` prefix marks the id as this function's doing (visible on
+    ``VaultCheckpoint.session_id``) so a live server's rungs can be told apart
+    from an operator-supplied id at a glance.
+
+    Returns ``None`` (meaning: do not auto-capture this request) when the
+    flag is off, the token list is empty, or it exceeds
+    :func:`apc_save_session_max_tokens`.
+    """
+    if not apc_save_session_enabled():
+        return None
+    toks = list(tokens)
+    if not toks or len(toks) > apc_save_session_max_tokens():
+        return None
+    sid = "auto:" + session_id_for(toks)
+    if tenant_id:
+        sid = f"{sid}:{tenant_id}"
+    return sid
+
+
+def session_tier_active() -> bool:
+    """Whether the vault's SESSION tier should be consulted at all -- on
+    ``capture_session``'s write side (generate/ar.py) and ``_vault_pick_for``'s
+    read side, in place of a bare ``session_capture_enabled()`` check.
+
+    True when EITHER the original, still-being-validated mechanism is on
+    (``MLX_VLM_GLM5_VAULT_SESSION``, default OFF, real per-conversation ids
+    only) OR the narrower default-ON auto-derived-id mechanism is on
+    (``apc_save_session_enabled``/``MLX_VLM_APC_SAVE_SESSION``). This is an OR,
+    not a replacement: an operator who has validated and turned on the
+    original mechanism keeps it exactly as before, whether or not
+    ``MLX_VLM_APC_SAVE_SESSION`` is also set; an operator who has done nothing
+    gets the auto-derived mechanism by default. Turning off BOTH flags is the
+    only way to disable the session tier entirely.
+    """
+    return session_capture_enabled() or apc_save_session_enabled()
 
 
 def default_boundary_stride() -> int:
