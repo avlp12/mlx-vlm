@@ -198,25 +198,68 @@ def test_prefill_is_bit_identical_to_eager(S, nv):
 
 @on_gpu
 def test_state_carries_across_chunks():
-    """Two 64-token chunks through one cache must equal one 128-token chunk.
+    """Two 64-token chunks through one cache must match EAGER over the SAME
+    two chunks -- not the fused kernel run whole in one call.
 
-    The kernel loads the state once per chunk and stores it once; if the
-    epilogue's window or state store were wrong the error would only show up on
-    the SECOND chunk, which single-chunk parity cannot see.
+    Fused-split-vs-fused-whole bit-equality is the wrong contract: the eager
+    KDA recurrence itself is not bit-exact across a chunk split on Metal (only
+    on CPU do the two decompositions agree bitwise at these shapes -- see the
+    ``ON_GPU`` branch of ``test_glm5_chunked_spec_prefill.py::_assert_row_matches``
+    and its ``CACHE_DRIFT_TOL = 2e-06``, worst measured 9.54e-07 on an M3 Ultra,
+    mlx 0.32.1.dev20260902, splitting this same KDA scan at a chunk boundary).
+    Demanding fused-split == fused-whole bit-exactly would therefore fail on a
+    CORRECT kernel, for the same float non-associativity reason, not a bug.
+
+    So the load-bearing check here is: fused split == eager split, run chunk
+    for chunk with fresh same-seed caches, bit-exact (this kernel's actual
+    claim -- see the module docstring -- is parity with the eager chain it
+    replaces, at whatever chunking the caller uses). Fused-split-vs-fused-whole
+    is kept only as a loose secondary guard against a gross chunk-carry bug
+    (state or window dropped between chunks), at the same drift bound the
+    sibling file established for this exact phenomenon -- confirmed by direct
+    measurement (see below) to be exactly 0 on CPU at this config, i.e. this
+    tolerance is inert here and only matters on the Metal box this test
+    actually runs on.
     """
     config = _config()
     layer = _layer(config, seed=7)
     mx.random.seed(77)
     x = (mx.random.normal((1, 128, config.hidden_size)) * 0.5).astype(mx.bfloat16)
-    whole, split = _cache(seed=7), _cache(seed=7)
+    whole, split, eager_split = _cache(seed=7), _cache(seed=7), _cache(seed=7)
 
     y_whole = _run(layer, x, whole, on=True)
     y_a = _run(layer, x[:, :64], split, on=True)
     y_b = _run(layer, x[:, 64:], split, on=True)
+    y_ea = _run(layer, x[:, :64], eager_split, on=False)
+    y_eb = _run(layer, x[:, 64:], eager_split, on=False)
 
-    assert mx.array_equal(mx.concatenate([y_a, y_b], axis=1), y_whole).item()
-    assert mx.array_equal(split[1], whole[1]).item(), "state after chunk 2 differs"
-    assert mx.array_equal(split[0], whole[0]).item(), "window after chunk 2 differs"
+    y_split = mx.concatenate([y_a, y_b], axis=1)
+    y_eager_split = mx.concatenate([y_ea, y_eb], axis=1)
+
+    # The module's actual claim: fused matches eager under IDENTICAL chunking,
+    # bit-exactly (atol = rtol = 0, per the module docstring).
+    assert mx.array_equal(y_split, y_eager_split).item(), (
+        "fused split differs from eager split"
+    )
+    assert all(
+        mx.array_equal(a, b).item() for a, b in zip(split.state, eager_split.state)
+    ), "fused cache state after two chunks differs from eager cache state"
+
+    # Secondary, loose guard: fused-split vs fused-whole should be close even
+    # though it is not the load-bearing contract above. ``KDA_SPLIT_DRIFT_TOL``
+    # is the sibling test file's measured Metal bound for splitting this same
+    # scan at a chunk boundary (test_glm5_chunked_spec_prefill.py), not a value
+    # invented here; measured directly against THIS test's own config on CPU it
+    # is 0 (bitwise), consistent with that file's note that CPU does not show
+    # the drift Metal does -- so this assertion is a no-op safety net on CPU
+    # and only exercises the tolerance on the GPU box.
+    KDA_SPLIT_DRIFT_TOL = 2e-06
+    assert mx.allclose(
+        y_split.astype(mx.float32),
+        y_whole.astype(mx.float32),
+        atol=KDA_SPLIT_DRIFT_TOL,
+        rtol=0,
+    ).item(), "fused split vs fused whole exceeded the KDA scan-split drift bound"
 
 
 @on_gpu
