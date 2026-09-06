@@ -1,17 +1,26 @@
-"""Falsification test for ledger I1372 / lever L31.
+"""Falsification test, then fix-verification test, for ledger I1372 / lever L31.
 
-Hypothesis: in a multi-turn OpenAI chat, the server returns ``reasoning_content``
-after ``.strip()`` (mlx_vlm/server/responses_state.py, ``_split_thinking`` /
-``_clean_reasoning``), and on the next turn the chat template re-renders the
+Original hypothesis (CONFIRMED, then fixed -- see commit history on this
+branch): the server returned ``reasoning_content`` after ``.strip()``
+(mlx_vlm/server/responses_state.py, ``_split_thinking`` / ``_clean_reasoning``,
+plus the same ``.lstrip("\\n")`` pattern in ``ThinkingStreamState`` for the
+streaming path), and on the next turn the chat template re-rendered the
 assistant turn as ``'<think>' + reasoning_content + '</think>' + content``
 (chat_template.jinja:143-153, ``clear_thinking`` defaults false).  The prior
 turn's *session token stream* -- the thing the vault / exact-APC prefix match
 actually keys against -- was ``'<think>'`` (already in the turn-1 prompt) +
 the RAW generated token ids (whatever whitespace the model actually emitted)
-+ ``'</think>'`` + content.  If ``.strip()`` removes bytes the model emitted,
-the re-rendered turn-2 prompt cannot literally be a token-prefix extension of
-the turn-1 session stream, and the vault's exact-prefix reuse of the prior
-turn's thinking prefill is defeated.
++ ``'</think>'`` + content.  Stripping removed bytes the model emitted, so the
+re-rendered turn-2 prompt was NOT a token-prefix extension of the turn-1
+session stream, and the vault's exact-prefix reuse of the prior turn's
+thinking prefill was defeated.
+
+Fix applied (this branch): removed every ``.strip()`` / ``.lstrip("\\n")`` in
+the marker-based and response-template-parser paths of ``_split_thinking``,
+``_clean_reasoning``, and the streaming ``ThinkingStreamState`` (`feed`,
+`_strip_open_marker`) -- see responses_state.py. Marker text itself
+(`<think>`/`</think>`/`<|channel>thought`/`<channel|>`/etc.) is still removed;
+only the surrounding whitespace bytes are now preserved verbatim.
 
 Where the session token stream really comes from (cited, not re-derived here):
 
@@ -112,9 +121,10 @@ RAW_GENERATION_VARIANTS = {
     # do before writing the first reasoning line.
     "with_leading_newline": "\nStep one...\n" + THINK_CLOSE + "Final answer.",
     # Same content, but the model happens not to emit a leading newline.
-    # Included to show the divergence is not solely about the leading '\n'.
+    # Included to show the (former) divergence was not solely about the
+    # leading '\n'.
     "no_leading_newline": "Step one...\n" + THINK_CLOSE + "Final answer.",
-    # Thinking-budget cutoff path: the budget critera force-closes thinking
+    # Thinking-budget cutoff path: the budget criteria force-close thinking
     # with little/no real reasoning text, just the trailing newline the
     # budget-stop path is documented to produce before splicing '</think>'.
     "budget_stop_variant": "\n" + THINK_CLOSE + "Final answer.",
@@ -122,16 +132,17 @@ RAW_GENERATION_VARIANTS = {
 
 
 @pytest.mark.parametrize("variant_name", sorted(RAW_GENERATION_VARIANTS))
-def test_stripped_reasoning_breaks_session_prefix_reuse(
+def test_split_thinking_is_lossless_and_preserves_session_prefix(
     tokenizer, chat_template, variant_name, capsys
 ):
-    """Falsification target: turn-2 prompt ids should equal turn-1 session ids
-    as a prefix (session ids = turn-1 prompt ids + raw generated ids). This
-    test documents that with the server's real (.strip()-ing) split, they do
-    NOT -- divergence starts inside the thinking span, right where stripping
-    ate bytes the model actually emitted. This is the EXPECTED (bug-confirming)
-    outcome; the assertions pin the exact position so a future fix invalidates
-    the pinned numbers loudly instead of silently.
+    """Fix-verification: turn-2 prompt ids must equal turn-1 session ids as a
+    full prefix (session ids = turn-1 prompt ids + raw generated ids), for
+    every raw-generation shape that used to break this (I1372/L31). Before
+    the fix, this parametrized test was named
+    ``test_stripped_reasoning_breaks_session_prefix_reuse`` and asserted the
+    OPPOSITE (divergence strictly inside the thinking span) -- see git log
+    for the pre-fix version and ``test_old_stripped_behavior_...`` below for
+    a standing regression guard against reintroducing that bug.
     """
     raw_generated = RAW_GENERATION_VARIANTS[variant_name]
 
@@ -175,7 +186,7 @@ def test_stripped_reasoning_breaks_session_prefix_reuse(
     divergence = _longest_common_prefix_len(session_ids_turn1, turn2_ids)
 
     print(f"\n[{variant_name}] raw_generated={raw_generated!r}")
-    print(f"[{variant_name}] reasoning_content (stripped)={reasoning_content!r}")
+    print(f"[{variant_name}] reasoning_content (lossless)={reasoning_content!r}")
     print(f"[{variant_name}] content={content!r}")
     print(
         f"[{variant_name}] len(session_ids_turn1)={len(session_ids_turn1)} "
@@ -187,53 +198,66 @@ def test_stripped_reasoning_breaks_session_prefix_reuse(
     )
     print(f"[{variant_name}] turn2   ctx @div: {_ctx(tokenizer, turn2_ids, divergence)}")
 
-    # The hypothesis under test: divergence happens strictly BEFORE the end
-    # of the turn-1 session stream (i.e. the vault's exact-prefix match must
-    # fail to reuse the full thinking span), and it happens after -- not
-    # before -- the '<think>' token, i.e. inside the thinking span itself.
-    assert divergence < len(session_ids_turn1), (
-        f"[{variant_name}] EXPECTED-BUG-ABSENT: turn-2 ids were a full prefix "
-        "extension of turn-1 session ids -- the stripped round-trip did NOT "
-        "diverge. If this assertion fails, either the fix has already landed "
-        "or this raw-generation variant no longer exercises the bug; re-check "
-        "against the hypothesis in the module docstring before treating this "
-        "as green."
-    )
-    assert divergence > think_open_pos, (
-        f"[{variant_name}] divergence at index {divergence} is at/before the "
-        f"'<think>' token position {think_open_pos}; expected the prompts to "
-        "agree at least through the opening thinking marker."
+    # Fix invariant: the whole turn-1 session stream (prompt + raw generated
+    # ids) must be a token-prefix of the turn-2 re-render, so the vault's
+    # exact-prefix match can reuse the full thinking prefill.
+    assert divergence >= len(session_ids_turn1), (
+        f"[{variant_name}] REGRESSION: turn-2 ids are NOT a full prefix "
+        "extension of turn-1 session ids -- the lossless split has regressed "
+        f"back toward the pre-fix (stripping) behaviour. Divergence at "
+        f"{divergence} of {len(session_ids_turn1)}; session ctx @div: "
+        f"{_ctx(tokenizer, session_ids_turn1, divergence)}"
     )
 
 
-def test_lossless_reasoning_preserves_session_prefix(tokenizer, chat_template):
-    """Control case: what the minimal fix would have to preserve.
+def test_old_stripped_behavior_would_have_broken_prefix_reuse_regression_guard(
+    tokenizer, chat_template
+):
+    """Regression guard documenting the PRE-FIX behaviour this branch removed.
 
-    If the raw generated span (leading/trailing whitespace included) is kept
-    verbatim as reasoning_content/content instead of `.strip()`-ed, the
-    turn-2 prompt IS a full prefix extension of the turn-1 session ids -- the
-    vault's exact-match reuse would work.  This is not what the server does
-    today (see the parametrized test above); it demonstrates the invariant a
-    fix must restore.
+    This does not call `_split_thinking` (that function is fixed now); it
+    reimplements, inline, the exact `.strip()`-based split that
+    `_clean_reasoning` / `_split_thinking` used to do, so that:
+
+      (a) the historical bug is documented in a form future readers can run,
+          rather than only in a commit message, and
+      (b) if someone re-adds `.strip()` to the production split "to tidy up
+          whitespace", this test's neighbour above
+          (`test_split_thinking_is_lossless_and_preserves_session_prefix`)
+          will fail loudly -- this test exists to explain *why* it fails
+          when that happens.
+
+    If this test's own assertions ever fail, it means the historical
+    strip-based transform stopped breaking the prefix invariant for this
+    fixture, which would be surprising and worth investigating on its own
+    (e.g. a tokenizer/template change) rather than assumed benign.
     """
     raw_generated = RAW_GENERATION_VARIANTS["with_leading_newline"]
 
     turn1_messages = [{"role": "user", "content": "Hello, what is 2+2?"}]
     turn1_text, turn1_prompt_ids = _render(tokenizer, chat_template, turn1_messages)
     assert turn1_text.endswith(THINK_OPEN)
+    think_open_pos = len(turn1_prompt_ids) - 1
 
     generated_ids = tokenizer.encode(raw_generated, add_special_tokens=False)
     session_ids_turn1 = turn1_prompt_ids + generated_ids
 
-    # Lossless split: no stripping, keep every byte the model emitted on
-    # either side of the literal '</think>' marker.
-    reasoning_lossless, content_lossless = raw_generated.split(THINK_CLOSE, 1)
+    # The old (pre-fix) `_split_thinking` marker branch, reproduced verbatim
+    # for documentation purposes only -- see git history of responses_state.py
+    # on this branch for the real removed code:
+    #
+    #   reasoning, content = text.split(end_marker, 1)
+    #   reasoning = reasoning.replace(start_marker, "").strip()   # <- the bug
+    #   content = content.strip()                                 # <- the bug
+    old_reasoning, old_content = raw_generated.split(THINK_CLOSE, 1)
+    old_reasoning = old_reasoning.replace(THINK_OPEN, "").strip()
+    old_content = old_content.strip()
 
     turn2_messages = turn1_messages + [
         {
             "role": "assistant",
-            "content": content_lossless,
-            "reasoning_content": reasoning_lossless,
+            "content": old_content,
+            "reasoning_content": old_reasoning,
         },
         {"role": "user", "content": "And 3+3?"},
     ]
@@ -241,15 +265,16 @@ def test_lossless_reasoning_preserves_session_prefix(tokenizer, chat_template):
 
     divergence = _longest_common_prefix_len(session_ids_turn1, turn2_ids)
     print(
-        f"\n[lossless] reasoning={reasoning_lossless!r} content={content_lossless!r} "
-        f"len(session_ids_turn1)={len(session_ids_turn1)} divergence_index={divergence}"
+        f"\n[old-stripped] reasoning={old_reasoning!r} content={old_content!r} "
+        f"len(session_ids_turn1)={len(session_ids_turn1)} divergence_index={divergence} "
+        f"think_open_pos={think_open_pos}"
     )
 
-    assert divergence >= len(session_ids_turn1), (
-        "lossless (unstripped) reasoning_content should make turn-2 ids a "
-        f"full prefix extension of the turn-1 session ids; got divergence "
-        f"at {divergence} of {len(session_ids_turn1)}"
+    assert divergence < len(session_ids_turn1), (
+        "the historical .strip()-based split no longer breaks the session "
+        "prefix for this fixture -- investigate before trusting this guard"
     )
+    assert divergence > think_open_pos
 
 
 def test_jinja_scoping_does_not_leak_reasoning_across_turns(tokenizer, chat_template):
@@ -259,7 +284,7 @@ def test_jinja_scoping_does_not_leak_reasoning_across_turns(tokenizer, chat_temp
     (this is documented Jinja2 behaviour, not something this fork added), so
     an assistant turn with no reasoning_content of its own must render
     `<think></think>` and must NOT inherit an earlier turn's reasoning text.
-    This is a sanity check that the round-trip bug above is a *stripping*
+    This is a sanity check that the round-trip bug above was a *stripping*
     problem, not a *scoping leak* -- both were flagged as things to verify.
     """
     # Must not itself contain the substrings "A1"/"A2" used as turn markers

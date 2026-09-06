@@ -2452,8 +2452,11 @@ def test_responses_endpoint_returns_reasoning_items(client):
     payload = response.json()
     assert [item["type"] for item in payload["output"]] == ["reasoning", "message"]
     assert payload["output"][0]["summary"][0]["text"] == "Check briefly."
-    assert payload["output"][1]["content"][0]["text"] == "Done."
-    assert payload["output_text"] == "Done."
+    # I1372/L31: _split_thinking no longer .strip()s -- the leading "\n\n" the
+    # model emitted right after '</think>' is preserved verbatim so the next
+    # turn's re-render is a token-prefix extension of this turn's session ids.
+    assert payload["output"][1]["content"][0]["text"] == "\n\nDone."
+    assert payload["output_text"] == "\n\nDone."
 
 
 def test_responses_endpoint_returns_native_shell_call_items(client):
@@ -2612,7 +2615,11 @@ def test_responses_streaming_emits_reasoning_events(client):
     )
 
     assert "".join(event["delta"] for event in reasoning_events) == "Check briefly."
-    assert "".join(event["delta"] for event in text_delta_events) == "Done."
+    # I1372/L31: the streamed content delta must carry the leading "\n\n" the
+    # model actually emitted after '</think>' -- ThinkingStreamState no longer
+    # lstrip("\n")s across the close marker, so this agrees byte-for-byte with
+    # the non-streamed _split_thinking path exercised above.
+    assert "".join(event["delta"] for event in text_delta_events) == "\n\nDone."
     assert reasoning_events[0]["timings"]["predicted_per_second"] is None
     assert reasoning_events[1]["timings"]["predicted_per_second"] > 0
     assert (
@@ -2622,7 +2629,7 @@ def test_responses_streaming_emits_reasoning_events(client):
     assert done_event["timings"]["predicted_per_second"] > 0
     assert [item["type"] for item in completed["output"]] == ["reasoning", "message"]
     assert completed["output"][0]["summary"][0]["text"] == "Check briefly."
-    assert completed["output_text"] == "Done."
+    assert completed["output_text"] == "\n\nDone."
 
 
 def test_responses_streaming_uses_prompt_opened_thinking_without_flag(client):
@@ -3082,7 +3089,10 @@ def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
     ]
 
     assert "".join(delta.get("content") or "" for delta in deltas) == "7 * 8 = 56"
-    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
+    # I1372/L31: the lone '\n' between "<|channel>thought" and "<channel|>" is
+    # no longer lstrip()-ed away; see TestThinkingStreamState's unit-level
+    # version of this same fixture for the byte-level explanation.
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == "\n"
     assert "<|channel>" not in response.text
     assert "<channel|>" not in response.text
 
@@ -4554,7 +4564,8 @@ def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
     ]
 
     assert "".join(delta.get("text") or "" for delta in deltas) == "7 * 8 = 56"
-    assert "".join(delta.get("thinking") or "" for delta in deltas) == ""
+    # I1372/L31: see the chat-completions counterpart of this test above.
+    assert "".join(delta.get("thinking") or "" for delta in deltas) == "\n"
     assert "<|channel>" not in response.text
     assert "<channel|>" not in response.text
 
@@ -7251,9 +7262,12 @@ class TestSplitThinking:
     """Tests for thinking tag parsing."""
 
     def test_channel_tags(self):
+        # I1372/L31: _split_thinking is now lossless -- the '\n' the model
+        # emitted right after the open marker is part of reasoning, not
+        # discarded. See mlx_vlm/tests/test_thinking_roundtrip_prefix.py.
         text = "<|channel>thought\nReasoning here.<channel|>The answer."
         reasoning, content = server._split_thinking(text)
-        assert reasoning == "Reasoning here."
+        assert reasoning == "\nReasoning here."
         assert content == "The answer."
 
     def test_think_tags(self):
@@ -7263,10 +7277,12 @@ class TestSplitThinking:
         assert content == "Answer."
 
     def test_partial_close_tag_only(self):
+        # I1372/L31: no more .strip() -- the newline before '</think>' stays
+        # in reasoning, and the newline after it stays in content.
         text = "Thinking text\n</think>\nAnswer."
         reasoning, content = server._split_thinking(text)
-        assert reasoning == "Thinking text"
-        assert content == "Answer."
+        assert reasoning == "Thinking text\n"
+        assert content == "\nAnswer."
 
     def test_no_thinking(self):
         text = "Just plain text."
@@ -7303,9 +7319,10 @@ class TestSplitThinking:
         assert content == "Answer."
 
     def test_empty_content_after_thinking(self):
+        # I1372/L31: no more .strip() on the reasoning span.
         text = "<|channel>thought\nOnly thinking.<channel|>"
         reasoning, content = server._split_thinking(text)
-        assert reasoning == "Only thinking."
+        assert reasoning == "\nOnly thinking."
         assert content == ""
 
     def test_custom_thinking_markers(self):
@@ -7453,7 +7470,11 @@ class TestThinkingStreamState:
             if delta.content:
                 content.append(delta.content)
 
-        assert "".join(reasoning) == ""
+        # I1372/L31: no more lstrip("\n") across the open marker -- the lone
+        # newline the gemma channel glue emits between "<|channel>thought" and
+        # "<channel|>" is now preserved as (whitespace-only) reasoning instead
+        # of being silently dropped.
+        assert "".join(reasoning) == "\n"
         assert "".join(content) == "7 * 8 = 56"
 
     def test_think_close_can_emit_reasoning_tail_and_content(self):
@@ -7466,7 +7487,9 @@ class TestThinkingStreamState:
         assert first.content is None
         assert first.thinking_closed is False
         assert second.reasoning == " tail"
-        assert second.content == "Answer"
+        # I1372/L31: no more lstrip("\n") on the content that follows the
+        # close marker -- the "\n\n" the model emitted is real content bytes.
+        assert second.content == "\n\nAnswer"
         assert second.thinking_closed is True
 
     def test_custom_markers_split_same_delta_content(self):

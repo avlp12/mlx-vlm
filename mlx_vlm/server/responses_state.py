@@ -83,7 +83,7 @@ class ThinkingStreamState:
                 if before:
                     reasoning.append(before)
 
-                self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+                self.buffer = self.buffer[idx + len(marker) :]
                 self.in_thinking = False
                 self.thinking_done = True
                 thinking_closed = True
@@ -109,7 +109,7 @@ class ThinkingStreamState:
                 if emit:
                     content.append(emit)
 
-            self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+            self.buffer = self.buffer[idx + len(marker) :]
             self.in_thinking = True
 
         if last and self.buffer:
@@ -164,10 +164,18 @@ class ThinkingStreamState:
         return text, ""
 
     def _strip_open_marker(self, text: str) -> str:
+        """Remove the open-marker text only -- no `.lstrip("\\n")`.
+
+        Removing the leading newline here made the streamed reasoning delta
+        disagree, byte-for-byte, with the non-streamed `_split_thinking`
+        path once that stopped stripping too (I1372/L31): a client
+        reconstructing content by concatenating deltas must land on the same
+        string as a client reading the final message.
+        """
         for marker in self.open_markers:
             if marker in text:
                 before, after = text.split(marker, 1)
-                return before + after.lstrip("\n")
+                return before + after
         return text
 
 
@@ -355,10 +363,20 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
 
 
 def _clean_reasoning(reasoning: str, start_marker: str) -> str:
+    """Remove the marker text only -- NOT `.strip()`.
+
+    The bytes on either side of a marker are what the model actually emitted
+    (e.g. a leading '\\n' right after '<think>'); the vault/exact-APC prefix
+    match keys on the raw generated token ids (ar.py:3984-4016), and the
+    chat template re-renders reasoning_content verbatim on the next turn
+    (chat_template.jinja:143-153). Stripping here made the round trip lossy:
+    see mlx_vlm/tests/test_thinking_roundtrip_prefix.py (I1372/L31) for the
+    measured divergence this caused.
+    """
     reasoning = reasoning.replace(start_marker, "")
     if start_marker == "<|channel>thought":
         reasoning = reasoning.lstrip("thought")
-    return reasoning.strip()
+    return reasoning
 
 
 def _split_thinking(
@@ -384,9 +402,11 @@ def _split_thinking(
                 content = parsed.get("content")
                 if reasoning is None or isinstance(reasoning, str):
                     if content is None or isinstance(content, str):
+                        # No .strip(): preserve exactly what the response-template
+                        # parser handed back (see _clean_reasoning docstring).
                         return (
-                            reasoning.strip() if reasoning else None,
-                            content.strip() if content else "",
+                            reasoning if reasoning else None,
+                            content if content else "",
                         )
         except (AttributeError, TypeError, ValueError):
             logger.debug(
@@ -399,26 +419,26 @@ def _split_thinking(
         start = text.find(start_marker)
         end = text.find(end_marker, start if start >= 0 else 0)
         if start >= 0 and start < end:
-            reasoning = text[start + len(start_marker) : end].strip()
+            reasoning = text[start + len(start_marker) : end]
             content = _strip_content_markers(
                 text[:start] + text[end + len(end_marker) :]
-            ).strip()
+            )
             return reasoning or None, content
 
         if end_marker in text:
             reasoning, content = text.split(end_marker, 1)
             reasoning = _clean_reasoning(reasoning, start_marker)
-            return reasoning or None, _strip_content_markers(content).strip()
+            return reasoning or None, _strip_content_markers(content)
 
         if start_marker in text:
             reasoning = _clean_reasoning(text, start_marker)
             return reasoning or None, ""
 
     if starts_in_thinking:
-        reasoning = _strip_content_markers(text).strip()
+        reasoning = _strip_content_markers(text)
         return reasoning or None, ""
 
-    return None, _strip_content_markers(text).strip()
+    return None, _strip_content_markers(text)
 
 
 def _response_output_items_from_text(
