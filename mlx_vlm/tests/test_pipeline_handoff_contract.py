@@ -261,6 +261,11 @@ def test_repeated_runtime_requests_reset_cache_stats_and_exit_tail(monkeypatch):
         io_timeout=2.0,
         depth=2,
         transport="socket",
+        # The tail is resident by default now (it holds tens of GB of pruned
+        # weights); ``--once`` is the old bench behaviour this test asserts --
+        # one connection, then exit.  The resident loop is pinned in
+        # test_pipeline_tail_daemon.py.
+        once=True,
     )
     errors = []
 

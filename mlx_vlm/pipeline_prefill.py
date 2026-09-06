@@ -67,6 +67,7 @@ import json
 import math
 import os
 import queue
+import signal
 import socket
 import struct
 import sys
@@ -993,39 +994,235 @@ def _head_one(args, stage: Stage, sock, tokens: int):
     }
 
 
-def run_tail(args):
-    # Validate pins before loading any weights. Identity is supplied by the
-    # caller's verified model manifest; no path-name equivalence is inferred.
-    _hex(args.model_sha256, 64, "model_sha256")
-    _hex(args.source_revision, 40, "source_revision")
-    stop_file = getattr(args, "stop_file", None)
-    _check_stop(stop_file)
-    lo, hi = args.split, args.layers
-    model, caches, local, n_layers, load_s = load_stage(args.model, lo, hi, args.prune)
-    stage = Stage(model, caches, local, n_layers)
-    print(f"[tail] layers {lo}:{hi} of {n_layers} loaded in {load_s:.1f}s", flush=True)
+class TailDaemon:
+    """A resident accept loop for the tail stage.
 
-    srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((args.bind, args.port))
-    srv.listen(1)
-    print(f"[tail] listening on {args.bind}:{args.port}", flush=True)
-    srv.settimeout(min(0.25, args.connect_timeout))
-    sock = None
-    try:
-        deadline = time.monotonic() + args.connect_timeout
-        while True:
-            _check_stop(stop_file)
-            if time.monotonic() >= deadline:
-                raise TimeoutError("pipeline tail accept timeout")
+    The bench tail served exactly one connection: ``listen(1)``, one
+    ``accept()``, ``break``, and a ``--connect-timeout`` deadline that killed
+    the process if a head was late.  A production tail holds tens of GB of
+    pruned weights, so tearing it down between requests is the expensive part
+    of the whole rig.  This class keeps the stage resident and re-arms
+    ``accept`` after every connection, whatever ended it -- ``bye``, EOF, or a
+    peer that died mid-chunk.  A failed connection is a connection-scoped
+    event: it is logged, counted, and the next head is served.
+
+    Shutdown is explicit and unloads BEFORE the process exits: a bare SIGTERM
+    to a process holding MLX buffers leaks wired memory that only a reboot
+    reclaims, so the signal only sets the flag and the loop's own ``finally``
+    releases the stage.
+    """
+
+    POLL_S = 0.25
+
+    def __init__(
+        self,
+        srv,
+        session,
+        *,
+        connect_timeout: float = 0.0,
+        idle_timeout: float = 0.0,
+        once: bool = False,
+        unload=None,
+        log=None,
+        clock=time.monotonic,
+    ):
+        self.srv = srv
+        self.session = session
+        self.connect_timeout = float(connect_timeout or 0.0)
+        self.idle_timeout = float(idle_timeout or 0.0)
+        self.once = bool(once)
+        self.unload = unload
+        self.log = log or (lambda line: print(line, flush=True))
+        self.clock = clock
+        self.state = "starting"
+        self.peer = None
+        self.shutdown_reason = None
+        self.started = clock()
+        self.last_active = self.started
+        self.counters = {
+            "connections": 0,
+            "requests": 0,
+            "connection_errors": 0,
+            "last_error": None,
+        }
+        self._stop = threading.Event()
+
+    # -- control ------------------------------------------------------------
+    def request_shutdown(self, reason: str = "shutdown"):
+        """Idempotent; safe from a signal handler (only sets a flag)."""
+        if self.shutdown_reason is None:
+            self.shutdown_reason = reason
+        self._stop.set()
+
+    @property
+    def stopping(self) -> bool:
+        return self._stop.is_set()
+
+    def status(self) -> dict:
+        return {
+            "role": "tail",
+            "state": self.state,
+            "peer": self.peer,
+            "uptime_s": round(self.clock() - self.started, 3),
+            "idle_s": round(self.clock() - self.last_active, 3),
+            "shutdown_reason": self.shutdown_reason,
+            **self.counters,
+        }
+
+    def _emit_status(self):
+        self.log("[tail-health] " + json.dumps(self.status()))
+
+    # -- loop ---------------------------------------------------------------
+    def serve_forever(self):
+        self.srv.settimeout(self.POLL_S)
+        self.state = "listening"
+        self._emit_status()
+        try:
+            while not self._stop.is_set():
+                conn = self._accept()
+                if conn is None:
+                    self._check_deadlines()
+                    continue
+                sock, addr = conn
+                self.counters["connections"] += 1
+                self.peer = str(addr)
+                self.state = "serving"
+                self.last_active = self.clock()
+                self._emit_status()
+                try:
+                    served = self.session(sock, addr)
+                    self.counters["requests"] += int(served or 0)
+                except BaseException as exc:  # noqa: BLE001
+                    # One head's bad day is not the daemon's: count it, name
+                    # it, re-arm.  KeyboardInterrupt still stops the service.
+                    self.counters["connection_errors"] += 1
+                    self.counters["last_error"] = repr(exc)
+                    self.log(f"[tail] connection error: {exc!r}")
+                    if isinstance(exc, KeyboardInterrupt):
+                        self.request_shutdown("interrupt")
+                finally:
+                    _close_quietly(sock)
+                    self.peer = None
+                    self.last_active = self.clock()
+                    self.state = "listening"
+                    self._emit_status()
+                if self.once:
+                    self.request_shutdown("once")
+        finally:
+            self.state = "stopping"
+            if self.shutdown_reason is None:
+                self.shutdown_reason = "loop_exit"
+            self._emit_status()
             try:
-                sock, addr = srv.accept()
-                break
-            except socket.timeout:
+                self.srv.close()
+            except OSError:
                 pass
-        sock.settimeout(args.io_timeout)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock = StopAwareSocket(sock, stop_file, args.io_timeout)
+            if self.unload is not None:
+                self.unload()
+            self.state = "stopped"
+            self._emit_status()
+        return self.status()
+
+    def _accept(self):
+        try:
+            sock, addr = self.srv.accept()
+        except (socket.timeout, TimeoutError):
+            return None
+        except OSError as exc:
+            if self._stop.is_set():
+                return None
+            raise exc
+        return sock, addr
+
+    def _check_deadlines(self):
+        now = self.clock()
+        if (
+            self.connect_timeout > 0
+            and self.counters["connections"] == 0
+            and now - self.started >= self.connect_timeout
+        ):
+            # Only the FIRST connection can time out, and only when the
+            # operator asked for a deadline; a resident tail that has served a
+            # head never dies of a quiet hour.
+            raise TimeoutError("pipeline tail accept timeout")
+        if self.idle_timeout > 0 and now - self.last_active >= self.idle_timeout:
+            self.request_shutdown("idle_timeout")
+
+
+def _close_quietly(sock):
+    if sock is None:
+        return
+    try:
+        _abort_socket(sock)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def install_tail_signal_handlers(daemon, signums=(signal.SIGTERM, signal.SIGINT)):
+    """SIGTERM asks; the loop unloads.  Never let the runtime be killed while
+    it owns MLX buffers -- a bare SIGTERM there leaks wired memory that only a
+    reboot reclaims.  Returns the previous handlers so a caller can restore."""
+    previous = {}
+    for num in signums:
+        def _handler(signo, frame, _daemon=daemon):
+            _daemon.request_shutdown(f"signal_{signo}")
+
+        try:
+            previous[num] = signal.signal(num, _handler)
+        except ValueError:
+            # not the main thread: the caller is embedding us, and owns signals
+            pass
+    return previous
+
+
+def serve_health(daemon, port: int, bind: str = "127.0.0.1"):
+    """One line of JSON per connection, then close.  A health check must not
+    be able to wedge the service, so it never reads from the client."""
+    if not port:
+        return None
+    hs = socket.socket()
+    hs.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    hs.bind((bind, int(port)))
+    hs.listen(8)
+    hs.settimeout(0.25)
+
+    def loop():
+        while not daemon.stopping:
+            try:
+                c, _ = hs.accept()
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                break
+            try:
+                c.sendall((json.dumps(daemon.status()) + "\n").encode())
+            except OSError:
+                pass
+            finally:
+                _close_quietly(c)
+        try:
+            hs.close()
+        except OSError:
+            pass
+
+    th = threading.Thread(target=loop, daemon=True, name="tail-health")
+    th.start()
+    return hs
+
+
+def tail_session_factory(args, stage, n_layers, load_s, stop_file):
+    """Build the per-connection handler: hello, then run/bye until the peer
+    leaves.  Returns the number of requests the connection served."""
+
+    def session(raw_sock, addr):
+        served = 0
+        raw_sock.settimeout(args.io_timeout)
+        raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock = StopAwareSocket(raw_sock, stop_file, args.io_timeout)
         print(f"[tail] peer {addr}", flush=True)
         hello = _recv_json(sock)
         if hello.get("cmd") != "hello" or hello.get("transport") not in (
@@ -1040,39 +1237,95 @@ def run_tail(args):
         _send_json(sock, {"ok": True, "load_s": load_s, **identity})
         if args.transport == "ring":
             ring_group()
-        while True:
-            req = _recv_json(sock)
-            if req.get("cmd") == "bye":
-                _send_json(sock, {"cmd": "bye", "ok": True})
-                break
-            if req.get("cmd") != "run" or req.get("transport") != args.transport:
-                raise ValueError("invalid pipeline run")
-            envelope = PrefillEnvelope.from_dict(req.get("envelope"))
-            _check_peer_identity(
-                envelope.to_dict(),
-                args.model_sha256,
-                args.source_revision,
-                args.split,
-                n_layers,
-            )
-            _check_stop(stop_file)
-            # Reset BEFORE acknowledging ownership of every request, including
-            # the first/no-prune request. No stale head layers enter handoff.
+        try:
+            while True:
+                req = _recv_json(sock)
+                if req.get("cmd") == "bye":
+                    _send_json(sock, {"cmd": "bye", "ok": True})
+                    return served
+                if req.get("cmd") != "run" or req.get("transport") != args.transport:
+                    raise ValueError("invalid pipeline run")
+                envelope = PrefillEnvelope.from_dict(req.get("envelope"))
+                _check_peer_identity(
+                    envelope.to_dict(),
+                    args.model_sha256,
+                    args.source_revision,
+                    args.split,
+                    n_layers,
+                )
+                _check_stop(stop_file)
+                # Reset BEFORE acknowledging ownership of every request,
+                # including the first/no-prune request. No stale head layers
+                # enter handoff.
+                _reset_caches(stage, args.model)
+                _send_json(sock, {"ok": True, "request_id": envelope.request_id})
+                rep = _tail_one(args, stage, sock, req)
+                served += 1
+                _send_json(sock, rep)
+                print(json.dumps(rep), flush=True)
+        finally:
+            # Whatever ended this connection, the next head gets an empty
+            # stage: a half-populated cache must never be reachable by a
+            # request that did not fill it.
             _reset_caches(stage, args.model)
-            _send_json(sock, {"ok": True, "request_id": envelope.request_id})
-            rep = _tail_one(args, stage, sock, req)
-            _send_json(sock, rep)
-            print(json.dumps(rep), flush=True)
-    finally:
-        if sock is not None:
-            _abort_socket(sock)
-            sock.close()
-        srv.close()
+
+    return session
+
+
+def run_tail(args, on_ready=None):
+    # Validate pins before loading any weights. Identity is supplied by the
+    # caller's verified model manifest; no path-name equivalence is inferred.
+    _hex(args.model_sha256, 64, "model_sha256")
+    _hex(args.source_revision, 40, "source_revision")
+    stop_file = getattr(args, "stop_file", None)
+    _check_stop(stop_file)
+    lo, hi = args.split, args.layers
+    model, caches, local, n_layers, load_s = load_stage(args.model, lo, hi, args.prune)
+    stage = Stage(model, caches, local, n_layers)
+    print(f"[tail] layers {lo}:{hi} of {n_layers} loaded in {load_s:.1f}s", flush=True)
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((args.bind, args.port))
+    srv.listen(getattr(args, "backlog", 8))
+    print(f"[tail] listening on {args.bind}:{args.port}", flush=True)
+
+    holder = {"stage": stage, "model": model, "caches": caches}
+
+    def unload():
         # No signals: the owner releases its local references and returns.
-        stage.caches = []
-        del stage, caches, model
+        # The session closure holds the Stage, and the Stage holds the weights,
+        # so clearing this frame's names is not enough -- the Stage's own
+        # references have to go or the pruned layers stay wired for as long as
+        # the interpreter lives.
+        st = holder.pop("stage", None)
+        if st is not None:
+            st.caches = []
+            st.model = None
+            st.lm = None
+        holder.pop("model", None)
+        holder.pop("caches", None)
         gc.collect()
         mx.clear_cache()
+
+    daemon = TailDaemon(
+        srv,
+        tail_session_factory(args, stage, n_layers, load_s, stop_file),
+        connect_timeout=getattr(args, "connect_timeout", 0.0) or 0.0,
+        idle_timeout=getattr(args, "idle_timeout", 0.0) or 0.0,
+        once=bool(getattr(args, "once", False)),
+        unload=unload,
+    )
+    install_tail_signal_handlers(daemon)
+    serve_health(daemon, getattr(args, "health_port", 0) or 0, bind=args.bind)
+    if on_ready is not None:
+        # An embedding caller (or a test) needs a handle on the running
+        # service to shut it down; the daemon is built here, so it is handed
+        # over here.
+        on_ready(daemon)
+    stage = None
+    del caches, model
+    return daemon.serve_forever()
 
 
 def _tail_one(args, stage: Stage, sock, req):
@@ -1303,7 +1556,29 @@ def main(argv=None):
         default=None,
         help="comma separated ip:port per rank, e.g. 10.0.0.1:39400,10.0.0.2:39401",
     )
-    p.add_argument("--connect-timeout", type=float, default=1800.0)
+    p.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=0.0,
+        help="deadline for the FIRST head only; 0 = wait forever (resident tail)",
+    )
+    p.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=0.0,
+        help="tail-role: shut down cleanly after this many idle seconds; 0 = never",
+    )
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="tail-role: serve a single connection then exit (the bench behaviour)",
+    )
+    p.add_argument(
+        "--health-port",
+        type=int,
+        default=0,
+        help="tail-role: one-line JSON status socket; 0 = stdout only",
+    )
     p.add_argument("--io-timeout", type=float, default=120.0)
     p.add_argument(
         "--model-sha256", default=os.environ.get("MLX_VLM_PIPELINE_MODEL_SHA256")
@@ -1326,6 +1601,8 @@ def main(argv=None):
     args = p.parse_args(argv)
     if not math.isfinite(args.io_timeout) or args.io_timeout <= 0 or args.depth < 1:
         p.error("io-timeout and queue depth must be positive")
+    if args.connect_timeout < 0 or args.idle_timeout < 0:
+        p.error("connect-timeout and idle-timeout must be >= 0 (0 disables)")
 
     mx.random.seed(args.seed)
     if args.role != "single" and args.transport == "ring":
