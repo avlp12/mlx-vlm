@@ -128,13 +128,23 @@ def _clone(cache):
     return out
 
 
-def _run(layer, x, cache, *, on, nv=None, mask=None):
-    """One forward with the prefill kernel forced on or off, everything else equal."""
+def _run(layer, x, cache, *, on, nv=None, mask=None, pipeline=0):
+    """One forward with the prefill kernel forced on or off, everything else equal.
+
+    ``pipeline`` picks the scan schedule (L36a): 0 is the shipped
+    one-token-at-a-time body, 1 is the software-pipelined one (simdgroup 0
+    stands down from the recurrence to service the two reductions), 2 is the
+    same double-buffered schedule with every simdgroup still on the recurrence
+    -- barrier saving only.  All three are meant to be bit-identical and are
+    therefore run against the SAME eager reference, not against each other.
+    """
     prev_env, prev_nv = glm5._FUSED_KDA_PREFILL_ENV, glm5._FUSED_KDA_PREFILL_NV
     prev_geom, prev_ready = layer._fused_kda_prefill_geom, layer._fused_kda_prefill
+    prev_pipe = F._PIPELINE_ENV
     try:
         glm5._FUSED_KDA_PREFILL_ENV = bool(on)
         glm5._FUSED_KDA_PREFILL_NV = "" if nv is None else str(nv)
+        F._PIPELINE_ENV = int(pipeline)
         layer._fused_kda_prefill = None       # re-probe under the new geometry
         layer._fused_kda_prefill_geom = None
         y = layer(x, mask=mask, cache=cache)
@@ -143,6 +153,7 @@ def _run(layer, x, cache, *, on, nv=None, mask=None):
     finally:
         glm5._FUSED_KDA_PREFILL_ENV = prev_env
         glm5._FUSED_KDA_PREFILL_NV = prev_nv
+        F._PIPELINE_ENV = prev_pipe
         layer._fused_kda_prefill_geom = prev_geom
         layer._fused_kda_prefill = prev_ready
 
@@ -166,12 +177,20 @@ _S_VALUES = [2, 5, 64, 300, 2048]
 @on_gpu
 @pytest.mark.parametrize("S", _S_VALUES)
 @pytest.mark.parametrize("nv", [None, 1])
-def test_prefill_is_bit_identical_to_eager(S, nv):
+@pytest.mark.parametrize("pipeline", [0, 1, 2])
+def test_prefill_is_bit_identical_to_eager(S, nv, pipeline):
     """Output, recurrent state and conv window, all exact, at both geometries.
 
     ``nv=None`` is the default value-split geometry (NV = D/TY = 4 here);
     ``nv=1`` is the maximally fused one-launch arm.  Both must agree with eager
     AND therefore with each other.
+
+    ``pipeline`` adds the L36a schedule (service simdgroup + double buffering)
+    to the same matrix.  It is compared against EAGER, not against the
+    non-pipelined kernel: "matches the other kernel" would pass if both drifted
+    the same way, and the module's claim is parity with the eager chain.  The
+    S values matter more here than for the baseline -- S=2 and S=5 are shorter
+    than the pipeline is deep, so they exercise the drain guards.
     """
     config = _config()
     layer = _layer(config, seed=S)
@@ -180,10 +199,12 @@ def test_prefill_is_bit_identical_to_eager(S, nv):
     c_eager, c_fused = _cache(seed=S), _cache(seed=S)
 
     y_e = _run(layer, x, c_eager, on=False)
-    y_f = _run(layer, x, c_fused, on=True, nv=nv)
+    y_f = _run(layer, x, c_fused, on=True, nv=nv, pipeline=pipeline)
 
     assert y_f.shape == y_e.shape == (1, S, config.hidden_size)
-    assert mx.array_equal(y_f, y_e).item(), f"output differs at S={S}, nv={nv}"
+    assert mx.array_equal(y_f, y_e).item(), (
+        f"output differs at S={S}, nv={nv}, pipeline={pipeline}"
+    )
     assert mx.array_equal(c_fused[1], c_eager[1]).item(), "final state differs"
     assert mx.array_equal(c_fused[0], c_eager[0]).item(), "conv window differs"
     # ArraysCache has no ``.offset`` (it is not a KVCache): the KDA layer keeps
@@ -296,8 +317,52 @@ def test_state_carries_across_chunks():
 
 
 @on_gpu
+@pytest.mark.parametrize("S", [1, 2, 3, 4])
+@pytest.mark.parametrize("mode", [1, 2])
+def test_pipelined_scan_drains_a_chunk_shorter_than_the_pipeline(S, mode):
+    """S < pipeline depth is the case the drain guards exist for.
+
+    The pipelined loop runs to S+2 and gates each stage on its own token index,
+    so at S=2 the very first iteration already has no phase-1 work and the last
+    two have no stage.  Off-by-one there does not corrupt a bit, it drops a
+    token entirely, which S=2048 would also catch but only after 20 s.
+    """
+    config = _config()
+    layer = _layer(config, seed=90 + S)
+    mx.random.seed(900 + S)
+    x = (mx.random.normal((1, S, config.hidden_size)) * 0.5).astype(mx.bfloat16)
+    c_e, c_p = _cache(seed=90 + S), _cache(seed=90 + S)
+    y_e = _run(layer, x, c_e, on=False)
+    y_p = _run(layer, x, c_p, on=True, nv=1, pipeline=mode)
+    assert mx.array_equal(y_p, y_e).item(), f"pipelined output differs at S={S}"
+    assert mx.array_equal(c_p[1], c_e[1]).item(), "final state differs"
+    assert mx.array_equal(c_p[0], c_e[0]).item(), "conv window differs"
+
+
+@on_gpu
+@pytest.mark.parametrize("S", [64, 300])
+@pytest.mark.parametrize("nv", [None, 1])
+@pytest.mark.parametrize("mode", [1, 2])
+def test_the_two_schedules_agree_with_each_other_bit_for_bit(nv, S, mode):
+    """Redundant with the eager comparison by construction, and kept anyway: it
+    is the assertion the L23 fingerprint gate actually reduces to (arm off vs
+    arm pipeline at equal prompt), so a failure here localises to the kernel
+    rather than to the eager chain."""
+    config = _config()
+    layer = _layer(config, seed=S)
+    mx.random.seed(1000 + S)
+    x = (mx.random.normal((1, S, config.hidden_size)) * 0.5).astype(mx.bfloat16)
+    c_a, c_b = _cache(seed=S), _cache(seed=S)
+    y_a = _run(layer, x, c_a, on=True, nv=nv, pipeline=0)
+    y_b = _run(layer, x, c_b, on=True, nv=nv, pipeline=mode)
+    assert mx.array_equal(y_a, y_b).item()
+    assert all(mx.array_equal(u, v).item() for u, v in zip(c_a.state, c_b.state))
+
+
+@on_gpu
 @pytest.mark.parametrize("S", [5, 300])
-def test_masked_tokens_match_the_eager_zeroing(S):
+@pytest.mark.parametrize("pipeline", [0, 1, 2])
+def test_masked_tokens_match_the_eager_zeroing(S, pipeline):
     """The eager path zeroes the PRE-conv input of a masked token; so must the
     kernel, before both the conv and the window write."""
     config = _config()
@@ -307,7 +372,7 @@ def test_masked_tokens_match_the_eager_zeroing(S):
     mask = mx.random.uniform(shape=(1, S)) > 0.25
     c_e, c_f = _cache(seed=11), _cache(seed=11)
     y_e = _run(layer, x, c_e, on=False, mask=mask)
-    y_f = _run(layer, x, c_f, on=True, mask=mask)
+    y_f = _run(layer, x, c_f, on=True, mask=mask, pipeline=pipeline)
     assert mx.array_equal(y_f, y_e).item()
     assert mx.array_equal(c_f[1], c_e[1]).item()
     assert mx.array_equal(c_f[0], c_e[0]).item()

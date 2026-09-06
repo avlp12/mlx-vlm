@@ -72,6 +72,7 @@ of pure waste -- so a call that carries a sink falls back to the eager path.
 """
 
 import logging
+import os
 from typing import Optional, Tuple
 
 import mlx.core as mx
@@ -79,6 +80,29 @@ import mlx.core as mx
 from .fused_kda import _HEADER
 
 logger = logging.getLogger(__name__)
+
+# MLX_VLM_GLM5_FUSED_KDA_PREFILL_PIPELINE: run the software-pipelined scan
+# (`_make_scan_source_pipelined`) instead of `_make_scan_source`.  Default OFF
+# until the L23 fingerprint gate has been run on a Metal device: the two are
+# meant to be bit-identical, but "meant to be" is what the gate is for, and the
+# pipelined variant also raises register pressure (NDV goes from DVPT/TY to
+# ceil(DVPT/(TY-1))), which a device can refuse only at eval time.
+_PIPELINE_ENV = None
+
+
+# 0 = the shipped scan; 1 = pipelined with a service simdgroup; 2 = the
+# barrier-only ablation (same schedule, all TY simdgroups still on phase 1).
+def _pipeline_mode() -> int:
+    global _PIPELINE_ENV
+    if _PIPELINE_ENV is None:
+        v = os.environ.get("MLX_VLM_GLM5_FUSED_KDA_PREFILL_PIPELINE", "0").strip()
+        _PIPELINE_ENV = 2 if v == "2" else int(v.lower() not in
+                                               ("", "0", "false", "no", "off"))
+    return int(_PIPELINE_ENV)
+
+
+def _pipeline_enabled() -> bool:
+    return _pipeline_mode() != 0
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +386,511 @@ def _make_scan_source(fuse_norm: bool) -> str:
 """
 
 
+# --------------------------------------------------------------------------- #
+# L36a: the software-pipelined variant of the same scan.
+#
+# WHAT IS SERIALISED IN `_make_scan_source`, and why pipelining is the fix.
+# The per-token body has three all-thread phases (conv+silu, the gates, the
+# rescale), one all-thread recurrence (phase 1), and TWO single-simdgroup
+# reductions -- the q/k L2 norms and, at NV == 1, the gated RMSNorm.  Both
+# reductions use MLX's row_reduce partition, which is exactly ONE simdgroup
+# wide (lane `l` reads 4 contiguous elements per 128-block, then simd_sum), so
+# at TY = 32 the other 31 simdgroups sit at a barrier through both of them.
+# They cannot be widened without changing the summation order, and the order is
+# the whole claim of this kernel (`atol = rtol = 0`).
+#
+# So instead of widening them, run them CONCURRENTLY with the recurrence, on a
+# different token.  Simdgroup 0 becomes a service simdgroup that owns no value
+# rows and does nothing but the two reductions; simdgroups 1..TY-1 own all
+# DVPT value rows and do nothing but phase 1.  Steady state of iteration `t`:
+#
+#     all      : stage token t      (conv window -> silu -> gates -> beta)
+#     --------- barrier
+#     service  : L2 norms of token t      || workers: phase 1 of token t-1
+#     service  : RMSNorm of token t-2     ||
+#     --------- barrier
+#     all      : rescale q/k of token t ; write out token t-2
+#
+# Everything the service simdgroup touches is double-buffered on `t & 1`, which
+# is why the schedule needs no extra barrier: the workers read parity `pp^1`
+# while the stage writes parity `pp`.  Iterations run to S+2 so the two drain
+# stages fall out of the same guards instead of an epilogue.
+#
+# BIT-IDENTITY.  Three things must hold, and each is mechanical rather than
+# argued:
+#
+#   1. every reduction body is the SAME TEXT as in `_make_scan_source` -- the
+#      snippets below are shared, and
+#      `test_glm5_next_fused_kda_prefill_pipeline.py` asserts each one occurs
+#      verbatim (modulo indentation) in both generated sources;
+#   2. the operands those bodies read are the same values.  `sq`/`sk`/`sv`/`sg`
+#      /`sy` become `threadgroup float*` aliases into the double buffer, so the
+#      snippet text is unchanged and only which of the two 128-float slabs it
+#      points at differs;
+#   3. the recurrence's partition is unchanged.  A value row's arithmetic is
+#      self-contained -- `kv` and `o` are simd_sum-ed over the 32 lanes of ONE
+#      simdgroup, and every lane of a simdgroup works the same row -- so which
+#      simdgroup owns a row does not enter the arithmetic, only `lane` does,
+#      and `lane` (= key elements [NDK*lane, NDK*lane+NDK)) is untouched.  Rows
+#      are redistributed over 31 workers instead of 32 threads-per-row groups;
+#      the row-major loop is still a loop over independent rows.
+#
+# MEASURED, gesicht (M3 Ultra, 80-core), kernel alone, B=1 H=64 D=128 K=4 bf16,
+# NV=1 TY=32, 10 reps/arm interleaved 0,1,2,2,1,0, min == median to <1 %:
+#
+#     S=8192   mode0 29.6 ms | mode1 28.4 ms (+3.9 %) | mode2 28.1 ms (+4.9 %)
+#     S=32768  mode0 117.4   | mode1 112.9   (+3.8 %) | mode2 111.4   (+5.1 %)
+#
+# and all three agree bit-for-bit on y, state and conv window at both widths.
+# Two things in that table are worth more than the headline:
+#
+#   * standing simdgroup 0 DOWN (mode 1) is a NET LOSS against not standing it
+#     down (mode 2).  DVPT = 128 rows over 31 workers is ceil = 5 rows on the
+#     critical path where 32 workers take 4, i.e. +25 % on phase 1, and that
+#     buys back only two simdgroup-wide reductions.  The overlap is real and it
+#     is too small to pay for the 32nd worker.  So the win here is NOT the
+#     overlap the lever was proposed for; it is the schedule around it.
+#   * the first version of this kernel was 19-27 % SLOWER than the baseline,
+#     and the whole difference was `const uint pp = t & 1u`: a runtime parity
+#     makes every `sq2[pp][d]` a dynamically based threadgroup address, and
+#     phase 1 issues 3 * NDV * NDK of them per token.  Unrolling the token loop
+#     by two, so each half has `constexpr uint pp`, moved the same kernel from
+#     -19 % to +4 %.  Double buffering is only free if the buffer index folds.
+#
+# The one non-shared change is the conv window: `_make_scan_source` reads the K
+# taps, barriers, then re-reads mq/mk/mv to write the new tap.  Both loops walk
+# `idx` with the same stride, so for a given `idx` the read of slot
+# (t % K-1) and the write of slot (t % K-1) are done by the SAME thread at the
+# same address -- there is no cross-thread hazard and the barrier is not load
+# bearing.  Merging the loops drops the barrier and one redundant global read
+# of x_t per token; `xnew` is the same expression, so `acc` and the stored tap
+# are the same bits.
+# --------------------------------------------------------------------------- #
+
+# Shared with `_make_scan_source` by assertion, not by construction: the
+# baseline is left byte-for-byte alone (its generated source is pinned by
+# sha256 in the pipeline test) and these snippets are checked to occur in it.
+_L2_BODY = """
+      float pq = 0.0f, pk = 0.0f;
+      for (int blk = 0; blk < RBLK; ++blk) {
+        uint base = (uint)(blk * 128) + 4u * lane;
+        for (int i = 0; i < 4; ++i) {
+          pq = sq_acc(pq, sq[base + i]);
+          pk = sq_acc(pk, sk[base + i]);
+        }
+      }
+      uint base = (uint)(RBLK * 128) + 4u * lane;
+      if (4u * lane + 4u <= (uint)REXTRA) {
+        for (int i = 0; i < 4; ++i) {
+          pq = sq_acc(pq, sq[base + i]);
+          pk = sq_acc(pk, sk[base + i]);
+        }
+      } else {
+        for (int i = 0; 4u * lane + (uint)i < (uint)REXTRA; ++i) {
+          pq = sq_acc(pq, sq[base + i]);
+          pk = sq_acc(pk, sk[base + i]);
+        }
+      }
+      pq = simd_sum(pq);
+      pk = simd_sum(pk);
+      if (lane == 0u) {
+        shr[0] = metal::precise::rsqrt(pq + 1.0e-6f);
+        shr[1] = metal::precise::rsqrt(pk + 1.0e-6f);
+      }
+"""
+
+_RESCALE_BODY = """
+      float rq = shr[0], rk = shr[1];
+      for (uint d = tid; d < (uint)D; d += NT) {
+        sq[d] = float(static_cast<T>((sq[d] * rq) * qscale));
+        sk[d] = float(static_cast<T>(sk[d] * rk));
+      }
+"""
+
+_RMS_BODY = """
+      float po = 0.0f;
+      for (int blk = 0; blk < RBLK; ++blk) {
+        uint base = (uint)(blk * 128) + 4u * lane;
+        for (int i = 0; i < 4; ++i) po = sq_acc(po, sy[base + i]);
+      }
+      uint base = (uint)(RBLK * 128) + 4u * lane;
+      if (4u * lane + 4u <= (uint)REXTRA) {
+        for (int i = 0; i < 4; ++i) po = sq_acc(po, sy[base + i]);
+      } else {
+        for (int i = 0; 4u * lane + (uint)i < (uint)REXTRA; ++i) {
+          po = sq_acc(po, sy[base + i]);
+        }
+      }
+      po = simd_sum(po);
+      if (lane == 0u) {
+        shr[0] = metal::precise::rsqrt(po / (float)D + norm_eps);
+      }
+"""
+
+
+def _make_scan_source_pipelined(fuse_norm: bool, service: bool = True) -> str:
+    """``service`` False is the ABLATION arm: keep all TY simdgroups on phase 1
+    (so the value rows are partitioned exactly as in `_make_scan_source`) and
+    take ONLY the schedule's other win, 7 barriers per token down to 2.  It
+    isolates the barrier saving from the cost of standing one simdgroup down,
+    which is the whole question this lever turns on."""
+    if fuse_norm:
+        y_store = "sy[dv] = float(static_cast<T>(o));"
+        p1_tok_off = ""
+        sy_decl = "  threadgroup float sy2[2][D];\n"
+        t_end = "2u"
+    else:
+        y_store = "y[tok_off + h * (uint)D + dv] = static_cast<T>(o);"
+        p1_tok_off = (
+            "      const size_t tok_off = ((size_t)b * S + (t - 1u)) * QKVD;\n"
+        )
+        sy_decl = ""
+        t_end = "1u"
+    sub = 1 if service else 0
+    worker_guard = "\n  if (ty > 0u)" if service else ""
+    sep = " else " if service else "\n    "
+
+    # Phases 2 (RMSNorm) and 3 (the gated write-out) of token t-2.  The norm
+    # runs on the service simdgroup, concurrently with the workers' phase 1; the
+    # write-out is all-thread and shares the rescale's slot.  `sgate` is gone:
+    # the baseline staged `sgate[d] = float(gate[tok_off + h*D + d])` into
+    # threadgroup memory one phase before reading it back, so reading `gate`
+    # directly here is the same float, and saves a double-buffered [D] slab.
+    norm_phase = (
+        f"""
+      if (t >= 2u && t - 2u < S) {{
+        threadgroup float* sy  = &sy2[pp][0];
+        threadgroup float* shr = &shr2[pp][0];
+{_RMS_BODY.replace("shr[0]", "shr[3]").rstrip()}
+      }}"""
+        if fuse_norm
+        else ""
+    )
+    out_phase = (
+        f"""
+    if (t >= 2u && t - 2u < S) {{
+      const size_t tok_off = ((size_t)b * S + (t - 2u)) * QKVD;
+      threadgroup float* sy = &sy2[pp][0];
+      float rn = shr2[pp][3];
+      for (uint d = tid; d < (uint)D; d += NT) {{
+        float x = sy[d] * rn;
+        x = float(o_w[d]) * x;
+        x = x * mlx_sigmoid_precise<float>(float(gate[tok_off + h * (uint)D + d]));
+        y[tok_off + h * (uint)D + d] = static_cast<T>(x);
+      }}
+    }}"""
+        if fuse_norm
+        else ""
+    )
+
+    return f"""
+  // Same launch geometry as the non-pipelined scan: grid.z is B * H * NV
+  // threadgroups, (b, h) major and nv minor.
+  const uint znv  = threadgroup_position_in_grid.z;
+  const uint bh   = znv / (uint)NV;
+  const uint nv   = znv - bh * (uint)NV;
+  const uint b    = bh / (uint)H;
+  const uint h    = bh - b * (uint)H;
+  const uint lane = thread_position_in_threadgroup.x;
+  const uint ty   = thread_position_in_threadgroup.y;
+  const uint tid  = thread_index_in_threadgroup;
+  const uint S    = (uint)nsteps;
+
+  constexpr int NT     = 32 * TY;
+  constexpr int RBLK   = D / 128;
+  constexpr int REXTRA = D - RBLK * 128;
+  constexpr int NDK    = D / 32;      // key elements per lane
+  constexpr int DVPT   = D / NV;      // value rows per threadgroup
+  // Simdgroup 0 services the reductions and owns no value rows, so the DVPT
+  // rows are spread over TY-1 workers instead of TY.  NDV is the ceiling, and
+  // the tail rows are masked, so it stays a compile-time bound and `st` stays
+  // in registers.
+  constexpr int NWG    = TY - {sub};
+  constexpr int NDV    = (DVPT + NWG - 1) / NWG;
+  constexpr uint QKVD  = (uint)(H * D);
+  constexpr uint CDIM  = 3u * QKVD;
+  constexpr uint KM1   = (uint)(K - 1);
+  const uint dv_off    = nv * (uint)DVPT;
+  const size_t cs_off  = (size_t)b * KM1 * CDIM;
+  // ty == simdgroup index: the threadgroup is (32, TY, 1) and simdgroups are 32
+  // wide, the same assumption every simd_sum in this file already makes.
+  const uint wg        = ty - {sub}u;
+
+  threadgroup float sq2[2][D];
+  threadgroup float sk2[2][D];
+  threadgroup float sv2[2][D];
+  threadgroup float sg2[2][D];
+{sy_decl}  threadgroup float shr2[2][4];
+  threadgroup T twin[(K - 1) * 3 * D];
+
+  device const ST* si = state_in  + (size_t)bh * D * D;
+  device ST*       so = state_out + (size_t)bh * D * D;
+  float st[NDV][NDK];
+  {{{worker_guard}
+    for (int j = 0; j < NDV; ++j) {{
+      uint r = wg + (uint)NWG * (uint)j;
+      if (r < (uint)DVPT) {{
+        uint dv = dv_off + r;
+        for (int i = 0; i < NDK; ++i) {{
+          st[j][i] = float(si[(size_t)dv * D + NDK * lane + i]);
+        }}
+      }}
+    }}
+  }}
+
+  for (uint idx = tid; idx < KM1 * 3u * (uint)D; idx += NT) {{
+    uint slot = idx / (3u * (uint)D);
+    uint r    = idx - slot * 3u * (uint)D;
+    uint part = r / (uint)D;
+    uint d    = r - part * (uint)D;
+    uint c    = part * QKVD + h * (uint)D + d;
+    twin[slot * 3u * (uint)D + r] = conv_state[cs_off + (size_t)slot * CDIM + c];
+  }}
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float a_exp = metal::precise::exp(A_log[h]);
+
+  // t is the STAGED token; the workers run t-1 and the write-out runs t-2, so
+  // the loop overruns S by the pipeline depth and the guards drain it.
+  // The token loop is unrolled by two so the buffer parity is a COMPILE-TIME
+  // constant in each half.  With `pp = t & 1u` every `sq2[pp][d]` is a
+  // dynamically based threadgroup address, and phase 1 issues 3 * NDV * NDK
+  // of those per token; folding the base is worth more than the doubled
+  // code size.  The trailing odd half is a no-op under the same guards.
+  for (uint tpair = 0u; tpair < S + {t_end}; tpair += 2u) {{
+   {{
+    const uint t = tpair;
+    constexpr uint pp = 0u;
+
+    // ------------------------------------------------------------ stage(t)
+    if (t < S) {{
+      const size_t tok_off = ((size_t)b * S + t) * QKVD;
+      threadgroup float* sq = &sq2[pp][0];
+      threadgroup float* sk = &sk2[pp][0];
+      threadgroup float* sv = &sv2[pp][0];
+      threadgroup float* sg = &sg2[pp][0];
+      for (uint idx = tid; idx < 3u * (uint)D; idx += NT) {{
+        uint part = idx / (uint)D;
+        uint d    = idx - part * (uint)D;
+        uint c    = part * QKVD + h * (uint)D + d;
+        device const T* wc = conv_w + (size_t)c * K;
+        float acc = 0.0f;
+        for (uint j = 0; j + 1 < (uint)K; ++j) {{
+          uint slot = (t + j) % KM1;
+          acc += float(twin[slot * 3u * (uint)D + idx]) * float(wc[j]);
+        }}
+        T xnew = valid[(size_t)b * S + t]
+                   ? ((part == 0u) ? mq[tok_off + h * (uint)D + d]
+                    : ((part == 1u) ? mk[tok_off + h * (uint)D + d]
+                                    : mv[tok_off + h * (uint)D + d]))
+                   : static_cast<T>(0);
+        acc += float(xnew) * float(wc[K - 1]);
+        // Same address, same thread as the taps just read: no barrier.
+        twin[(t % KM1) * 3u * (uint)D + idx] = xnew;
+
+        T xb  = static_cast<T>(acc);      // mx.conv1d writes its output in T
+        T sig = mlx_sigmoid_fast(xb);     // nn.silu = x * mx.sigmoid(x), compiled
+        T sl  = xb * sig;
+        if (part == 0u)      sq[d] = float(sl);
+        else if (part == 1u) sk[d] = float(sl);
+        else                 sv[d] = float(sl);
+      }}
+      for (uint d = tid; d < (uint)D; d += NT) {{
+        float av = float(a[tok_off + h * (uint)D + d]) + dt_bias[h * (uint)D + d];
+        sg[d]    = metal::precise::exp(lower_bound * mlx_sigmoid_fast<float>(a_exp * av));
+      }}
+      if (tid == 0u) {{
+        shr2[pp][2] = float(mlx_sigmoid_precise(bvec[((size_t)b * S + t) * (uint)H + h]));
+      }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (ty == 0u) {{
+      // --------------------------------------------------- service simdgroup
+      // q = l2norm(q) * D^-0.5 ; k = l2norm(k) for token t, and the value-axis
+      // RMSNorm of token t-2, both on the parity the workers are NOT reading.
+      if (t < S) {{
+        threadgroup float* sq  = &sq2[pp][0];
+        threadgroup float* sk  = &sk2[pp][0];
+        threadgroup float* shr = &shr2[pp][0];
+{_L2_BODY.rstrip()}
+      }}{norm_phase}
+    }}{sep}if (t >= 1u && t - 1u < S) {{
+      // ------------------------------------------------------------- phase 1
+      // Gated delta rule for token t-1.  Lane `lane` owns key elements
+      // [NDK*lane, NDK*lane+NDK) exactly as in gated_delta_kernel; only which
+      // simdgroup carries a value row changed, and a row is self-contained.
+      const uint qq = pp ^ 1u;
+      threadgroup float* sq = &sq2[qq][0];
+      threadgroup float* sk = &sk2[qq][0];
+      threadgroup float* sv = &sv2[qq][0];
+      threadgroup float* sg = &sg2[qq][0];
+{"      threadgroup float* sy = &sy2[qq][0];" if fuse_norm else ""}
+{p1_tok_off}      float beta = shr2[qq][2];
+      for (int j = 0; j < NDV; ++j) {{
+        uint r = wg + (uint)NWG * (uint)j;
+        if (r < (uint)DVPT) {{
+        uint dv = dv_off + r;
+        float kv = 0.0f;
+        for (int i = 0; i < NDK; ++i) {{
+          uint s = NDK * lane + i;
+          st[j][i] = st[j][i] * sg[s];
+          kv += st[j][i] * sk[s];
+        }}
+        kv = simd_sum(kv);
+        float delta = (sv[dv] - kv) * beta;
+        float o = 0.0f;
+        for (int i = 0; i < NDK; ++i) {{
+          uint s = NDK * lane + i;
+          st[j][i] = st[j][i] + sk[s] * delta;
+          o += st[j][i] * sq[s];
+        }}
+        o = simd_sum(o);
+        if (thread_index_in_simdgroup == 0u) {{
+          {y_store}
+        }}
+        }}
+      }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (t < S) {{
+      threadgroup float* sq  = &sq2[pp][0];
+      threadgroup float* sk  = &sk2[pp][0];
+      threadgroup float* shr = &shr2[pp][0];
+{_RESCALE_BODY.rstrip()}
+    }}{out_phase}
+   }}
+   {{
+    const uint t = tpair + 1u;
+    constexpr uint pp = 1u;
+
+    // ------------------------------------------------------------ stage(t)
+    if (t < S) {{
+      const size_t tok_off = ((size_t)b * S + t) * QKVD;
+      threadgroup float* sq = &sq2[pp][0];
+      threadgroup float* sk = &sk2[pp][0];
+      threadgroup float* sv = &sv2[pp][0];
+      threadgroup float* sg = &sg2[pp][0];
+      for (uint idx = tid; idx < 3u * (uint)D; idx += NT) {{
+        uint part = idx / (uint)D;
+        uint d    = idx - part * (uint)D;
+        uint c    = part * QKVD + h * (uint)D + d;
+        device const T* wc = conv_w + (size_t)c * K;
+        float acc = 0.0f;
+        for (uint j = 0; j + 1 < (uint)K; ++j) {{
+          uint slot = (t + j) % KM1;
+          acc += float(twin[slot * 3u * (uint)D + idx]) * float(wc[j]);
+        }}
+        T xnew = valid[(size_t)b * S + t]
+                   ? ((part == 0u) ? mq[tok_off + h * (uint)D + d]
+                    : ((part == 1u) ? mk[tok_off + h * (uint)D + d]
+                                    : mv[tok_off + h * (uint)D + d]))
+                   : static_cast<T>(0);
+        acc += float(xnew) * float(wc[K - 1]);
+        // Same address, same thread as the taps just read: no barrier.
+        twin[(t % KM1) * 3u * (uint)D + idx] = xnew;
+
+        T xb  = static_cast<T>(acc);      // mx.conv1d writes its output in T
+        T sig = mlx_sigmoid_fast(xb);     // nn.silu = x * mx.sigmoid(x), compiled
+        T sl  = xb * sig;
+        if (part == 0u)      sq[d] = float(sl);
+        else if (part == 1u) sk[d] = float(sl);
+        else                 sv[d] = float(sl);
+      }}
+      for (uint d = tid; d < (uint)D; d += NT) {{
+        float av = float(a[tok_off + h * (uint)D + d]) + dt_bias[h * (uint)D + d];
+        sg[d]    = metal::precise::exp(lower_bound * mlx_sigmoid_fast<float>(a_exp * av));
+      }}
+      if (tid == 0u) {{
+        shr2[pp][2] = float(mlx_sigmoid_precise(bvec[((size_t)b * S + t) * (uint)H + h]));
+      }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (ty == 0u) {{
+      // --------------------------------------------------- service simdgroup
+      // q = l2norm(q) * D^-0.5 ; k = l2norm(k) for token t, and the value-axis
+      // RMSNorm of token t-2, both on the parity the workers are NOT reading.
+      if (t < S) {{
+        threadgroup float* sq  = &sq2[pp][0];
+        threadgroup float* sk  = &sk2[pp][0];
+        threadgroup float* shr = &shr2[pp][0];
+{_L2_BODY.rstrip()}
+      }}{norm_phase}
+    }}{sep}if (t >= 1u && t - 1u < S) {{
+      // ------------------------------------------------------------- phase 1
+      // Gated delta rule for token t-1.  Lane `lane` owns key elements
+      // [NDK*lane, NDK*lane+NDK) exactly as in gated_delta_kernel; only which
+      // simdgroup carries a value row changed, and a row is self-contained.
+      const uint qq = pp ^ 1u;
+      threadgroup float* sq = &sq2[qq][0];
+      threadgroup float* sk = &sk2[qq][0];
+      threadgroup float* sv = &sv2[qq][0];
+      threadgroup float* sg = &sg2[qq][0];
+{"      threadgroup float* sy = &sy2[qq][0];" if fuse_norm else ""}
+{p1_tok_off}      float beta = shr2[qq][2];
+      for (int j = 0; j < NDV; ++j) {{
+        uint r = wg + (uint)NWG * (uint)j;
+        if (r < (uint)DVPT) {{
+        uint dv = dv_off + r;
+        float kv = 0.0f;
+        for (int i = 0; i < NDK; ++i) {{
+          uint s = NDK * lane + i;
+          st[j][i] = st[j][i] * sg[s];
+          kv += st[j][i] * sk[s];
+        }}
+        kv = simd_sum(kv);
+        float delta = (sv[dv] - kv) * beta;
+        float o = 0.0f;
+        for (int i = 0; i < NDK; ++i) {{
+          uint s = NDK * lane + i;
+          st[j][i] = st[j][i] + sk[s] * delta;
+          o += st[j][i] * sq[s];
+        }}
+        o = simd_sum(o);
+        if (thread_index_in_simdgroup == 0u) {{
+          {y_store}
+        }}
+        }}
+      }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (t < S) {{
+      threadgroup float* sq  = &sq2[pp][0];
+      threadgroup float* sk  = &sk2[pp][0];
+      threadgroup float* shr = &shr2[pp][0];
+{_RESCALE_BODY.rstrip()}
+    }}{out_phase}
+   }}
+  }}
+
+  // ---------------------------------------------------------------- epilogue
+  {{{worker_guard}
+    for (int j = 0; j < NDV; ++j) {{
+      uint r = wg + (uint)NWG * (uint)j;
+      if (r < (uint)DVPT) {{
+        uint dv = dv_off + r;
+        for (int i = 0; i < NDK; ++i) {{
+          so[(size_t)dv * D + NDK * lane + i] = static_cast<ST>(st[j][i]);
+        }}
+      }}
+    }}
+  }}
+  if (nv == 0u) {{
+    for (uint idx = tid; idx < KM1 * 3u * (uint)D; idx += NT) {{
+      uint slot = idx / (3u * (uint)D);
+      uint r    = idx - slot * 3u * (uint)D;
+      uint part = r / (uint)D;
+      uint d    = r - part * (uint)D;
+      uint c    = part * QKVD + h * (uint)D + d;
+      conv_state_out[cs_off + (size_t)slot * CDIM + c] =
+          twin[((S + slot) % KM1) * 3u * (uint)D + r];
+    }}
+  }}
+"""
+
 # The gated RMSNorm as one launch, for the NV > 1 geometry.  One simdgroup per
 # (b, s, h) row, TY rows per threadgroup; the reduction is MLX's row_reduce
 # partition (4 contiguous reads per lane, then simd_sum) so it matches
@@ -432,6 +961,37 @@ def _kernel(kind: str):
                 output_names=_SCAN_OUTPUTS,
                 header=_HEADER,
                 source=_make_scan_source(False),
+            )
+            _KERNELS["fused_pipe"] = mx.fast.metal_kernel(
+                name="glm5_kda_prefill_scan_fused_pipe",
+                input_names=_SCAN_INPUTS_FUSED,
+                output_names=_SCAN_OUTPUTS,
+                header=_HEADER,
+                source=_make_scan_source_pipelined(True),
+            )
+            _KERNELS["split_pipe"] = mx.fast.metal_kernel(
+                name="glm5_kda_prefill_scan_split_pipe",
+                input_names=_SCAN_INPUTS_SPLIT,
+                output_names=_SCAN_OUTPUTS,
+                header=_HEADER,
+                source=_make_scan_source_pipelined(False),
+            )
+            # The barrier-only ablation: same double-buffered schedule, but no
+            # simdgroup is stood down, so the value-row partition is the shipped
+            # one.  Selected by MLX_VLM_GLM5_FUSED_KDA_PREFILL_PIPELINE=2.
+            _KERNELS["fused_bar"] = mx.fast.metal_kernel(
+                name="glm5_kda_prefill_scan_fused_bar",
+                input_names=_SCAN_INPUTS_FUSED,
+                output_names=_SCAN_OUTPUTS,
+                header=_HEADER,
+                source=_make_scan_source_pipelined(True, service=False),
+            )
+            _KERNELS["split_bar"] = mx.fast.metal_kernel(
+                name="glm5_kda_prefill_scan_split_bar",
+                input_names=_SCAN_INPUTS_SPLIT,
+                output_names=_SCAN_OUTPUTS,
+                header=_HEADER,
+                source=_make_scan_source_pipelined(False, service=False),
             )
             _KERNELS["norm"] = mx.fast.metal_kernel(
                 name="glm5_kda_prefill_norm",
@@ -512,6 +1072,7 @@ def fused_kda_prefill_scan(
     mask: Optional[mx.array] = None,
     nv: int = 1,
     ty: int = 32,
+    pipeline: Optional[bool] = None,
 ) -> Tuple[mx.array, ...]:
     """The whole S-token KDA chunk in one launch (plus one for the norm at nv>1).
 
@@ -534,7 +1095,15 @@ def fused_kda_prefill_scan(
     dt = q_in.dtype
     valid = _all_valid(B * S) if mask is None else mask.reshape(B * S)
     fused = nv == 1
-    kernel = _kernel("fused" if fused else "split")
+    # The pipeline dedicates simdgroup 0 to the reductions, so it needs at least
+    # one worker simdgroup left; at ty == 1 there is none and the choice is not
+    # available.  Falling back rather than raising keeps the degraded-TY probe
+    # path (see fused_kda_prefill_probe) working.
+    mode = _pipeline_mode() if pipeline is None else int(pipeline)
+    if mode == 1 and ty < 2:
+        mode = 0
+    kind = ("fused" if fused else "split") + {0: "", 1: "_pipe", 2: "_bar"}[mode]
+    kernel = _kernel(kind)
     template = [
         ("T", dt), ("ST", state.dtype), ("H", H), ("D", D), ("K", K),
         ("TY", ty), ("NV", nv),
@@ -602,6 +1171,7 @@ def fused_kda_prefill(
     mask: Optional[mx.array] = None,
     nv: int = 1,
     ty: int = 32,
+    pipeline: Optional[bool] = None,
 ) -> Tuple[mx.array, mx.array, mx.array]:
     """Scan (+ norm at nv>1).  Returns ``(y [B,S,H*D], state, conv_state)``."""
     y, state_out, conv_out = fused_kda_prefill_scan(
@@ -610,7 +1180,7 @@ def fused_kda_prefill(
         o_weight if nv == 1 else None,
         num_heads=num_heads, head_dim=head_dim,
         conv_kernel_size=conv_kernel_size, lower_bound=lower_bound,
-        norm_eps=norm_eps, mask=mask, nv=nv, ty=ty,
+        norm_eps=norm_eps, mask=mask, nv=nv, ty=ty, pipeline=pipeline,
     )
     if nv != 1:
         B, S = q_in.shape[0], q_in.shape[1]
@@ -636,7 +1206,11 @@ def fused_kda_prefill_probe(
     *, num_heads: int, head_dim: int, conv_kernel_size: int, dtype, state_dtype,
     nv: Optional[int] = None, ty: int = 32,
 ) -> Optional[Tuple[int, int]]:
-    key = (dtype, state_dtype, num_heads, head_dim, conv_kernel_size, nv, ty)
+    # The pipelined variant carries ceil(DVPT/(TY-1)) value rows per thread
+    # instead of DVPT/TY, so it can hit the per-pipeline thread limit at a TY
+    # the baseline clears: the flag is part of the probe identity.
+    key = (dtype, state_dtype, num_heads, head_dim, conv_kernel_size, nv, ty,
+           _pipeline_mode())
     if key in _PROBE_CACHE:
         return _PROBE_CACHE[key]
     H, D, K = num_heads, head_dim, conv_kernel_size
