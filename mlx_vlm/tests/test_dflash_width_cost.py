@@ -69,6 +69,7 @@ def _reset():
     dflash._ROUND_MS_WARNED = False
     dflash._SURVIVAL_NUMERATOR = None
     dflash._WIDTH_DWELL = None
+    dflash._WIDTH_EXTRAS = None
     dflash._ROUND_TIMERS_ENV = None
     dflash._HAZ_EMPIRICAL = None
     dflash._HAZ_PARAMS = None
@@ -643,3 +644,120 @@ def test_b1_and_batch_timers_use_the_same_counters():
     assert "_record_draft_seconds(draft_model" in src
     assert "_record_verify_seconds(draft_model" in src
     assert "timed = _round_timers_enabled()" in src
+
+
+# --------------------------------------------------------------------------
+# the default path must be the SAME STATEMENTS, not merely the same answer
+# --------------------------------------------------------------------------
+#
+# A GPU panel on this branch reported the served B=1 rail 11% slower than
+# d17a97fe at IDENTICAL widths and acceptance, which is the signature of added
+# per-round host work or an added device sync.  These are the guards that make
+# that claim testable without a GPU: an mx.eval / mx.async_eval census of the
+# round loop, and a gate that keeps every opt-in behind ONE memoised boolean.
+#
+# The census below was taken on the base commit d17a97fe with this exact stub
+# (5 rounds, max_tokens 12, accepts 1/2/0, block total 4):
+#
+#     mx.eval = 0        mx.async_eval = 15
+#
+# Zero evals is the load-bearing half: the round loop never waits, it only ever
+# submits, and every wait belongs to the walk that reads the tokens back.  A
+# single mx.eval added between the draft and the verify would serialise the
+# pipeline the async_evals exist to build, and would not change a single width
+# or acceptance count while doing it -- exactly the symptom that was reported.
+
+BASE_EVAL_COUNTS = (0, 15)   # (mx.eval, mx.async_eval) on d17a97fe
+
+
+def _count_b1_evals(max_tokens=12, accepts=(1, 2, 0)):
+    real_eval, real_async = mx.eval, mx.async_eval
+    counts = [0, 0]
+
+    def counted_eval(*a, **kw):
+        counts[0] += 1
+        return real_eval(*a, **kw)
+
+    def counted_async(*a, **kw):
+        counts[1] += 1
+        return real_async(*a, **kw)
+
+    mx.eval, mx.async_eval = counted_eval, counted_async
+    try:
+        drafter, target, tokens = _run_b1_rounds(max_tokens, accepts)
+    finally:
+        mx.eval, mx.async_eval = real_eval, real_async
+    return tuple(counts), drafter, target, tokens
+
+
+def test_the_default_round_loop_issues_exactly_the_base_evals():
+    """No added sync, no added submit, with the new variables unset."""
+    _reset()
+    counts, drafter, target, tokens = _count_b1_evals()
+    assert counts == BASE_EVAL_COUNTS, (
+        "the default B=1 round loop must issue the same mx.eval/mx.async_eval "
+        "calls as d17a97fe; anything extra is per-round overhead the shipped "
+        "policy never asked for"
+    )
+    assert counts[0] == 0, "the default loop must never WAIT inside a round"
+    assert target.forwards == 5 and len(tokens) == 11
+
+
+def test_all_three_new_knobs_set_still_add_no_evals_to_the_round_loop():
+    """The width policy is not allowed to reach the round loop at all: none of
+    these knobs may add a sync, whatever they do to the chosen width."""
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "1"
+    os.environ["MLX_VLM_DFLASH_ROUND_MS"] = R20_MS
+    os.environ["MLX_VLM_DFLASH_SURVIVAL_NUMERATOR"] = "1"
+    os.environ["MLX_VLM_DFLASH_WIDTH_DWELL"] = "2"
+    _reset()
+    counts, _, _, _ = _count_b1_evals()
+    assert counts[0] == 0
+
+
+def test_the_timing_arm_is_the_only_thing_that_adds_evals():
+    """Two per round, and only with MLX_VLM_DFLASH_ROUND_TIMERS=1."""
+    os.environ["MLX_VLM_DFLASH_ROUND_TIMERS"] = "1"
+    _reset()
+    counts, drafter, target, tokens = _count_b1_evals()
+    assert counts[0] == 2 * target.forwards
+    assert counts[1] == BASE_EVAL_COUNTS[1], "and it must not add submits"
+    assert drafter.speculative_draft_seconds > 0.0
+
+
+def test_the_extras_gate_is_one_memoised_boolean():
+    """Every opt-in is behind ``_width_policy_extras_enabled``, which is read
+    once per process -- so the default round pays one global compare, not one
+    environment lookup per knob per round."""
+    _reset()
+    assert dflash._WIDTH_EXTRAS is None
+    assert dflash._width_policy_extras_enabled() is False
+    assert dflash._WIDTH_EXTRAS is False
+    for var, value in (
+        ("MLX_VLM_DFLASH_ROUND_MS", R20_MS),
+        ("MLX_VLM_DFLASH_SURVIVAL_NUMERATOR", "1"),
+        ("MLX_VLM_DFLASH_WIDTH_DWELL", "1"),
+    ):
+        for k in ("MLX_VLM_DFLASH_ROUND_MS", "MLX_VLM_DFLASH_SURVIVAL_NUMERATOR",
+                  "MLX_VLM_DFLASH_WIDTH_DWELL"):
+            os.environ.pop(k, None)
+        os.environ[var] = value
+        _reset()
+        assert dflash._width_policy_extras_enabled() is True, var
+
+
+def test_the_default_width_call_touches_none_of_the_opt_in_machinery(monkeypatch):
+    """The strongest form of "unchanged": with the knobs unset, the survival
+    curve, the cost table and the dwell state are never even consulted."""
+    os.environ["MLX_VLM_DFLASH_ADAPTIVE_K"] = "1"
+    _reset()
+    dflash._width_policy_extras_enabled()          # resolve the gate first
+
+    def _boom(*a, **kw):                            # pragma: no cover
+        raise AssertionError("opt-in machinery reached on the default path")
+
+    monkeypatch.setattr(dflash, "_dflash_survival_curve", _boom)
+    monkeypatch.setattr(dflash, "_dflash_dwell_width", _boom)
+    monkeypatch.setattr(dflash, "_round_cost_table", _boom)
+    assert dflash._dflash_next_block_size(_Drafter([2] * 8, [7] * 8), 8, 64) == 3
+    assert dflash._dflash_block_size_for_hazard(0.80, 8) == 5

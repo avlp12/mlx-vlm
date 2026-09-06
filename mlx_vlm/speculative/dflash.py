@@ -43,6 +43,7 @@ _ROUND_MS_WARNED = False
 # Optional per-position survival numerator / width hysteresis; both default off.
 _SURVIVAL_NUMERATOR = None
 _WIDTH_DWELL = None
+_WIDTH_EXTRAS = None
 
 _LOG = logging.getLogger(__name__)
 
@@ -520,6 +521,32 @@ def _dflash_dwell_width(draft_model: nn.Module, proposed: int) -> int:
     return held
 
 
+def _width_policy_extras_enabled() -> bool:
+    """ONE memoised boolean for the whole opt-in surface above.
+
+    ``_dflash_next_block_size`` runs once per DFlash round on the served path,
+    so anything it consults per round is in the decode loop's critical path.
+    Each knob is individually memoised, but three global reads and three
+    branches per round is still three more than the shipped policy had, and the
+    contract for a default-off feature is that the default path executes the
+    SAME STATEMENTS, not merely reaches the same answer.  This collapses the
+    whole surface to a single global compare, and everything downstream of it --
+    the cost table, the survival curve, the dwell state -- is unreachable
+    without it.
+
+    Read once per process like every other knob here; the callers that reset the
+    memos in tests must reset this one too or they will measure nothing.
+    """
+    global _WIDTH_EXTRAS
+    if _WIDTH_EXTRAS is None:
+        _WIDTH_EXTRAS = bool(
+            _round_cost_table() is not None
+            or _survival_numerator_enabled()
+            or _width_dwell() > 0
+        )
+    return _WIDTH_EXTRAS
+
+
 def _dflash_hazard(draft_model: nn.Module) -> Optional[float]:
     """Truncated-geometric MLE of the per-token acceptance hazard.
 
@@ -584,12 +611,41 @@ def _dflash_block_size_for_hazard(
     ``fixed`` AND ``cost`` (MTP's rollout depth) is describing a different
     machine, and a DFlash round-cost table has nothing to say about it.  With
     neither environment variable set the arithmetic below is unchanged.
+
+    THE DEFAULT PATH IS A SEPARATE LOOP AND THAT IS DELIBERATE.  The opt-in
+    denominator wants a per-width function call and the opt-in numerator wants a
+    bounds test, and folding either into the shipped loop puts them in the inner
+    loop of the served round for every request that never asked for them.  This
+    is called once per DFlash round, so "unchanged" has to mean the same
+    statements, not just the same answer.
     """
-    table = _round_cost_table() if (fixed is None and cost is None) else None
     if fixed is None or cost is None:
         f, c = _round_cost_params()
+        table = (
+            _round_cost_table()
+            if (fixed is None and cost is None and _width_policy_extras_enabled())
+            else None
+        )
         fixed = f if fixed is None else fixed
         cost = c if cost is None else cost
+    else:
+        table = None
+
+    if table is None and survival is None:
+        # DEFAULT PATH -- statement for statement the shipped policy's loop.
+        best, best_gain = floor, -1.0
+        e = 0.0
+        pk = 1.0
+        if floor <= 1:
+            best_gain = 1.0 / fixed      # width 1 == propose nothing
+            best = 1
+        for width in range(2, cap + 1):
+            pk *= p
+            e += pk                   # E[accepted] at width-1 drafted tokens
+            gain = (1.0 + e) / (fixed + cost * (width - 1))
+            if gain > best_gain:
+                best_gain, best = gain, width
+        return max(floor, min(cap, best))
 
     if table is None:
         def den(width: int) -> float:
@@ -771,22 +827,32 @@ def _dflash_next_block_size(
         p = _dflash_hazard(draft_model)
         if p is not None:
             floor = max(2, int(getattr(draft_model, "dflash_min_block_size", 2)))
+            if not _width_policy_extras_enabled():
+                # DEFAULT PATH -- one memoised global compare above, and then
+                # exactly the calls the shipped policy made.  No survival curve
+                # is built, no cost table is consulted, no dwell state is
+                # touched, and nothing here reads an MLX array.
+                if _empirical_enabled():
+                    f, c = _round_cost_params()
+                    return _dflash_block_size_empirical(
+                        draft_model, p, block_total, floor, f, c
+                    )
+                return _dflash_block_size_for_hazard(p, block_total, floor=floor)
             if _empirical_enabled():
                 f, c = _round_cost_params()
                 chosen = _dflash_block_size_empirical(
                     draft_model, p, block_total, floor, f, c
                 )
             else:
-                survival = None
-                if _survival_numerator_enabled():
-                    survival = _dflash_survival_curve(
-                        draft_model, _ADAPTIVE_K_WINDOW or 16
-                    )
+                survival = (
+                    _dflash_survival_curve(draft_model, _ADAPTIVE_K_WINDOW or 16)
+                    if _survival_numerator_enabled()
+                    else None
+                )
                 chosen = _dflash_block_size_for_hazard(
                     p, block_total, floor=floor, survival=survival
                 )
-            # Hysteresis is a no-op unless MLX_VLM_DFLASH_WIDTH_DWELL is set;
-            # the budget clamp is re-applied because a held width predates the
+            # The budget clamp is re-applied because a held width predates the
             # budget that is left now.
             return max(floor, min(block_total, _dflash_dwell_width(draft_model, chosen)))
         if initial_block_size is not None:
@@ -1166,7 +1232,15 @@ def _dflash_rounds(
     # from the one path the timers never covered.  Same contract as the batch
     # loop -- off by default, and deliberately perturbing when on, because a
     # split is only meaningful if each half is waited for.
+    #
+    # ``timed`` is resolved ONCE, here, and the three sites below are bare
+    # ``if timed:`` tests.  With the variable unset the round loop executes the
+    # same statements it did before the timers existed: no perf_counter, no
+    # mx.eval, no attribute write, and no scalar pulled off the device between
+    # the draft and the verify (which would serialise the very pipeline the
+    # async_evals exist to build).
     timed = _round_timers_enabled()
+    draft_started = 0.0
     draft_finished = 0.0
 
     b = first_bonus
@@ -1196,7 +1270,8 @@ def _dflash_rounds(
             if not greedy_sampling and positioned_sampling
             else sampler
         )
-        draft_started = time.perf_counter() if timed else 0.0
+        if timed:
+            draft_started = time.perf_counter()
         draft_tokens = sampler_rng.draft_tokens(
             draft_model.draft_block,
             b,
