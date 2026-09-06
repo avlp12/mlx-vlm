@@ -127,7 +127,8 @@ def _env_flag(name: str, default: str = "0") -> bool:
 # --------------------------------------------------------------------------- #
 # MLX_VLM_GLM5_FUSED_KDA_PREFILL: the S>1 PREFILL kernel (fused_kda_prefill.py).
 #
-# Default OFF.  It is a different bet from the verify-block kernel it shares its
+# Default ON since 2026-09-06 (operator-approved after L23 measured it; see the
+# flag line below).  It is a different bet from the verify-block kernel it shares its
 # arithmetic with: at S<=8 the glue is launch-bound and fusing removes ~33
 # dependent dispatches per layer, but at S=8192 those same 33 launches cost 0.5 ms
 # against a measured ~59 ms per layer -- the prefill glue is BANDWIDTH-bound, and
@@ -143,7 +144,7 @@ _FUSED_KDA_PREFILL_ENV = None
 # would cut by NV.  NV=1 selects the maximally fused arm instead (the gated
 # RMSNorm stays in the kernel, one launch per layer, but H threadgroups at B=1).
 # Both are bit-identical; which is faster is a measurement.
-_FUSED_KDA_PREFILL_NV = os.environ.get("MLX_VLM_GLM5_FUSED_KDA_PREFILL_NV", "")
+_FUSED_KDA_PREFILL_NV = os.environ.get("MLX_VLM_GLM5_FUSED_KDA_PREFILL_NV", "1")  # NV=1 default 2026-09-06 (L23: NV=1 +1-2 %, NV=D/TY -3 %); "" restores the eager-partition geometry
 
 # Chunk width bounds.  The lower bound keeps the S=1 and verify-block paths
 # untouched; the upper bound is 0 (no cap) because S is a runtime scalar -- one
@@ -166,7 +167,7 @@ _FUSED_KDA_PREFILL_MAX_BATCH = int(
 def _fused_kda_prefill_enabled() -> bool:
     global _FUSED_KDA_PREFILL_ENV
     if _FUSED_KDA_PREFILL_ENV is None:
-        _FUSED_KDA_PREFILL_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA_PREFILL", "0")
+        _FUSED_KDA_PREFILL_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA_PREFILL", "1")  # default ON 2026-09-06 (operator-approved, L23: +1.2 %/8k, +2.2 %/32k prefill, logits bit-identical; =0 restores eager)
     return _FUSED_KDA_PREFILL_ENV
 
 

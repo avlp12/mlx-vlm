@@ -523,7 +523,7 @@ def _elig(probe, B, S, mask=None, cache=None, sink=None):
     )
 
 
-def test_flag_is_off_by_default_and_refuses_before_touching_anything():
+def test_flag_off_refuses_before_touching_anything():
     prev = glm5._FUSED_KDA_PREFILL_ENV
     try:
         glm5._FUSED_KDA_PREFILL_ENV = False
@@ -532,18 +532,26 @@ def test_flag_is_off_by_default_and_refuses_before_touching_anything():
         glm5._FUSED_KDA_PREFILL_ENV = prev
 
 
-def test_default_of_the_env_flag_is_off():
-    """Read from the environment, not from the cached global: this kernel is not
-    on the default serving path until L7-b has measured it."""
+def test_default_of_the_env_flag_is_on_and_zero_restores_eager():
+    """Read from the environment, not from the cached global: default ON since
+    2026-09-06 (L23 measured +1-2 % prefill, logits bit-identical); "0" restores
+    the eager path.  NV defaults to 1 (the measured-faster geometry)."""
     import os
 
-    prev = glm5._FUSED_KDA_PREFILL_ENV
+    prev, prev_nv = glm5._FUSED_KDA_PREFILL_ENV, glm5._FUSED_KDA_PREFILL_NV
     try:
         glm5._FUSED_KDA_PREFILL_ENV = None
         os.environ.pop("MLX_VLM_GLM5_FUSED_KDA_PREFILL", None)
+        assert glm5._fused_kda_prefill_enabled() is True
+        glm5._FUSED_KDA_PREFILL_ENV = None
+        os.environ["MLX_VLM_GLM5_FUSED_KDA_PREFILL"] = "0"
         assert glm5._fused_kda_prefill_enabled() is False
+        glm5._FUSED_KDA_PREFILL_NV = "1"
+        assert glm5._fused_kda_prefill_nv() == 1
     finally:
+        os.environ.pop("MLX_VLM_GLM5_FUSED_KDA_PREFILL", None)
         glm5._FUSED_KDA_PREFILL_ENV = prev
+        glm5._FUSED_KDA_PREFILL_NV = prev_nv
 
 
 def test_s1_and_a_speculative_sink_are_refused_on_the_guard_alone():
