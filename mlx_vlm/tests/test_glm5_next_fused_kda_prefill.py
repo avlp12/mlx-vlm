@@ -125,7 +125,6 @@ def _cache(batch=1, seed=1):
 def _clone(cache):
     out = ArraysCache(size=2)
     out[0], out[1] = cache[0], cache[1]
-    out.offset = cache.offset
     return out
 
 
@@ -187,7 +186,14 @@ def test_prefill_is_bit_identical_to_eager(S, nv):
     assert mx.array_equal(y_f, y_e).item(), f"output differs at S={S}, nv={nv}"
     assert mx.array_equal(c_fused[1], c_eager[1]).item(), "final state differs"
     assert mx.array_equal(c_fused[0], c_eager[0]).item(), "conv window differs"
-    assert c_fused.offset == c_eager.offset
+    # ArraysCache has no ``.offset`` (it is not a KVCache): the KDA layer keeps
+    # no step counter of its own, only the conv window and recurrent state
+    # slots returned by ``.state``. Compare the whole state list bit-exactly
+    # so a slot added to ArraysCache later is covered by this test too.
+    assert all(
+        mx.array_equal(a, b).item()
+        for a, b in zip(c_fused.state, c_eager.state)
+    ), "full cache state differs"
 
 
 @on_gpu
