@@ -639,6 +639,8 @@ class PipelineMetrics:
             self.wire_s = 0.0
             self.bypass = {}
             self.breaker_state = "closed"
+            self.ladder_collapsed = 0
+            self.ladder_rungs_skipped = 0
 
     def note_bypass(self, reason: Optional[str]):
         if not reason:
@@ -668,6 +670,18 @@ class PipelineMetrics:
             self.handoff_bytes += int(handoff.get("handoff_bytes") or 0)
             self.wire_s += float(handoff.get("handoff_wire_recv_s") or 0.0)
 
+    def note_ladder_collapsed(self, skipped: int = 0):
+        """One request's vault ladder replaced by a single full-depth rung.
+
+        Two numbers because they answer different questions: how many requests
+        traded their ladder for the peer, and how many rungs the vault does not
+        have as a result.  Without the second, a collapse that quietly dropped a
+        five-rung ladder reads the same as one that dropped nothing.
+        """
+        with self._lock:
+            self.ladder_collapsed += 1
+            self.ladder_rungs_skipped += max(0, int(skipped))
+
     def set_breaker_state(self, state: str):
         with self._lock:
             self.breaker_state = state
@@ -683,6 +697,8 @@ class PipelineMetrics:
                 "pp_wire_s": round(self.wire_s, 6),
                 "pp_breaker_state": self.breaker_state,
                 "pp_breaker_trips": self.breaker_trips,
+                "pp_ladder_collapsed": self.ladder_collapsed,
+                "pp_ladder_rungs_skipped": self.ladder_rungs_skipped,
             }
 
 
@@ -993,6 +1009,16 @@ def pipeline_bypass_reason(*args, **kwargs):
     reason = _pipeline_bypass_reason(*args, **kwargs)
     METRICS.note_bypass(reason)
     return reason
+
+
+def note_pipeline_ladder_collapsed(skipped: int = 0) -> None:
+    """A PP request kept the deepest vault rung and skipped ``skipped`` others.
+
+    Counted rather than logged for the same reason the bypass reasons are: a
+    vault that quietly stopped storing its halving tail on every long prompt
+    looks exactly like a vault whose ladder policy changed.
+    """
+    METRICS.note_ladder_collapsed(skipped)
 
 
 def note_pipeline_bypass(reason: Optional[str]) -> Optional[str]:

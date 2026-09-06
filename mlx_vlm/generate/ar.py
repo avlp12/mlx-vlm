@@ -2263,13 +2263,18 @@ class PromptProcessingBatch:
         # of the first chunk; ``_pipeline_declined`` latches that decision so no
         # later chunk pays the gate again.  A batch that never meets the gate --
         # every batch, with ``MLX_VLM_PIPELINE_HOSTS`` unset -- carries these
-        # five attributes and executes one ``os.environ.get``.
+        # six attributes and executes one ``os.environ.get``.
         self._pipeline = None
         self._pipeline_declined = False
         self._pipeline_slot = False
         self._pipeline_chunks: List[int] = []
         self._pipeline_chunks_done = 0
         self._pipeline_restore: Optional[dict] = None
+        # A5: the vault ladder this request took out of the chunk loop's way,
+        # kept so the post-finalize checkpoint knows which rows to store and so
+        # a fallback can put the original rungs BACK (a peer that dies must not
+        # turn a vault-on request into a silently vault-off one).
+        self._pipeline_ladder: Optional[dict] = None
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
@@ -2775,25 +2780,39 @@ class PromptProcessingBatch:
             if not rungs:
                 continue
             done = self._row_real_tokens_processed(batch_idx)
-            landed = [r for r in rungs if int(r) == done]
+            landed = [int(r) for r in rungs if int(r) == done]
             remaining = [r for r in rungs if int(r) > done]
             if landed:
-                row_cache = self._apc_prompt_cache_for_store(batch_idx)
-                if row_cache is not None:
-                    full_ids = meta.get("full_input_ids") or []
-                    provenance = self._harvest_provenance(batch_idx)
-                    for r in landed:
-                        try:
-                            _context_vault.insert_checkpoint(
-                                self._vault,
-                                full_ids,
-                                int(r),
-                                _context_vault.capture_fragments(row_cache, int(r)),
-                                harvest_provenance=provenance,
-                            )
-                        except Exception:  # noqa: BLE001 - storing is best-effort
-                            pass
+                self._insert_vault_rungs(batch_idx, meta, landed)
             meta["vault_rungs"] = remaining
+
+    def _insert_vault_rungs(self, batch_idx: int, meta: dict, rungs: List[int]) -> None:
+        """Capture and store this row's cache at each of ``rungs``.
+
+        The ONE place a vault rung is written from the batch path, so the
+        pipelined full-depth checkpoint (A5) and the chunk loop's ladder store
+        cannot drift apart in what they capture or how they name it: same
+        ``capture_fragments`` over the same row snapshot, same
+        ``insert_checkpoint``, same provenance.  Best-effort per rung -- a vault
+        fault must never fail a request, and ``capture_fragments`` returns None
+        rather than a partial ladder, which ``insert`` refuses.
+        """
+        row_cache = self._apc_prompt_cache_for_store(batch_idx)
+        if row_cache is None:
+            return
+        full_ids = meta.get("full_input_ids") or []
+        provenance = self._harvest_provenance(batch_idx)
+        for r in rungs:
+            try:
+                _context_vault.insert_checkpoint(
+                    self._vault,
+                    full_ids,
+                    int(r),
+                    _context_vault.capture_fragments(row_cache, int(r)),
+                    harvest_provenance=provenance,
+                )
+            except Exception:  # noqa: BLE001 - storing is best-effort
+                pass
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
         if n is None or not self._prompt_length_aware_keys:
@@ -2875,28 +2894,161 @@ class PromptProcessingBatch:
             return True
         return any(int(p or 0) > 0 for p in self._left_padding_per_row)
 
-    def _pipeline_has_checkpoint_ladder(self) -> bool:
-        """Is a mid-prefill checkpoint owed to APC or the vault?
+    def _pipeline_full_depth(self) -> int:
+        """Tokens the pipelined part of this prefill will have written: ``k*C``.
 
-        PP cannot serve one: at any chunk boundary half the KV lives on the peer,
-        so a checkpoint taken there would store a half-populated cache.  A5 adds
-        the one checkpoint PP CAN take -- a single full-depth one after
-        ``finalize`` -- and this refusal narrows to the rungs alone then.
+        The one depth at which a two-box prefill holds a COMPLETE cache before
+        the request is over: ``finalize`` has just pulled stage B's caches back
+        and installed them, the head owns all ``n_layers``, and the remainder
+        (1..C tokens) has not been forwarded yet.
+        """
+        return sum(self._pipeline_chunk_schedule())
+
+    def _pipeline_has_checkpoint_ladder(self) -> bool:
+        """Is a checkpoint owed that ONE post-finalize snapshot cannot pay?
+
+        PP cannot checkpoint MID-prefill: at a chunk boundary half the KV lives
+        on the peer and the snapshot would be of a half-populated cache.  What
+        it can do -- A5 -- is take exactly one checkpoint, at full depth,
+        immediately after ``finalize``.  So the refusal narrows from "any rung
+        is owed" to "a rung is owed that the full-depth one cannot stand in
+        for", which is three cases and no more:
+
+        1.  THE VAULT LADDER, when every pending rung is a multiple of the chunk
+            size and none is deeper than ``k*C``, is admitted and COLLAPSED onto
+            the single rung at ``k*C``.  Note that this is not a lucky case, it
+            is the only case: ``align_boundaries`` admits a rung only if it is a
+            positive multiple of ``prefill_step_size`` strictly below the prompt
+            length, and the largest such multiple IS ``k*C``.  So the deepest
+            rung the ladder can ever ask for is exactly the depth PP can serve,
+            and the geometric ladder's halving tail is what gets dropped --
+            counted, per request and per rung, as ``pp_ladder_collapsed`` /
+            ``pp_ladder_rungs_skipped``.  The rung that survives is the one the
+            ladder itself calls dominant ("the deepest rung serves the dominant
+            same-document-new-suffix workload", ``boundary_ladder``); what is
+            lost is early-divergence coverage, for long prompts only, and only
+            while the peer is in use.  An unaligned or too-deep rung is still
+            refused: unaligned would make ``_next_apc_checkpoint_column`` clamp
+            a chunk, and a clamped chunk is a chunk the peer's schedule does not
+            have.
+        2.  APC EXACT is still refused whole, and this is a deliberate NON-
+            narrowing.  Its checkpoint sits at ``checkpoint_len`` -- a length
+            chosen by the APC block policy from the prompt, not by the chunk
+            size -- so it is at ``T'``, essentially never at ``k*C``, and a
+            checkpoint stored at the wrong length is not a slower cache but a
+            wrong one.  (Nor could it simply be MOVED to ``k*C``: the APC store
+            is ``store_exact_cache``, keyed on ``full_input_ids[:checkpoint_len]``
+            and carrying a drafter ``hidden_tail`` for that same length; there is
+            no sense in which a k*C snapshot answers it.)  A request that wants
+            an exact APC checkpoint keeps prefilling on the box that can give it.
+        3.  No pipelined chunks at all (``depth <= 0``) means there is no
+            full-depth point to take, so any pending rung is unserveable.
         """
         if not self._apc_meta:
             return False
         apc_on = self._apc_manager is not None and self._apc_mode == "exact"
+        depth = self._pipeline_full_depth()
+        step = int(self.prefill_step_size or 0)
         for meta in self._apc_meta:
             if meta is None:
                 continue
-            if self._vault is not None and meta.get("vault_rungs"):
-                return True
             if apc_on and not meta.get("checkpoint_done"):
                 if int(meta.get("checkpoint_len") or 0) > int(
                     meta.get("prefix_len") or 0
                 ):
                     return True
+            if self._vault is None:
+                continue
+            rungs = [int(r) for r in (meta.get("vault_rungs") or ())]
+            if not rungs:
+                continue
+            if depth <= 0 or step <= 0:
+                return True
+            if any(r > depth or r % step for r in rungs):
+                return True
         return False
+
+    def _pipeline_collapse_ladder(self, depth: int) -> None:
+        """Take the vault rungs out of the chunk loop's way for this request.
+
+        Two things have to happen before the first pipelined chunk runs, and
+        both are this method.  The rungs must stop being PENDING, or
+        ``_store_vault_checkpoints`` fires at the chunk boundary they land on
+        and captures a cache whose stage-B layers are empty -- a rung that
+        restores to a fluent wrong answer, which is the one failure a cache
+        change must not introduce.  And they must be REMEMBERED, because a peer
+        that dies mid-prefill sends this request back to column 0 single-box,
+        where the ladder is exactly as serveable as it was before the peer was
+        ever dialled.
+        """
+        self._pipeline_ladder = None
+        if self._vault is None or not self._apc_meta:
+            return
+        rows: dict = {}
+        skipped = 0
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None:
+                continue
+            rungs = [int(r) for r in (meta.get("vault_rungs") or ())]
+            if not rungs:
+                continue
+            rows[batch_idx] = rungs
+            skipped += sum(1 for r in rungs if r != depth)
+            meta["vault_rungs"] = []
+        if not rows:
+            return
+        self._pipeline_ladder = {"depth": int(depth), "rows": rows}
+        from ..pipeline_runtime import note_pipeline_ladder_collapsed
+
+        note_pipeline_ladder_collapsed(skipped)
+
+    def _pipeline_restore_ladder(self) -> None:
+        """Give the rungs back.  Runs when the peer failed and the request is
+        about to be re-prefilled on one box, which can serve all of them."""
+        ladder, self._pipeline_ladder = self._pipeline_ladder, None
+        if not ladder:
+            return
+        for batch_idx, rungs in ladder["rows"].items():
+            meta = self._apc_meta[batch_idx] if batch_idx < len(self._apc_meta) else None
+            if meta is not None:
+                meta["vault_rungs"] = list(rungs)
+
+    def _pipeline_store_full_depth_checkpoint(self) -> None:
+        """The one checkpoint a two-box prefill CAN take, taken.
+
+        Called immediately after ``finalize`` and BEFORE the batch advances, so
+        the preconditions are the ones the gate reasoned about and not a
+        reconstruction of them: the head owns every layer, the cache holds
+        exactly ``depth`` tokens, ``_processed_prompt_columns`` has not moved,
+        and ``_apc_meta`` is intact.  The capture goes through
+        ``_insert_vault_rungs`` -- the same ``capture_fragments`` +
+        ``insert_checkpoint`` the single-box chunk loop stores a rung with -- so
+        the entry's bytes, keys and provenance are what the vault expects and a
+        loopback run is bit-identical to a single-box one at this depth.
+
+        Never raises.  A fault here would otherwise reach ``_pipeline_step``'s
+        handler, which would throw away a cache that is COMPLETE and correct and
+        re-prefill the whole prompt -- paying the entire request over again for
+        a best-effort store.
+        """
+        ladder, self._pipeline_ladder = self._pipeline_ladder, None
+        if not ladder or self._vault is None:
+            return
+        try:
+            depth = int(ladder["depth"])
+            for batch_idx in ladder["rows"]:
+                meta = (
+                    self._apc_meta[batch_idx]
+                    if batch_idx < len(self._apc_meta)
+                    else None
+                )
+                if meta is not None:
+                    self._insert_vault_rungs(batch_idx, meta, [depth])
+        except Exception as exc:  # noqa: BLE001 - a store must not fail a prefill
+            logger.warning(
+                "pipeline: the post-finalize vault checkpoint failed (%r); the "
+                "prefill itself is complete and the request continues", exc,
+            )
 
     def _pipeline_chunk_schedule(self) -> List[int]:
         """The chunks this loop will hand the peer, in order.
@@ -2999,6 +3151,10 @@ class PromptProcessingBatch:
             return
         self._pipeline_chunks = chunks
         self._pipeline_chunks_done = 0
+        # The gate has admitted the ladder; collapse it now, BEFORE the first
+        # chunk, so no boundary the chunk loop is about to cross can fire a
+        # capture over a half-populated cache.
+        self._pipeline_collapse_ladder(depth)
         # Everything the fallback needs to start over.  ``_inputs_embeds`` is
         # the whole prompt's embedding and is held for the duration of the
         # pipelined prefill (1.07 GB at 131k) -- the price of being able to
@@ -3050,6 +3206,9 @@ class PromptProcessingBatch:
         restore = self._pipeline_restore or {}
         self._pipeline_release()
         self._pipeline_restore = None
+        # The single-box re-prefill can serve every rung, including the ones the
+        # collapse dropped, so it gets the whole ladder back.
+        self._pipeline_restore_ladder()
         self.prompt_cache = self._build_prompt_cache()
         if restore:
             self._input_ids = restore["input_ids"]
@@ -3086,6 +3245,10 @@ class PromptProcessingBatch:
                 # the remainder forward, the last token and all of decode run
                 # locally over the full stack.
                 self._pipeline.finalize(self.prompt_cache)
+                # A5.  Here and nowhere else: all 45 layers are on this box,
+                # the cache is exactly ``sum(chunks)`` tokens deep, and the
+                # batch has not advanced past it yet.
+                self._pipeline_store_full_depth_checkpoint()
                 self._pipeline_restore = None
                 self._pipeline_release()
         except Exception as exc:  # noqa: BLE001 - never surface a peer fault

@@ -311,10 +311,14 @@ def test_the_schedule_is_the_chunk_loop_and_nothing_else():
         ),
         ("warm_prefix", [PROMPT], {}, {"_apc_meta": [{"prefix_len": 4}]}),
         (
+            # A5 admits a rung the post-finalize checkpoint can stand in for.
+            # This one it cannot: 12 is not a multiple of the chunk size, so
+            # ``_next_apc_checkpoint_column`` would clamp a chunk to land on it
+            # and the peer's schedule has no such chunk in it.
             "apc_checkpoint_ladder",
             [PROMPT],
             {},
-            {"_vault": object(), "_apc_meta": [{"vault_rungs": [16]}]},
+            {"_vault": object(), "_apc_meta": [{"vault_rungs": [12]}]},
         ),
         (
             "speculative_hidden_capture",
@@ -576,8 +580,412 @@ def test_the_cold_prefill_is_byte_identical_to_a6634a75(monkeypatch):
     """The guard that the call site did not become a prefill change.
 
     Measured on a clean detached worktree of ``a6634a75`` with this fixture.
+
+    Extended for A5, which touched the vault ladder's STORE path (the chunk
+    loop's capture and the post-finalize one now share
+    ``_insert_vault_rungs``) and its GATE.  Neither may be visible with the
+    feature off, so the env-off arm is run twice -- once as a plain cold
+    prefill and once with a vault ladder in hand -- and both land on the same
+    pinned digest, with the ladder stored WHOLE (no collapse, no counter).
     """
     monkeypatch.delenv("MLX_VLM_PIPELINE_HOSTS", raising=False)
     digest, _, steps = _drain(_batch(_lm()))
     assert steps == PIPELINED_CHUNKS
     assert digest == A6634A75_COLD_CACHE
+
+    vault = _FakeVault()
+    ladder_digest, _, ladder_steps = _drain(_vault_batch(_lm(), vault, LADDER))
+    assert ladder_steps == PIPELINED_CHUNKS
+    assert ladder_digest == A6634A75_COLD_CACHE, "the ladder store moved the prefill"
+    assert vault.depths() == LADDER, "every rung, at its own depth"
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_ladder_collapsed"] == 0 and snap["pp_bypass_reason"] == {}
+
+
+# ------------------------------------------- 5. A5: the one checkpoint PP can take
+#
+# The vault has been default-ON since d1a3c3a4, so ``apc_checkpoint_ladder``
+# refused every request in the default served config: a pipeline that is
+# reachable only with the vault switched off is a pipeline nobody reaches.  A5
+# narrows the gate to the rungs the single post-finalize checkpoint cannot stand
+# in for, and takes that one checkpoint through the SAME capture the chunk loop
+# uses -- which is what these pin.
+
+
+class _FakeVault:
+    """Records what the store side hands it, in order."""
+
+    def __init__(self):
+        self.inserts = []
+
+    def insert(self, tokens, prefix_len, fragments, harvest_provenance=None, **kw):
+        self.inserts.append(
+            {
+                "tokens": list(tokens),
+                "prefix_len": int(prefix_len),
+                "fragments": fragments,
+                "harvest_provenance": harvest_provenance,
+            }
+        )
+        return True
+
+    def depths(self):
+        return [i["prefix_len"] for i in self.inserts]
+
+
+def _fragments_digest(fragments):
+    """sha256 over every array in a captured rung, shapes included."""
+    assert fragments is not None, "capture_fragments refused the cache"
+    arrays = []
+    stack = [f.payload for f in fragments]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, mx.array):
+            arrays.append(item)
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+    mx.eval(arrays)
+    h = hashlib.sha256()
+    for a in arrays:
+        h.update(repr(tuple(a.shape)).encode())
+        h.update(memoryview(np.asarray(a.astype(mx.float32))).tobytes())
+    return h.hexdigest(), len(arrays)
+
+
+DEPTH = sum(PIPELINED_CHUNKS)  # 32: the deepest rung align_boundaries admits
+LADDER = [STEP * 2, DEPTH]  # 16, 32 -- a geometric ladder in miniature
+
+
+def _vault_batch(lm, vault, rungs, **kwargs):
+    batch = _batch(lm, **kwargs)
+    batch._vault = vault
+    batch._apc_meta = [
+        {"prefix_len": 0, "vault_rungs": list(rungs), "full_input_ids": list(PROMPT)}
+    ]
+    return batch
+
+
+def test_the_deepest_rung_is_exactly_the_depth_pp_can_serve():
+    """Not a lucky case -- the only case.
+
+    ``align_boundaries`` admits a rung only if it is a positive multiple of the
+    chunk size strictly below the prompt length, and the largest such multiple
+    IS ``k*C``.  So a full-depth checkpoint can always stand in for the DEEPEST
+    rung the ladder asks for; the narrowing turns on nothing else.
+    """
+    from mlx_vlm.context_vault import align_boundaries, boundary_ladder
+
+    for total in (40, 41, 47, 48, 64, 129):
+        depth = (-(-total // STEP) - 1) * STEP
+        admissible = align_boundaries(range(1, total), STEP, total)
+        assert admissible and max(admissible) == depth, (total, depth, admissible)
+        ladder = boundary_ladder(total, stride=STEP * 2, step=STEP)
+        assert all(r <= depth for r in ladder), (total, ladder)
+
+
+def test_a_servable_ladder_is_admitted_and_collapsed(monkeypatch):
+    _arm(monkeypatch)
+    vault = _FakeVault()
+    batch = _vault_batch(_lm(), vault, LADDER)
+    digest, logprobs, steps = _drain(batch)
+
+    assert steps == PIPELINED_CHUNKS, "the collapse must not move a chunk boundary"
+    assert vault.depths() == [DEPTH], "one rung, at full depth"
+    assert _hist() == {}, "no refusal"
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_used"] == 1
+    assert snap["pp_ladder_collapsed"] == 1
+    assert snap["pp_ladder_rungs_skipped"] == 1, "the 16 rung is the one dropped"
+
+    # ... and the prefill itself is still the single-box prefill
+    ref_digest, ref_lp, _ = _single_box_reference()
+    assert digest == ref_digest
+    assert mx.array_equal(logprobs, ref_lp)
+
+
+def test_the_collapsed_rung_is_bit_identical_to_the_single_box_rung(monkeypatch):
+    """The loopback double against one box, at the same depth, byte for byte.
+
+    This is the ``align_boundaries`` contract restated for the two-box path: a
+    rung at a multiple of the chunk size restores to the same cache a
+    straight-through cold prefill would have had at that length.  If the
+    post-finalize capture used a different function, a different row snapshot or
+    a different moment, the payload would differ here.
+    """
+    pp_vault = _FakeVault()
+    _arm(monkeypatch)
+    _drain(_vault_batch(_lm(), pp_vault, LADDER))
+
+    ref_vault = _FakeVault()
+    with _pipeline_off():
+        _drain(_vault_batch(_lm(), ref_vault, [DEPTH]))
+
+    assert pp_vault.depths() == ref_vault.depths() == [DEPTH]
+    got, n_got = _fragments_digest(pp_vault.inserts[0]["fragments"])
+    want, n_want = _fragments_digest(ref_vault.inserts[0]["fragments"])
+    assert n_got == n_want and n_got > 0
+    assert got == want, "the pipelined rung is not the single-box rung"
+    # the keys the vault indexes on, and the provenance it records, too
+    assert pp_vault.inserts[0]["tokens"] == ref_vault.inserts[0]["tokens"]
+
+    def _prov(entry):  # everything but the wall clock the capture happened at
+        return {
+            k: v
+            for k, v in (entry["harvest_provenance"] or {}).items()
+            if k != "harvest_at"
+        }
+
+    assert _prov(pp_vault.inserts[0]) == _prov(ref_vault.inserts[0])
+    assert _prov(pp_vault.inserts[0]), "provenance is recorded, not merely equal"
+
+
+@pytest.mark.parametrize(
+    "rungs,why",
+    [
+        ([STEP + 4], "unaligned: it would clamp a chunk the peer does not have"),
+        ([DEPTH + STEP], "deeper than the pipelined part"),
+    ],
+)
+def test_a_rung_the_full_depth_checkpoint_cannot_serve_is_still_refused(
+    monkeypatch, rungs, why
+):
+    _arm(monkeypatch)
+    batch = _vault_batch(_lm(), _FakeVault(), rungs)
+    batch._pipeline_open()
+    assert batch._pipeline is None, why
+    assert _hist() == {"apc_checkpoint_ladder": 1}
+
+
+def test_the_apc_exact_checkpoint_is_still_refused_whole(monkeypatch):
+    """A5 narrows the VAULT clause and nothing else.
+
+    APC's checkpoint sits at a length the block policy chose from the prompt,
+    not at ``k*C``, and its store is keyed on ``full_input_ids[:checkpoint_len]``
+    -- a k*C snapshot is not a slower answer to it, it is a different one.
+    """
+    _arm(monkeypatch)
+    batch = _vault_batch(_lm(), _FakeVault(), [DEPTH])
+    batch._apc_manager = object()
+    batch._apc_mode = "exact"
+    batch._apc_meta[0]["checkpoint_len"] = 16
+    batch._pipeline_open()
+    assert batch._pipeline is None and _hist() == {"apc_checkpoint_ladder": 1}
+
+
+def test_no_rung_fires_while_half_the_cache_is_on_the_peer(monkeypatch):
+    """The reason the collapse happens at OPEN and not at finalize.
+
+    A rung at 16 lands exactly on a chunk boundary.  If it were still pending
+    there, ``_store_vault_checkpoints`` would capture a cache whose stage-B
+    layers had never been written -- an entry that restores to a fluent wrong
+    answer rather than to a slow one.
+    """
+    _arm(monkeypatch)
+    vault = _FakeVault()
+    batch = _vault_batch(_lm(), vault, LADDER)
+    seen = []
+    while batch.needs_processing():
+        batch.prompt_step()
+        seen.append((batch._pipeline_chunks_done, list(vault.depths())))
+    # nothing stored until the last chunk, whose step is the one that finalizes
+    assert [s[1] for s in seen[:-1]] == [[] for _ in seen[:-1]], seen
+    assert seen[-1][1] == [DEPTH]
+
+
+def test_a_dead_peer_gives_the_whole_ladder_back(monkeypatch):
+    """The collapse is a property of the PP attempt, not of the request.
+
+    A peer that dies mid-prefill sends the request back to column 0 on a fresh
+    cache, single-box -- which can serve every rung.  If the collapse were not
+    undone, a tail that died at 03:00 would quietly turn a vault-on server into
+    a vault-storing-one-rung server.
+    """
+    _arm(monkeypatch, fail_at=2)
+    vault = _FakeVault()
+    digest, logprobs, _ = _drain(_vault_batch(_lm(), vault, LADDER))
+    assert vault.depths() == LADDER, "the full ladder, stored by the fallback"
+
+    ref_vault = _FakeVault()
+    with _pipeline_off():
+        ref_digest, ref_lp, _ = _drain(_vault_batch(_lm(), ref_vault, LADDER))
+    assert digest == ref_digest
+    assert mx.array_equal(logprobs, ref_lp)
+    got = [_fragments_digest(i["fragments"]) for i in vault.inserts]
+    want = [_fragments_digest(i["fragments"]) for i in ref_vault.inserts]
+    assert got == want, "the fallback's rungs are the never-tried run's rungs"
+    assert pr.METRICS.snapshot()["pp_ladder_collapsed"] == 1
+
+
+def test_a_store_that_blows_up_after_finalize_does_not_cost_the_prefill(monkeypatch):
+    """The prefill is COMPLETE by then.
+
+    Letting a best-effort store reach ``_pipeline_step``'s handler would throw
+    away a full, correct cache and pay the whole prompt again.
+    """
+    _arm(monkeypatch)
+
+    def explode(self, batch_idx, meta, rungs):
+        raise RuntimeError("the vault fell over")
+
+    monkeypatch.setattr(PromptProcessingBatch, "_insert_vault_rungs", explode)
+    batch = _vault_batch(_lm(), _FakeVault(), LADDER)
+    digest, logprobs, steps = _drain(batch)
+    assert steps == PIPELINED_CHUNKS, "no re-prefill"
+    assert pr.METRICS.snapshot()["pp_used"] == 1
+    ref_digest, ref_lp, _ = _single_box_reference()
+    assert digest == ref_digest and mx.array_equal(logprobs, ref_lp)
+
+
+def test_with_no_vault_the_ladder_code_is_not_reached(monkeypatch):
+    """The default-off shape: no vault, no meta, no collapse, no counter."""
+    _arm(monkeypatch)
+    batch = _batch(_lm())
+    _drain(batch)
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_ladder_collapsed"] == 0 and snap["pp_ladder_rungs_skipped"] == 0
+    assert batch._pipeline_ladder is None
+
+
+# ---------------------------------- 6. A5: the session tier after a PP turn 1
+#
+# The rail on A5 that matters most in production: the multi-turn win
+# (MLX_VLM_APC_SAVE_SESSION, default ON) must survive a pipelined turn 1.  It
+# should, structurally -- the session rung is captured from the cache AFTER the
+# response finishes, downstream of everything the pipeline touches -- and this
+# is the measurement of "should".
+
+
+class _PickGen:
+    """Only what ``_vault_pick_for`` touches -- the same duck type
+    ``test_session_restore._Gen`` uses, which is why the method is called
+    unbound here rather than through a BatchGenerator nobody needs."""
+
+    def __init__(self, vault, model=None):
+        self.vault = vault
+        self.model = model if model is not None else _lm()
+        self.apc_manager = None
+
+    def _vault_prefix_trim_is_safe(self):
+        return True
+
+    def _apc_extra_hash(self, kw):
+        return 0
+
+
+def _turn1_cache(monkeypatch, *, pipelined):
+    """Turn 1's post-response cache: prompt + the token generate() produced."""
+    ctx = contextlib.nullcontext()
+    if pipelined:
+        _arm(monkeypatch)
+    else:
+        ctx = _pipeline_off()
+    with ctx:
+        batch = _batch(_lm())
+        while batch.needs_processing():
+            batch.prompt_step()
+        first = {}
+
+        def sampler(logprobs):
+            tok = mx.argmax(logprobs, axis=-1)
+            first["tok"] = tok
+            return tok
+
+        gen = batch.generate(sampler=sampler, stop_criteria=lambda t: False)
+        mx.eval(first["tok"])
+        used = batch._pipeline_declined and pipelined
+        assert not pipelined or pr.METRICS.snapshot()["pp_used"] == 1, used
+        return gen.prompt_cache, PROMPT + [int(first["tok"][0].item())]
+
+
+def test_a_pp_turn_1_leaves_the_session_tier_exactly_where_one_box_does(monkeypatch):
+    """Turn 2 must find the same rung, at the same depth, with the same bytes.
+
+    Two arms, identical but for the peer: capture the end-of-turn rung the way
+    ``BatchGenerator.capture_session`` does (``snapshot_prompt_cache_row`` ->
+    ``record_session_turn``), then ask the READ side -- ``_vault_pick_for``,
+    called unbound against a duck-typed generator exactly as the session tests
+    do -- what turn 2 gets.
+    """
+    from mlx_vlm import apc as _apc
+    from mlx_vlm import context_vault as cv
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    monkeypatch.setenv("MLX_VLM_APC_SAVE_SESSION", "1")
+    assert cv.session_tier_active()
+    turn2 = None
+    picks = {}
+    warm = {}
+    for arm in ("pipelined", "single_box"):
+        pr.METRICS.reset()
+        cache, key = _turn1_cache(monkeypatch, pipelined=arm == "pipelined")
+        vault = cv.ContextVault("identity-for-the-test", budget_bytes=1 << 30)
+        row = _apc.snapshot_prompt_cache_row(cache, 0)
+        assert row, "the session capture reads the row off the finished cache"
+        assert cv.record_session_turn(
+            vault, key, row, completed=True, session_id="conv-1", adopt=False
+        ), cv.session_skip_counts()
+
+        turn2 = key + [97, 98, 99]  # turn 1 plus the next user message
+        pick = BatchGenerator._vault_pick_for(_PickGen(vault), turn2, {}, None)
+        assert pick is not None, f"{arm}: turn 2 missed the session tier"
+        picks[arm] = {
+            "prefix_len": pick["prefix_len"],
+            "source": pick.get("source"),
+            "cached_tokens": pick["prefix_len"],
+        }
+        warm[arm] = _cache_digest(pick["warm_cache"])
+
+    assert picks["pipelined"] == picks["single_box"], picks
+    assert picks["pipelined"]["source"] == "vault-session"
+    # The rung sits at the cache's depth, which is the prompt: ``generate()``
+    # EMITS the first token, it does not forward it.  What matters here is not
+    # the number but that both arms produce the same one, and that it is deeper
+    # than the k*C rung the collapse keeps (32) -- so turn 2 restores the whole
+    # of turn 1 and prefills only the new user message.
+    assert picks["pipelined"]["prefix_len"] == len(PROMPT) > DEPTH
+    assert warm["pipelined"] == warm["single_box"], "the restored cache moved"
+
+
+def test_the_session_rung_is_not_the_collapsed_prefill_rung(monkeypatch):
+    """The two tiers are separate stores and the PP path must keep them so.
+
+    The collapse writes ONE prefill rung at ``k*C``; the session rung is written
+    at the end of the turn, at prompt+generated.  A turn-2 prompt is deeper than
+    both, so the pick must be the session one -- if the collapse had leaked into
+    the session trie, turn 2 would restore a rung 9 tokens shallower and
+    re-prefill the whole tail of turn 1.
+    """
+    from mlx_vlm import apc as _apc
+    from mlx_vlm import context_vault as cv
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    monkeypatch.setenv("MLX_VLM_APC_SAVE_SESSION", "1")
+    vault = cv.ContextVault("identity-for-the-test", budget_bytes=1 << 30)
+    _arm(monkeypatch)
+    batch = _vault_batch(_lm(), vault, LADDER)
+    while batch.needs_processing():
+        batch.prompt_step()
+    first = {}
+
+    def sampler(logprobs):
+        first["tok"] = mx.argmax(logprobs, axis=-1)
+        return first["tok"]
+
+    gen = batch.generate(sampler=sampler, stop_criteria=lambda t: False)
+    mx.eval(first["tok"])
+    key = PROMPT + [int(first["tok"][0].item())]
+    assert cv.record_session_turn(
+        vault,
+        key,
+        _apc.snapshot_prompt_cache_row(gen.prompt_cache, 0),
+        completed=True,
+        session_id="conv-1",
+        adopt=False,
+    )
+    turn2 = key + [97, 98, 99]
+    pick = BatchGenerator._vault_pick_for(_PickGen(vault, gen.model), turn2, {}, None)
+    assert pick is not None
+    assert pick["prefix_len"] == len(PROMPT) > DEPTH, "the session rung, not k*C"
+    assert pr.METRICS.snapshot()["pp_ladder_collapsed"] == 1
