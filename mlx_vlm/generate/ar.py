@@ -629,10 +629,10 @@ def generate_step(
         # R1.  ``_step`` above has already applied ``processors`` to the FIRST
         # bonus token; the list used to stop here, so every speculative token
         # after it decoded unconstrained.  It is now carried into the round
-        # loop, which threads a grammar processor through when
-        # MLX_VLM_SPEC_STRUCTURED=1 and refuses the shapes it cannot serve.
-        # With the toggle off the gate returns before it looks at the list, so
-        # this argument changes nothing and the off path is what shipped.
+        # loop, which threads a grammar processor through (the rail is ON by
+        # default since the LU panel) and refuses the shapes it cannot serve.
+        # With MLX_VLM_SPEC_STRUCTURED=0 the gate returns before it looks at the
+        # list, so this argument changes nothing and that path is base 71732451.
         yield from run_speculative_rounds(
             model,
             draft_model,
@@ -1755,8 +1755,9 @@ class SpeculativeGenerationBatch:
         self.draft_kind = draft_kind
         # R1: the batch path never handed these on at all -- ``PromptProcessingBatch``
         # simply did not pass ``logits_processors`` when it built this class.  They
-        # are carried now, and used only when MLX_VLM_SPEC_STRUCTURED is on; with
-        # the toggle off they are ignored exactly as they were before.
+        # are carried now, and used when the structured rail is on (the
+        # default); with MLX_VLM_SPEC_STRUCTURED=0 they are ignored exactly as
+        # they were before.
         self.logits_processors = logits_processors or []
         self.uids = list(uids)
         self._all_uids = list(uids)
@@ -1782,10 +1783,10 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
-        # With MLX_VLM_SPEC_STRUCTURED on, refuse an unsupported shape at
-        # construction rather than on the first ``next()``, so the request fails
-        # where the batch was admitted.  With the toggle off this returns
-        # without looking at the list.
+        # Refuse an unsupported STRUCTURED shape at construction rather than on
+        # the first ``next()``, so the request fails where the batch was
+        # admitted.  A request with no grammar processor, and any request at all
+        # under MLX_VLM_SPEC_STRUCTURED=0, returns from the gate untouched.
         if self.logits_processors:
             resolve_structured_processor(
                 self.logits_processors,

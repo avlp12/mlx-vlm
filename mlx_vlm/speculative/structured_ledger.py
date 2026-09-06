@@ -63,11 +63,15 @@ import numpy as np
 
 logger = logging.getLogger("mlx_vlm.speculative.structured_ledger")
 
-#: D1.  ``0`` (the default) keeps today's refusal byte-identical; ``1`` opts the
-#: structured + speculative rail in.  Empty/whitespace counts as unset; an
-#: unparseable value warns once per distinct value and falls back to the default.
+#: D1.  ``1`` is the default as of the LU-panel promotion: text sha identical to
+#: the AR+mask reference on 4/4 prompts, 2.2x per-token, and the natural (no
+#: response_format) panel unchanged with the rail on.  ``0`` restores the
+#: pre-promotion behaviour exactly -- the server's original refusal message and
+#: a round loop byte-for-byte the code at base 71732451.  Empty/whitespace counts
+#: as unset; an unparseable value warns once per distinct value and falls back to
+#: the default.
 SPEC_STRUCTURED_ENV = "MLX_VLM_SPEC_STRUCTURED"
-SPEC_STRUCTURED_DEFAULT = False
+SPEC_STRUCTURED_DEFAULT = True
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
 _FALSE_VALUES = ("0", "false", "no", "off")
@@ -92,7 +96,7 @@ def _env_value(environ, name: str) -> Optional[str]:
 
 
 def spec_structured_enabled(env: Optional[dict] = None) -> bool:
-    """Is the structured x speculative rail switched on?  Default OFF."""
+    """Is the structured x speculative rail switched on?  Default ON."""
     environ = os.environ if env is None else env
     raw = _env_value(environ, SPEC_STRUCTURED_ENV)
     if raw is None:
@@ -109,7 +113,7 @@ def spec_structured_enabled(env: Optional[dict] = None) -> bool:
             "Ignoring invalid %s=%r; using %r. Valid values: 0/1.",
             SPEC_STRUCTURED_ENV,
             raw,
-            "0",
+            "1" if SPEC_STRUCTURED_DEFAULT else "0",
         )
     return SPEC_STRUCTURED_DEFAULT
 
@@ -271,15 +275,23 @@ def resolve_structured_processor(
     there is nothing to thread.
 
     THE TOGGLE IS CHECKED FIRST, BEFORE THE PROCESSORS ARE EVEN LOOKED AT.
-    With ``MLX_VLM_SPEC_STRUCTURED`` off -- the default -- this returns ``None``
-    unconditionally and every speculative path is byte-for-byte the code that
-    shipped: no ledger is constructed, nothing is inspected, and nothing new can
-    raise.  R1's silent partial constraint is still there in that configuration,
-    and deliberately so: the toggle is the only thing that changes behaviour.
+    With ``MLX_VLM_SPEC_STRUCTURED=0`` this returns ``None`` unconditionally and
+    every speculative path is byte-for-byte the code at base 71732451: no ledger
+    is constructed, nothing is inspected, and nothing new can raise.  R1's silent
+    partial constraint is still there in that configuration, and deliberately so
+    -- ``0`` is the escape hatch back to the pre-promotion server.
 
-    With the toggle on, exactly one grammar processor is threaded and every
-    other shape refuses by name (a non-grammar processor alongside it, more than
-    one grammar, MTP, a non-DFlash drafter, B > 1).
+    With the rail on (the default), exactly one grammar processor is threaded and
+    every other STRUCTURED shape refuses by name: a non-grammar processor
+    alongside the grammar, more than one grammar, MTP, a non-DFlash drafter,
+    B > 1.
+
+    A request with NO grammar processor is not a structured request, so it is
+    none of this feature's business: penalty-only processors return ``None`` and
+    keep whatever the speculative path did with them before.  That carve-out is
+    load-bearing now that the default is on -- without it every
+    ``repetition_penalty`` request served with a draft model would start failing,
+    which is not what the panel promoted.
     """
     # D1: the off path must not differ from base in ANY observable way, so the
     # environment decides before anything else happens.
@@ -291,21 +303,25 @@ def resolve_structured_processor(
         return None
 
     grammar = [p for p in processors if is_grammar_processor(_unwrap_thinking(p)[0])]
+    if not grammar:
+        return None
+
     extra = [p for p in processors if p not in grammar]
     if extra:
         raise StructuredSpeculationRefused(
-            f"{call_site}: {SPEC_STRUCTURED_ENV}=1 threads a grammar processor "
-            "through the speculative round loop, but this request also carries "
+            f"{call_site}: the structured speculative rail threads a grammar "
+            "processor through the round loop, but this request also carries "
             f"{len(extra)} non-grammar logits processor(s) "
             f"({', '.join(sorted({type(p).__name__ for p in extra}))}); those "
             "have no block interface and would be silently dropped. Drop the "
             "repetition/presence/frequency/logit-bias penalties or the draft "
-            "model."
+            f"model, or set {SPEC_STRUCTURED_ENV}=0 to refuse structured "
+            "requests outright."
         )
     if len(grammar) != 1:
         raise StructuredSpeculationRefused(
-            f"{call_site}: {SPEC_STRUCTURED_ENV}=1 supports exactly one grammar "
-            f"processor per sequence; got {len(grammar)}."
+            f"{call_site}: the structured speculative rail supports exactly one "
+            f"grammar processor per sequence; got {len(grammar)}."
         )
 
     # D7: MTP's fast path emits tokens without target logits at every position,
@@ -314,14 +330,14 @@ def resolve_structured_processor(
     if draft_kind == "mtp":
         raise StructuredSpeculationRefused(
             f"{call_site}: structured response_format is not supported with MTP "
-            f"speculative decoding ({SPEC_STRUCTURED_ENV}=1 covers DFlash only "
-            "in v1). MTP's draft fast path produces tokens without per-position "
-            "target logits, so the grammar mask has nothing to apply to."
+            "speculative decoding (the structured rail covers DFlash only in v1). "
+            "MTP's draft fast path produces tokens without per-position target "
+            "logits, so the grammar mask has nothing to apply to."
         )
     if draft_kind != "dflash":
         raise StructuredSpeculationRefused(
-            f"{call_site}: structured response_format with {SPEC_STRUCTURED_ENV}"
-            f"=1 supports draft_kind='dflash' only in v1; got {draft_kind!r}."
+            f"{call_site}: the structured speculative rail supports "
+            f"draft_kind='dflash' only in v1; got {draft_kind!r}."
         )
 
     # D3: the block ledger, the fast-forward draft and the position-0 drafter
@@ -329,10 +345,9 @@ def resolve_structured_processor(
     # constrain row 0 and leave the rest of the batch free.
     if int(batch_size) != 1:
         raise StructuredSpeculationRefused(
-            f"{call_site}: structured response_format with {SPEC_STRUCTURED_ENV}"
-            f"=1 supports batch size 1 only in v1; got batch_size={int(batch_size)}. "
-            "Serve the structured request on its own batch or unset "
-            f"{SPEC_STRUCTURED_ENV}."
+            f"{call_site}: the structured speculative rail supports batch size 1 "
+            f"only in v1; got batch_size={int(batch_size)}. Serve the structured "
+            f"request on its own batch, or set {SPEC_STRUCTURED_ENV}=0."
         )
 
     return grammar[0]

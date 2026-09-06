@@ -50,7 +50,12 @@ from ..sampling_coupling import (
     sample_top_p_token_order,
     sampled_coupling_enabled,
 )
-from ..speculative.structured_ledger import spec_structured_enabled
+from ..speculative.structured_ledger import (
+    SPEC_STRUCTURED_ENV,
+    StructuredSpeculationRefused,
+    resolve_structured_processor,
+    spec_structured_enabled,
+)
 from ..speculative.utils import (
     PrefillHiddenAccumulator,
     batched_draft_enabled,
@@ -1611,18 +1616,37 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        # D1.  With MLX_VLM_SPEC_STRUCTURED unset or 0 this refusal, and its
-        # message, are byte-identical to what shipped.  With the toggle on the
-        # request proceeds and the round loop's own gate decides -- it refuses
-        # loudly for B > 1 (D3), for MTP (D7), and for any non-grammar processor.
-        if (
-            self.draft_model is not None
-            and args.logits_processors is not None
-            and not spec_structured_enabled()
-        ):
-            raise ValueError(
-                "Structured response_format is not supported with speculative decoding."
+        # D1.  The structured x speculative rail is ON by default since the LU
+        # panel (text sha 4/4 identical to the AR+mask reference, 2.2x per
+        # token, natural panel unchanged).  MLX_VLM_SPEC_STRUCTURED=0 is the
+        # escape hatch and restores the pre-promotion refusal, message and all.
+        if self.draft_model is not None and args.logits_processors is not None:
+            if not spec_structured_enabled():
+                raise ValueError(
+                    "Structured response_format is not supported with speculative decoding."
+                )
+            # Rail on: refuse the drafter kinds it does not cover, by name and
+            # here -- at the request, not two layers down on the first decode.
+            # ``resolve_structured_processor`` owns the vocabulary (D7 for MTP,
+            # the generic one for eagle3/lookup); B > 1 and grammar+penalty are
+            # still checked at batch admission, where the real shapes are known.
+            resolve_structured_processor(
+                [args.logits_processors],
+                batch_size=1,
+                draft_kind=self.draft_kind,
+                call_site="ResponseGenerator.generate",
             )
+            # v1 was measured on the continuous-batching loop only.  The legacy
+            # dflash arm (MLX_VLM_DFLASH_CONTINUOUS_BATCHING=0) is a control arm
+            # for a different A/B and was never on the structured panel.
+            if not _uses_continuous_batching_loop(self.draft_kind):
+                raise StructuredSpeculationRefused(
+                    "ResponseGenerator.generate: the structured speculative rail "
+                    "is served through the continuous-batching loop, which "
+                    "MLX_VLM_DFLASH_CONTINUOUS_BATCHING=0 turns off for dflash. "
+                    "Unset that variable to serve structured requests, or set "
+                    f"{SPEC_STRUCTURED_ENV}=0 to refuse them."
+                )
         if self.draft_model is not None and args.thinking_budget is not None:
             raise ValueError(
                 "thinking_budget is not supported with speculative decoding in the server."

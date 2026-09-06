@@ -7,15 +7,20 @@ request's logits processors to the FIRST bonus token and then handed the round
 loop nothing, and ``PromptProcessingBatch`` did not pass ``logits_processors``
 to ``SpeculativeGenerationBatch`` at all.  A structured request served with a
 draft model therefore emitted one constrained token followed by an unconstrained
-stream -- silently.  With ``MLX_VLM_SPEC_STRUCTURED=1`` a grammar processor is
-now threaded through the round loop and the shapes that cannot be served refuse
-by name.
+stream -- silently.  A grammar processor is now threaded through the round loop
+and the shapes that cannot be served refuse by name.
 
-The toggle is the ONLY thing that changes behaviour.  With it off -- the default
--- every speculative path is the code that shipped at base 71732451: the gate
-returns before it looks at the processor list, no ledger is built, and nothing
-new can raise.  ``test_toggle_off_*`` are the guards on that, and the strongest
-of them compares emitted token streams, not exception types.
+The rail is ON by default as of the LU-panel promotion (text sha 4/4 identical
+to the AR+mask reference, 2.2x per token, natural panel unchanged).
+``MLX_VLM_SPEC_STRUCTURED=0`` is the only escape hatch, and it is exact: the
+gate returns before it looks at the processor list, no ledger is built, nothing
+new can raise, and the server's original refusal message comes back verbatim.
+``test_toggle_off_*`` are the guards on that, and the strongest of them compare
+emitted token streams, not exception types.
+
+A request with no grammar processor is not a structured request: penalty-only
+processors pass through the gate untouched in either configuration, so the
+promotion does not turn ``repetition_penalty`` + a draft model into a failure.
 
 Everything below runs on stub targets and a ``StubLedger`` -- a scripted
 legal-set schedule with the same interface as the llguidance-backed ledger -- so
@@ -268,23 +273,29 @@ def _all_allow(prefix):
 # --------------------------------------------------------------------------
 # D1 -- the toggle
 # --------------------------------------------------------------------------
-def test_the_toggle_is_off_by_default_and_empty_counts_as_unset():
-    assert spec_structured_enabled({}) is False
-    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: ""}) is False
-    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "   "}) is False
-    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "0"}) is False
-    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "off"}) is False
+def test_the_rail_is_on_by_default_and_empty_counts_as_unset():
+    """Promoted on the LU panel: unset means ON.  Only an explicit falsy value
+    turns it off, and empty/whitespace is still "unset", not "off"."""
+    assert spec_structured_enabled({}) is True
+    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: ""}) is True
+    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "   "}) is True
     assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "1"}) is True
     assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "TRUE"}) is True
     assert spec_structured_enabled({SPEC_STRUCTURED_ENV: " on "}) is True
+    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "0"}) is False
+    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "off"}) is False
+    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: " FALSE "}) is False
+    assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "no"}) is False
 
 
-def test_an_invalid_toggle_warns_once_not_per_request(caplog):
+def test_an_invalid_toggle_warns_once_and_falls_back_to_the_default(caplog):
     with caplog.at_level("WARNING", logger="mlx_vlm.speculative.structured_ledger"):
         for _ in range(5):
-            assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "maybe"}) is False
+            assert spec_structured_enabled({SPEC_STRUCTURED_ENV: "maybe"}) is True
     warnings = [r for r in caplog.records if "maybe" in r.getMessage()]
     assert len(warnings) == 1
+    # the warning has to name the value it actually fell back to
+    assert "'1'" in warnings[0].getMessage()
 
 
 # --------------------------------------------------------------------------
@@ -318,15 +329,15 @@ def test_no_processors_means_nothing_to_thread_and_no_refusal():
 
 
 def test_the_toggle_off_gate_never_raises_whatever_it_is_handed(monkeypatch):
-    """D1's hard rule: toggle off == the code that shipped.
+    """D1's hard rule: ``MLX_VLM_SPEC_STRUCTURED=0`` == the code that shipped.
 
-    Every shape that refuses with the toggle on -- a grammar processor, a
-    penalty, both, B > 1, MTP, eagle3 -- must pass straight through here and
-    return ``None``, so the round loop takes exactly the branch it took at base
+    Every shape that refuses with the rail on -- a grammar processor, a penalty,
+    both, B > 1, MTP, eagle3 -- must pass straight through here and return
+    ``None``, so the round loop takes exactly the branch it took at base
     71732451.  (R1's silent partial constraint is still there in that
-    configuration; the toggle is the only thing that changes behaviour.)
+    configuration; the variable is the only thing that changes behaviour.)
     """
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "0")
 
     def penalty(input_ids, logits):  # pragma: no cover - never called
         return logits
@@ -346,9 +357,10 @@ def test_the_toggle_off_gate_does_not_even_look_at_the_processors(monkeypatch):
     """Not just "does not raise" -- does not touch them.
 
     A processor whose attribute access explodes must survive the gate, which is
-    the mechanical statement of "no new code runs when the toggle is off".
+    the mechanical statement of "no new code runs under
+    ``MLX_VLM_SPEC_STRUCTURED=0``".
     """
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "0")
 
     class _Landmine:
         def __getattr__(self, name):  # pragma: no cover - the point is it never runs
@@ -357,17 +369,26 @@ def test_the_toggle_off_gate_does_not_even_look_at_the_processors(monkeypatch):
     assert _refusal(processors=[_Landmine()]) is None
 
 
-def test_r1_with_the_toggle_on_a_penalty_only_request_is_refused(monkeypatch):
-    """With the rail ON the penalties still have no block interface, so they
-    refuse by name instead of being dropped into a partially-constrained
-    stream."""
-    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "1")
+def test_a_penalty_only_request_is_not_this_features_business(monkeypatch):
+    """Load-bearing now that the rail is ON by default.
+
+    A request with no grammar processor is not a structured request, so the gate
+    hands it back untouched and it keeps whatever the speculative path did with
+    it before.  Refusing here would turn every ``repetition_penalty`` request
+    served with a draft model into a hard failure, which is not what the panel
+    promoted -- only ``grammar + penalty`` refuses.
+    """
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    assert spec_structured_enabled() is True
 
     def penalty(input_ids, logits):  # pragma: no cover - never called
         return logits
 
-    with pytest.raises(StructuredSpeculationRefused):
-        _refusal(processors=[penalty])
+    assert _refusal(processors=[penalty]) is None
+    assert _refusal(processors=[penalty, penalty]) is None
+    # and it stays out of the way for every drafter kind and batch size
+    assert _refusal(processors=[penalty], draft_kind="mtp") is None
+    assert _refusal(processors=[penalty], batch_size=8) is None
 
 
 def test_b_greater_than_one_is_refused_by_name(monkeypatch):
@@ -447,12 +468,13 @@ def _run_entry_point(
 def test_toggle_off_a_penalty_processor_emits_exactly_the_base_stream(monkeypatch):
     """THE regression guard the whole gate exists for.
 
-    With ``MLX_VLM_SPEC_STRUCTURED`` unset, ``generate_step``'s speculative
-    branch handed a penalty processor now emits the same tokens as the same run
-    with no processor at all -- which is what base 71732451 does, because it
-    dropped the list here.  No refusal, no ledger, no behaviour difference.
+    With ``MLX_VLM_SPEC_STRUCTURED=0``, ``generate_step``'s speculative branch
+    handed a penalty processor -- or a grammar one -- emits the same tokens as
+    the same run with no processor at all, which is what base 71732451 does,
+    because it dropped the list here.  No refusal, no ledger, no behaviour
+    difference.  This is the escape hatch the promotion has to keep intact.
     """
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "0")
 
     def penalty(input_ids, logits):  # pragma: no cover - never called
         return logits
@@ -474,7 +496,7 @@ def test_toggle_off_a_penalty_processor_emits_exactly_the_base_stream(monkeypatc
 
 def test_toggle_off_the_batch_path_emits_exactly_the_base_stream(monkeypatch):
     """Same equivalence on ``run_speculative_server_rounds`` (the batch side)."""
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "0")
 
     def penalty(input_ids, logits):  # pragma: no cover - never called
         return logits
@@ -529,7 +551,7 @@ def _speculative_batch(processors, **overrides):
 
 
 def test_toggle_off_the_batch_constructor_accepts_anything(monkeypatch):
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "0")
 
     def penalty(input_ids, logits):  # pragma: no cover - never called
         return logits
@@ -537,6 +559,19 @@ def test_toggle_off_the_batch_constructor_accepts_anything(monkeypatch):
     assert _speculative_batch([[_FakeGrammarProcessor()]]) is not None
     assert _speculative_batch([[penalty]]) is not None
     assert _speculative_batch([[_FakeGrammarProcessor()]], draft_kind="mtp") is not None
+
+
+def test_by_default_the_batch_constructor_refuses_an_unsupported_drafter():
+    """The mirror image with the rail on (no env set at all)."""
+    with pytest.raises(StructuredSpeculationRefused):
+        _speculative_batch([[_FakeGrammarProcessor()]], draft_kind="mtp")
+
+
+def test_by_default_a_penalty_only_batch_is_still_admitted():
+    def penalty(input_ids, logits):  # pragma: no cover - never called
+        return logits
+
+    assert _speculative_batch([[penalty]]) is not None
 
 
 def test_the_single_stream_entry_point_refuses_an_unsupported_shape(monkeypatch):
@@ -589,42 +624,79 @@ def test_speculative_generation_batch_refuses_at_construction(monkeypatch):
         )
 
 
-def _server_stub(draft_model):
+def _server_stub(draft_model, draft_kind="dflash"):
     return SimpleNamespace(
         wait_until_ready=lambda: None,
         draft_model=draft_model,
+        draft_kind=draft_kind,
+    )
+
+
+def _server_generate(stub, args):
+    return server_generation.ResponseGenerator.generate(stub, "hello", args=args)
+
+
+def _grammar_args():
+    return server_generation.GenerationArguments(
+        max_tokens=8, logits_processors=[_FakeGrammarProcessor()]
     )
 
 
 def test_the_server_refusal_message_is_byte_identical_with_the_toggle_off(monkeypatch):
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
-    args = server_generation.GenerationArguments(
-        max_tokens=8, logits_processors=[_FakeGrammarProcessor()]
-    )
+    """``MLX_VLM_SPEC_STRUCTURED=0`` restores the pre-promotion server exactly,
+    message included -- clients that key on the string keep working."""
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "0")
     with pytest.raises(ValueError) as excinfo:
-        server_generation.ResponseGenerator.generate(
-            _server_stub(SimpleNamespace()), "hello", args=args
-        )
+        _server_generate(_server_stub(SimpleNamespace()), _grammar_args())
     assert str(excinfo.value) == (
         "Structured response_format is not supported with speculative decoding."
     )
 
 
-def test_the_server_refusal_lifts_with_the_toggle_on(monkeypatch):
-    """With the toggle on the request must get PAST the structured refusal.
+def test_the_server_serves_structured_speculative_requests_by_default(monkeypatch):
+    """The promotion: a dflash server takes a structured request with no env set.
 
-    It still fails later (the stub is not a real server), but the failure must
-    not be the structured/speculative refusal any more.
+    It still fails further in (the stub is not a real server), but it must be
+    past the structured gate -- neither the old refusal nor a new one.
     """
-    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "1")
-    args = server_generation.GenerationArguments(
-        max_tokens=8, logits_processors=[_FakeGrammarProcessor()]
-    )
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
     with pytest.raises(Exception) as excinfo:
-        server_generation.ResponseGenerator.generate(
-            _server_stub(SimpleNamespace()), "hello", args=args
-        )
-    assert "not supported with speculative decoding" not in str(excinfo.value)
+        _server_generate(_server_stub(SimpleNamespace()), _grammar_args())
+    message = str(excinfo.value)
+    assert not isinstance(excinfo.value, StructuredSpeculationRefused)
+    assert "not supported with speculative decoding" not in message
+
+
+@pytest.mark.parametrize("draft_kind", ["mtp", "eagle3", "lookup"])
+def test_the_server_refuses_an_unsupported_drafter_kind_by_name(
+    monkeypatch, draft_kind
+):
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    with pytest.raises(StructuredSpeculationRefused) as excinfo:
+        _server_generate(_server_stub(SimpleNamespace(), draft_kind), _grammar_args())
+    message = str(excinfo.value)
+    if draft_kind == "mtp":
+        assert "MTP" in message
+    else:
+        assert repr(draft_kind) in message
+
+
+def test_the_server_refuses_the_legacy_dflash_arm_by_name(monkeypatch):
+    """v1 was measured on the continuous-batching loop only; the
+    MLX_VLM_DFLASH_CONTINUOUS_BATCHING=0 control arm is not on that panel."""
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    monkeypatch.setenv("MLX_VLM_DFLASH_CONTINUOUS_BATCHING", "0")
+    assert server_generation._uses_continuous_batching_loop("dflash") is False
+    with pytest.raises(StructuredSpeculationRefused) as excinfo:
+        _server_generate(_server_stub(SimpleNamespace()), _grammar_args())
+    assert "MLX_VLM_DFLASH_CONTINUOUS_BATCHING" in str(excinfo.value)
+
+
+def test_a_server_without_a_draft_model_is_untouched_by_any_of_this(monkeypatch):
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    with pytest.raises(Exception) as excinfo:
+        _server_generate(_server_stub(None), _grammar_args())
+    assert not isinstance(excinfo.value, StructuredSpeculationRefused)
 
 
 # --------------------------------------------------------------------------
