@@ -204,32 +204,48 @@ def test_state_carries_across_chunks():
     Fused-split-vs-fused-whole bit-equality is the wrong contract: the eager
     KDA recurrence itself is not bit-exact across a chunk split on Metal (only
     on CPU do the two decompositions agree bitwise at these shapes -- see the
-    ``ON_GPU`` branch of ``test_glm5_chunked_spec_prefill.py::_assert_row_matches``
-    and its ``CACHE_DRIFT_TOL = 2e-06``, worst measured 9.54e-07 on an M3 Ultra,
-    mlx 0.32.1.dev20260902, splitting this same KDA scan at a chunk boundary).
+    ``ON_GPU`` branch of ``test_glm5_chunked_spec_prefill.py::_assert_row_matches``,
+    which documents this same scan-split drift for the cache-state arrays).
     Demanding fused-split == fused-whole bit-exactly would therefore fail on a
     CORRECT kernel, for the same float non-associativity reason, not a bug.
 
     So the load-bearing check here is: fused split == eager split, run chunk
     for chunk with fresh same-seed caches, bit-exact (this kernel's actual
     claim -- see the module docstring -- is parity with the eager chain it
-    replaces, at whatever chunking the caller uses). Fused-split-vs-fused-whole
-    is kept only as a loose secondary guard against a gross chunk-carry bug
-    (state or window dropped between chunks), at the same drift bound the
-    sibling file established for this exact phenomenon -- confirmed by direct
-    measurement (see below) to be exactly 0 on CPU at this config, i.e. this
-    tolerance is inert here and only matters on the Metal box this test
-    actually runs on.
+    replaces, at whatever chunking the caller uses).
+
+    Fused-split-vs-fused-whole is kept only as a loose secondary guard against
+    a gross chunk-carry bug (state or window dropped between chunks). It is
+    NOT bounded by a fixed absolute tolerance borrowed from the sibling file's
+    ``CACHE_DRIFT_TOL``: that bound was measured on float32 cache-state arrays,
+    and this test's ``y`` is bf16, where one ulp is already ~4e-3 relative --
+    any scan-split drift at all can flip a bf16 rounding decision, so a fixed
+    ``2e-6`` absolute tolerance can never hold here and would not be measuring
+    anything meaningful. Instead the bound is relative to eager's OWN
+    split-vs-whole drift, measured inside this test on the same inputs: the
+    fused kernel is allowed up to 4x eager's split-vs-whole drift (headroom
+    for the fused kernel's independent, differently-ordered summation), floored
+    at one bf16 ulp of the output magnitude (below one ulp, bf16 cannot
+    represent the difference at all, so a tighter floor would demand precision
+    the dtype does not have -- this matters on CPU, where eager's own drift
+    measures exactly 0 at this config, so the floor is what keeps the check
+    non-vacuous there).
     """
     config = _config()
     layer = _layer(config, seed=7)
     mx.random.seed(77)
     x = (mx.random.normal((1, 128, config.hidden_size)) * 0.5).astype(mx.bfloat16)
-    whole, split, eager_split = _cache(seed=7), _cache(seed=7), _cache(seed=7)
+    whole, split, eager_whole, eager_split = (
+        _cache(seed=7),
+        _cache(seed=7),
+        _cache(seed=7),
+        _cache(seed=7),
+    )
 
     y_whole = _run(layer, x, whole, on=True)
     y_a = _run(layer, x[:, :64], split, on=True)
     y_b = _run(layer, x[:, 64:], split, on=True)
+    y_ew = _run(layer, x, eager_whole, on=False)
     y_ea = _run(layer, x[:, :64], eager_split, on=False)
     y_eb = _run(layer, x[:, 64:], eager_split, on=False)
 
@@ -245,21 +261,38 @@ def test_state_carries_across_chunks():
         mx.array_equal(a, b).item() for a, b in zip(split.state, eager_split.state)
     ), "fused cache state after two chunks differs from eager cache state"
 
-    # Secondary, loose guard: fused-split vs fused-whole should be close even
-    # though it is not the load-bearing contract above. ``KDA_SPLIT_DRIFT_TOL``
-    # is the sibling test file's measured Metal bound for splitting this same
-    # scan at a chunk boundary (test_glm5_chunked_spec_prefill.py), not a value
-    # invented here; measured directly against THIS test's own config on CPU it
-    # is 0 (bitwise), consistent with that file's note that CPU does not show
-    # the drift Metal does -- so this assertion is a no-op safety net on CPU
-    # and only exercises the tolerance on the GPU box.
-    KDA_SPLIT_DRIFT_TOL = 2e-06
-    assert mx.allclose(
-        y_split.astype(mx.float32),
-        y_whole.astype(mx.float32),
-        atol=KDA_SPLIT_DRIFT_TOL,
-        rtol=0,
-    ).item(), "fused split vs fused whole exceeded the KDA scan-split drift bound"
+    # Secondary, loose guard against a gross chunk-carry bug -- see the
+    # docstring for why the bound is relative to eager's own split-vs-whole
+    # drift (measured here, on the same inputs, in float32) rather than a
+    # fixed absolute tolerance, which cannot mean anything for a bf16 output.
+    y_split_f32 = y_split.astype(mx.float32)
+    y_whole_f32 = y_whole.astype(mx.float32)
+    d_eager = float(
+        mx.max(mx.abs(y_eager_split.astype(mx.float32) - y_ew.astype(mx.float32)))
+    )
+    d_fused = float(mx.max(mx.abs(y_split_f32 - y_whole_f32)))
+    BF16_UNIT_ROUNDOFF = 2.0**-8  # bf16: 8 significand bits (7 stored + hidden)
+    max_abs_y = float(
+        mx.max(
+            mx.abs(
+                mx.stack(
+                    [
+                        y_split_f32,
+                        y_whole_f32,
+                        y_eager_split.astype(mx.float32),
+                        y_ew.astype(mx.float32),
+                    ]
+                )
+            )
+        )
+    )
+    one_bf16_ulp = BF16_UNIT_ROUNDOFF * max_abs_y
+    tol = max(d_eager * 4.0, one_bf16_ulp)
+    assert d_fused <= tol, (
+        f"fused split vs fused whole drifted {d_fused} beyond {tol} "
+        f"(4x eager's own split-vs-whole drift {d_eager}, floored at one bf16 "
+        f"ulp {one_bf16_ulp} of max|y| {max_abs_y})"
+    )
 
 
 @on_gpu
