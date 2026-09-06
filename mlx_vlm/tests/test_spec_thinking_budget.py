@@ -962,14 +962,51 @@ class TestThinkingBudgetRefusalNarrowing:
             gen.generate("hi", args=args)
         assert "thinking_budget" not in str(excinfo.value)
 
-    def test_the_structured_refusal_is_untouched(self, monkeypatch):
+    def test_the_structured_toggle_off_still_refuses(self, monkeypatch):
+        """The two rails share a predicate; neither may eat the other's refusal.
+
+        ``MLX_VLM_SPEC_STRUCTURED=0`` restores the pre-promotion structured
+        refusal verbatim, and the thinking budget must not have moved it.
+        """
         monkeypatch.delenv("MLX_VLM_DFLASH_CONTINUOUS_BATCHING", raising=False)
+        monkeypatch.setenv("MLX_VLM_SPEC_STRUCTURED", "0")
         gen = _generator_with_draft_kind("dflash")
         args = server_generation.GenerationArguments(
             max_tokens=8, logits_processors=[lambda toks, logits: logits]
         )
         with pytest.raises(ValueError, match="Structured response_format"):
             gen.generate("hi", args=args)
+
+    def test_the_promoted_structured_rail_is_not_refused(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_DFLASH_CONTINUOUS_BATCHING", raising=False)
+        monkeypatch.delenv("MLX_VLM_SPEC_STRUCTURED", raising=False)
+        gen = _generator_with_draft_kind("dflash")
+        args = server_generation.GenerationArguments(
+            max_tokens=8, logits_processors=[lambda toks, logits: logits]
+        )
+        with pytest.raises(Exception) as excinfo:
+            gen.generate("hi", args=args)
+        assert "Structured response_format" not in str(excinfo.value), (
+            "the rail is ON by default since 943b0cb0; the fake generator must "
+            "die further in, not on the pre-promotion refusal"
+        )
+
+    def test_a_budget_and_a_grammar_can_be_requested_together(self, monkeypatch):
+        """Both features live in the continuous-batching loop, so neither gate
+        may refuse a request that carries the other's field."""
+        monkeypatch.delenv("MLX_VLM_DFLASH_CONTINUOUS_BATCHING", raising=False)
+        monkeypatch.delenv("MLX_VLM_SPEC_STRUCTURED", raising=False)
+        gen = _generator_with_draft_kind("dflash")
+        args = server_generation.GenerationArguments(
+            max_tokens=8,
+            thinking_budget=4,
+            logits_processors=[lambda toks, logits: logits],
+        )
+        with pytest.raises(Exception) as excinfo:
+            gen.generate("hi", args=args)
+        message = str(excinfo.value)
+        assert "Structured response_format" not in message
+        assert "thinking_budget" not in message
 
 
 # ==========================================================================

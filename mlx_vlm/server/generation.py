@@ -1667,7 +1667,6 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        self._apply_always_on_thinking(args)
         # D1.  The structured x speculative rail is ON by default since the LU
         # panel (text sha 4/4 identical to the AR+mask reference, 2.2x per
         # token, natural panel unchanged).  MLX_VLM_SPEC_STRUCTURED=0 is the
@@ -1729,6 +1728,10 @@ class ResponseGenerator:
         # CPU preprocessing and thinking-token resolution share tokenizer state.
         # Keep both on the caller side and serialize them so the GPU worker never
         # races request threads through the mutable fast-tokenizer backend.
+        # After the refusals, before the criteria that reads it: a request that
+        # is going to be refused outright never needed a thinking decision, and
+        # the refusals must stay reachable without a fully built generator.
+        self._apply_always_on_thinking(args)
         tokenizer_lock = getattr(self, "_tokenizer_lock", None)
         with tokenizer_lock if tokenizer_lock is not None else nullcontext():
             raw_inputs = self._preprocess_request(prompt, images, audio, videos)
