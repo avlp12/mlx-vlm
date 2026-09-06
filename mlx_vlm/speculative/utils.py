@@ -487,13 +487,17 @@ def _resolve_structured_ledger(
     draft_kind: Optional[str],
     call_site: str,
 ):
-    """D1/D2/D3/D7 + R1 gate for one speculative entry point.
+    """D1/D2/D3/D7 gate for one speculative entry point.
 
     ``structured_ledger`` is the test/caller injection hook: when a ledger is
     handed in directly it is used as is (a ``StubLedger`` in the CPU tests).
-    Otherwise a request's ``logits_processors`` either build one or -- with the
-    toggle off, or on an unsupported shape -- raise.  What must never happen is
-    what happens today: the list silently disappearing here.
+    Otherwise a request's ``logits_processors`` build one when
+    MLX_VLM_SPEC_STRUCTURED is on, or refuse if the shape is unsupported.
+
+    With the toggle off this returns ``None`` without inspecting the list, so
+    the round loop runs exactly the code it ran before this feature existed --
+    including the pre-existing R1 behaviour of ignoring the processors.  The
+    toggle is the only thing that changes what a request does.
     """
     if structured_ledger is not None:
         return structured_ledger

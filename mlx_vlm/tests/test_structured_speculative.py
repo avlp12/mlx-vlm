@@ -7,8 +7,15 @@ request's logits processors to the FIRST bonus token and then handed the round
 loop nothing, and ``PromptProcessingBatch`` did not pass ``logits_processors``
 to ``SpeculativeGenerationBatch`` at all.  A structured request served with a
 draft model therefore emitted one constrained token followed by an unconstrained
-stream -- silently.  It is now either threaded (``MLX_VLM_SPEC_STRUCTURED=1``)
-or refused.
+stream -- silently.  With ``MLX_VLM_SPEC_STRUCTURED=1`` a grammar processor is
+now threaded through the round loop and the shapes that cannot be served refuse
+by name.
+
+The toggle is the ONLY thing that changes behaviour.  With it off -- the default
+-- every speculative path is the code that shipped at base 71732451: the gate
+returns before it looks at the processor list, no ledger is built, and nothing
+new can raise.  ``test_toggle_off_*`` are the guards on that, and the strongest
+of them compares emitted token streams, not exception types.
 
 Everything below runs on stub targets and a ``StubLedger`` -- a scripted
 legal-set schedule with the same interface as the llguidance-backed ledger -- so
@@ -310,23 +317,51 @@ def test_no_processors_means_nothing_to_thread_and_no_refusal():
     assert _refusal(processors=[None]) is None
 
 
-def test_r1_processors_with_the_toggle_off_raise_instead_of_being_dropped(monkeypatch):
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
-    with pytest.raises(StructuredSpeculationRefused) as excinfo:
-        _refusal()
-    message = str(excinfo.value)
-    assert SPEC_STRUCTURED_ENV in message
-    assert "first bonus token" in message
+def test_the_toggle_off_gate_never_raises_whatever_it_is_handed(monkeypatch):
+    """D1's hard rule: toggle off == the code that shipped.
 
-
-def test_r1_a_penalty_only_request_is_refused_too(monkeypatch):
-    """BEHAVIOUR CHANGE.  repetition/presence/frequency penalties and logit_bias
-    were dropped by the same silent path as the grammar, so a draft-model
-    request that asked for them got exactly one penalised token.  They now
-    refuse.  Requests that ask for none of them build an EMPTY processor list
-    and are untouched -- that is the ordinary serving path.
+    Every shape that refuses with the toggle on -- a grammar processor, a
+    penalty, both, B > 1, MTP, eagle3 -- must pass straight through here and
+    return ``None``, so the round loop takes exactly the branch it took at base
+    71732451.  (R1's silent partial constraint is still there in that
+    configuration; the toggle is the only thing that changes behaviour.)
     """
     monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+
+    def penalty(input_ids, logits):  # pragma: no cover - never called
+        return logits
+
+    assert _refusal() is None
+    assert _refusal(processors=[penalty]) is None
+    assert _refusal(processors=[penalty, _FakeGrammarProcessor()]) is None
+    two_grammars = [_FakeGrammarProcessor(), _FakeGrammarProcessor()]
+    assert _refusal(processors=two_grammars) is None
+    assert _refusal(batch_size=8) is None
+    assert _refusal(draft_kind="mtp") is None
+    assert _refusal(draft_kind="eagle3") is None
+    assert _refusal(draft_kind=None) is None
+
+
+def test_the_toggle_off_gate_does_not_even_look_at_the_processors(monkeypatch):
+    """Not just "does not raise" -- does not touch them.
+
+    A processor whose attribute access explodes must survive the gate, which is
+    the mechanical statement of "no new code runs when the toggle is off".
+    """
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+
+    class _Landmine:
+        def __getattr__(self, name):  # pragma: no cover - the point is it never runs
+            raise AssertionError(f"the toggle-off gate inspected .{name}")
+
+    assert _refusal(processors=[_Landmine()]) is None
+
+
+def test_r1_with_the_toggle_on_a_penalty_only_request_is_refused(monkeypatch):
+    """With the rail ON the penalties still have no block interface, so they
+    refuse by name instead of being dropped into a partially-constrained
+    stream."""
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "1")
 
     def penalty(input_ids, logits):  # pragma: no cover - never called
         return logits
@@ -377,9 +412,136 @@ def test_the_grammar_processor_is_returned_with_the_toggle_on(monkeypatch):
     assert _refusal(processors=[[processor]]) is processor
 
 
-def test_the_single_stream_entry_point_refuses_with_the_toggle_off(monkeypatch):
-    """``run_speculative_rounds`` -- the ``generate_step`` side of R1."""
+def _run_entry_point(
+    drafter, logits_processors, *, max_tokens=24, block_size=8, bonus=3
+):
+    """Drive the real ``generate_step`` entry point, not ``_dflash_rounds``.
+
+    This is the path that used to drop the list on the floor, so it is the one
+    the toggle-off equivalence has to be measured on.
+    """
+    rounds = spec_utils.run_speculative_rounds(
+        SimpleNamespace(language_model=drafter.target),
+        drafter,
+        [SimpleNamespace(offset=0)],
+        mx.zeros((1, 1), dtype=mx.int32),
+        mx.array([bonus], dtype=mx.int32),
+        mx.zeros((1, VOCAB)),
+        SimpleNamespace(hidden_states=[mx.zeros((1, 1, HIDDEN))]),
+        draft_kind="dflash",
+        max_tokens=max_tokens,
+        sampler=_greedy_sampler,
+        draft_block_size=block_size,
+        sampler_is_greedy=True,
+        logits_processors=logits_processors,
+    )
+    tokens = []
+    try:
+        for tok, _ in rounds:
+            tokens.append(int(tok))
+    finally:
+        rounds.close()
+    return tokens
+
+
+def test_toggle_off_a_penalty_processor_emits_exactly_the_base_stream(monkeypatch):
+    """THE regression guard the whole gate exists for.
+
+    With ``MLX_VLM_SPEC_STRUCTURED`` unset, ``generate_step``'s speculative
+    branch handed a penalty processor now emits the same tokens as the same run
+    with no processor at all -- which is what base 71732451 does, because it
+    dropped the list here.  No refusal, no ledger, no behaviour difference.
+    """
     monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+
+    def penalty(input_ids, logits):  # pragma: no cover - never called
+        return logits
+
+    base = _run_entry_point(
+        _StubDrafter(_Markov1Target(seed=21), "noise", seed=21), None
+    )
+    with_penalty = _run_entry_point(
+        _StubDrafter(_Markov1Target(seed=21), "noise", seed=21), [penalty]
+    )
+    with_grammar = _run_entry_point(
+        _StubDrafter(_Markov1Target(seed=21), "noise", seed=21),
+        [_FakeGrammarProcessor()],
+    )
+    assert base
+    assert with_penalty == base
+    assert with_grammar == base
+
+
+def test_toggle_off_the_batch_path_emits_exactly_the_base_stream(monkeypatch):
+    """Same equivalence on ``run_speculative_server_rounds`` (the batch side)."""
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+
+    def penalty(input_ids, logits):  # pragma: no cover - never called
+        return logits
+
+    def _run(processors):
+        drafter = _StubDrafter(_Markov1Target(seed=22), "noise", seed=22)
+        rounds = spec_utils.run_speculative_server_rounds(
+            SimpleNamespace(language_model=drafter.target),
+            drafter,
+            [SimpleNamespace(offset=0)],
+            mx.zeros((1, 1, HIDDEN)),
+            draft_kind="dflash",
+            first_bonus=mx.array([3], dtype=mx.int32),
+            max_tokens=24,
+            sampler=_greedy_sampler,
+            draft_block_size=8,
+            greedy_sampling=True,
+            logits_processors=processors,
+        )
+        tokens = []
+        try:
+            for toks, _ in rounds:
+                tokens.extend(int(t) for t in toks)
+        finally:
+            rounds.close()
+        return tokens
+
+    base = _run(None)
+    assert base
+    assert _run([[penalty]]) == base
+    assert _run([[_FakeGrammarProcessor()]]) == base
+
+
+def _speculative_batch(processors, **overrides):
+    kwargs = dict(
+        model=SimpleNamespace(),
+        draft_model=SimpleNamespace(),
+        draft_kind="dflash",
+        uids=[0],
+        first_tokens=mx.array([3], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=_greedy_sampler,
+        stop_criteria=lambda t: False,
+        max_tokens=[8],
+        hidden=mx.zeros((1, 1, HIDDEN)),
+        shared_kv_states=None,
+        prompt_tokens=mx.zeros((1, 1), dtype=mx.int32),
+        logits_processors=processors,
+    )
+    kwargs.update(overrides)
+    return SpeculativeGenerationBatch(**kwargs)
+
+
+def test_toggle_off_the_batch_constructor_accepts_anything(monkeypatch):
+    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+
+    def penalty(input_ids, logits):  # pragma: no cover - never called
+        return logits
+
+    assert _speculative_batch([[_FakeGrammarProcessor()]]) is not None
+    assert _speculative_batch([[penalty]]) is not None
+    assert _speculative_batch([[_FakeGrammarProcessor()]], draft_kind="mtp") is not None
+
+
+def test_the_single_stream_entry_point_refuses_an_unsupported_shape(monkeypatch):
+    """``run_speculative_rounds`` -- the ``generate_step`` side, toggle ON."""
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "1")
     rounds = spec_utils.run_speculative_rounds(
         SimpleNamespace(),
         SimpleNamespace(),
@@ -388,7 +550,7 @@ def test_the_single_stream_entry_point_refuses_with_the_toggle_off(monkeypatch):
         mx.array([3], dtype=mx.int32),
         mx.zeros((1, VOCAB)),
         None,
-        draft_kind="dflash",
+        draft_kind="mtp",
         max_tokens=8,
         sampler=_greedy_sampler,
         logits_processors=[_FakeGrammarProcessor()],
@@ -397,41 +559,33 @@ def test_the_single_stream_entry_point_refuses_with_the_toggle_off(monkeypatch):
         next(rounds)
 
 
-def test_the_server_entry_point_refuses_with_the_toggle_off(monkeypatch):
-    """``run_speculative_server_rounds`` -- the batch side of R1."""
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+def test_the_server_entry_point_refuses_an_unsupported_shape(monkeypatch):
+    """``run_speculative_server_rounds`` -- the batch side, toggle ON."""
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "1")
     rounds = spec_utils.run_speculative_server_rounds(
         SimpleNamespace(),
         SimpleNamespace(),
         [],
         mx.zeros((1, 1, HIDDEN)),
         draft_kind="dflash",
-        first_bonus=mx.array([3], dtype=mx.int32),
+        first_bonus=mx.array([3, 4], dtype=mx.int32),
         max_tokens=8,
         sampler=_greedy_sampler,
-        logits_processors=[[_FakeGrammarProcessor()]],
+        logits_processors=[[_FakeGrammarProcessor()], [_FakeGrammarProcessor()]],
     )
     with pytest.raises(StructuredSpeculationRefused):
         next(rounds)
 
 
 def test_speculative_generation_batch_refuses_at_construction(monkeypatch):
-    monkeypatch.delenv(SPEC_STRUCTURED_ENV, raising=False)
+    """Toggle ON, B > 1: fail where the batch was admitted, not on next()."""
+    monkeypatch.setenv(SPEC_STRUCTURED_ENV, "1")
     with pytest.raises(StructuredSpeculationRefused):
-        SpeculativeGenerationBatch(
-            model=SimpleNamespace(),
-            draft_model=SimpleNamespace(),
-            draft_kind="dflash",
-            uids=[0],
-            first_tokens=mx.array([3], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=_greedy_sampler,
-            stop_criteria=lambda t: False,
-            max_tokens=[8],
-            hidden=mx.zeros((1, 1, HIDDEN)),
-            shared_kv_states=None,
-            prompt_tokens=mx.zeros((1, 1), dtype=mx.int32),
-            logits_processors=[[_FakeGrammarProcessor()]],
+        _speculative_batch(
+            [[_FakeGrammarProcessor()], [_FakeGrammarProcessor()]],
+            uids=[0, 1],
+            first_tokens=mx.array([3, 4], dtype=mx.int32),
+            max_tokens=[8, 8],
         )
 
 
@@ -902,7 +1056,7 @@ def test_a_masked_drafter_still_emits_the_masked_reference():
 # --------------------------------------------------------------------------
 # mask application
 # --------------------------------------------------------------------------
-def test_apply_block_mask_matches_the_metal_kernel_semantics():
+def test_apply_block_mask_sets_illegal_logits_to_negative_infinity():
     mask = mx.array(SL._pack_rows([[1, 3], None], 8))
     logits = mx.arange(16, dtype=mx.float32).reshape(2, 8)
     masked = apply_block_mask(logits, mask).tolist()
@@ -911,6 +1065,76 @@ def test_apply_block_mask_matches_the_metal_kernel_semantics():
         -float("inf"), -float("inf"), -float("inf"), -float("inf"),
     ]
     assert masked[1] == list(range(8, 16))
+
+
+def test_the_portable_path_is_what_a_cpu_only_session_takes(monkeypatch):
+    """``mx.fast.metal_kernel`` has no CPU implementation, and this MLX build
+    (0.32.1) does not act on ``MLX_DEFAULT_DEVICE`` -- ``mx.default_device()``
+    still says gpu -- so the CPU signal is honoured explicitly here.  Every test
+    in this file therefore runs the portable path, which is the point."""
+    monkeypatch.setenv("MLX_DEFAULT_DEVICE", "cpu")
+    assert SL.metal_mask_kernel_enabled() is False
+    monkeypatch.setenv("MLX_DEFAULT_DEVICE", " CPU ")
+    assert SL.metal_mask_kernel_enabled() is False
+
+
+def test_the_metal_kernel_is_selected_on_a_gpu_default_device(monkeypatch):
+    monkeypatch.delenv("MLX_DEFAULT_DEVICE", raising=False)
+    expected = bool(mx.metal.is_available()) and (
+        mx.default_device() == mx.Device(mx.DeviceType.gpu, 0)
+    )
+    assert SL.metal_mask_kernel_enabled() is expected
+
+
+def test_the_round_loop_never_dispatches_a_metal_kernel_on_the_cpu_rail(monkeypatch):
+    """The measurement runs are CPU-only; a Metal dispatch from here would be a
+    protocol violation, not just a slow path."""
+    monkeypatch.setenv("MLX_DEFAULT_DEVICE", "cpu")
+
+    def _boom(*args, **kwargs):  # pragma: no cover - the point is it never runs
+        raise AssertionError("the CPU rail dispatched the Metal mask kernel")
+
+    monkeypatch.setattr("mlx_vlm.structured._apply_llguidance_mask", _boom)
+    tokens = _run_rounds(
+        _StubDrafter(_Markov1Target(seed=23), "noise", seed=23),
+        StubLedger(VOCAB, _mixed_legal),
+        max_tokens=32,
+    )
+    assert tokens
+
+
+@pytest.mark.skipif(
+    (os.environ.get("MLX_DEFAULT_DEVICE") or "").strip().lower() == "cpu"
+    or not mx.metal.is_available(),
+    reason="CPU-only rail: this is the one test that would dispatch Metal",
+)
+def test_the_two_mask_paths_agree_elementwise():
+    """The GPU kernel and the portable fallback are the same function.
+
+    Deliberately the ONLY test here that touches Metal, and it skips on the
+    CPU-only rail -- so this is the identity a GPU session has to confirm before
+    the kernel path is measured.
+    """
+    from mlx_vlm.structured import _apply_llguidance_mask
+
+    rng = np.random.default_rng(0)
+    vocab = 200
+    mask = mx.array(
+        SL._pack_rows(
+            [
+                sorted(rng.choice(vocab, size=17, replace=False).tolist()),
+                None,
+                [0],
+                [vocab - 1],
+            ],
+            vocab,
+        )
+    )
+    logits = mx.array(rng.normal(size=(4, vocab)).astype(np.float32))
+    assert (
+        SL.apply_block_mask_portable(logits, mask).tolist()
+        == _apply_llguidance_mask(logits, mask).tolist()
+    )
 
 
 # --------------------------------------------------------------------------

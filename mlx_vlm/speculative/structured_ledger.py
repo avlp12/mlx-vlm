@@ -143,19 +143,53 @@ def unpack_bitmask(mask: mx.array, vocab_size: int) -> mx.array:
     return ((words >> (index % 32)) & 1).astype(mx.bool_)
 
 
-def apply_block_mask(logits: mx.array, mask: mx.array) -> mx.array:
-    """Set every grammar-illegal logit to ``-inf``.
-
-    ``logits`` is ``(rows, vocab)`` and ``mask`` is the matching
-    ``(rows, words)`` bitmask.  ``structured._apply_llguidance_mask`` does the
-    same thing with a Metal kernel; this stays in portable MLX ops so the same
-    code path runs on CPU test rails and so the masked array is an ordinary
-    lazily-evaluated node (R3).  One gather + one select over (rows, vocab).
-    """
+def apply_block_mask_portable(logits: mx.array, mask: mx.array) -> mx.array:
+    """The device-independent mask: one gather + one select over (rows, vocab)."""
     if logits.ndim == 1:
         logits = logits[None, :]
     allowed = unpack_bitmask(mask, int(logits.shape[-1]))
     return mx.where(allowed, logits, mx.array(-float("inf"), dtype=logits.dtype))
+
+
+def metal_mask_kernel_enabled() -> bool:
+    """Should the block mask go through ``structured._apply_llguidance_mask``?
+
+    Only on the GPU: ``mx.fast.metal_kernel`` has no CPU implementation, so a
+    CPU rail must take the portable path.  ``MLX_DEFAULT_DEVICE=cpu`` is the
+    fleet's CPU-only signal and is honoured here explicitly, because this MLX
+    build (0.32.1) does not act on it -- ``mx.default_device()`` still reports
+    the GPU -- and a CPU-only session must not be dispatching Metal kernels.
+
+    Read per call, not cached: a test that flips the environment has to see it.
+    """
+    raw = (os.environ.get("MLX_DEFAULT_DEVICE") or "").strip().lower()
+    if raw == "cpu":
+        return False
+    try:
+        if not mx.metal.is_available():
+            return False
+        return mx.default_device() == mx.Device(mx.DeviceType.gpu, 0)
+    except Exception:
+        return False
+
+
+def apply_block_mask(logits: mx.array, mask: mx.array) -> mx.array:
+    """Set every grammar-illegal logit to ``-inf``.
+
+    ``logits`` is ``(rows, vocab)`` and ``mask`` is the matching
+    ``(rows, words)`` bitmask.  On the GPU this is the same fused Metal kernel
+    the single-token processor already uses (``structured._apply_llguidance_mask``,
+    one thread per token, no full-vocab bool materialised); on CPU it falls back
+    to portable MLX ops.  Either way the result is an ordinary lazily-evaluated
+    node, so the R3 fresh-array rule still does the work it has to.
+    """
+    if logits.ndim == 1:
+        logits = logits[None, :]
+    if metal_mask_kernel_enabled():
+        from ..structured import _apply_llguidance_mask
+
+        return _apply_llguidance_mask(logits, mask)
+    return apply_block_mask_portable(logits, mask)
 
 
 def _pack_rows(rows: Sequence[Optional[Sequence[int]]], vocab_size: int) -> np.ndarray:
@@ -234,23 +268,27 @@ def resolve_structured_processor(
     """The single gate every speculative entry point calls.
 
     Returns the one grammar processor to build a ledger from, or ``None`` when
-    there is nothing to thread.  Raises rather than silently dropping the
-    processors -- that silent drop is R1, the bug this whole change exists to
-    close: today the first bonus token is constrained by the processor in
-    ``generate_step`` and every speculative token after it is not.
+    there is nothing to thread.
+
+    THE TOGGLE IS CHECKED FIRST, BEFORE THE PROCESSORS ARE EVEN LOOKED AT.
+    With ``MLX_VLM_SPEC_STRUCTURED`` off -- the default -- this returns ``None``
+    unconditionally and every speculative path is byte-for-byte the code that
+    shipped: no ledger is constructed, nothing is inspected, and nothing new can
+    raise.  R1's silent partial constraint is still there in that configuration,
+    and deliberately so: the toggle is the only thing that changes behaviour.
+
+    With the toggle on, exactly one grammar processor is threaded and every
+    other shape refuses by name (a non-grammar processor alongside it, more than
+    one grammar, MTP, a non-DFlash drafter, B > 1).
     """
+    # D1: the off path must not differ from base in ANY observable way, so the
+    # environment decides before anything else happens.
+    if not spec_structured_enabled(env):
+        return None
+
     processors = flatten_logits_processors(logits_processors)
     if not processors:
         return None
-
-    if not spec_structured_enabled(env):
-        raise StructuredSpeculationRefused(
-            f"{call_site}: logits_processors were supplied with speculative "
-            f"decoding (draft_kind={draft_kind!r}), which would constrain only "
-            "the first bonus token and leave every speculative token after it "
-            f"unconstrained. Set {SPEC_STRUCTURED_ENV}=1 to use the structured "
-            "speculative rail, or run this request without a draft model."
-        )
 
     grammar = [p for p in processors if is_grammar_processor(_unwrap_thinking(p)[0])]
     extra = [p for p in processors if p not in grammar]
