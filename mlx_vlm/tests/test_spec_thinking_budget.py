@@ -28,6 +28,7 @@ was right" and "the walk accepted" the same statement.
 """
 
 import contextlib
+import os
 from threading import Event
 from types import SimpleNamespace
 from typing import List, Optional
@@ -1273,3 +1274,193 @@ class TestThinkingConfigSnapshot:
         snap = self._snapshot(_generator_with_template(NO_THINKING_KW_TEMPLATE))
         assert snap["server_clear_thinking"] is True
         assert snap["template_references_clear_thinking"] is True
+
+
+# ==========================================================================
+# LV2 root cause: the CLI made MLX_VLM_ENABLE_THINKING permanently "set"
+# ==========================================================================
+class TestCliDoesNotFakeAnExplicitThinkingMode:
+    """``--enable-thinking`` absent must leave the env var absent.
+
+    ``action="store_true"`` with a ``False`` default and an UNCONDITIONAL
+    ``os.environ[...] = "0"`` write meant every server ever started reported
+    ``server_enable_thinking_is_explicit() == True`` -- an operator decision
+    nobody made.  Always-on thinking then short-circuited on its "an operator
+    said off" early return, and the LV2 panel logged
+    ``enabled=False always_on_template=True`` for every arm.
+    """
+
+    def _run_cli(self, monkeypatch, extra_argv):
+        """Run the real ``main()`` over a THROWAWAY environment.
+
+        ``main()`` writes a dozen preload/env keys; letting them escape into the
+        process environment made a later test try to fetch a model named "demo"
+        from the Hub. Swapping ``os.environ`` for a plain dict keeps every write
+        inside this test while ``os.environ.get`` -- which is how the server
+        reads all of them -- still sees it.
+        """
+        import sys as _sys
+
+        import mlx_vlm.server.cli as server_cli
+
+        sandbox = dict(os.environ)
+        for name in ("MLX_VLM_ENABLE_THINKING", "MLX_VLM_THINKING_BUDGET"):
+            sandbox.pop(name, None)
+        monkeypatch.setattr(os, "environ", sandbox)
+        monkeypatch.setattr(
+            _sys, "argv", ["mlx_vlm.server", "--model", "demo", *extra_argv]
+        )
+        monkeypatch.setattr(server_cli.uvicorn, "run", lambda *a, **k: None)
+        server_cli.main()
+        return sandbox
+
+    def test_without_the_flag_the_env_var_stays_unset(self, monkeypatch):
+        env = self._run_cli(monkeypatch, [])
+        assert "MLX_VLM_ENABLE_THINKING" not in env, (
+            "an unwritten env var is what lets the template decide; writing "
+            "'0' here is the server telling itself the operator said off"
+        )
+        assert server_generation.server_enable_thinking_is_explicit() is False
+        assert server_generation.get_server_enable_thinking() is False, (
+            "the effective default is unchanged -- only its explicitness is"
+        )
+
+    def test_with_the_flag_it_is_set_on(self, monkeypatch):
+        env = self._run_cli(monkeypatch, ["--enable-thinking"])
+        assert env["MLX_VLM_ENABLE_THINKING"] == "1"
+        assert server_generation.server_enable_thinking_is_explicit() is True
+
+    def test_an_inherited_value_survives_a_launch_without_the_flag(
+        self, monkeypatch
+    ):
+        import sys as _sys
+
+        import mlx_vlm.server.cli as server_cli
+
+        sandbox = dict(os.environ)
+        sandbox["MLX_VLM_ENABLE_THINKING"] = "1"
+        monkeypatch.setattr(os, "environ", sandbox)
+        monkeypatch.setattr(_sys, "argv", ["mlx_vlm.server", "--model", "demo"])
+        monkeypatch.setattr(server_cli.uvicorn, "run", lambda *a, **k: None)
+        server_cli.main()
+        assert sandbox["MLX_VLM_ENABLE_THINKING"] == "1", (
+            "the launcher's own export must not be clobbered by an argparse "
+            "default the operator never typed"
+        )
+
+
+# ==========================================================================
+# End to end: a chat.completions body with NO enable_thinking field
+# ==========================================================================
+GLM_SHAPED_TEMPLATE = (
+    "{%- set clear_thinking = clear_thinking if clear_thinking is defined "
+    "else false %}{%- for m in messages %}<|user|>{{ m.content }}"
+    "{%- if not clear_thinking and m.reasoning_content is defined %}"
+    "{{ m.reasoning_content }}{%- endif %}{%- endfor %}"
+    "{%- if add_generation_prompt %}<|assistant|><think>{%- endif %}"
+)
+
+
+def _glm_shaped_generator():
+    """A ResponseGenerator carrying only what the thinking path reads.
+
+    Mirrors the served build: the chat template has no ``enable_thinking``
+    variable and its generation prompt ends in ``<think>``, and the tokenizer
+    resolves both think markers to single ids.
+    """
+    gen = server_generation.ResponseGenerator.__new__(
+        server_generation.ResponseGenerator
+    )
+    gen.processor = SimpleNamespace(chat_template=GLM_SHAPED_TEMPLATE, config=None)
+    gen.tokenizer = _PreopenedTokenizer()
+    return gen
+
+
+def _resolve_like_the_server(request, generator):
+    """``_build_gen_args`` -> ``_apply_always_on_thinking`` -> criteria.
+
+    The exact order ``ResponseGenerator.generate`` runs them in, minus the
+    tokenizer/model work: normalization on the request thread, the always-on
+    decision at the top of ``generate``, then the criteria built from the
+    prompt's own ids.
+    """
+    from mlx_vlm.server import request_normalization as rn
+
+    args = rn._build_gen_args(request, generator.processor)
+    generator._apply_always_on_thinking(args)
+    # ...<|assistant|><think>: the last id of a prompt this template rendered.
+    input_ids = mx.array([[7, 8, 9, 154841]], dtype=mx.int32)
+    criteria = generator._make_thinking_budget_criteria(args, input_ids)
+    return args, criteria
+
+
+class TestChatCompletionsBodyWithoutEnableThinking:
+    def _request(self, **extra):
+        from mlx_vlm.server.schemas import ChatRequest
+
+        return ChatRequest(
+            model="demo",
+            messages=[{"role": "user", "content": "spec"}],
+            stream=True,
+            max_tokens=1024,
+            temperature=0.0,
+            **extra,
+        )
+
+    def test_a_body_without_the_field_does_not_count_as_explicit(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MLX_VLM_ENABLE_THINKING", raising=False)
+        monkeypatch.delenv("MLX_VLM_THINKING_BUDGET", raising=False)
+        request = self._request()
+        assert "enable_thinking" not in request.model_fields_set, (
+            "a pydantic Optional default must not land in model_fields_set"
+        )
+        args, _ = _resolve_like_the_server(request, _glm_shaped_generator())
+        assert args.enable_thinking_explicit is False
+        assert args.enable_thinking is True
+
+    def test_the_budget_arm_resolves_armed_and_preopened(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_ENABLE_THINKING", raising=False)
+        monkeypatch.delenv("MLX_VLM_THINKING_BUDGET", raising=False)
+        generator = _glm_shaped_generator()
+        args, criteria = _resolve_like_the_server(
+            self._request(thinking_budget=256), generator
+        )
+        # The three fields the server's "Thinking resolved:" line reports.
+        assert args.enable_thinking is True, "enabled"
+        assert generator._thinking_always_on() is True, "always_on_template"
+        assert args.thinking_budget == 256, "budget"
+        assert criteria is not None and criteria.in_thinking is True, "preopened"
+
+    def test_it_then_forces_the_close_at_budget_plus_one(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_ENABLE_THINKING", raising=False)
+        monkeypatch.delenv("MLX_VLM_THINKING_BUDGET", raising=False)
+        _, criteria = _resolve_like_the_server(
+            self._request(thinking_budget=256), _glm_shaped_generator()
+        )
+        forced = []
+        for _ in range(300):
+            criteria(9999)
+            token = criteria.pop_forced_token_id()
+            if token is not None:
+                forced.append(token)
+        assert forced[:2] == [198, 154842]
+
+    def test_an_operator_who_says_off_is_still_obeyed(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        args, criteria = _resolve_like_the_server(
+            self._request(thinking_budget=256), _glm_shaped_generator()
+        )
+        assert args.enable_thinking is False
+        assert criteria.in_thinking is False
+
+    def test_a_body_that_says_off_is_still_obeyed(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_ENABLE_THINKING", raising=False)
+        args, criteria = _resolve_like_the_server(
+            self._request(thinking_budget=256, enable_thinking=False),
+            _glm_shaped_generator(),
+        )
+        assert args.enable_thinking_explicit is True
+        assert args.enable_thinking is False
+        assert criteria.in_thinking is False

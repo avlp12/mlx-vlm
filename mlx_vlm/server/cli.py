@@ -134,10 +134,20 @@ def main():
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
-        default=DEFAULT_ENABLE_THINKING,
+        # ``None``, not ``DEFAULT_ENABLE_THINKING``: the absence of this flag has
+        # to stay distinguishable from an operator asking for thinking off.  The
+        # env var it writes is read back as "somebody NAMED a thinking mode"
+        # (``server_enable_thinking_is_explicit``), and a False default here made
+        # every server ever launched claim the operator had said off -- which
+        # then suppressed always-on thinking for templates that cannot express
+        # the variable at all.
+        default=None,
         help=(
             "Enable thinking mode by default for requests that do not set "
-            "enable_thinking explicitly."
+            "enable_thinking explicitly. Omitting the flag leaves "
+            "MLX_VLM_ENABLE_THINKING untouched (so an inherited value survives, "
+            "and a template with no enable_thinking variable decides for itself); "
+            "export MLX_VLM_ENABLE_THINKING=0 to force it off."
         ),
     )
     parser.add_argument(
@@ -343,7 +353,13 @@ def main():
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
-    os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
+    # Only when the operator actually passed the flag -- writing "0" on every
+    # launch made ``MLX_VLM_ENABLE_THINKING`` permanently "set" inside the server
+    # process, which is a decision the operator never made and which clobbered an
+    # inherited value too. Every other optional knob in this block is already
+    # guarded the same way.
+    if args.enable_thinking is not None:
+        os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.thinking_budget is not None:
         os.environ["MLX_VLM_THINKING_BUDGET"] = str(args.thinking_budget)
     if args.thinking_start_token is not None:
