@@ -40,6 +40,7 @@ from .mtp import (
     _speculative_walk_batch_deferred_greedy,
     _speculative_walk_deferred_greedy,
 )
+from .structured_ledger import StructuredLedger, resolve_structured_processor
 
 __all__ = [
     "PrefillHiddenAccumulator",
@@ -478,6 +479,35 @@ def make_speculative_prompt_cache(
     return make_cache(lm, left_padding)
 
 
+def _resolve_structured_ledger(
+    logits_processors,
+    structured_ledger,
+    *,
+    batch_size: int,
+    draft_kind: Optional[str],
+    call_site: str,
+):
+    """D1/D2/D3/D7 + R1 gate for one speculative entry point.
+
+    ``structured_ledger`` is the test/caller injection hook: when a ledger is
+    handed in directly it is used as is (a ``StubLedger`` in the CPU tests).
+    Otherwise a request's ``logits_processors`` either build one or -- with the
+    toggle off, or on an unsupported shape -- raise.  What must never happen is
+    what happens today: the list silently disappearing here.
+    """
+    if structured_ledger is not None:
+        return structured_ledger
+    processor = resolve_structured_processor(
+        logits_processors,
+        batch_size=batch_size,
+        draft_kind=draft_kind,
+        call_site=call_site,
+    )
+    if processor is None:
+        return None
+    return StructuredLedger.from_processor(processor)
+
+
 def run_speculative_server_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -497,9 +527,18 @@ def run_speculative_server_rounds(
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
     target_hidden_offset: int = 0,
+    logits_processors: Optional[List[Any]] = None,
+    structured_ledger: Optional[Any] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
+    structured_ledger = _resolve_structured_ledger(
+        logits_processors,
+        structured_ledger,
+        batch_size=batch_size,
+        draft_kind=draft_kind,
+        call_site="run_speculative_server_rounds",
+    )
 
     if draft_kind == "lookup":
         if batch_size != 1:
@@ -592,6 +631,7 @@ def run_speculative_server_rounds(
                 token_dtype=token_dtype,
                 greedy_sampling=greedy_sampling,
                 target_hidden_offset=target_hidden_offset,
+                structured_ledger=structured_ledger,
             ):
                 yield [tok], state
                 if stop_check is not None and stop_check(0, tok):
@@ -636,9 +676,18 @@ def run_speculative_rounds(
     sampler_is_greedy: bool = False,
     prompt_tokens: Optional[mx.array] = None,
     target_hidden_offset: int = 0,
+    logits_processors: Optional[List[Any]] = None,
+    structured_ledger: Optional[Any] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
+    structured_ledger = _resolve_structured_ledger(
+        logits_processors,
+        structured_ledger,
+        batch_size=B,
+        draft_kind=draft_kind,
+        call_site="run_speculative_rounds",
+    )
 
     if draft_kind == "lookup":
         if B != 1:
@@ -782,6 +831,7 @@ def run_speculative_rounds(
             token_dtype=input_ids.dtype,
             greedy_sampling=sampler_is_greedy,
             target_hidden_offset=target_hidden_offset,
+            structured_ledger=structured_ledger,
         )
     else:
         mx.eval(first_token)

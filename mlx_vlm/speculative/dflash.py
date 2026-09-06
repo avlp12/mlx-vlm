@@ -26,6 +26,7 @@ from .common import (
     _SpeculativeSamplerRNG,
     generation_stream,
 )
+from .structured_ledger import apply_block_mask
 
 
 _ADAPTIVE_K_ENV = None
@@ -953,12 +954,28 @@ def _dflash_rounds(
     use_model_initial_block_size: bool = True,
     greedy_sampling: bool = True,
     target_hidden_offset: int = 0,
+    structured_ledger: Optional[Any] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
     draft → verify → walk → rollback. ``generate_step`` is responsible
     for prefill, sampling the first bonus token, and packaging the
     captured hidden states into ``hidden``.
+
+    ``structured_ledger`` (D4/D5/D6) is an optional grammar ledger.  When set,
+    every round additionally
+
+      * asks the ledger for a forced-token run and, if there is one, uses it AS
+        the draft block and skips the drafter forward entirely (Tier A);
+      * hands the drafter the position-0 legal mask so its top-k candidates at
+        the first position are grammar-legal (Tier B, DFlash2 only);
+      * masks the target's verify logits with the block mask BEFORE the sampler
+        runs, on both the greedy and the sampled walk (D5); and
+      * commits the round's emitted tokens back into the grammar.
+
+    Correctness lives entirely in the target mask: even an unmasked drafter can
+    only ever have its illegal proposals rejected, because the target mask at
+    that position excludes them.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -996,8 +1013,22 @@ def _dflash_rounds(
         hidden = prepare_target_hidden(hidden)
         mx.async_eval(hidden)
 
+    structured_draft_mask = structured_ledger is not None and bool(
+        getattr(draft_model, "supports_structured_draft_mask", False)
+    )
+    # Rounds that fast-forward do not call the drafter, so the target hidden
+    # states of those rounds never reach the drafter's cross-attention cache.
+    # Hold them here and hand them to the next real ``draft_block`` call, which
+    # ingests the whole context in one go.
+    pending_hidden: Optional[mx.array] = None
+
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
+    if structured_ledger is not None:
+        # The processor masked the first bonus in ``generate_step`` but did not
+        # consume it (``LLGuidanceLogitsProcessor`` consumes lazily, on the next
+        # call).  The ledger takes over from exactly that state.
+        structured_ledger.commit([b])
 
     while emitted < max_tokens:
         bs = _dflash_next_block_size(
@@ -1025,17 +1056,59 @@ def _dflash_rounds(
             if not greedy_sampling and positioned_sampling
             else sampler
         )
-        draft_tokens = sampler_rng.draft_tokens(
-            draft_model.draft_block,
-            b,
-            hidden,
-            draft_cache,
-            bs,
-            draft_sampler,
-            token_dtype,
-            **draft_kwargs,
+
+        # D6 Tier A -- grammar fast-forward.  ``compute_ff_tokens`` costs ~0.01 ms
+        # and, where the grammar forces a run of tokens (structural JSON, enum
+        # bodies), it IS the block: acceptance 1.0 with no drafter forward at all.
+        forced = (
+            structured_ledger.forced_tokens(bs - 1)
+            if structured_ledger is not None
+            else []
         )
-        mx.async_eval(draft_tokens)
+        if forced:
+            draft_host = list(forced)
+            draft_tokens = mx.array([draft_host], dtype=token_dtype)
+            bs = len(draft_host) + 1
+            # The drafter did not see this round's context; carry it forward.
+            pending_hidden = (
+                hidden
+                if pending_hidden is None
+                else mx.concatenate([pending_hidden, hidden], axis=1)
+            )
+        else:
+            if pending_hidden is not None:
+                hidden = mx.concatenate([pending_hidden, hidden], axis=1)
+                pending_hidden = None
+            if structured_draft_mask:
+                # D6 Tier B: the legal set for block position 0 only.  Applied to
+                # ``unary[:, 0]`` inside ``CandidateSelector.select``, i.e. AFTER
+                # the drafter's logit softcapping (R6).
+                draft_kwargs["structured_position0_mask"] = (
+                    structured_ledger.next_token_mask()
+                )
+            draft_tokens = sampler_rng.draft_tokens(
+                draft_model.draft_block,
+                b,
+                hidden,
+                draft_cache,
+                bs,
+                draft_sampler,
+                token_dtype,
+                **draft_kwargs,
+            )
+            mx.async_eval(draft_tokens)
+            draft_host = None
+
+        block_mask = None
+        if structured_ledger is not None:
+            # R4: the block mask is a function of the DRAFTED tokens, so they have
+            # to be on the host before the verify is issued.  That is one extra
+            # host sync per round on top of the deferred greedy walk's single
+            # transfer -- the only synchronisation this feature adds.  The
+            # fast-forward branch already has them on the host and pays nothing.
+            if draft_host is None:
+                draft_host = draft_tokens.reshape(-1).tolist()
+            block_mask = structured_ledger.masks_for_block(draft_host)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
@@ -1049,8 +1122,19 @@ def _dflash_rounds(
                 speculative_verify=True,
             )
             hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+            target_logits = verify_out.logits
+            if block_mask is not None:
+                # D5: (1, bs, V) -> (bs, V), mask, and back.  This happens BEFORE
+                # the sampler on the greedy path (and before packing on the
+                # deferred greedy walk, R4) and before ``_sample_dflash_target_walk``
+                # on the sampled path, so both walks see one and the same masked
+                # logits in token order and the F2 coupling is untouched (R8).
+                target_logits = apply_block_mask(
+                    target_logits.reshape(-1, target_logits.shape[-1]),
+                    block_mask,
+                ).reshape(target_logits.shape)
             if greedy_sampling:
-                target_tokens = sampler(verify_out.logits)
+                target_tokens = sampler(target_logits)
                 if deferred_walk:
                     walk_packed = _dflash_pack_greedy_walk(
                         draft_tokens, target_tokens, 1
@@ -1070,7 +1154,7 @@ def _dflash_rounds(
             )
         else:
             accepted_list, new_tokens_list = _sample_dflash_target_walk(
-                verify_out.logits,
+                target_logits,
                 draft_tokens,
                 sampler,
                 [max_tokens - emitted],
@@ -1080,6 +1164,8 @@ def _dflash_rounds(
             accepted = accepted_list[0]
             new_tokens = new_tokens_list[0]
             sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+        if structured_ledger is not None:
+            structured_ledger.commit(new_tokens)
         _record_speculative_round(draft_model, accepted, bs - 1)
         _record_batch_round(draft_model, 1)
 
@@ -1106,6 +1192,7 @@ def _dflash_rounds(
                 return
 
         verify_out = None
+        target_logits = None
 
 
 def _dflash_rounds_batch(

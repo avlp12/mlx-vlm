@@ -27,6 +27,7 @@ from ..sampling_coupling import (
     sample_top_p_token_order,
     sampled_coupling_enabled,
 )
+from ..speculative.structured_ledger import resolve_structured_processor
 from ..speculative.utils import (
     PrefillHiddenAccumulator,
     chunk_capture_kwargs_for,
@@ -625,6 +626,11 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
+        # R1.  ``_step`` above has already applied ``processors`` to the FIRST
+        # bonus token; before this change the list stopped here, so every
+        # speculative token after it decoded unconstrained.  The round loop now
+        # either threads a grammar processor through (MLX_VLM_SPEC_STRUCTURED=1)
+        # or refuses -- it never silently drops them.
         yield from run_speculative_rounds(
             model,
             draft_model,
@@ -640,6 +646,7 @@ def generate_step(
             sampler_is_greedy=sampler_is_greedy,
             prompt_tokens=full_prompt_ids,
             target_hidden_offset=target_hidden_offset,
+            logits_processors=processors,
         )
         return
 
@@ -1739,10 +1746,15 @@ class SpeculativeGenerationBatch:
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
         target_hidden_offset: int = 0,
+        logits_processors: Optional[List[Any]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
         self.draft_kind = draft_kind
+        # R1: the batch path never handed these on at all -- ``PromptProcessingBatch``
+        # simply did not pass ``logits_processors`` when it built this class.  They
+        # are carried now and either threaded or refused in ``_start_rounds``.
+        self.logits_processors = logits_processors or []
         self.uids = list(uids)
         self._all_uids = list(uids)
         self.first_tokens = first_tokens
@@ -1767,6 +1779,15 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        # Refuse at construction rather than on the first ``next()``, so the
+        # request fails where the batch was admitted.
+        if self.logits_processors:
+            resolve_structured_processor(
+                self.logits_processors,
+                batch_size=len(self._all_uids),
+                draft_kind=draft_kind,
+                call_site="SpeculativeGenerationBatch",
+            )
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1850,6 +1871,7 @@ class SpeculativeGenerationBatch:
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
             target_hidden_offset=self.target_hidden_offset,
+            logits_processors=self.logits_processors,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -2996,6 +3018,7 @@ class PromptProcessingBatch:
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
                 target_hidden_offset=self.target_hidden_offset,
+                logits_processors=list(self.logits_processors),
             )
             compute_logprobs = False
         else:

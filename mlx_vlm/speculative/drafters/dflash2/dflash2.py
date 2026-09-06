@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ....sampling_coupling import scatter_candidates_to_vocab
+from ...structured_ledger import unpack_bitmask
 from ..compatibility import validate_dflash_target
 from ..qwen3_dflash.dflash import DFlashDecoderLayer, DFlashDraftModel
 from .config import DFlash2Config
@@ -207,15 +208,77 @@ class CandidateSelector(nn.Module):
         selected = mx.argmax(scores, axis=-1).reshape(-1)
         return mx.take_along_axis(candidates_pos, selected[:, None], axis=-1)[:, 0]
 
+    def _apply_structured_position0_mask(
+        self, candidates: mx.array, unary: mx.array, logits: mx.array, mask: mx.array
+    ):
+        """D6 Tier B -- keep the drafter's FIRST proposal grammar-legal.
+
+        Only position 0 is masked.  Positions 1..W-1 would each need their own
+        legal set, which depends on the token this walk is still choosing, so
+        they stay unconstrained (Tier C, deliberately not implemented): an
+        illegal proposal there costs acceptance, never correctness, because the
+        target mask at that position excludes it anyway.
+
+        R6: this runs on ``unary``, which is gathered from logits the drafter has
+        ALREADY softcapped, so a masked entry stays ``-inf`` instead of being
+        pulled back to ``-softcap`` by ``tanh``.
+
+        R5: if none of the top-k candidates is legal the masked row would be all
+        ``-inf`` and ``argmax`` would silently return slot 0.  Fall back to the
+        legal argmax over the full vocabulary and collapse the position onto it
+        (effective width 1 at this position).
+        """
+        allowed_full = unpack_bitmask(mask, int(logits.shape[-1]))
+        candidates0 = candidates[:, 0]
+        unary0 = unary[:, 0]
+        rows = int(candidates0.shape[0])
+        if int(allowed_full.shape[0]) != rows:
+            allowed_full = mx.broadcast_to(
+                allowed_full[:1], (rows, int(allowed_full.shape[-1]))
+            )
+        allowed0 = mx.take_along_axis(
+            allowed_full.astype(mx.int32), candidates0.astype(mx.int32), axis=-1
+        ).astype(mx.bool_)
+        any_legal = mx.any(allowed0, axis=-1, keepdims=True)
+
+        neg_inf = mx.array(-float("inf"), dtype=unary.dtype)
+        masked_unary0 = mx.where(allowed0, unary0, neg_inf)
+        fallback_token = mx.argmax(
+            mx.where(
+                allowed_full,
+                logits[:, 0],
+                mx.array(-float("inf"), dtype=logits.dtype),
+            ),
+            axis=-1,
+        ).astype(candidates.dtype)
+
+        candidates0 = mx.where(
+            any_legal,
+            candidates0,
+            mx.broadcast_to(fallback_token[:, None], candidates0.shape),
+        )
+        # Every slot carries the same token in the fallback, so the scores are
+        # flattened too: whichever slot wins, the token is the legal argmax.
+        unary0 = mx.where(any_legal, masked_unary0, mx.zeros_like(unary0))
+
+        candidates = mx.concatenate([candidates0[:, None], candidates[:, 1:]], axis=1)
+        unary = mx.concatenate([unary0[:, None], unary[:, 1:]], axis=1)
+        return candidates, unary
+
     def select(
         self,
         hidden: mx.array,
         logits: mx.array,
         anchor_ids: mx.array,
         sampler: Callable[[mx.array], mx.array],
+        structured_position0_mask: mx.array = None,
     ) -> mx.array:
         candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k :]
         unary = mx.take_along_axis(logits, candidates, axis=-1)
+        if structured_position0_mask is not None and hidden.shape[1] > 0:
+            candidates, unary = self._apply_structured_position0_mask(
+                candidates, unary, logits, structured_position0_mask
+            )
         hidden = self.hidden_projection(hidden)
         predecessor = anchor_ids.reshape(-1)
         path = []
@@ -282,6 +345,9 @@ class DFlash2DraftModel(DFlashDraftModel):
     prefer_requested_block_size = False
     dflash_initial_block_size = 3
     dflash_min_block_size = 3
+    #: D6 Tier B: this drafter's ``draft_block`` accepts a position-0 grammar
+    #: mask.  The round loop only passes one to drafters that advertise it.
+    supports_structured_draft_mask = True
 
     def __init__(self, config: DFlash2Config):
         super().__init__(config)
@@ -317,6 +383,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         block_size: int,
         sampler: Callable[[mx.array], mx.array],
         token_dtype: mx.Dtype = mx.int32,
+        structured_position0_mask: mx.array = None,
     ) -> mx.array:
         proposal_length = int(block_size) - 1
         if proposal_length <= 0:
@@ -339,6 +406,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             self._logits(draft_hidden),
             anchor,
             sampler,
+            structured_position0_mask=structured_position0_mask,
         ).astype(token_dtype)
 
     def sanitize(self, weights: Mapping[str, mx.array]) -> dict[str, mx.array]:

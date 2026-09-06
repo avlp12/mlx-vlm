@@ -50,6 +50,7 @@ from ..sampling_coupling import (
     sample_top_p_token_order,
     sampled_coupling_enabled,
 )
+from ..speculative.structured_ledger import spec_structured_enabled
 from ..speculative.utils import (
     PrefillHiddenAccumulator,
     batched_draft_enabled,
@@ -1610,7 +1611,15 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        if self.draft_model is not None and args.logits_processors is not None:
+        # D1.  With MLX_VLM_SPEC_STRUCTURED unset or 0 this refusal, and its
+        # message, are byte-identical to what shipped.  With the toggle on the
+        # request proceeds and the round loop's own gate decides -- it refuses
+        # loudly for B > 1 (D3), for MTP (D7), and for any non-grammar processor.
+        if (
+            self.draft_model is not None
+            and args.logits_processors is not None
+            and not spec_structured_enabled()
+        ):
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
             )
