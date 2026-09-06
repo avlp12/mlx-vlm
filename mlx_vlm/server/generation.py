@@ -1613,13 +1613,13 @@ class ResponseGenerator:
     def _build_vault(model):
         """The Warm Context Vault for this model, or None.
 
-        Off unless ``MLX_VLM_GLM5_VAULT=1``, and off under TP regardless: the
-        mirror's rungs have to be announced to rank 1 over the control
-        collective, and a restore in that path is a known stall (the TP wrapper
-        exists -- ``tp_mode.tp_mirror_vault`` -- but the server request path has
-        not been validated against it, and a plausible-looking hang is worse
-        than a cold prefill).  A vault fault must never fail a load, so this
-        returns None on any error rather than raising.
+        On by default (``MLX_VLM_GLM5_VAULT=0`` opts out), and off under TP
+        regardless: the mirror's rungs have to be announced to rank 1 over the
+        control collective, and a restore in that path is a known stall (the TP
+        wrapper exists -- ``tp_mode.tp_mirror_vault`` -- but the server request
+        path has not been validated against it, and a plausible-looking hang is
+        worse than a cold prefill).  A vault fault must never fail a load, so
+        this returns None on any error rather than raising.
         """
         from .. import context_vault as _vault_mod
 
@@ -1640,10 +1640,13 @@ class ResponseGenerator:
                 _vault_mod.vault_budget_bytes() / 1e9,
                 _vault_mod.default_boundary_stride(),
             )
-            # Cold tier, off unless MLX_VLM_VAULT_DISK_DIR is set.  Attached
-            # here rather than inside get_vault so a vault that already exists
-            # for this identity keeps the tier it was given, and so a disk fault
-            # is contained to the same try/except that already protects the load.
+            # Cold tier: defaults on (~/glm53flash/vaultdisk) whenever the RAM
+            # vault above is on; MLX_VLM_VAULT_DISK_DIR="" / "0" opts out, any
+            # other value is an explicit path (see vault_disk.disk_vault_dir).
+            # Attached here rather than inside get_vault so a vault that
+            # already exists for this identity keeps the tier it was given,
+            # and so a disk fault is contained to the same try/except that
+            # already protects the load.
             from .. import vault_disk as _disk_mod
 
             if _disk_mod.disk_vault_enabled():

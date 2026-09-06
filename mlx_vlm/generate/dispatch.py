@@ -960,7 +960,7 @@ def stream_generate(
     # CHECKPOINT-only, so the mixed cache is never fully block-pageable), which
     # makes "same document, new suffix" a total miss. The vault restores the
     # deepest stored boundary that prefixes this request and re-prefills only
-    # the tail. Off unless MLX_VLM_GLM5_VAULT=1.
+    # the tail. On by default; MLX_VLM_GLM5_VAULT=0 opts out.
     # ------------------------------------------------------------------
     _vault = None
     _vault_boundaries: List[int] = []

@@ -818,6 +818,11 @@ class TestConcurrency(DiskVaultTestCase):
 
 class TestEnvAndWiring(DiskVaultTestCase):
     def test_the_tier_is_off_unless_the_directory_is_set(self):
+        """With the RAM vault explicitly off, the disk tier has nothing to
+        spill and stays off regardless of MLX_VLM_VAULT_DISK_DIR -- this test
+        isolates the directory-gating behaviour from the RAM-vault-on default
+        covered separately below."""
+        os.environ[CV._ENV_ENABLE] = "0"
         os.environ.pop(VD._ENV_DIR, None)
         self.assertIsNone(VD.disk_vault_dir())
         self.assertFalse(VD.disk_vault_enabled())
@@ -832,11 +837,12 @@ class TestEnvAndWiring(DiskVaultTestCase):
         self.assertIs(vault.disk, dv)
 
     def test_ram_vault_off_and_dir_unset_stays_off(self):
-        """Confirms the no-vault default is unaffected: this is the ambient
-        state of every other test in this file, so it also guards against a
-        regression the rest of the suite would not otherwise catch."""
+        """The RAM vault now defaults ON, so this confirms only the explicit
+        opt-out path: with MLX_VLM_GLM5_VAULT=0 and the directory unset, both
+        tiers stay off. This also guards against a regression the rest of the
+        suite would not otherwise catch."""
         os.environ.pop(VD._ENV_DIR, None)
-        os.environ.pop(CV._ENV_ENABLE, None)
+        os.environ[CV._ENV_ENABLE] = "0"
         self.assertFalse(CV.vault_enabled())
         self.assertIsNone(VD.disk_vault_dir())
         self.assertFalse(VD.disk_vault_enabled())

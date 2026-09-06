@@ -76,13 +76,16 @@ Environment
 ``MLX_VLM_VAULT_DISK_DIR``          root directory.  **Unset** (the variable is
                                     not in the environment at all) defaults the
                                     tier ON at ``~/glm53flash/vaultdisk``
-                                    whenever the RAM vault is on
-                                    (``MLX_VLM_GLM5_VAULT=1``; if the RAM vault
-                                    is off there is nothing to spill, so the
-                                    disk tier stays off too).  Set to ``""`` or
-                                    ``"0"`` to opt out explicitly even with the
-                                    RAM vault on.  Any other value is the
-                                    literal path and wins over the default.
+                                    whenever the RAM vault is on -- and the RAM
+                                    vault (``MLX_VLM_GLM5_VAULT``) is itself
+                                    default-on, so this combined default now
+                                    activates out of the box; if the RAM vault
+                                    is turned off (``MLX_VLM_GLM5_VAULT=0``)
+                                    there is nothing to spill, so the disk tier
+                                    stays off too.  Set to ``""`` or ``"0"`` to
+                                    opt out explicitly even with the RAM vault
+                                    on.  Any other value is the literal path
+                                    and wins over the default.
 ``MLX_VLM_VAULT_DISK_MAX_GB``       disk cap, default 200
 ``MLX_VLM_VAULT_DISK_SAVE_ON_INSERT`` also save when a rung is inserted (default 0;
                                     the default policy is save-on-eviction only)

@@ -88,22 +88,40 @@ _ENV_MAX_LADDER = "MLX_VLM_GLM5_VAULT_MAX_LADDER"
 _ENV_SESSION = "MLX_VLM_GLM5_VAULT_SESSION"
 _ENV_SESSION_DERIVED_ID = "MLX_VLM_GLM5_VAULT_SESSION_DERIVED_ID"
 
-_DEFAULT_BUDGET_GB = 256.0
+_DEFAULT_BUDGET_GB = 48.0
 _DEFAULT_STRIDE = 8192
 _DEFAULT_MAX_LADDER = 8
+
+# Explicit opt-out tokens for MLX_VLM_GLM5_VAULT. The vault defaults ON (an
+# unset variable, or any value other than one of these, keeps it on).
+_FALSY_OPT_OUT = ("0", "false", "no", "off")
 
 
 def _env_truthy(name: str, default: str = "") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_opts_out(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _FALSY_OPT_OUT
+
+
 def vault_enabled() -> bool:
-    """True when ``MLX_VLM_GLM5_VAULT`` opts the vault in. Default off."""
-    return _env_truthy(_ENV_ENABLE)
+    """True unless ``MLX_VLM_GLM5_VAULT`` explicitly opts out. Default ON.
+
+    This is default-on, not merely default-permitted: an unset variable (or
+    any value other than ``0``/``false``/``no``/``off``) keeps the vault on.
+    ``MLX_VLM_GLM5_VAULT=0`` (or ``false``) is the opt-out.
+    """
+    return not _env_opts_out(_ENV_ENABLE)
 
 
 def vault_budget_bytes() -> int:
-    """Resident budget in bytes (``MLX_VLM_GLM5_VAULT_BUDGET_GB``, default 256)."""
+    """Resident budget in bytes (``MLX_VLM_GLM5_VAULT_BUDGET_GB``, default 48).
+
+    48 GB is the default headroom on top of the ~197 GiB resident
+    GLM-5.3-Flash 320B-A18B q4 model; an explicit value always wins over the
+    default.
+    """
     try:
         gb = float(os.environ.get(_ENV_BUDGET_GB, _DEFAULT_BUDGET_GB))
     except (TypeError, ValueError):

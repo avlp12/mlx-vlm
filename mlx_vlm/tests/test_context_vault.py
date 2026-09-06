@@ -11,6 +11,7 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_vlm import context_vault as CV
 from mlx_vlm.context_vault import (
     ContextVault,
     align_boundaries,
@@ -20,6 +21,8 @@ from mlx_vlm.context_vault import (
     get_vault,
     reset_vault,
     restore_fragments,
+    vault_budget_bytes,
+    vault_enabled,
     vault_identity,
 )
 from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
@@ -424,3 +427,49 @@ class TestPeerProtocol(unittest.TestCase):
         self.assertIsNone(
             fetch_plan(65000, toks, ident, peer, [65536], min_gain_tokens=4096)
         )
+
+
+class TestEnvDefaults(unittest.TestCase):
+    """``vault_enabled``/``vault_budget_bytes`` default-on policy.
+
+    The vault used to be opt-in (unset ``MLX_VLM_GLM5_VAULT`` -> off, 256 GB
+    budget). It is now default-on with a 48 GB budget -- sized to sit on top
+    of the ~197 GiB resident GLM-5.3-Flash 320B-A18B q4 model without pushing
+    the box into swap. Only an explicit falsy value opts out or overrides.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: os.environ.get(k) for k in (CV._ENV_ENABLE, CV._ENV_BUDGET_GB)
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_unset_env_defaults_enabled(self):
+        os.environ.pop(CV._ENV_ENABLE, None)
+        self.assertTrue(vault_enabled())
+
+    def test_zero_opts_out(self):
+        os.environ[CV._ENV_ENABLE] = "0"
+        self.assertFalse(vault_enabled())
+
+    def test_false_opts_out(self):
+        os.environ[CV._ENV_ENABLE] = "false"
+        self.assertFalse(vault_enabled())
+
+    def test_explicit_one_stays_enabled(self):
+        os.environ[CV._ENV_ENABLE] = "1"
+        self.assertTrue(vault_enabled())
+
+    def test_unset_budget_defaults_to_48gb(self):
+        os.environ.pop(CV._ENV_BUDGET_GB, None)
+        self.assertEqual(vault_budget_bytes(), int(48.0 * (1024**3)))
+
+    def test_explicit_budget_wins_over_default(self):
+        os.environ[CV._ENV_BUDGET_GB] = "12"
+        self.assertEqual(vault_budget_bytes(), int(12.0 * (1024**3)))
