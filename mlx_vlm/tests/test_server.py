@@ -1204,6 +1204,169 @@ def test_admission_loop_auto_derives_a_session_id_with_no_header(
     )
 
 
+_GLM_MODEL_DIR = "/Users/gesicht/glm53flash/builds/GLM-5.3-Flash-vlm-q4-quasar"
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(_GLM_MODEL_DIR),
+    reason=f"tokenizer fixture not present: {_GLM_MODEL_DIR}",
+)
+def test_admission_loop_splices_a_retokenization_mismatched_session_bridge(
+    monkeypatch,
+):
+    """LW4 (2026-09-07): end-to-end proof that the admission loop's bridge
+    wiring actually reaches batch_gen.insert() -- not just that
+    find_session_text_bridge/the splice math work in isolation (see
+    test_session_retokenization_bridge.py for that).
+
+    A SESSION rung is stored (real ContextVault) keyed by raw ids that
+    include a merge-boundary hazard ('.' + '\\n' + '\\n', three separate
+    generated tokens). The incoming request's own prompt tokens (what
+    _gpu_embed hands back) are a FRESH re-tokenisation of the identical
+    text -- '.\\n\\n' collapsed to one token -- so the ordinary trie walk
+    alone would diverge before the stored depth. This test asserts
+    FakeBatchGenerator.insert receives the SPLICED sequence (the stored raw
+    ids, verbatim, plus a freshly-encoded remainder), not the naturally
+    re-tokenised one.
+    """
+    from transformers import AutoTokenizer
+
+    from mlx_vlm import context_vault as vault_module
+    from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+
+    tokenizer = AutoTokenizer.from_pretrained(_GLM_MODEL_DIR)
+
+    prompt_ids = list(range(500))
+    prefix_ids = tokenizer.encode("Step one", add_special_tokens=False)
+    dot_id = tokenizer.encode(".", add_special_tokens=False)
+    nl_id = tokenizer.encode("\n", add_special_tokens=False)
+    suffix_ids = tokenizer.encode("Step two is done.", add_special_tokens=False)
+    raw_generated = prefix_ids + dot_id + nl_id + nl_id + suffix_ids
+    stored_full = prompt_ids + raw_generated
+
+    H, D = 2, 8
+
+    def row_cache(n):
+        c = [ArraysCache(size=2), CacheList(KVCache(), KVCache())]
+        c[0][0] = mx.zeros((1, H, D, 4), mx.float32)
+        c[0][1] = mx.zeros((1, H, D, D), mx.float32)
+        lat = mx.zeros((1, H, n, D), mx.bfloat16)
+        c[1].caches[0].update_and_fetch(lat, lat)
+        idx = mx.zeros((1, 1, n, 2 * D + 1), mx.bfloat16)
+        c[1].caches[1].update_and_fetch(idx, mx.zeros((1, 1, n, 0), mx.bfloat16))
+        mx.eval([e.state for e in c])
+        return c
+
+    real_vault = vault_module.ContextVault("bridge-e2e", budget_bytes=1 << 30)
+    frags = vault_module.capture_fragments(row_cache(len(stored_full)), len(stored_full))
+    assert real_vault.insert(
+        stored_full, len(stored_full), frags,
+        tier=vault_module.VaultTier.SESSION, session_id="s1",
+    )
+
+    # The QUERY: what a fresh re-render + re-tokenize of the SAME generated
+    # text plus a new user turn naturally produces -- '.' + '\n' + '\n'
+    # collapses to one token, so this is NOT byte-for-byte stored_full.
+    generated_text = tokenizer.decode(raw_generated)
+    fresh_reencode = tokenizer.encode(generated_text, add_special_tokens=False)
+    next_turn_ids = tokenizer.encode("And the next turn.", add_special_tokens=False)
+    query_ids = prompt_ids + fresh_reencode + next_turn_ids
+    assert query_ids[: len(stored_full)] != stored_full, (
+        "the query must NOT already agree with the stored ids token-for-token "
+        "-- that is the whole point of this fixture"
+    )
+
+    class FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = ""
+
+        def add_token(self, token):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            pass
+
+    class FakeBatchGenerator:
+        inserted_prompts = []
+
+        def __init__(self, *args, **kwargs):
+            self.unprocessed_prompts = []
+            self.has_pending_prompts = False
+
+        def insert(self, prompts, **kwargs):
+            FakeBatchGenerator.inserted_prompts.append(list(prompts[0]))
+            return (1,)
+
+        def next(self, **kwargs):
+            return [], [
+                SimpleNamespace(
+                    uid=1, token=7, token_logprob=0.0, finish_reason="stop"
+                )
+            ]
+
+    FakeBatchGenerator.inserted_prompts = []
+    target_config = SimpleNamespace(
+        model_type="gemma4_text", hidden_size=5376, eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    gen = _unstarted_response_generator()
+    gen.tokenizer = tokenizer
+    gen.vault = real_vault
+
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(
+        server_generation, "make_streaming_detokenizer",
+        lambda _processor: FakeDetokenizer(),
+    )
+    monkeypatch.setattr(
+        server_generation, "load_model_resources",
+        lambda *_a, **_kw: (model, processor, target_config),
+    )
+    # _initialize_model() (triggered by gen.model being None) unconditionally
+    # sets self.vault = self._build_vault(model) -- which would silently
+    # replace the real_vault set above with whatever the fake model's
+    # identity produces (None, in practice). Keep the pre-seeded vault.
+    monkeypatch.setattr(
+        server_generation.ResponseGenerator, "_build_vault",
+        staticmethod(lambda _model: real_vault),
+    )
+    gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
+        mx.array([query_ids], dtype=mx.int32),
+        {},
+    )
+
+    rqueue = Queue()
+    gen.requests.put(
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"token": query_ids},
+            prompt_tokens=len(query_ids),
+            args=server.GenerationArguments(max_tokens=1),
+        )
+    )
+    worker = Thread(target=gen._run, daemon=True)
+    worker.start()
+    try:
+        rqueue.get(timeout=1)  # GenerationContext
+        rqueue.get(timeout=1)  # token
+        rqueue.get(timeout=1)  # done
+    finally:
+        gen._stop = True
+        gen.requests.put(None)
+        worker.join(timeout=2)
+
+    assert len(FakeBatchGenerator.inserted_prompts) == 1
+    inserted = FakeBatchGenerator.inserted_prompts[0]
+    assert inserted[: len(stored_full)] == stored_full, (
+        "insert() must receive the STORED raw ids verbatim for the matched "
+        "span, not the query's own re-tokenisation of the same text"
+    )
+    assert tokenizer.decode(inserted) == tokenizer.decode(query_ids), (
+        "the splice must preserve the original query's text exactly"
+    )
+
+
 def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
     gen = _unstarted_response_generator()
     gen.model = SimpleNamespace(language_model=SimpleNamespace())

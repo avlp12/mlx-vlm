@@ -47,7 +47,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 
@@ -81,6 +81,9 @@ __all__ = [
     "vault_enabled",
     "apc_save_session_enabled",
     "apc_save_session_max_tokens",
+    "record_session_pick",
+    "session_pick_counts",
+    "reset_session_picks",
     "auto_session_id",
     "session_tier_active",
 ]
@@ -220,6 +223,35 @@ def session_skip_counts() -> Dict[str, int]:
 def reset_session_skips() -> None:
     with _SKIP_LOCK:
         SESSION_SKIPS.clear()
+
+
+# Pick-side counterpart to SESSION_SKIPS above: that dict names why the
+# WRITE side (capture_session) did nothing; this one names the outcome of
+# every SESSION-tier attempt on the READ side (_vault_pick_for), for the
+# LW4 (2026-09-07) question "did the session tier ever have anything to
+# offer, and if so did it match" -- distinguishable from the aggregate
+# vault.stats.session_hits counter (which only ever counts hits) by also
+# naming "no_candidate" (nothing was ever captured for this trie at all)
+# and "diverged" (something was captured, but the query's own tokens stop
+# matching it before reaching a usable depth -- the retokenisation-mismatch
+# shape, see diagnose_lookup).
+SESSION_PICKS: Dict[str, int] = {}
+_PICK_LOCK = threading.Lock()
+
+
+def record_session_pick(reason: str) -> None:
+    with _PICK_LOCK:
+        SESSION_PICKS[reason] = SESSION_PICKS.get(reason, 0) + 1
+
+
+def session_pick_counts() -> Dict[str, int]:
+    with _PICK_LOCK:
+        return dict(SESSION_PICKS)
+
+
+def reset_session_picks() -> None:
+    with _PICK_LOCK:
+        SESSION_PICKS.clear()
 
 
 def session_capture_enabled() -> bool:
@@ -721,6 +753,76 @@ class ContextVault:
                 best = node
         return best, (best.depth if best else 0)
 
+    def diagnose_lookup(
+        self, tokens: Sequence[int], tier: VaultTier = VaultTier.PREFILL
+    ) -> Dict[str, Any]:
+        """Why a lookup landed where it did -- for the ``vault-pick`` log line.
+
+        Not on the hot path (``lookup``/``_walk`` do not call this): re-walks
+        the trie recording exactly where the match diverges, for a caller that
+        already knows it wants to explain a miss or a shallow hit, not to
+        decide one. Cheap enough to always call before logging (the trie is a
+        handful of nodes deep for one conversation), but a second walk all the
+        same, so it stays out of ``lookup``'s way.
+
+        Returns ``candidates`` (how many stored checkpoints exist anywhere in
+        this tier -- 0 immediately answers "was anything ever captured"),
+        ``longest_common_prefix`` (how far the walk got before diverging from
+        every stored path, independent of whether any node at that depth
+        happens to hold a checkpoint -- this is what a retokenisation
+        boundary would show up as: shorter than the query, often far shorter
+        than the deepest stored checkpoint), and, when it diverged before
+        exhausting ``tokens``, ``mismatch_position``/``got``/``expected``
+        (the query's own token at that position vs. the sole stored
+        continuation, when there is exactly one -- ``expected`` is ``None``
+        when several stored paths disagree with each other there, which is
+        itself worth knowing).
+        """
+        candidates = sum(
+            1 for n in self._iter_nodes()
+            if n.checkpoint is not None and n.checkpoint.tier is tier
+        )
+        node = self._roots[tier]
+        pos = 0
+        while pos < len(tokens):
+            child = node.children.get(tokens[pos])
+            if child is None:
+                expected = None
+                if len(node.children) == 1:
+                    (only,) = node.children.values()
+                    if only.edge:
+                        expected = only.edge[0]
+                return {
+                    "candidates": candidates,
+                    "longest_common_prefix": pos,
+                    "mismatch_position": pos,
+                    "got": int(tokens[pos]),
+                    "expected": expected,
+                }
+            edge = child.edge
+            span = min(len(edge), len(tokens) - pos)
+            shared = _common_len(edge, tokens[pos : pos + span])
+            if shared < len(edge):
+                return {
+                    "candidates": candidates,
+                    "longest_common_prefix": pos + shared,
+                    "mismatch_position": pos + shared,
+                    "got": (
+                        int(tokens[pos + shared])
+                        if pos + shared < len(tokens) else None
+                    ),
+                    "expected": int(edge[shared]),
+                }
+            pos += len(edge)
+            node = child
+        return {
+            "candidates": candidates,
+            "longest_common_prefix": pos,
+            "mismatch_position": None,
+            "got": None,
+            "expected": None,
+        }
+
     def _insert_path(
         self, tokens: Sequence[int], depth: int, tier: VaultTier = VaultTier.PREFILL
     ) -> _Node:
@@ -801,6 +903,20 @@ class ContextVault:
             if best is None or cp.prefix_len > best.checkpoint.prefix_len:
                 best = n
         return best
+
+    def iter_session_entries(self) -> Iterable[Tuple[List[int], "VaultCheckpoint"]]:
+        """Every live SESSION-tier checkpoint, as (its full raw token path,
+        the checkpoint). For :func:`find_session_text_bridge` -- the token
+        path is exactly what was captured (``capture_session``'s prompt +
+        generated ids), never re-derived or re-tokenised.
+        """
+        for n in self._iter_nodes():
+            cp = n.checkpoint
+            if cp is None or cp.tier is not VaultTier.SESSION:
+                continue
+            toks = self._tokens_for_node(n)
+            if toks is not None:
+                yield toks, cp
 
     @staticmethod
     def _tokens_for_node(node: _Node) -> Optional[List[int]]:
@@ -1376,6 +1492,76 @@ def restore_session(
         return False
 
 
+def find_session_text_bridge(
+    vault: Optional[ContextVault],
+    query_ids: Sequence[int],
+    *,
+    decode: Callable[[Sequence[int]], str],
+) -> Optional[Tuple[List[int], str]]:
+    """Find a SESSION entry whose stored text is a literal prefix of the
+    query's own decoded text, when the RAW TOKEN IDS no longer agree
+    (LW4, 2026-09-07: re-tokenisation non-identity).
+
+    Why token ids can stop matching even though nothing is wrong: the
+    session key is the model's own generated ids (ar.py's ``note_generated``
+    accumulates exactly what was sampled); the query arrives as a re-rendered
+    conversation, tokenised fresh by the SAME tokenizer. BPE is not injective
+    at merge boundaries -- two adjacent generated tokens can decode to text
+    that a single fresh ``encode`` call merges into ONE different token
+    (measured: ``encode("\\n")==[198]``, but ``encode(decode([198,198]))``
+    ``== encode("\\n\\n") == [271]``, never ``[198, 198]``). The ordinary
+    token-trie walk (``ContextVault.lookup``) sees a real divergence at that
+    point and reports (correctly, for what it does) whatever the longest
+    matching prefix in TOKEN SPACE was -- often far short of the full stored
+    session, sometimes zero tokens past whatever an ordinary PREFILL/APC
+    match already covered.
+
+    This function does the equivalent comparison in TEXT space, where BPE's
+    non-injectivity does not apply: has the query's rendering reproduced,
+    byte for byte, the exact text a stored session's tokens decode to. A hit
+    here tells the caller it may safely SPLICE the stored session's own raw
+    ids in place of however the query happened to re-tokenise that span (see
+    generate/ar.py callers) -- not merely that the text looks similar, but
+    that continuing generation from the stored cache is bit-identical to
+    what continuing the original turn would have produced, because the
+    tokens about to be fed back are the exact tokens the cache was computed
+    from, not a re-encoded approximation of them.
+
+    Returns the deepest (longest) matching ``(stored_tokens, stored_text)``,
+    or ``None`` if no SESSION entry's text is a prefix of the query's text,
+    or the vault is ``None``, or a candidate's ids are not shorter than the
+    query's own (nothing to splice). ``decode`` failing on any one candidate
+    skips that candidate rather than failing the whole search; ``decode``
+    failing on the query itself is a total miss (never raises).
+    """
+    if vault is None:
+        return None
+    try:
+        query_text = decode(query_ids)
+    except Exception:  # noqa: BLE001 - a decode fault must never fail a request
+        return None
+    if not query_text:
+        return None
+    best: Optional[Tuple[List[int], str]] = None
+    try:
+        entries = list(vault.iter_session_entries())
+    except Exception:  # noqa: BLE001
+        return None
+    for tokens, _cp in entries:
+        if not tokens or len(tokens) >= len(query_ids):
+            continue
+        try:
+            stored_text = decode(tokens)
+        except Exception:  # noqa: BLE001 - one bad candidate must not break the rest
+            continue
+        if not stored_text or not query_text.startswith(stored_text):
+            continue
+        if best is None or len(tokens) > len(best[0]):
+            best = (tokens, stored_text)
+    return best
+
+
 __all__ += ["session_id_for", "restore_session", "prefix_len_from_cache",
             "session_skip_counts", "reset_session_skips", "record_session_skip",
-            "session_capture_enabled", "derived_session_id_allowed"]
+            "session_capture_enabled", "derived_session_id_allowed",
+            "find_session_text_bridge"]

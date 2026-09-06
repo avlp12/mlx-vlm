@@ -3358,6 +3358,10 @@ class BatchGenerator:
         # while the session-capture flag is on; empty dict otherwise, so the
         # feature costs one attribute when off.
         self._session_tokens: Dict[Any, List[int]] = {}
+        # uid -> len(prompt ids) at seed time, so capture_session's log line
+        # can report the prompt/generated split (P/G) without having to
+        # guess it back out of the combined accumulator.
+        self._session_prompt_len: Dict[Any, int] = {}
         if self.vault is not None:
             if self.apc_mode is None:
                 self.apc_mode = _apc.model_apc_mode(model)
@@ -3587,6 +3591,46 @@ class BatchGenerator:
         hit, hit_tier = _vault_disk_deepen(
             vault, ids_list, hit, hit_tier, tiers,
             require_harvest_width_1=require_b1, min_depth=have)
+
+        # LW4 (2026-09-07): the server log had nothing per-request to say
+        # about whether the session tier ever had a chance, or where it gave
+        # up -- this is that line, logged once per pick regardless of outcome
+        # (hit, miss, or "not attempted because the flag is off"). Diagnostics
+        # only cost a second trie walk (diagnose_lookup, not on lookup's own
+        # hot path) and only run when the session tier was actually in play.
+        _session_active = _context_vault.VaultTier.SESSION in tiers
+        _diag = None
+        if _session_active and hasattr(vault, "diagnose_lookup"):
+            try:
+                _diag = vault.diagnose_lookup(
+                    list(ids_list), tier=_context_vault.VaultTier.SESSION
+                )
+            except Exception:  # noqa: BLE001 - diagnostics must never fail a pick
+                _diag = None
+        if hit is not None:
+            _context_vault.record_session_pick(
+                "hit" if hit_tier is _context_vault.VaultTier.SESSION
+                else "hit_prefill"
+            )
+        elif _session_active:
+            _context_vault.record_session_pick(
+                "no_candidate" if not _diag or not _diag.get("candidates")
+                else "diverged"
+            )
+        logger.info(
+            "vault-pick: tier=%s prefix_len=%s of prompt_len=%d (session "
+            "candidates=%s, longest common prefix=%s, first mismatch at "
+            "position %s: got id %s expected %s)",
+            (hit_tier.value if hit is not None else "none"),
+            (int(hit.prefix_len) if hit is not None else have),
+            len(ids_list),
+            _diag.get("candidates") if _diag else ("n/a" if not _session_active else 0),
+            _diag.get("longest_common_prefix") if _diag else "n/a",
+            _diag.get("mismatch_position") if _diag else "n/a",
+            _diag.get("got") if _diag else "n/a",
+            _diag.get("expected") if _diag else "n/a",
+        )
+
         if hit is None:
             return pick
         if not self._vault_prefix_trim_is_safe():
@@ -4072,6 +4116,9 @@ class BatchGenerator:
                 # see. Re-deriving them at completion from the request would
                 # re-tokenise and could disagree by a token; these are the ones.
                 self._session_tokens[self.uid_count] = list(p)
+                prompt_len_map = getattr(self, "_session_prompt_len", None)
+                if prompt_len_map is not None:
+                    prompt_len_map[self.uid_count] = len(p)
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -4100,11 +4147,13 @@ class BatchGenerator:
             acc.extend(int(t) for t in tokens)
         except Exception:  # noqa: BLE001 - bookkeeping must never fail a response
             self._session_tokens.pop(uid, None)
+            getattr(self, "_session_prompt_len", {}).pop(uid, None)
 
     def forget_session(self, uid) -> None:
         """Drop ``uid``'s accumulator.  Called on removal so a cancelled or
         completed request cannot leak its token list for the process lifetime."""
         self._session_tokens.pop(uid, None)
+        getattr(self, "_session_prompt_len", {}).pop(uid, None)
 
     def capture_session(
         self,
@@ -4140,21 +4189,25 @@ class BatchGenerator:
         # Every early return NAMES ITSELF. Live on ff9a3045 this method returned
         # False five different ways in silence, and the seven checks could only
         # report "nothing happened" -- which is indistinguishable from the
-        # feature being switched off.
+        # feature being switched off. Each one also gets an INFO log line
+        # (LW4, 2026-09-07: the only thing the previous server log showed was
+        # the two startup lines -- no per-request line said whether capture
+        # even ran), in addition to the SESSION_SKIPS counter it already fed.
+        def _refuse(reason: str) -> bool:
+            _context_vault.record_session_skip(reason)
+            logger.info("vault-session: refused uid=%s reason=%s", uid, reason)
+            return False
+
         if not _context_vault.session_tier_active():
-            _context_vault.record_session_skip("flag_off")
-            return False
+            return _refuse("flag_off")
         if getattr(self, "vault", None) is None:
-            _context_vault.record_session_skip("generator_has_no_vault")
-            return False
+            return _refuse("generator_has_no_vault")
         if not session_id:
-            _context_vault.record_session_skip("no_session_id_at_generator")
-            return False
+            return _refuse("no_session_id_at_generator")
         try:
             gb = self._generation_batch
             if gb is None:
-                _context_vault.record_session_skip("no_generation_batch")
-                return False
+                return _refuse("no_generation_batch")
             # ``uids`` is "rows still generating", NOT "rows in this batch":
             # SpeculativeGenerationBatch._refresh_uids rebuilds it from
             # ``_finished``, so a uid leaves it at the very moment finish_reason
@@ -4169,18 +4222,15 @@ class BatchGenerator:
             # no _all_uids and never prunes on finish, so uids is correct there.
             all_uids = getattr(gb, "_all_uids", None) or gb.uids
             if uid not in all_uids:
-                _context_vault.record_session_skip("uid_gone_from_batch")
-                return False
+                return _refuse("uid_gone_from_batch")
             row = all_uids.index(uid)
             row_cache = _apc.snapshot_prompt_cache_row(gb.prompt_cache, row)
             if not row_cache:
-                _context_vault.record_session_skip("row_cache_unavailable")
-                return False
+                return _refuse("row_cache_unavailable")
             key = list(tokens) if tokens is not None else self._session_tokens.get(uid)
             if not key:
-                _context_vault.record_session_skip("empty_token_key")
-                return False
-            return _context_vault.record_session_turn(
+                return _refuse("empty_token_key")
+            stored = _context_vault.record_session_turn(
                 self.vault,
                 key,
                 row_cache,
@@ -4189,6 +4239,28 @@ class BatchGenerator:
                 ttl_s=ttl_s,
                 adopt=False,
             )
+            if stored:
+                prompt_len = getattr(self, "_session_prompt_len", {}).get(uid)
+                generated_len = (
+                    len(key) - prompt_len if prompt_len is not None else None
+                )
+                logger.info(
+                    "vault-session: captured uid=%s tokens=%d (prompt %s + "
+                    "generated %s) session_id=%s",
+                    uid, len(key),
+                    prompt_len if prompt_len is not None else "?",
+                    generated_len if generated_len is not None else "?",
+                    session_id,
+                )
+            else:
+                # record_session_turn names its own refusal via
+                # record_session_skip; mirror it here as a log line too
+                # rather than duplicating its reason-selection logic.
+                logger.info(
+                    "vault-session: not captured uid=%s tokens=%d -- see "
+                    "session_skip_counts() for the reason", uid, len(key),
+                )
+            return stored
         except Exception:  # noqa: BLE001 - never fail a response over a rung
             _context_vault.record_session_skip("exception_in_capture_session")
             logger.warning("vault: session capture failed for uid=%s; the next "

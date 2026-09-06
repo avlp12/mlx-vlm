@@ -2507,6 +2507,66 @@ class ResponseGenerator:
                     try:
                         thinking_budget_criteria = request.thinking_budget_criteria
                         _prompt_ids_list = input_ids.squeeze(0).tolist()
+
+                        # LW4 (2026-09-07): re-tokenisation non-identity. The
+                        # session tier's stored key is the model's own raw
+                        # generated ids; a follow-up turn arrives as re-
+                        # rendered TEXT, tokenised fresh, and BPE is not
+                        # injective at merge boundaries (measured:
+                        # encode(decode([198, 198])) == [271], never
+                        # [198, 198] back). The ordinary token-trie walk then
+                        # sees a real divergence and the session rung is
+                        # unreachable even though the text is identical.
+                        # Splice the STORED ids back in wherever the query's
+                        # own re-tokenisation of that same text disagrees with
+                        # them, so the trie walk that runs afterwards (ar.py's
+                        # _vault_pick_for, unchanged) finds an ordinary,
+                        # exact, full-depth match -- no new matching logic
+                        # there. Text-only (no inputs_embeds): an image/audio
+                        # row's token stream is not simply spliceable the same
+                        # way and is out of scope here.
+                        if (
+                            not has_embeds
+                            and _context_vault.session_tier_active()
+                            and self.tokenizer is not None
+                        ):
+                            try:
+                                _bridge = _context_vault.find_session_text_bridge(
+                                    getattr(self, "vault", None),
+                                    _prompt_ids_list,
+                                    decode=lambda ids: self.tokenizer.decode(ids),
+                                )
+                            except Exception:  # noqa: BLE001 - a bridge fault costs a miss, no more
+                                _bridge = None
+                            if _bridge is not None:
+                                _stored_tokens, _stored_text = _bridge
+                                _query_tokens_before = len(_prompt_ids_list)
+                                try:
+                                    _query_text = self.tokenizer.decode(_prompt_ids_list)
+                                    _remainder_text = _query_text[len(_stored_text):]
+                                    _remainder_ids = self.tokenizer.encode(
+                                        _remainder_text, add_special_tokens=False
+                                    )
+                                    _prompt_ids_list = list(_stored_tokens) + list(
+                                        _remainder_ids
+                                    )
+                                    prompt_tokens = len(_prompt_ids_list)
+                                    logger.info(
+                                        "vault-session: bridged stored_tokens=%d "
+                                        "query_tokens_before=%d spliced_tokens=%d",
+                                        len(_stored_tokens),
+                                        _query_tokens_before,
+                                        len(_prompt_ids_list),
+                                    )
+                                except Exception:  # noqa: BLE001 - fall back to the unspliced prompt
+                                    logger.warning(
+                                        "vault-session: bridge splice failed; "
+                                        "continuing with the unspliced prompt",
+                                        exc_info=True,
+                                    )
+                                    _prompt_ids_list = input_ids.squeeze(0).tolist()
+                                    prompt_tokens = request.prompt_tokens
+
                         (uid,) = batch_gen.insert(
                             [_prompt_ids_list],
                             max_tokens=args.max_tokens,

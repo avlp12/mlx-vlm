@@ -261,12 +261,21 @@ class TestSkipReasonsAreNamed(unittest.TestCase):
                           "the two must not collapse into one reason")
 
     def test_every_reason_is_a_distinct_string(self):
-        """A counter that reuses a name cannot separate two causes."""
+        """A counter that reuses a name cannot separate two causes.
+
+        2026-09-07 (LW4 per-request logging): each early return now goes
+        through a local ``_refuse(reason)`` helper (so the refusal also gets
+        an INFO log line, not just the counter) instead of calling
+        ``record_session_skip("...")`` directly -- match both call shapes.
+        """
         import inspect
         from mlx_vlm.generate import ar
         src = inspect.getsource(ar.BatchGenerator.capture_session)
-        names = [ln.split('record_session_skip("')[1].split('"')[0]
-                 for ln in src.splitlines() if 'record_session_skip("' in ln]
+        names = []
+        for ln in src.splitlines():
+            for marker in ('record_session_skip("', '_refuse("'):
+                if marker in ln:
+                    names.append(ln.split(marker)[1].split('"')[0])
         self.assertEqual(len(names), len(set(names)), f"duplicate reasons: {names}")
         self.assertGreaterEqual(len(names), 6)
 
