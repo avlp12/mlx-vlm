@@ -126,7 +126,8 @@ from . import harvest_provenance as _harvest_prov
 from .apc_adapters import ADAPTER_SCHEMA_VERSION, StateFragment, dedup_enabled
 from .context_vault import VaultCheckpoint, VaultTier
 from .context_vault import vault_enabled as _ram_vault_enabled
-from .context_vault_wire import _DTYPES, plan_fragments, unpack_fragments
+from .context_vault_wire import _DTYPES, plan_fragments
+from .context_vault_wire import _rebuild as _wire_rebuild
 
 logger = logging.getLogger(__name__)
 
@@ -778,6 +779,85 @@ def _header_refusal(
 
 
 # --------------------------------------------------------------------------
+# Bounded array reconstruction -- MLX's 32-bit shape limit
+# --------------------------------------------------------------------------
+
+# MLX represents an array's shape dimensions as signed 32-bit integers.  Measured on epsilon,
+# 2026-09-07 (unified 943b0cb0, a served 131,072-token restore): ``load_entry`` used to
+# materialise an entry's ENTIRE payload as one flat ``mx.array(memoryview(buf))`` before
+# slicing it per record.  That entry's payload was 2,365,095,936 bytes (2.37 GB, 131,084
+# tokens) -- one element count past the limit -- and the construction raised ``OverflowError:
+# Shape dimension 2365095936 is outside the supported range [-2147483648, 2147483647]``.  Every
+# entry whose TOTAL payload exceeds this (any prompt above ~75k tokens at 28,180 B/token) could
+# be SAVED (the save path, ``plan_fragments``, already streams a *list* of per-array views and
+# never concatenates them -- see its own docstring) but never RESTORED: the server logged
+# ``rebuild_failed`` and fell back to a cold prefill, silently, since a vault fault must never
+# fail a request.
+#
+# The per-ENTRY payload can be arbitrarily large; the fix does not try to raise the limit (it
+# cannot -- this is MLX's own array representation), it stops needing one array that big. Every
+# individual RECORD (one array in the manifest -- one KDA/DSA layer's cache slice) is what a
+# caller ultimately consumes, and no real record is anywhere near 2 GB on its own, so
+# reconstructing per record removes the one place a whole-entry-sized array was ever built.
+# ``_MAX_ARRAY_BYTES`` is a second, independent belt-and-suspenders bound *within* a record, in
+# case a future cache shape ever produces a single record that large: it is enforced regardless
+# of how big a record turns out to be.
+_MAX_MX_ARRAY_ELEMENTS = 2**31 - 1
+_MAX_ARRAY_BYTES = 1 << 30  # 1 GiB; a uint8 array this size is 2^30 elements, well under the limit
+
+
+def _slice_bounds(nbytes: int, max_slice_bytes: int = _MAX_ARRAY_BYTES) -> List[Tuple[int, int]]:
+    """``[(offset, length), ...]`` covering ``[0, nbytes)`` in pieces of at most
+    ``max_slice_bytes``. Pure integer arithmetic -- no buffer, no allocation, no MLX call -- so
+    the "never ask for more than N elements" invariant is checkable directly, at any ``nbytes``,
+    without materialising anything (this is what the 2.4 GB "no allocation" guard test exercises)."""
+    if nbytes <= 0:
+        return []
+    max_slice_bytes = max(1, int(max_slice_bytes))
+    bounds = []
+    pos = 0
+    while pos < nbytes:
+        n = min(max_slice_bytes, nbytes - pos)
+        bounds.append((pos, n))
+        pos += n
+    return bounds
+
+
+def _array_from_bytes(buf: Any, start: int, nbytes: int, *, max_slice_bytes: int = _MAX_ARRAY_BYTES) -> mx.array:
+    """A flat ``uint8`` ``mx.array`` of ``buf[start:start+nbytes]``, never built in one
+    ``mx.array(...)`` call larger than ``max_slice_bytes`` -- see the module note above.  ``buf``
+    is any object supporting the buffer protocol (``bytearray``/``memoryview``); slicing it is a
+    zero-copy Python-level view, so splitting costs extra ``mx.array``/``mx.concatenate`` calls
+    only, not extra I/O."""
+    if nbytes <= 0:
+        return mx.zeros((0,), dtype=mx.uint8)
+    mv = memoryview(buf)
+    bounds = _slice_bounds(nbytes, max_slice_bytes)
+    if len(bounds) == 1:
+        off, n = bounds[0]
+        return mx.array(mv[start + off : start + off + n])
+    pieces = [mx.array(mv[start + off : start + off + n]) for off, n in bounds]
+    return mx.concatenate(pieces)
+
+
+def _unpack_fragments_from_buffer(manifest: Dict[str, Any], buf: Any) -> List[StateFragment]:
+    """Like :func:`mlx_vlm.context_vault_wire.unpack_fragments`, but builds each record's
+    ``mx.array`` straight off the raw byte buffer instead of slicing one pre-materialised
+    payload array covering the whole entry -- the payload for a 131k-token entry is 3.7 GB,
+    comfortably past MLX's 32-bit array-shape limit (see the module note above), while every
+    individual record is one KDA/DSA layer's cache slice and nowhere near that large."""
+    arrays: List[mx.array] = []
+    for rec in manifest["offsets"]:
+        start, n = int(rec["start"]), int(rec["nbytes"])
+        dtype = _DTYPES[rec["dtype"]]
+        raw = _array_from_bytes(buf, start, n)
+        arrays.append(mx.view(raw, dtype).reshape(rec["shape"]))
+    if arrays:
+        mx.eval(*arrays)
+    return [_wire_rebuild(node, arrays) for node in manifest["tree"]]
+
+
+# --------------------------------------------------------------------------
 # The vault
 # --------------------------------------------------------------------------
 
@@ -1327,15 +1407,18 @@ class DiskPrefixVault:
         read_s = time.perf_counter() - t_read0
 
         try:
-            payload = mx.array(memoryview(buf))
-            mx.eval(payload)
+            # Reconstruct per record (``_unpack_fragments_from_buffer``), NOT as one
+            # ``mx.array`` over the whole payload: an entry's total payload can exceed MLX's
+            # 32-bit array-shape limit (measured -- see the module note above the function),
+            # while every individual record is one KDA/DSA layer's cache slice and nowhere
+            # near that large.
             manifest = {
                 "tree": header["tree"],
                 "offsets": header["arrays"],
                 "total_bytes": payload_nbytes,
                 "version": header.get("manifest_version", 1),
             }
-            frags = unpack_fragments(manifest, payload)
+            frags = _unpack_fragments_from_buffer(manifest, buf)
         except Exception:  # noqa: BLE001 - a corrupt blob must not raise at a caller
             self.stats.record_refusal("rebuild_failed")
             logger.warning("vault-disk: could not rebuild %s", path.name, exc_info=True)

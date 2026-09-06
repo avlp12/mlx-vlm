@@ -21,6 +21,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import mlx.core as mx
 
@@ -977,6 +978,148 @@ class TestEnvAndWiring(DiskVaultTestCase):
                 seen.append(toks)
         self.assertIn(a[:20], seen)
         self.assertIn(b[:25], seen)
+
+
+# --------------------------------------------------------------------------
+# 8. Bounded array reconstruction (MLX's 32-bit shape limit)
+# --------------------------------------------------------------------------
+#
+# Regression coverage for the epsilon 131k restore (2026-09-07, unified 943b0cb0):
+# ``load_entry`` used to materialise an entry's WHOLE payload as one
+# ``mx.array(memoryview(buf))`` before slicing it per record.  A 131,084-token entry's
+# payload is 2,365,095,936 bytes and raised ``OverflowError: Shape dimension 2365095936
+# is outside the supported range [-2147483648, 2147483647]`` -- every entry above
+# roughly 75k tokens (roughly 2.1 GB at 28,180 B/token) could be saved but never
+# restored.  ``VD._slice_bounds``/``VD._array_from_bytes``/``VD._unpack_fragments_from_buffer``
+# are the fix: never build a single ``mx.array`` bigger than ``_MAX_ARRAY_BYTES``.
+
+
+class TestBoundedArrayReconstruction(unittest.TestCase):
+    def test_slice_bounds_never_exceeds_the_requested_max_no_allocation(self):
+        """The exact byte count from the epsilon OverflowError, checked with pure integer
+        arithmetic -- no buffer, no mx.array, no allocation of any kind."""
+        nbytes = 2_365_095_936  # the entry that overflowed
+        bounds = VD._slice_bounds(nbytes, VD._MAX_ARRAY_BYTES)
+        self.assertGreater(len(bounds), 1, "must actually split -- this is the whole point")
+        total = 0
+        for start, n in bounds:
+            self.assertEqual(start, total, "contiguous, no gaps or overlaps")
+            self.assertGreater(n, 0)
+            self.assertLessEqual(n, VD._MAX_ARRAY_BYTES)
+            self.assertLess(n, VD._MAX_MX_ARRAY_ELEMENTS, "a uint8 array: bytes == elements")
+            total += n
+        self.assertEqual(total, nbytes)
+
+    def test_slice_bounds_a_size_at_the_mlx_limit_still_splits_safely(self):
+        # One byte past what a single uint8 mx.array can hold.
+        nbytes = VD._MAX_MX_ARRAY_ELEMENTS + 1
+        bounds = VD._slice_bounds(nbytes, VD._MAX_ARRAY_BYTES)
+        for _start, n in bounds:
+            self.assertLessEqual(n, VD._MAX_ARRAY_BYTES)
+        self.assertEqual(sum(n for _s, n in bounds), nbytes)
+
+    def test_slice_bounds_small_size_is_a_single_piece(self):
+        bounds = VD._slice_bounds(100, VD._MAX_ARRAY_BYTES)
+        self.assertEqual(bounds, [(0, 100)])
+
+    def test_slice_bounds_zero_is_empty(self):
+        self.assertEqual(VD._slice_bounds(0, VD._MAX_ARRAY_BYTES), [])
+
+    def test_array_from_bytes_matches_a_direct_build_for_a_small_buffer(self):
+        buf = bytearray(range(256)) * 4  # 1024 distinct-ish bytes
+        start, n = 10, 200
+        direct = mx.array(memoryview(buf)[start : start + n])
+        got = VD._array_from_bytes(buf, start, n, max_slice_bytes=1_000_000)
+        self.assertEqual(got.shape, direct.shape)
+        self.assertTrue(bool(mx.array_equal(got, direct).item()))
+
+    def test_array_from_bytes_is_byte_identical_across_tiny_slice_boundaries(self):
+        """A tiny ``max_slice_bytes`` forces many boundary crossings on a small entry --
+        exactly the "small entry, tiny slice size" substitute for a real >2GB allocation."""
+        buf = bytearray((i * 37 + 5) % 256 for i in range(577))  # awkward, non-round length
+        start, n = 13, 511
+        direct = mx.array(memoryview(buf)[start : start + n])
+        for slice_size in (1, 2, 3, 7, 16, 64, 511, 512, 10_000):
+            got = VD._array_from_bytes(buf, start, n, max_slice_bytes=slice_size)
+            self.assertEqual(got.shape, direct.shape, f"slice_size={slice_size}")
+            self.assertTrue(
+                bool(mx.array_equal(got, direct).item()),
+                f"byte mismatch at slice_size={slice_size}",
+            )
+
+    def test_array_from_bytes_never_builds_a_single_mx_array_over_the_max(self):
+        """Records the ``nbytes`` every ``mx.array(...)`` call inside ``_array_from_bytes`` is
+        asked to build, for a buffer this test CAN actually allocate, and asserts every one of
+        them stays within ``max_slice_bytes`` (the real 2.4 GB case is covered, allocation-free,
+        by the ``_slice_bounds`` tests above -- this test proves the wiring from bounds to
+        actual ``mx.array`` calls matches, at a size this process can hold). Only ``mx.array``
+        itself is patched -- ``mx.concatenate`` and everything else run for real, so the spy's
+        own return value is a genuine array and the reassembled result is still checked
+        downstream by the byte-identity tests above."""
+        buf = bytearray(50_000)
+        seen_sizes = []
+        real_array = VD.mx.array
+
+        def _spy(obj):
+            try:
+                seen_sizes.append(len(obj))
+            except TypeError:
+                pass
+            return real_array(obj)
+
+        with mock.patch.object(VD.mx, "array", side_effect=_spy):
+            VD._array_from_bytes(buf, 0, len(buf), max_slice_bytes=333)
+        self.assertTrue(seen_sizes, "the spy must have observed at least one call")
+        for n in seen_sizes:
+            self.assertLessEqual(n, 333)
+
+    def test_unpack_fragments_from_buffer_matches_load_entry_output(self):
+        """End-to-end: a real disk entry's fragments, reconstructed the OLD way (one
+        ``mx.array`` over the whole payload, as ``load_entry`` did before this fix) and the NEW
+        way (``_unpack_fragments_from_buffer``, per-record), must be bit-identical. Guards
+        against the refactor silently changing output while fixing the overflow."""
+        with tempfile.TemporaryDirectory(prefix="vaultdisk-bounded-") as tmp:
+            root = Path(tmp)
+            stats = VD.DiskVaultStats()
+            dv = VD.DiskPrefixVault(root, "ident-B", stats=stats, chunk_bytes=4 << 20, cap_bytes=1 << 40)
+            try:
+                toks = tokens_for(18, base=555)
+                vault = ContextVault("ident-B", budget_bytes=1 << 30)
+                vault.insert(toks, 18, frags_at(18, seed=99), harvest_provenance=_HARVEST_W1)
+                cp = vault.lookup(toks)
+                self.assertTrue(dv.save_async(toks, cp))
+                self.assertTrue(dv.flush(30.0))
+
+                path = dv._entry_path(dv.records()[0]["key"])
+                header = VD.read_header(path)
+                payload_offset = int(header["payload_offset"])
+                payload_nbytes = int(header["payload_nbytes"])
+                with open(path, "rb") as f:
+                    f.seek(payload_offset)
+                    raw = f.read(payload_nbytes)
+                buf = bytearray(raw)
+
+                manifest = {
+                    "tree": header["tree"], "offsets": header["arrays"],
+                    "total_bytes": payload_nbytes, "version": header.get("manifest_version", 1),
+                }
+                # OLD path: one array over the whole payload (safe here -- small test entry).
+                from mlx_vlm.context_vault_wire import unpack_fragments as _old_unpack
+                old_payload = mx.array(memoryview(buf))
+                mx.eval(old_payload)
+                old_frags = _old_unpack(manifest, old_payload)
+                # NEW path.
+                new_frags = VD._unpack_fragments_from_buffer(manifest, buf)
+
+                want = flat_arrays(old_frags)
+                got = flat_arrays(new_frags)
+                self.assertEqual(len(want), len(got))
+                for a, b in zip(want, got):
+                    self.assertEqual(a.dtype, b.dtype)
+                    self.assertEqual(a.shape, b.shape)
+                    self.assertTrue(bool(mx.array_equal(a, b).item()))
+            finally:
+                dv.close(timeout=10.0)
 
 
 if __name__ == "__main__":
