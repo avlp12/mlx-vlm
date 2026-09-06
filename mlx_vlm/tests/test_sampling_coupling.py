@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 
 from mlx_vlm import sampling_coupling as SC
+from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate.ar import _PositionedTargetSampler, _position_keys
 from mlx_vlm.server import generation as server_generation
 from mlx_vlm.speculative import dflash as dflash_utils
@@ -90,48 +91,118 @@ class _SortedAxisCoupledSampler(_PositionedTargetSampler):
 
 
 # --------------------------------------------------------------------------
-# env contract: both toggles inert by default
+# env contract: ONE effective mode, table-driven
 # --------------------------------------------------------------------------
-def test_both_toggles_are_off_by_default(monkeypatch):
-    monkeypatch.delenv(SC.COUPLING_ENV, raising=False)
-    monkeypatch.delenv(SC.DRAFT_MODE_ENV, raising=False)
-    assert SC.sampled_coupling_enabled() is False
-    assert SC.dflash_sampled_draft_mode() == SC.DRAFT_MODE_INDEPENDENT
+# (MLX_VLM_DFLASH_SAMPLED_DRAFT, MLX_VLM_SPEC_SAMPLED_COUPLING) -> (mode, coupled)
+#
+# The draft mode is authoritative; the coupling variable is a pure alias that is
+# consulted ONLY when the draft mode is unset or unparseable.  There must be no
+# combination that yields a coupled target with a slot-axis proposal.
+EFFECTIVE_MODE_TABLE = [
+    # draft mode unset -> the alias decides, default gumbel
+    (None, None, SC.DRAFT_MODE_GUMBEL, True),
+    (None, "1", SC.DRAFT_MODE_GUMBEL, True),
+    (None, "0", SC.DRAFT_MODE_INDEPENDENT, False),
+    (None, "on", SC.DRAFT_MODE_GUMBEL, True),
+    (None, "off", SC.DRAFT_MODE_INDEPENDENT, False),
+    (None, "", SC.DRAFT_MODE_GUMBEL, True),
+    (None, "   ", SC.DRAFT_MODE_GUMBEL, True),
+    (None, "maybe", SC.DRAFT_MODE_GUMBEL, True),
+    # draft mode set -> it wins outright, whatever the alias says
+    ("independent", None, SC.DRAFT_MODE_INDEPENDENT, False),
+    ("independent", "0", SC.DRAFT_MODE_INDEPENDENT, False),
+    ("independent", "1", SC.DRAFT_MODE_INDEPENDENT, False),
+    ("argmax", None, SC.DRAFT_MODE_ARGMAX, False),
+    ("argmax", "0", SC.DRAFT_MODE_ARGMAX, False),
+    ("argmax", "1", SC.DRAFT_MODE_ARGMAX, False),
+    ("gumbel", None, SC.DRAFT_MODE_GUMBEL, True),
+    ("gumbel", "0", SC.DRAFT_MODE_GUMBEL, True),
+    ("gumbel", "1", SC.DRAFT_MODE_GUMBEL, True),
+    ("GUMBEL", None, SC.DRAFT_MODE_GUMBEL, True),
+    ("  argmax  ", None, SC.DRAFT_MODE_ARGMAX, False),
+    # unset-equivalents and unparseables fall through to the alias
+    ("", "0", SC.DRAFT_MODE_INDEPENDENT, False),
+    ("   ", "1", SC.DRAFT_MODE_GUMBEL, True),
+    ("maximal", "0", SC.DRAFT_MODE_INDEPENDENT, False),
+    ("maximal", None, SC.DRAFT_MODE_GUMBEL, True),
+]
 
 
-def test_the_draft_mode_default_follows_the_coupling_toggle(monkeypatch):
-    monkeypatch.delenv(SC.DRAFT_MODE_ENV, raising=False)
-    monkeypatch.setenv(SC.COUPLING_ENV, "1")
+def _set_env(monkeypatch, draft, coupling):
+    for name, value in ((SC.DRAFT_MODE_ENV, draft), (SC.COUPLING_ENV, coupling)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+@pytest.mark.parametrize("draft,coupling,mode,coupled", EFFECTIVE_MODE_TABLE)
+def test_every_env_combination_resolves_to_one_effective_mode(
+    monkeypatch, draft, coupling, mode, coupled
+):
+    _set_env(monkeypatch, draft, coupling)
+    assert SC.dflash_sampled_draft_mode() == mode
+    assert SC.sampled_coupling_enabled() is coupled
+    # and the samplers agree with the resolver, so no third configuration exists
+    assert (
+        _PositionedTargetSampler(temperature=1.0, top_p=0.95, seed=1).coupled is coupled
+    )
+    assert (
+        server_generation._PositionedTargetSampler(
+            temperature=1.0, top_p=0.95, seed=1
+        ).coupled
+        is coupled
+    )
+    built = dflash_utils._make_draft_sampler(
+        _PositionedTargetSampler(temperature=1.0, top_p=0.95, seed=1),
+        row_ids=[0],
+        positions=[0],
+    )
+    if mode == SC.DRAFT_MODE_ARGMAX:
+        assert isinstance(built, dflash_utils._ArgmaxDraftSampler)
+    else:
+        assert built.mode == mode
+        assert built.coupled_full_vocab is coupled
+
+
+def test_the_coupling_is_the_default_with_both_variables_unset(monkeypatch):
+    _set_env(monkeypatch, None, None)
     assert SC.dflash_sampled_draft_mode() == SC.DRAFT_MODE_GUMBEL
-    monkeypatch.setenv(SC.COUPLING_ENV, "0")
-    assert SC.dflash_sampled_draft_mode() == SC.DRAFT_MODE_INDEPENDENT
+    assert SC.sampled_coupling_enabled() is True
 
 
-@pytest.mark.parametrize(
-    "raw,expected",
-    [
-        ("independent", SC.DRAFT_MODE_INDEPENDENT),
-        ("argmax", SC.DRAFT_MODE_ARGMAX),
-        ("GUMBEL", SC.DRAFT_MODE_GUMBEL),
-        ("  argmax  ", SC.DRAFT_MODE_ARGMAX),
-    ],
-)
-def test_the_draft_mode_is_read_from_the_environment(monkeypatch, raw, expected):
-    monkeypatch.delenv(SC.COUPLING_ENV, raising=False)
-    monkeypatch.setenv(SC.DRAFT_MODE_ENV, raw)
-    assert SC.dflash_sampled_draft_mode() == expected
+def test_an_invalid_value_warns_once_not_per_round(monkeypatch, caplog):
+    _set_env(monkeypatch, "maximal", None)
+    SC._reset_env_warnings()
+    with caplog.at_level("WARNING", logger="mlx_vlm.sampling_coupling"):
+        for _ in range(64):
+            assert SC.dflash_sampled_draft_mode() == SC.DRAFT_MODE_GUMBEL
+    warnings = [r for r in caplog.records if SC.DRAFT_MODE_ENV in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    # a DIFFERENT bad value is a different fact and is reported once too
+    caplog.clear()
+    monkeypatch.setenv(SC.DRAFT_MODE_ENV, "coupled")
+    with caplog.at_level("WARNING", logger="mlx_vlm.sampling_coupling"):
+        for _ in range(8):
+            SC.dflash_sampled_draft_mode()
+    assert len([r for r in caplog.records if SC.DRAFT_MODE_ENV in r.getMessage()]) == 1
 
 
-def test_an_invalid_draft_mode_falls_back_and_does_not_raise(monkeypatch):
-    monkeypatch.delenv(SC.COUPLING_ENV, raising=False)
-    monkeypatch.setenv(SC.DRAFT_MODE_ENV, "maximal")
-    assert SC.dflash_sampled_draft_mode() == SC.DRAFT_MODE_INDEPENDENT
+def test_an_invalid_coupling_alias_warns_once(monkeypatch, caplog):
+    _set_env(monkeypatch, None, "sometimes")
+    SC._reset_env_warnings()
+    with caplog.at_level("WARNING", logger="mlx_vlm.sampling_coupling"):
+        for _ in range(32):
+            assert SC.dflash_sampled_draft_mode() == SC.DRAFT_MODE_GUMBEL
+    assert len([r for r in caplog.records if SC.COUPLING_ENV in r.getMessage()]) == 1
 
 
 @pytest.mark.parametrize("top_p", [1.0, 0.95])
-def test_the_default_sampler_still_draws_the_independent_streams(monkeypatch, top_p):
-    """With both toggles unset, every draw is byte-identical to the old code."""
-    monkeypatch.delenv(SC.COUPLING_ENV, raising=False)
+def test_independent_mode_restores_the_pre_fix_draws_byte_identically(
+    monkeypatch, top_p
+):
+    """``MLX_VLM_DFLASH_SAMPLED_DRAFT=independent`` == the pre-fix rail."""
+    _set_env(monkeypatch, "independent", None)
     p, q = _pq()
     sampler = _PositionedTargetSampler(temperature=1.0, top_p=top_p, seed=11)
     assert sampler.coupled is False
@@ -164,18 +235,100 @@ def test_the_default_sampler_still_draws_the_independent_streams(monkeypatch, to
 
 
 def test_the_server_sampler_carries_the_same_contract(monkeypatch):
-    monkeypatch.delenv(SC.COUPLING_ENV, raising=False)
+    _set_env(monkeypatch, "independent", None)
     off = server_generation._PositionedTargetSampler(
         temperature=1.0, top_p=0.95, seed=3
     )
     assert off.coupled is False
-    monkeypatch.setenv(SC.COUPLING_ENV, "1")
+    _set_env(monkeypatch, "gumbel", None)
     on = server_generation._PositionedTargetSampler(
         temperature=1.0, top_p=0.95, seed=3
     )
     assert on.coupled is True
     p, q = _pq()
     assert _match_rate(on, p, q, 512) > 0.6 > _match_rate(off, p, q, 512)
+
+
+# --------------------------------------------------------------------------
+# R2: the proposal must see the target's top-k mask
+# --------------------------------------------------------------------------
+def _truncated(vector, k):
+    """The law ``apply_top_k`` leaves: own top-k, renormalised."""
+    out = np.zeros_like(vector)
+    idx = np.argsort(vector)[::-1][:k]
+    out[idx] = vector[idx]
+    return out / out.sum()
+
+
+class _UnmaskedProposalSampler(server_generation._PositionedTargetSampler):
+    """The bug: a coupled proposal drawn WITHOUT the target's top-k rule."""
+
+    def sample_proposal(self, logprobs, *, row_ids, positions):
+        keys = server_generation._position_keys(self.seed, row_ids, positions)
+        return self._draw(logprobs, keys)
+
+
+def test_the_server_proposal_applies_the_same_top_k_mask():
+    """top_k 40: the coupling must still reach the bound of the TRUNCATED laws.
+
+    ``apply_top_k`` is what the target applies, so the coupling is between
+    p and q each restricted to their own top-k and renormalised; that pair is
+    the right bound, not sum min over the untruncated vectors.
+    """
+    p, q = _pq()
+    n = 4000
+    alpha_max = float(np.minimum(_truncated(p, 40), _truncated(q, 40)).sum())
+
+    coupled = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=1.0, top_k=40, seed=SEED, coupled=True
+    )
+    match = _match_rate(coupled, p, q, n)
+    assert match >= 0.85 * alpha_max, (match, alpha_max)
+
+
+def test_leaving_top_k_off_the_proposal_collapses_the_coupling():
+    """The R2 regression itself, at the k where it bites hardest.
+
+    Without the mask a token the target has already masked to -inf can still
+    win the proposal's Gumbel argmax, so the two draws sit on different
+    supports.  On these vectors: top_k 4 loses 3.0x, top_k 8 loses 1.7x,
+    top_k 20 loses 1.2x -- the tighter the nucleus, the worse the leak.
+    """
+    p, q = _pq()
+    n = 4000
+    for top_k, min_gain in ((4, 2.0), (8, 1.4)):
+        masked = _match_rate(
+            server_generation._PositionedTargetSampler(
+                temperature=1.0, top_p=1.0, top_k=top_k, seed=SEED, coupled=True
+            ),
+            p,
+            q,
+            n,
+        )
+        leaky = _match_rate(
+            _UnmaskedProposalSampler(
+                temperature=1.0, top_p=1.0, top_k=top_k, seed=SEED, coupled=True
+            ),
+            p,
+            q,
+            n,
+        )
+        assert masked > min_gain * leaky, (top_k, masked, leaky)
+
+
+def test_the_top_k_mask_is_applied_on_the_uncoupled_branch_too():
+    p, q = _pq()
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=1.0, top_k=8, seed=5, coupled=False
+    )
+    rows, positions = [0] * 256, list(range(256))
+    drawn = np.array(
+        sampler.sample_proposal(
+            _logprob_rows(q, 256), row_ids=rows, positions=positions
+        )
+    ).reshape(-1)
+    kept = set(int(t) for t in np.argsort(q)[::-1][:8])
+    assert set(int(t) for t in drawn) <= kept, sorted(set(drawn) - kept)
 
 
 # --------------------------------------------------------------------------
@@ -644,18 +797,344 @@ def test_a_full_draft_block_runs_in_every_mode(mode):
 
 def test_the_round_loop_resolver_follows_the_environment(monkeypatch):
     target = _PositionedTargetSampler(temperature=1.0, top_p=0.95, seed=1)
-    monkeypatch.delenv(SC.DRAFT_MODE_ENV, raising=False)
-    monkeypatch.setenv(SC.COUPLING_ENV, "1")
+    _set_env(monkeypatch, None, None)
     built = dflash_utils._make_draft_sampler(target, row_ids=[0], positions=[0])
     assert built.mode == SC.DRAFT_MODE_GUMBEL and built.coupled_full_vocab
 
-    monkeypatch.setenv(SC.DRAFT_MODE_ENV, "argmax")
+    _set_env(monkeypatch, "argmax", "1")
     assert isinstance(
         dflash_utils._make_draft_sampler(target, row_ids=[0], positions=[0]),
         dflash_utils._ArgmaxDraftSampler,
     )
 
-    monkeypatch.delenv(SC.COUPLING_ENV, raising=False)
-    monkeypatch.delenv(SC.DRAFT_MODE_ENV, raising=False)
+    _set_env(monkeypatch, "independent", "1")
     built = dflash_utils._make_draft_sampler(target, row_ids=[0], positions=[0])
     assert built.mode == SC.DRAFT_MODE_INDEPENDENT and not built.coupled_full_vocab
+
+
+# --------------------------------------------------------------------------
+# R5: the scatter form of the token-order nucleus mask
+# --------------------------------------------------------------------------
+def _token_order_two_argsort(logprobs, top_p, temperature):
+    """The previous implementation: rank = argsort(argsort(probs))."""
+    if logprobs.dtype == mx.bfloat16:
+        logprobs = logprobs.astype(mx.float32)
+    probs = mx.softmax(logprobs / temperature, axis=-1)
+    order = mx.argsort(probs, axis=-1)
+    sorted_probs = mx.take_along_axis(probs, order, axis=-1)
+    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+    rank = mx.argsort(order, axis=-1)
+    cumulative_at_token = mx.take_along_axis(cumulative_probs, rank, axis=-1)
+    return mx.log(
+        mx.where(cumulative_at_token > 1 - top_p, probs, mx.zeros_like(probs))
+    )
+
+
+@pytest.mark.parametrize("top_p", [0.95, 0.5, 0.999])
+def test_the_scatter_mask_is_bit_identical_to_the_two_argsort_form(top_p):
+    rng = np.random.default_rng(4242)
+    rows = [
+        rng.normal(size=1024).astype(np.float32),          # generic
+        np.zeros(1024, dtype=np.float32),                  # all tied
+        np.repeat(rng.normal(size=8), 128).astype(np.float32),  # heavy ties
+        np.full(1024, -30.0, dtype=np.float32),            # tied and tiny
+    ]
+    rows[3][17] = 5.0                                      # one spike, rest tied
+    for row in rows:
+        logprobs = mx.array(row)[None, :]
+        got = SC.top_p_logits_token_order(logprobs, top_p, 1.0)
+        want = _token_order_two_argsort(logprobs, top_p, 1.0)
+        mx.eval(got, want)
+        assert mx.array_equal(got, want).item(), row[:8]
+
+
+def test_the_scatter_mask_survives_a_wide_vocabulary():
+    rng = np.random.default_rng(7)
+    logprobs = mx.array(rng.normal(size=(1, 154880)).astype(np.float32))
+    got = SC.top_p_logits_token_order(logprobs, 0.95, 1.0)
+    want = _token_order_two_argsort(logprobs, 0.95, 1.0)
+    mx.eval(got, want)
+    assert mx.array_equal(got, want).item()
+
+
+# --------------------------------------------------------------------------
+# R1: what the round loop actually keys, and drafter-independence
+# --------------------------------------------------------------------------
+MARKOV_VOCAB = 24
+MARKOV_HIDDEN = 4
+
+
+class _Markov1Target:
+    """A stub target whose logits depend only on the immediately previous token.
+
+    That is the whole point: for a Markov-1 target the emitted chain
+    x_i = sample_target(f(x_{i-1}), position=i) is fully determined by the seed
+    and the positions, so ANY drafter -- or none at all -- must produce the same
+    stream.  If the drafter can move it, the verification is not exact.
+    """
+
+    def __init__(self, seed):
+        rng = np.random.default_rng(seed)
+        self.table = mx.array(
+            (rng.normal(size=(MARKOV_VOCAB, MARKOV_VOCAB)) * 2.0).astype(np.float32)
+        )
+        self.forwards = 0
+
+    def logits_for(self, token_ids):
+        return self.table[token_ids]
+
+    def __call__(self, ids, cache=None, **kw):
+        self.forwards += 1
+        length = int(ids.shape[1])
+        return SimpleNamespace(
+            logits=self.logits_for(ids),
+            hidden_states=[mx.zeros((1, length, MARKOV_HIDDEN))],
+            gdn_states=["gdn"],
+        )
+
+    def rollback_speculative_cache(self, *args, **kwargs):
+        return 0
+
+
+class _StubDrafter:
+    """Mimics DFlash2's contract: one ``sample_proposal`` call per position."""
+
+    def __init__(self, target, kind, block_size=8, seed=0):
+        self.target = target
+        self.kind = kind
+        self.config = SimpleNamespace(
+            target_layer_ids=[0],
+            block_size=block_size,
+            runtime_block_size=block_size,
+            vocab_size=MARKOV_VOCAB,
+        )
+        self.accept_lens = []
+        self.draft_lens = []
+        self.dflash_deferred_walk = True
+        rng = np.random.default_rng(1000 + seed)
+        self.noise = mx.array(
+            (rng.normal(size=(MARKOV_VOCAB, MARKOV_VOCAB)) * 2.0).astype(np.float32)
+        )
+
+    def reset(self, model):
+        return ["draft-cache"]
+
+    def _scores(self, previous):
+        table = self.target.table if self.kind == "oracle" else self.noise
+        return table[mx.array([previous], dtype=mx.int32)]
+
+    def draft_block(self, last_bonus, hidden, cache, bs, sampler, token_dtype, **kw):
+        previous = (
+            int(last_bonus)
+            if isinstance(last_bonus, int)
+            else int(last_bonus.reshape(-1)[0])
+        )
+        propose = getattr(sampler, "sample_proposal", None)
+        tokens = []
+        for _ in range(bs - 1):
+            scores = self._scores(previous)
+            drawn = propose(scores) if callable(propose) else sampler(scores)
+            previous = int(mx.array(drawn).reshape(-1)[0])
+            tokens.append(previous)
+        return mx.array([tokens], dtype=token_dtype)
+
+
+class _TracingSampler(_PositionedTargetSampler):
+    """Marks which of the two streams is asking for keys."""
+
+    in_proposal = False
+
+    def sample_proposal(self, *args, **kwargs):
+        self.in_proposal = True
+        try:
+            return super().sample_proposal(*args, **kwargs)
+        finally:
+            self.in_proposal = False
+
+
+def _run_sampled_rounds(sampler, kind, *, max_tokens=40, block_size=8, seed=0):
+    target = _Markov1Target(seed)
+    model = SimpleNamespace(language_model=target)
+    drafter = _StubDrafter(target, kind, block_size=block_size, seed=seed)
+    rounds = dflash_utils._dflash_rounds(
+        model,
+        drafter,
+        [SimpleNamespace(offset=0)],
+        mx.zeros((1, 1, MARKOV_HIDDEN)),
+        first_bonus=3,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        draft_block_size=block_size,
+        use_model_initial_block_size=False,
+        greedy_sampling=False,
+    )
+    tokens = [3]
+    try:
+        for tok, _ in rounds:
+            tokens.append(int(tok))
+    finally:
+        rounds.close()
+    return target, drafter, tokens
+
+
+def _autoregressive_reference(sampler, seed, count):
+    """No drafter at all: the same chain drawn one token at a time."""
+    target = _Markov1Target(seed)
+    tokens = [3]
+    for position in range(1, count):
+        logits = target.logits_for(mx.array([tokens[-1]], dtype=mx.int32))
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        drawn = sampler.sample_target(logprobs, row_ids=[0], positions=[position])
+        tokens.append(int(mx.array(drawn).reshape(-1)[0]))
+    return tokens
+
+
+def test_the_round_loop_keys_the_positions_the_block_occupies(monkeypatch):
+    """Proposal keys [emitted .. emitted+W-1], target keys [emitted .. emitted+W]."""
+    sampler = _TracingSampler(temperature=1.0, top_p=0.95, seed=SEED, coupled=True)
+    traced = {"target": [], "proposal": []}
+    real = ar_module._position_keys
+
+    def _traced_position_keys(seed, row_ids, positions):
+        traced["proposal" if sampler.in_proposal else "target"].append(
+            (int(seed), list(row_ids), list(positions))
+        )
+        return real(seed, row_ids, positions)
+
+    monkeypatch.setattr(ar_module, "_position_keys", _traced_position_keys)
+
+    _, _, tokens = _run_sampled_rounds(sampler, "oracle", max_tokens=40, block_size=8)
+    assert len(tokens) > 8
+
+    # every proposal call is one position of one round, in order
+    proposal_positions = [call[2][0] for call in traced["proposal"]]
+    target_blocks = [call[2] for call in traced["target"]]
+    assert target_blocks, "no target draw was keyed"
+
+    # W = block_total - 1 = 7 drafted tokens; the verify block is W + 1 wide
+    width = len(target_blocks[0]) - 1
+    assert width == 7, len(target_blocks[0])
+
+    cursor = 0
+    for block in target_blocks:
+        emitted = block[0]
+        assert block == list(range(emitted, emitted + width + 1)), block
+        drafted = proposal_positions[cursor : cursor + width]
+        assert drafted == list(range(emitted, emitted + width)), (emitted, drafted)
+        cursor += width
+    assert cursor == len(proposal_positions)
+
+    # the coupling uses ONE key stream: same seed on both sides
+    assert {call[0] for call in traced["target"]} == {
+        call[0] for call in traced["proposal"]
+    }
+
+
+def test_the_uncoupled_proposal_keys_a_different_stream(monkeypatch):
+    sampler = _TracingSampler(temperature=1.0, top_p=0.95, seed=SEED, coupled=False)
+    seeds = {"target": set(), "proposal": set()}
+    real = ar_module._position_keys
+
+    def _traced_position_keys(seed, row_ids, positions):
+        seeds["proposal" if sampler.in_proposal else "target"].add(int(seed))
+        return real(seed, row_ids, positions)
+
+    monkeypatch.setattr(ar_module, "_position_keys", _traced_position_keys)
+    _run_sampled_rounds(sampler, "oracle", max_tokens=24, block_size=8)
+    assert seeds["target"] == {SEED}
+    assert seeds["proposal"] == {SEED ^ SC.PROPOSAL_KEY_XOR}
+
+
+@pytest.mark.parametrize("coupled", [False, True])
+@pytest.mark.parametrize("seed", [1, 2, 7])
+def test_the_emitted_stream_does_not_depend_on_the_drafter(seed, coupled):
+    """Random drafter vs oracle drafter vs no drafter -- one identical stream."""
+    count = 40
+
+    def _sampler():
+        return _PositionedTargetSampler(
+            temperature=1.0, top_p=0.95, seed=seed, coupled=coupled
+        )
+
+    _, random_drafter, random_tokens = _run_sampled_rounds(
+        _sampler(), "random", max_tokens=count, seed=seed
+    )
+    _, oracle_drafter, oracle_tokens = _run_sampled_rounds(
+        _sampler(), "oracle", max_tokens=count, seed=seed
+    )
+    reference = _autoregressive_reference(_sampler(), seed, len(random_tokens))
+
+    assert random_tokens == oracle_tokens == reference, (
+        random_tokens,
+        oracle_tokens,
+        reference,
+    )
+    # and the two drafters really did behave differently
+    assert sum(random_drafter.accept_lens) < sum(oracle_drafter.accept_lens), (
+        random_drafter.accept_lens,
+        oracle_drafter.accept_lens,
+    )
+
+
+def test_the_coupling_lifts_acceptance_in_the_round_loop():
+    """The same stub, coupled vs not: acceptance goes up by a large factor.
+
+    The two modes do NOT emit the same stream and are not meant to: a
+    token-id-order Gumbel draw and a sorted-axis one assign different noise to
+    the same key, so the realised token at a given (seed, position) differs.
+    What is preserved is the LAW -- tested by the mask-equality and chi-square
+    tests -- and, within a mode, independence from the drafter.
+    """
+    _, coupled_drafter, _ = _run_sampled_rounds(
+        _PositionedTargetSampler(temperature=1.0, top_p=0.95, seed=5, coupled=True),
+        "oracle",
+        max_tokens=60,
+        seed=5,
+    )
+    _, plain_drafter, _ = _run_sampled_rounds(
+        _PositionedTargetSampler(temperature=1.0, top_p=0.95, seed=5, coupled=False),
+        "oracle",
+        max_tokens=60,
+        seed=5,
+    )
+    coupled_alpha = sum(coupled_drafter.accept_lens) / sum(coupled_drafter.draft_lens)
+    plain_alpha = sum(plain_drafter.accept_lens) / sum(plain_drafter.draft_lens)
+    assert coupled_alpha > 3 * plain_alpha, (coupled_alpha, plain_alpha)
+
+
+def test_a_vocabulary_width_mismatch_is_refused_at_construction():
+    target = _PositionedTargetSampler(temperature=1.0, top_p=0.95, seed=1)
+    with pytest.raises(ValueError, match="one vocabulary axis"):
+        dflash_utils._make_draft_sampler(
+            target,
+            row_ids=[0],
+            positions=[0],
+            mode=SC.DRAFT_MODE_GUMBEL,
+            draft_vocab_size=32000,
+            target_vocab_size=154880,
+        )
+    # the other two modes do not couple, so they do not care
+    for mode in (SC.DRAFT_MODE_INDEPENDENT, SC.DRAFT_MODE_ARGMAX):
+        dflash_utils._make_draft_sampler(
+            target,
+            row_ids=[0],
+            positions=[0],
+            mode=mode,
+            draft_vocab_size=32000,
+            target_vocab_size=154880,
+        )
+
+
+def test_a_coupled_proposal_of_the_wrong_width_is_refused_at_call_time():
+    target = _PositionedTargetSampler(temperature=1.0, top_p=0.95, seed=1)
+    built = dflash_utils._make_draft_sampler(
+        target,
+        row_ids=[0],
+        positions=[0],
+        mode=SC.DRAFT_MODE_GUMBEL,
+        draft_vocab_size=64,
+        target_vocab_size=64,
+    )
+    assert built.vocab_size == 64
+    with pytest.raises(ValueError, match="one token-id axis"):
+        built.sample_proposal(mx.zeros((1, 48)))

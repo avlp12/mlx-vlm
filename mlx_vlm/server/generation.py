@@ -446,6 +446,14 @@ class _PositionedTargetSampler:
         row_ids: List[int],
         positions: List[int],
     ) -> mx.array:
+        # The proposal must see the SAME mask the target sees.  Leaving top-k
+        # off here (as this did) puts the two draws on different supports: a
+        # token the target has already masked to -inf can still win the
+        # proposal's Gumbel argmax.  Measured on the test vectors: 3.0x
+        # acceptance loss at top_k 4, 1.7x at 8, 1.2x at 20 -- the tighter the
+        # cut, the worse the leak.  Applied on BOTH branches, so the mask never
+        # depends on the mode.
+        logprobs = self._apply_top_k(logprobs)
         if self.coupled:
             # Same key, same nucleus mask, same token-id axis as the target:
             # mx.random.categorical is Gumbel-max, so the two draws agree

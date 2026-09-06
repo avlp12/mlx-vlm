@@ -32,40 +32,62 @@ probability of any independently sampled q.  It also restores DFlash2's
 fused/compiled Viterbi step, which is skipped whenever ``sample_proposal`` is a
 callable (``drafters/dflash2/dflash2.py:222-229``).
 
-F2 ``MLX_VLM_SPEC_SAMPLED_COUPLING=1`` -- shared-key Gumbel-max coupling.
-``mx.random.categorical`` is Gumbel-max: it draws one iid Gumbel per *array
-slot* from the key and returns the argmax of ``logits + G``.  Two distributions
-sampled with the *same key over the same index space* are therefore coupled:
-they agree whenever the Gumbel-argmax agrees, which happens with probability
-close to sum_t min(p_t, q_t) (measured 0.72 against a maximal 0.78, 92% of the
-bound).  Three things have to hold at once:
+F2 ``MLX_VLM_DFLASH_SAMPLED_DRAFT=gumbel`` (the default) -- shared-key
+Gumbel-max coupling.  ``mx.random.categorical`` is Gumbel-max: it draws one iid
+Gumbel per *array slot* from the key and returns the argmax of ``logits + G``.
+Two distributions sampled with the *same key over the same index space* are
+therefore coupled: they agree whenever the Gumbel-argmax agrees, which happens
+with probability close to sum_t min(p_t, q_t) (measured 0.72 against a maximal
+0.78, 93% of the bound).  Three things go into it, and they are NOT equally
+important:
 
-  (a) proposal and target must use the same per-position key (drop the XOR);
-  (b) the target's top-p sampler must sample in **token-id order**.  The
-      shipped one argsorts the probabilities and calls ``categorical`` on the
-      *sorted* axis, so slot j carries a different token for p than for q and
-      the shared key couples nothing.  Removing the XOR alone leaves acceptance
-      at the broken value -- that is the regression this module's token-order
-      path guards against;
-  (c) the proposal must go through the same nucleus mask at the same
-      temperature over the same token-id axis, so identical logits give
-      identical draws.
+  (a) LOAD-BEARING.  Proposal and target must use the same per-position key
+      (drop the XOR).  Without it there is no coupling at all: 0.03.
+  (b) LOAD-BEARING.  The target's top-p sampler must sample in **token-id
+      order**.  The shipped one argsorts the probabilities and calls
+      ``categorical`` on the *sorted* axis, so slot j carries a different token
+      for p than for q and the shared key couples nothing.  Removing the XOR
+      alone only reaches 0.07; adding the token-order axis reaches 0.72.
+  (c) WORTH ABOUT 2%.  Applying the same nucleus mask, at the same temperature,
+      to the proposal before its draw.  This one is a refinement, not the
+      mechanism: the drafter's scores are DFlash2 **Viterbi path scores**
+      evaluated at the target's temperature, not a calibrated conditional law,
+      so masking them makes the proposal a slightly better q -- it does not
+      make it the target's distribution, and nothing downstream assumes it is.
 
 Neither fix changes the output distribution: the emitted token is still the
 target's own draw, and the token-order nucleus mask is the sorted-order mask
 under a permutation.  Only *which* proposal the target happens to agree with
 changes.
 
-Defaults are inert: with both environment variables unset the resolved mode is
-``"independent"`` and coupling is off, which is byte-identical to the previous
-behaviour.
+Environment contract (precedence)
+---------------------------------
+``MLX_VLM_DFLASH_SAMPLED_DRAFT`` is the one authoritative setting and resolves
+to exactly one effective mode:
+
+    independent  ->  coupled=False, XOR-keyed slot-axis proposal (pre-fix)
+    argmax       ->  coupled=False, argmax draft (F1)
+    gumbel       ->  coupled=True,  shared-key token-order coupling (F2)
+
+``MLX_VLM_SPEC_SAMPLED_COUPLING`` is a pure alias kept for the served rail's A/B
+switch: it is consulted ONLY when the draft mode is unset (or unparseable),
+where truthy selects ``gumbel`` and falsy selects ``independent``.  There is no
+combination that yields a coupled target with an uncoupled proposal -- that
+third, broken configuration was reachable before this resolver existed.
+
+With both unset the effective mode is ``gumbel``: the coupling is the serving
+default as of the 43.0 -> 54.4 tok/s panel.  ``MLX_VLM_DFLASH_SAMPLED_DRAFT=
+independent`` restores the pre-fix behaviour byte-identically.
+
+Empty or whitespace-only values count as unset.  An unparseable value warns
+once per distinct value (never per round) and falls through to the default.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Set, Tuple
 
 import mlx.core as mx
 
@@ -79,47 +101,78 @@ DRAFT_MODE_ARGMAX = "argmax"
 DRAFT_MODE_GUMBEL = "gumbel"
 DRAFT_MODES = (DRAFT_MODE_INDEPENDENT, DRAFT_MODE_ARGMAX, DRAFT_MODE_GUMBEL)
 
+#: Both variables unset == the coupling.  Flipped from ``independent`` after the
+#: served panel measured 43.0 -> 54.4 tok/s and the exactness review.
+DEFAULT_DRAFT_MODE = DRAFT_MODE_GUMBEL
+
 PROPOSAL_KEY_XOR = 0x0DFA5202
 
+_TRUE_VALUES = ("1", "true", "yes", "on")
+_FALSE_VALUES = ("0", "false", "no", "off")
 
-def _truthy(raw: str) -> bool:
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+# (variable, offending value) pairs already reported.  R6: the round loop
+# resolves the mode every round, so an unguarded warning would print per round.
+_WARNED: Set[Tuple[str, str]] = set()
 
 
-def sampled_coupling_enabled(env: Optional[dict] = None) -> bool:
-    """F2 toggle. Off by default: unset == today's independent streams."""
-    raw = (os.environ if env is None else env).get(COUPLING_ENV)
-    return False if raw is None else _truthy(raw)
+def _reset_env_warnings() -> None:
+    """Test hook: forget which invalid values have already been reported."""
+    _WARNED.clear()
+
+
+def _warn_once(name: str, raw: str, fallback: str) -> None:
+    key = (name, raw)
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    logger.warning(
+        "Ignoring invalid %s=%r; using %r. Valid values: %s.",
+        name,
+        raw,
+        fallback,
+        ", ".join(DRAFT_MODES) if name == DRAFT_MODE_ENV else "0/1",
+    )
+
+
+def _env_value(environ, name: str) -> Optional[str]:
+    """R6: an empty or whitespace-only value is the same as not setting it."""
+    raw = environ.get(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    return raw or None
 
 
 def dflash_sampled_draft_mode(env: Optional[dict] = None) -> str:
-    """F1 toggle -- how DFlash2 draws its proposal under sampling.
-
-    ``"independent"`` (default while F2 is off) keeps the XOR-keyed independent
-    draw, ``"argmax"`` drafts the drafter's own argmax like MTP, ``"gumbel"``
-    (default once F2 is on) draws the proposal in full-vocabulary token-id
-    order with the target's key so the two are Gumbel-coupled.
-    """
+    """The ONE effective sampled-draft mode.  See the module docstring."""
     environ = os.environ if env is None else env
-    raw = environ.get(DRAFT_MODE_ENV)
-    fallback = (
-        DRAFT_MODE_GUMBEL
-        if sampled_coupling_enabled(environ)
-        else DRAFT_MODE_INDEPENDENT
-    )
-    if raw is None:
-        return fallback
-    mode = raw.strip().lower()
-    if mode not in DRAFT_MODES:
-        logger.warning(
-            "Ignoring invalid %s=%r (expected one of %s); using %r",
-            DRAFT_MODE_ENV,
-            raw,
-            ", ".join(DRAFT_MODES),
-            fallback,
-        )
-        return fallback
-    return mode
+
+    raw = _env_value(environ, DRAFT_MODE_ENV)
+    if raw is not None:
+        mode = raw.lower()
+        if mode in DRAFT_MODES:
+            return mode
+        _warn_once(DRAFT_MODE_ENV, raw, DEFAULT_DRAFT_MODE)
+
+    alias = _env_value(environ, COUPLING_ENV)
+    if alias is None:
+        return DEFAULT_DRAFT_MODE
+    lowered = alias.lower()
+    if lowered in _TRUE_VALUES:
+        return DRAFT_MODE_GUMBEL
+    if lowered in _FALSE_VALUES:
+        return DRAFT_MODE_INDEPENDENT
+    _warn_once(COUPLING_ENV, alias, DEFAULT_DRAFT_MODE)
+    return DEFAULT_DRAFT_MODE
+
+
+def sampled_coupling_enabled(env: Optional[dict] = None) -> bool:
+    """Is the target/proposal pair coupled?  Exactly ``mode == "gumbel"``.
+
+    Derived from the mode rather than read from ``MLX_VLM_SPEC_SAMPLED_COUPLING``
+    directly, so a coupled target can never be paired with a slot-axis proposal.
+    """
+    return dflash_sampled_draft_mode(env) == DRAFT_MODE_GUMBEL
 
 
 def top_p_logits_token_order(
@@ -129,11 +182,15 @@ def top_p_logits_token_order(
 
     The shipped sampler keeps the mask on the argsorted axis and samples there.
     This computes the identical mask -- ascending argsort, cumulative sum, keep
-    where the cumulative mass exceeds ``1 - top_p`` -- and then scatters it back
-    to token ids by gathering the cumulative sum at each token's rank, so the
-    categorical draw that follows is indexed by token id.  Same mask, same
-    weights, same marginal; only the Gumbel slot each token occupies changes,
-    and that is exactly what makes a shared key couple.
+    where the cumulative mass exceeds ``1 - top_p`` -- and then scatters the
+    cumulative sum straight back to token ids, so the categorical draw that
+    follows is indexed by token id.  Same mask, same weights, same marginal;
+    only the Gumbel slot each token occupies changes, and that is exactly what
+    makes a shared key couple.
+
+    One argsort, one scatter.  The scatter replaced a second ``argsort`` of the
+    permutation (``rank = argsort(order)``); the two are bit-identical because
+    ``order`` is a permutation, so the scatter writes every slot exactly once.
     """
     if logprobs.dtype == mx.bfloat16:
         logprobs = logprobs.astype(mx.float32)
@@ -141,9 +198,9 @@ def top_p_logits_token_order(
     order = mx.argsort(probs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, order, axis=-1)
     cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-    # rank[t] = the slot token t occupies in the ascending order.
-    rank = mx.argsort(order, axis=-1)
-    cumulative_at_token = mx.take_along_axis(cumulative_probs, rank, axis=-1)
+    cumulative_at_token = mx.put_along_axis(
+        mx.zeros_like(probs), order, cumulative_probs, axis=-1
+    )
     top_probs = mx.where(
         cumulative_at_token > 1 - top_p,
         probs,
@@ -182,6 +239,7 @@ def scatter_candidates_to_vocab(
 
 __all__ = [
     "COUPLING_ENV",
+    "DEFAULT_DRAFT_MODE",
     "DRAFT_MODES",
     "DRAFT_MODE_ARGMAX",
     "DRAFT_MODE_GUMBEL",

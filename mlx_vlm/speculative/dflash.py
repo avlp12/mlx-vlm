@@ -636,19 +636,54 @@ class _ArgmaxDraftSampler:
         return mx.argmax(logits, axis=-1)
 
 
+def _model_vocab_size(module) -> Optional[int]:
+    """Best-effort vocabulary width of a model or drafter.  None if unknown."""
+    for holder in (module, getattr(module, "config", None)):
+        value = getattr(holder, "vocab_size", None)
+        if isinstance(value, int) and value > 0:
+            return int(value)
+    return None
+
+
 def _make_draft_sampler(
     sampler: Callable,
     *,
     row_ids: List[int],
     positions: List[int],
     mode: Optional[str] = None,
+    draft_vocab_size: Optional[int] = None,
+    target_vocab_size: Optional[int] = None,
 ) -> Callable:
-    """Build the drafter-side sampler for one sampled round (F1/F2)."""
+    """Build the drafter-side sampler for one sampled round (F1/F2).
+
+    The Gumbel coupling is SHAPE-DEPENDENT: ``mx.random.categorical`` draws one
+    Gumbel per array slot, so a proposal laid out over a different vocabulary
+    width than the target does not merely couple badly -- it couples to the
+    wrong tokens, silently.  Refuse that pairing here, where the error can still
+    name both widths, instead of shipping a quiet acceptance regression.
+    """
     resolved = dflash_sampled_draft_mode() if mode is None else mode
     if resolved == DRAFT_MODE_ARGMAX:
         return _ArgmaxDraftSampler()
+    if (
+        resolved == DRAFT_MODE_GUMBEL
+        and draft_vocab_size is not None
+        and target_vocab_size is not None
+        and int(draft_vocab_size) != int(target_vocab_size)
+    ):
+        raise ValueError(
+            "Sampled-draft coupling requires the drafter and the target to share "
+            f"one vocabulary axis: drafter={int(draft_vocab_size)}, "
+            f"target={int(target_vocab_size)}. mx.random.categorical draws one "
+            "Gumbel per slot, so mismatched widths couple different tokens. Set "
+            "MLX_VLM_DFLASH_SAMPLED_DRAFT=argmax or =independent for this pair."
+        )
     return _PositionedDraftSampler(
-        sampler, row_ids=row_ids, positions=positions, mode=resolved
+        sampler,
+        row_ids=row_ids,
+        positions=positions,
+        mode=resolved,
+        vocab_size=draft_vocab_size if target_vocab_size is None else target_vocab_size,
     )
 
 
@@ -660,6 +695,7 @@ class _PositionedDraftSampler:
         row_ids: List[int],
         positions: List[int],
         mode: Optional[str] = None,
+        vocab_size: Optional[int] = None,
     ):
         self.sampler = sampler
         self.row_ids = [int(row_id) for row_id in row_ids]
@@ -669,6 +705,7 @@ class _PositionedDraftSampler:
         # couple anything, so the DFlash2 selector lifts its per-candidate
         # scores onto the full vocabulary before calling ``sample_proposal``.
         self.coupled_full_vocab = self.mode == DRAFT_MODE_GUMBEL
+        self.vocab_size = None if vocab_size is None else int(vocab_size)
 
     def __call__(self, logits: mx.array) -> mx.array:
         if logits.ndim == 1:
@@ -707,6 +744,17 @@ class _PositionedDraftSampler:
         if batch != len(self.row_ids):
             raise ValueError(
                 "Draft sampler row count does not match logits batch size."
+            )
+        if (
+            self.coupled_full_vocab
+            and self.vocab_size is not None
+            and int(logits.shape[-1]) != self.vocab_size
+        ):
+            raise ValueError(
+                "Coupled proposal width does not match the target vocabulary: "
+                f"proposal={int(logits.shape[-1])}, target={self.vocab_size}. "
+                "The Gumbel coupling is indexed by array slot, so the two draws "
+                "must share one token-id axis."
             )
         rows = [row_id for row_id in self.row_ids for _ in range(length)]
         positions = [
@@ -928,6 +976,11 @@ def _dflash_rounds(
     _reset_uniform_clamp(draft_model)
     _reset_per_row_rollback(draft_model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
+    # Gumbel noise is indexed by array slot, so a coupled proposal and the
+    # target must share one vocabulary axis.  Resolved once per loop; None
+    # wherever a width is not discoverable, in which case the check is skipped.
+    draft_vocab_size = _model_vocab_size(draft_model)
+    target_vocab_size = _model_vocab_size(lm) or _model_vocab_size(model)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling and not positioned_sampling,
@@ -966,6 +1019,8 @@ def _dflash_rounds(
                 sampler,
                 row_ids=[0],
                 positions=[emitted],
+                draft_vocab_size=draft_vocab_size,
+                target_vocab_size=target_vocab_size,
             )
             if not greedy_sampling and positioned_sampling
             else sampler
@@ -1098,6 +1153,11 @@ def _dflash_rounds_batch(
     _reset_uniform_clamp(draft_model)
     _reset_per_row_rollback(draft_model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
+    # Gumbel noise is indexed by array slot, so a coupled proposal and the
+    # target must share one vocabulary axis.  Resolved once per loop; None
+    # wherever a width is not discoverable, in which case the check is skipped.
+    draft_vocab_size = _model_vocab_size(draft_model)
+    target_vocab_size = _model_vocab_size(lm) or _model_vocab_size(model)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling and not positioned_sampling,
@@ -1169,6 +1229,8 @@ def _dflash_rounds_batch(
                                 sampler,
                                 row_ids=[row_ids[active_idx[j]]],
                                 positions=[emitted[active_idx[j]]],
+                                draft_vocab_size=draft_vocab_size,
+                                target_vocab_size=target_vocab_size,
                             )
                             if not greedy_sampling and positioned_sampling
                             else sampler
@@ -1194,6 +1256,8 @@ def _dflash_rounds_batch(
                         sampler,
                         row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
                         positions=[emitted[active_idx[j]] for j in range(n_active)],
+                        draft_vocab_size=draft_vocab_size,
+                        target_vocab_size=target_vocab_size,
                     )
                     if not greedy_sampling and positioned_sampling
                     else sampler

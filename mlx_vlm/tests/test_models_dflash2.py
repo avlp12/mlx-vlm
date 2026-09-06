@@ -242,20 +242,31 @@ def test_candidate_selector_uses_coherent_top_candidate_path():
     assert selected.tolist() == [[2, 1]]
 
 
-def test_positioned_proposal_sampling_is_independent_of_target_filters():
+def test_positioned_proposal_sampling_carries_the_target_top_k_mask():
+    """R2: the proposal must see the SAME filters as the target.
+
+    This test previously asserted the opposite -- that the proposal was
+    "independent of target filters" -- and that was the defect.  A token the
+    target has already masked to -inf could still win the proposal's Gumbel
+    argmax, so the two draws sat on different supports and the coupling
+    collapsed (measured 3.0x acceptance loss at top_k 4).  Determinism per
+    (row_id, position) is unchanged.
+    """
     sampler = _PositionedTargetSampler(
         temperature=1.0,
         top_p=0.95,
-        top_k=20,
+        top_k=4,
         seed=7,
     )
-    scores = mx.zeros((1, 16))
+    scores = mx.array([[float(value) for value in range(16)]])
 
     first = sampler.sample_proposal(scores, row_ids=[0], positions=[3])
     second = sampler.sample_proposal(scores, row_ids=[0], positions=[3])
 
     assert first.shape == (1,)
     assert bool(mx.array_equal(first, second))
+    # only ids 12..15 survive top_k=4 on a monotonically increasing score row
+    assert int(first[0]) >= 12, int(first[0])
 
 
 def test_dflash2_target_validation_is_structural():
