@@ -173,6 +173,49 @@ def get_speculative_batch_coalesce_s():
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
+def dflash_continuous_batching_enabled() -> bool:
+    """``MLX_VLM_DFLASH_CONTINUOUS_BATCHING`` -- route dflash through BatchGenerator.
+
+    Default ``"1"``.  ``"0"`` restores the legacy ``_run_speculative`` loop for
+    dflash, which is the A/B control arm.
+
+    WHY THIS EXISTS.  ``_run_speculative`` never constructs a ``BatchGenerator``,
+    and ``BatchGenerator`` is the only object that holds ``apc_manager``/``vault``
+    -- so every dflash request was a full cold prefill and the server's prefill
+    line reported ``cached_tokens=0`` from a *string literal* rather than from a
+    measurement.  MTP was narrowed out of this branch by upstream ``eb7537b9``
+    (batched target-verify drift) and picked up APC as a side effect; dflash was
+    left behind by accident, not by policy: ``apc.py`` has no ``draft_kind``
+    reference and there is no refusal, test, or doc for it anywhere.  Downstream
+    is already drafter-agnostic (``run_speculative_server_rounds`` handles dflash
+    at B=1 and B>1, ``PromptProcessingBatch`` builds the dflash capture kwargs,
+    admission never looks at the kind), so the only thing in the way was this
+    dispatch.
+
+    Read per ``_run_impl`` entry (i.e. once per server process), not per request:
+    flipping the arm means restarting the server, which the A/B has to do anyway
+    because the APC exact cache is an in-process ``OrderedDict``.
+    """
+    return os.environ.get("MLX_VLM_DFLASH_CONTINUOUS_BATCHING", "1") != "0"
+
+
+def _uses_continuous_batching_loop(draft_kind: Optional[str]) -> bool:
+    """Does this drafter kind decode inside the ``BatchGenerator`` loop?
+
+    ``None`` (no drafter) and ``"mtp"`` always do.  ``"dflash"`` does unless the
+    toggle above is off.  ``"eagle3"`` and ``"lookup"`` never do -- deliberately
+    unchanged here: eagle3's server round loop has its own batched entry point
+    and lookup reads token ids rather than a hidden capture, and neither was
+    measured on the continuous-batching path.  Routing by NAME, not by "not
+    mtp", is the whole point: the old condition swept up every non-MTP kind.
+    """
+    if draft_kind is None or draft_kind == "mtp":
+        return True
+    if draft_kind == "dflash":
+        return dflash_continuous_batching_enabled()
+    return False
+
+
 def get_log_progress_interval():
     """Number of decoded tokens between INFO progress messages (0 disables)."""
     raw = os.environ.get(
@@ -2095,10 +2138,20 @@ class ResponseGenerator:
             self._run_diffusion()
             return
 
-        if self.draft_model is not None and self.draft_kind != "mtp":
+        if self.draft_model is not None and not _uses_continuous_batching_loop(
+            self.draft_kind
+        ):
+            # eagle3 / lookup, and dflash with
+            # MLX_VLM_DFLASH_CONTINUOUS_BATCHING=0 (the A/B control arm).
+            # Everything else falls through to the BatchGenerator loop below,
+            # which is the only place ``apc_manager``/``vault`` are wired --
+            # see ``dflash_continuous_batching_enabled``.
+            #
             # The speculative loop owns the GPU thread for its whole life but
-            # never wired the model: BatchGenerator does that at
-            # generate/ar.py:2345 and _run_speculative does not construct one.
+            # never wired the model: BatchGenerator does that in its own
+            # constructor (``generate/ar.py::BatchGenerator.__init__``,
+            # ``self._wire_stack.enter_context(wired_limit(model, ...))``) and
+            # _run_speculative does not construct one.
             # An unwired forward costs about 1690 ms regardless of block width,
             # against 34 ms at width 1 and 59 ms at width 5 wired -- which is
             # exactly the 1688.8 ms this path was measured at, and why the cost
@@ -2124,12 +2177,18 @@ class ResponseGenerator:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
                 active_batch = bool(active)
+                # The idle coalescing window belongs to the DRAFTER, not to MTP:
+                # _run_speculative applied it to dflash too
+                # (``get_speculative_batch_coalesce_s()`` at its collect site),
+                # so a dflash arm routed here would otherwise differ from the
+                # legacy arm by the 5 ms window alone -- a confound in the very
+                # A/B this dispatch exists for.
                 coalesce_s = (
                     get_speculative_batch_coalesce_s()
                     if (
                         not active_batch
                         and self.draft_model is not None
-                        and self.draft_kind == "mtp"
+                        and self.draft_kind in ("mtp", "dflash")
                     )
                     else 0.0
                 )
