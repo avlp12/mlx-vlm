@@ -38,7 +38,10 @@ import pytest
 from mlx_vlm.generate import ar as ar_mod
 from mlx_vlm.prompt_utils import template_references_kw
 from mlx_vlm.server import generation as server_generation
-from mlx_vlm.server.app import _speculative_stats_snapshot
+from mlx_vlm.server.app import (
+    _speculative_stats_snapshot,
+    _thinking_config_snapshot,
+)
 from mlx_vlm.server.runtime import runtime as server_runtime
 from mlx_vlm.speculative import dflash as dflash_utils
 from mlx_vlm.speculative import mtp as mtp_utils
@@ -1147,3 +1150,126 @@ def test_budget_clamped_reads_zero_on_a_drafter_that_never_clamped(monkeypatch):
         raising=False,
     )
     assert _speculative_stats_snapshot()["budget_clamped"] == 0
+
+
+# ==========================================================================
+# Observability -- the GPU panel LV could not tell "budget never armed" from
+# "budget armed and never tripped", because nothing on the server said either.
+# ==========================================================================
+class _PreopenedTokenizer:
+    """A GLM-5.3-Flash-shaped tokenizer: <think> and </think> are single ids."""
+
+    def encode(self, text, add_special_tokens=False):
+        return {"\n": [198], "</think>": [154842], "<think>": [154841]}[text]
+
+
+def _generator_with_template(template, processor=None):
+    gen = server_generation.ResponseGenerator.__new__(
+        server_generation.ResponseGenerator
+    )
+    gen.processor = processor or SimpleNamespace(chat_template=template)
+    gen.tokenizer = _PreopenedTokenizer()
+    return gen
+
+
+class TestPromptPreopenedThinking:
+    """The template's generation prompt ENDS in ``<think>``.
+
+    The model therefore never emits a think-start token, so the criteria has to
+    start INSIDE the block or it counts nothing for the whole response and the
+    budget never forces a close -- which is exactly the shape of the LV panel's
+    null result.
+    """
+
+    def _criteria(self, *, enable_thinking, budget=256):
+        gen = _generator_with_template(NO_THINKING_KW_TEMPLATE)
+        args = server_generation.GenerationArguments(
+            max_tokens=1024,
+            thinking_budget=budget,
+            enable_thinking=enable_thinking,
+        )
+        # ...<|assistant|><think> -- the last id of the rendered prompt.
+        input_ids = mx.array([[1, 2, 3, 154828, 154841]], dtype=mx.int32)
+        return gen._make_thinking_budget_criteria(args, input_ids)
+
+    def test_a_prompt_that_ends_in_think_starts_the_criteria_inside(self):
+        criteria = self._criteria(enable_thinking=True)
+        assert criteria.prompt_preopens_thinking is True
+        assert criteria.in_thinking is True, (
+            "if this is False the counter never increments: the generated "
+            "stream contains no <think> to switch it on"
+        )
+
+    def test_it_forces_the_closing_run_at_budget_plus_one(self):
+        criteria = self._criteria(enable_thinking=True, budget=256)
+        forced = []
+        for _ in range(300):
+            criteria(9999)
+            token = criteria.pop_forced_token_id()
+            if token is not None:
+                forced.append(token)
+        assert forced[:2] == [198, 154842], (
+            "\\n then </think>, starting at the 257th generated token"
+        )
+
+    def test_thinking_off_disarms_it_entirely(self):
+        criteria = self._criteria(enable_thinking=False)
+        assert criteria.in_thinking is False
+        for _ in range(300):
+            criteria(9999)
+            assert criteria.pop_forced_token_id() is None, (
+                "MLX_VLM_ENABLE_THINKING=0 is an operator saying off, and it "
+                "must keep disarming the budget"
+            )
+
+
+class TestThinkingConfigSnapshot:
+    def _snapshot(self, generator):
+        server_runtime.response_generator = generator
+        try:
+            return _thinking_config_snapshot()
+        finally:
+            server_runtime.response_generator = None
+
+    def test_it_reports_the_budget_the_env_actually_set(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
+        monkeypatch.delenv("MLX_VLM_ENABLE_THINKING", raising=False)
+        snap = self._snapshot(_generator_with_template(NO_THINKING_KW_TEMPLATE))
+        assert snap["server_budget"] == 256
+        assert snap["enable_thinking_env_set"] is False
+        assert snap["template_references_enable_thinking"] is False
+        assert snap["always_on"] is True
+
+    def test_an_unset_budget_reads_none_not_zero(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_THINKING_BUDGET", raising=False)
+        snap = self._snapshot(_generator_with_template(NO_THINKING_KW_TEMPLATE))
+        assert snap["server_budget"] is None, (
+            "None and 0 are different arms and the receipt must say which"
+        )
+
+    def test_env_off_is_distinguishable_from_env_unset(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        snap = self._snapshot(_generator_with_template(NO_THINKING_KW_TEMPLATE))
+        assert snap["server_enable_thinking"] is False
+        assert snap["enable_thinking_env_set"] is True, (
+            "the whole point: 0 and unset both read False, and only this field "
+            "separates 'operator said off' from 'the template decides'"
+        )
+
+    def test_a_template_that_owns_the_variable_is_not_always_on(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_ENABLE_THINKING", raising=False)
+        snap = self._snapshot(_generator_with_template(THINKING_KW_TEMPLATE))
+        assert snap["template_references_enable_thinking"] is True
+        assert snap["always_on"] is False
+
+    def test_it_survives_a_server_with_no_generator(self):
+        server_runtime.response_generator = None
+        snap = _thinking_config_snapshot()
+        assert snap["always_on"] is None
+        assert snap["template_references_enable_thinking"] is None
+
+    def test_clear_thinking_is_reported_both_ways(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_CLEAR_THINKING", "1")
+        snap = self._snapshot(_generator_with_template(NO_THINKING_KW_TEMPLATE))
+        assert snap["server_clear_thinking"] is True
+        assert snap["template_references_clear_thinking"] is True

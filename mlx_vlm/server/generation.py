@@ -1735,6 +1735,23 @@ class ResponseGenerator:
             thinking_budget_criteria = self._make_thinking_budget_criteria(
                 args, raw_inputs.get("input_ids")
             )
+        # One line per request, because a thinking budget that silently did not
+        # arm is indistinguishable from one that armed and never tripped -- and
+        # the panel that found this had no way to tell which.  ``preopened`` is
+        # the load-bearing field for a template like GLM-5.3-Flash's, whose
+        # generation prompt ENDS in ``<think>``: the model never emits a
+        # think-start token, so a criteria that did not start inside the block
+        # would count nothing and never force a close.
+        logger.info(
+            "Thinking resolved: enabled=%s always_on_template=%s budget=%s "
+            "preopened=%s clear_thinking=%s armed=%s",
+            args.enable_thinking,
+            self._thinking_always_on(),
+            args.thinking_budget,
+            getattr(thinking_budget_criteria, "in_thinking", None),
+            args.clear_thinking,
+            thinking_budget_criteria is not None,
+        )
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 

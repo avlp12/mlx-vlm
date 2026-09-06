@@ -21,6 +21,7 @@ from starlette.requests import HTTPConnection
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..prompt_utils import template_references_kw
 from ..reranker import RerankerKind, reranker_kind
 from ..speculative.utils import batched_draft_enabled
 from ..structured import build_json_schema_logits_processor
@@ -44,7 +45,11 @@ from .generation import (
     get_quantized_kv_bits,
     get_quantized_kv_split_bits,
     get_quantized_kv_start,
+    get_server_clear_thinking,
+    get_server_enable_thinking,
+    get_server_thinking_budget,
     get_top_logprobs_k,
+    server_enable_thinking_is_explicit,
 )
 from .openai import register_routes as register_openai_routes
 from .realtime import register_routes as register_realtime_routes
@@ -172,6 +177,47 @@ def _prefill_batch_refusal_counts() -> dict:
         return {}
 
 
+def _thinking_config_snapshot() -> dict:
+    """What this server process resolved thinking to, readable without decoding.
+
+    An A/B on thinking is unfalsifiable until this exists.  The env that selects
+    the arm reaches the server as process environment, and a harness that snapshots
+    only the keys it thought to name records nothing about it -- so a run whose
+    ``MLX_VLM_THINKING_BUDGET`` never made it into the child is indistinguishable
+    in the receipt from one where it did and the budget simply never tripped.
+    ``GET /metrics`` right after startup now answers that with no decode at all.
+
+    ``enable_thinking_env_set`` is separate from ``server_enable_thinking``
+    deliberately: unset means "the template decides" (``always_on``), ``0`` means
+    an operator said off, and the two produce the same ``False`` here.
+    """
+    generator = runtime.response_generator
+    processor = getattr(generator, "processor", None) if generator else None
+    try:
+        always_on = generator._thinking_always_on() if generator is not None else None
+    except Exception:  # noqa: BLE001 - observability must not break the endpoint
+        always_on = None
+    return {
+        "server_budget": get_server_thinking_budget(),
+        "server_enable_thinking": get_server_enable_thinking(),
+        "enable_thinking_env_set": server_enable_thinking_is_explicit(),
+        "server_clear_thinking": get_server_clear_thinking(),
+        "template_references_enable_thinking": (
+            template_references_kw(processor, "enable_thinking")
+            if processor is not None
+            else None
+        ),
+        "template_references_clear_thinking": (
+            template_references_kw(processor, "clear_thinking")
+            if processor is not None
+            else None
+        ),
+        # True = this build cannot turn thinking off, so the server forces it on
+        # and the budget criteria arms for every request.
+        "always_on": always_on,
+    }
+
+
 def _speculative_stats_snapshot() -> dict:
     """The drafter's lifetime speculative receipts, or ``{"enabled": False}``.
 
@@ -297,6 +343,9 @@ def _server_runtime_snapshot() -> dict:
         # here: a counter reachable only from inside the process is a counter
         # nobody can read while the thing it measures is running.
         "speculative": _speculative_stats_snapshot(),
+        # Same reason as the three above: an arm nobody can read off a running
+        # server is an arm nobody can prove was applied.
+        "thinking": _thinking_config_snapshot(),
         # Prefill batches the admission policy refused to build, by reason.
         # ``right_pad_kda`` is the throughput a linear-attention model pays for
         # correctness: rows with unequal suffix lengths cannot share a
