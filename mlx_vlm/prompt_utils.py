@@ -178,6 +178,41 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     return None
 
 
+def _carry_reasoning_fields(built: Any, original: Any) -> Any:
+    """Preserve a client-supplied ``reasoning_content``/``reasoning`` onto a
+    message ``get_message_json``/``MessageFormatter`` rebuilt from scratch.
+
+    Every ``MessageFormatter._format_*`` method returns a fresh ``{"role":
+    ..., "content": ...}`` (or similar) dict built only from the ``role``/
+    ``content`` arguments it was given -- it has no way to know about, and so
+    silently drops, any other field the original message carried (unlike the
+    tool-call path's ``_normalize_tool_message``, which copies the whole dict
+    and only overlays a few normalized fields). For a plain multi-turn
+    OpenAI chat where a client resends an assistant turn's own
+    ``reasoning_content`` (see mlx_vlm/server/openai.py's
+    ``chat_completions_endpoint``, which already forwards it correctly onto
+    the per-message dict at request-normalization time), this meant the
+    reasoning never reached the Jinja template at all -- not stripped, not
+    rendered as ``<think></think>``, just absent -- so a follow-up turn's
+    prompt was missing the entire prior turn's thinking span. See
+    mlx_vlm/tests/test_prompt_utils.py's reasoning-carry-over tests for the
+    measured effect on prompt-token counts.
+    """
+    if not isinstance(built, dict):
+        return built
+    if isinstance(original, dict):
+        get = original.get
+    else:
+        get = lambda key, default=None: getattr(original, key, default)  # noqa: E731
+    for key in ("reasoning_content", "reasoning"):
+        if key in built:
+            continue
+        value = get(key)
+        if value is not None:
+            built[key] = value
+    return built
+
+
 def _content_media_count(content: Any, media_types: tuple[str, ...]) -> int:
     if not isinstance(content, list):
         return 0
@@ -930,13 +965,16 @@ def apply_chat_template(
         else:
             content = extract_text_from_content(prompt["content"])
             messages.append(
-                get_message_json(
-                    model_type,
-                    content,
-                    role,
-                    num_images=num_images,
-                    num_audios=num_audios,
-                    **kwargs,
+                _carry_reasoning_fields(
+                    get_message_json(
+                        model_type,
+                        content,
+                        role,
+                        num_images=num_images,
+                        num_audios=num_audios,
+                        **kwargs,
+                    ),
+                    prompt,
                 )
             )
     elif isinstance(prompt, list):
@@ -1002,18 +1040,21 @@ def apply_chat_template(
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)
                     messages.append(
-                        get_message_json(
-                            model_type,
-                            content,
-                            role,
-                            skip_image_token=image_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            skip_audio_token=audio_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            num_images=image_counts[i],
-                            num_audios=audio_counts[i],
-                            video=video_i,
-                            **kwargs,
+                        _carry_reasoning_fields(
+                            get_message_json(
+                                model_type,
+                                content,
+                                role,
+                                skip_image_token=image_counts[i] == 0
+                                or role in ["system", "assistant"],
+                                skip_audio_token=audio_counts[i] == 0
+                                or role in ["system", "assistant"],
+                                num_images=image_counts[i],
+                                num_audios=audio_counts[i],
+                                video=video_i,
+                                **kwargs,
+                            ),
+                            p,
                         )
                     )
 

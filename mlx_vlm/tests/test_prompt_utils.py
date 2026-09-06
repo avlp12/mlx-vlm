@@ -278,6 +278,130 @@ class TestApplyChatTemplateIntegration:
         )
         assert videos == 1
 
+    # -- reasoning_content carry-over on rebuilt messages (I1372/L31 follow-up,
+    # LW panel 2026-09-06: multiturn thinking round-trip observed turn-2
+    # prompt_tokens far too small -- 511 vs an expected >900+ for
+    # code_ratelimiter_spec -- because a client-supplied assistant
+    # reasoning_content never reached the Jinja template at all. Root cause:
+    # for any model in MODEL_CONFIG (glm5_next included), a non-tool-call
+    # message is rebuilt from scratch via get_message_json/MessageFormatter,
+    # whose _format_* methods return a fresh {"role":..., "content":...} with
+    # no path for reasoning_content/reasoning to survive -- unlike the
+    # tool-call path (_normalize_tool_message) or the generic non-MODEL_CONFIG
+    # fallback (dict(item) shallow copy), both of which keep it automatically.
+    # This block covers every branch that previously dropped it. --
+
+    def test_glm5_next_carries_reasoning_content_from_list_prompt(self):
+        """The exact shape the multiturn harness sends (bench/ops/
+        l20_request_train.py's ``_assistant_message`` + ``build_chat_body``):
+        messages=[user, assistant{content, reasoning_content}, user2] via
+        chat.completions. Before the fix, the returned assistant message dict
+        had no ``reasoning_content``/``reasoning`` key at all."""
+        messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {
+                "role": "assistant",
+                "content": "4.",
+                "reasoning_content": "The user asks for 2+2, which is 4.",
+            },
+            {"role": "user", "content": "And 3+3?"},
+        ]
+        result = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            messages,
+            return_messages=True,
+        )
+        assistant_msg = result[1]
+        assert assistant_msg["reasoning_content"] == "The user asks for 2+2, which is 4."
+        # sync_reasoning_aliases (schemas.py) mirrors reasoning_content onto
+        # "reasoning" at the request layer before this function ever sees the
+        # message; prompt_utils must not require that upstream step, so
+        # carrying reasoning_content alone must not silently leave the
+        # deprecated "reasoning" alias stale if the template reads that key
+        # instead for some model family -- carry whichever key(s) were given.
+        assert "reasoning" not in assistant_msg or (
+            assistant_msg["reasoning"] == "The user asks for 2+2, which is 4."
+        )
+
+    def test_glm5_next_carries_deprecated_reasoning_alias(self):
+        """A caller using the deprecated ``reasoning`` key (instead of
+        ``reasoning_content``) must also survive the rebuild."""
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello", "reasoning": "greet back"},
+        ]
+        result = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            messages,
+            return_messages=True,
+        )
+        assert result[1]["reasoning"] == "greet back"
+
+    def test_glm5_next_single_dict_prompt_carries_reasoning_content(self):
+        """The single-dict-prompt branch (apply_chat_template called with one
+        message, not a list) must carry reasoning_content too."""
+        result = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            {"role": "assistant", "content": "done", "reasoning_content": "thought"},
+            return_messages=True,
+        )
+        assert result[0]["reasoning_content"] == "thought"
+
+    def test_glm5_next_does_not_add_reasoning_content_key_when_absent(self):
+        """A message with no reasoning_content/reasoning must not gain one --
+        no spurious ``None`` key on every plain turn."""
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        result = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            messages,
+            return_messages=True,
+        )
+        assert "reasoning_content" not in result[1]
+        assert "reasoning" not in result[1]
+
+    def test_glm5_next_tool_call_message_still_carries_reasoning_content(self):
+        """Regression guard: the tool-call path already preserved
+        reasoning_content via _normalize_tool_message's whole-dict copy --
+        the new carry-over for the non-tool-call path must not disturb that."""
+        message = _assistant_tool_call(None)
+        message["reasoning_content"] = "deciding which tool to call"
+        result = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            [{"role": "user", "content": "weather?"}, message],
+            return_messages=True,
+        )
+        assert result[1]["reasoning_content"] == "deciding which tool to call"
+
+    def test_generic_text_model_fallback_already_carries_reasoning_content(self):
+        """Regression guard for the non-MODEL_CONFIG fallback branch (a model
+        type not in MODEL_CONFIG): it already shallow-copies the whole
+        message dict, so reasoning_content already survives there -- this
+        pins that so a future refactor of that branch doesn't reintroduce
+        the MODEL_CONFIG branch's bug."""
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "hello",
+                "reasoning_content": "already worked before the fix",
+            },
+        ]
+        result = apply_chat_template(
+            None,
+            {"model_type": "some_unregistered_model_type"},
+            messages,
+            return_messages=True,
+        )
+        assert result[1]["reasoning_content"] == "already worked before the fix"
+
     def test_gemma4_unified_formats_video_messages(self):
         """Gemma 4 Unified should use typed video content for HF templates."""
         from mlx_vlm.prompt_utils import apply_chat_template
