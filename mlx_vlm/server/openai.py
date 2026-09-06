@@ -830,7 +830,7 @@ async def responses_input_tokens_endpoint(request: Request):
         gen_args = _build_gen_args(
             openai_request, processor, tenant_id=_read_tenant_id(request)
         )
-        template_kwargs = gen_args.to_template_kwargs()
+        template_kwargs = gen_args.to_template_kwargs(processor)
         if openai_request.tool_choice is not None:
             template_kwargs["tool_choice"] = openai_request.tool_choice
         formatted_prompt = apply_chat_template(
@@ -1008,7 +1008,7 @@ async def responses_endpoint(request: Request):
         if chat_tools and tool_module is not None:
             gen_args.skip_special_tokens = False
 
-        template_kwargs = gen_args.to_template_kwargs()
+        template_kwargs = gen_args.to_template_kwargs(processor)
         if openai_request.tool_choice is not None:
             template_kwargs["tool_choice"] = openai_request.tool_choice
 
@@ -1748,7 +1748,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         if tools and tool_module is not None:
             gen_args.skip_special_tokens = False
 
-        template_kwargs = gen_args.to_template_kwargs()
+        template_kwargs = gen_args.to_template_kwargs(processor)
         if tool_choice is not None:
             template_kwargs["tool_choice"] = tool_choice
 

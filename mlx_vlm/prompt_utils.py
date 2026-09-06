@@ -2,7 +2,7 @@ import inspect
 import json
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 
 class MessageFormat(Enum):
@@ -595,6 +595,44 @@ def get_message_json(
     )
 
 
+def template_references_kw(
+    template_processor: Any,
+    name: str,
+    chat_template_override: Optional[Any] = None,
+) -> bool:
+    """Does this processor's chat template actually MENTION ``name``?
+
+    Accepting a keyword and reading it are different questions: nearly every
+    ``apply_chat_template`` takes ``**kwargs``, so a signature check says yes to
+    variables the Jinja never looks at.  The server needs the second question --
+    a template with no ``enable_thinking`` variable cannot have thinking turned
+    off, so the server has to treat it as always on rather than injecting a
+    ``False`` that renders to nothing.
+
+    Module level (rather than a closure inside ``get_chat_template``) precisely
+    so the server can ask it about a loaded processor without rendering a
+    prompt.
+    """
+    templates = [
+        chat_template_override,
+        getattr(template_processor, "chat_template", None),
+        getattr(
+            getattr(template_processor, "tokenizer", None),
+            "chat_template",
+            None,
+        ),
+    ]
+
+    for template in templates:
+        if isinstance(template, str) and name in template:
+            return True
+        if isinstance(template, dict) and any(
+            isinstance(value, str) and name in value for value in template.values()
+        ):
+            return True
+    return False
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -752,24 +790,9 @@ def get_chat_template(
         )
 
     def _template_references_kw(template_processor: Any, name: str) -> bool:
-        templates = [
-            chat_template_override,
-            getattr(template_processor, "chat_template", None),
-            getattr(
-                getattr(template_processor, "tokenizer", None),
-                "chat_template",
-                None,
-            ),
-        ]
-
-        for template in templates:
-            if isinstance(template, str) and name in template:
-                return True
-            if isinstance(template, dict) and any(
-                isinstance(value, str) and name in value for value in template.values()
-            ):
-                return True
-        return False
+        return template_references_kw(
+            template_processor, name, chat_template_override=chat_template_override
+        )
 
     try:
         template_processor = None

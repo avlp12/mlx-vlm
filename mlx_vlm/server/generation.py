@@ -39,6 +39,7 @@ from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from ..prompt_utils import template_references_kw
 from ..sample_utils import (
     apply_top_k,
     make_logits_processors,
@@ -89,6 +90,10 @@ ENV_HOIST_WIRED_LIMIT = "MLX_VLM_HOIST_WIRED_LIMIT"
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
+# The vendor recommendation for GLM-5.3-Flash, and harmless elsewhere because
+# it only reaches a template that references the variable: false keeps each
+# earlier turn's ``reasoning_content`` in the rendered history.
+DEFAULT_CLEAR_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
@@ -526,6 +531,32 @@ def get_server_enable_thinking():
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def server_enable_thinking_is_explicit() -> bool:
+    """Did the operator actually SET ``MLX_VLM_ENABLE_THINKING``?
+
+    Unset is not the same as ``0``.  Unset lets the loaded chat template decide
+    (a template with no ``enable_thinking`` variable cannot turn thinking off,
+    so the server treats it as always on); ``0`` is an operator saying off, and
+    is honoured.
+    """
+    return os.environ.get("MLX_VLM_ENABLE_THINKING") is not None
+
+
+def get_server_clear_thinking() -> bool:
+    """``MLX_VLM_CLEAR_THINKING`` -- drop prior-turn thinking from the prompt.
+
+    Default FALSE, which is the GLM-5.3-Flash vendor recommendation: with
+    ``clear_thinking`` false the template renders each earlier turn's
+    ``reasoning_content`` back into the history, so a multi-turn request keeps
+    the reasoning it already paid for.  Only reaches the template when the
+    template actually references the variable.
+    """
+    raw = os.environ.get("MLX_VLM_CLEAR_THINKING")
+    if raw is None:
+        return DEFAULT_CLEAR_THINKING
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
 def get_server_thinking_budget():
     raw = os.environ.get("MLX_VLM_THINKING_BUDGET")
     return None if raw is None else int(raw)
@@ -947,6 +978,12 @@ class GenerationArguments:
     min_threshold: Optional[float] = None
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
+    # True when the request or the operator NAMED a thinking mode. False means
+    # "nobody said", which is what lets a template with no ``enable_thinking``
+    # variable decide for itself (see ``ResponseGenerator._thinking_always_on``).
+    enable_thinking_explicit: bool = False
+    # Rendered into the template only when the template references it.
+    clear_thinking: Optional[bool] = None
     reasoning: Optional[bool] = None
     reasoning_effort: Optional[str] = None
     thinking_budget: Optional[int] = None
@@ -1031,8 +1068,14 @@ class GenerationArguments:
         kw.update(self.diffusion_kwargs())
         return kw
 
-    def to_template_kwargs(self) -> dict:
-        """Convert to kwargs for apply_chat_template()."""
+    def to_template_kwargs(self, processor: Any = None) -> dict:
+        """Convert to kwargs for apply_chat_template().
+
+        ``processor``, when supplied, gates the variables that only make sense
+        for a template that reads them: ``clear_thinking`` is passed only when
+        the loaded chat template actually references it, so a build whose
+        template has no such variable is not handed a silent no-op.
+        """
         kw = {"enable_thinking": self.enable_thinking}
         if self.reasoning is not None:
             kw["reasoning"] = self.reasoning
@@ -1046,6 +1089,14 @@ class GenerationArguments:
             kw["thinking_start_token"] = self.thinking_start_token
         if self.thinking_end_token is not None:
             kw["thinking_end_token"] = self.thinking_end_token
+        if self.clear_thinking is not None and (
+            processor is None
+            or template_references_kw(processor, "clear_thinking")
+            or template_references_kw(
+                getattr(processor, "tokenizer", None), "clear_thinking"
+            )
+        ):
+            kw["clear_thinking"] = bool(self.clear_thinking)
         return kw
 
 
@@ -1616,6 +1667,7 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
+        self._apply_always_on_thinking(args)
         # D1.  The structured x speculative rail is ON by default since the LU
         # panel (text sha 4/4 identical to the AR+mask reference, 2.2x per
         # token, natural panel unchanged).  MLX_VLM_SPEC_STRUCTURED=0 is the
@@ -1647,9 +1699,29 @@ class ResponseGenerator:
                     "Unset that variable to serve structured requests, or set "
                     f"{SPEC_STRUCTURED_ENV}=0 to refuse them."
                 )
-        if self.draft_model is not None and args.thinking_budget is not None:
+        # A thinking budget rides the CONTINUOUS-BATCHING speculative loops:
+        # ``SpeculativeGenerationBatch`` hands the criteria's emit cap and its
+        # forced closing sequence to the round loop, which stops the accepted
+        # walk at the exact position and conditions the target's bonus on
+        # ``...\n</think>``.  The legacy ``_run_speculative`` loop has no such
+        # hook -- eagle3 and lookup always, dflash with continuous batching
+        # switched off -- so the refusal narrows to exactly those.  Same
+        # predicate the structured rail refuses on just above, for the same
+        # reason: both features live in that loop.
+        if (
+            self.draft_model is not None
+            and args.thinking_budget is not None
+            and not _uses_continuous_batching_loop(self.draft_kind)
+        ):
             raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
+                "thinking_budget is not supported with the legacy speculative "
+                f"server loop (draft kind {self.draft_kind!r}"
+                + (
+                    ", MLX_VLM_DFLASH_CONTINUOUS_BATCHING=0"
+                    if self.draft_kind == "dflash"
+                    else ""
+                )
+                + ")."
             )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
@@ -2052,6 +2124,54 @@ class ResponseGenerator:
             )
             for processor in processors
         ]
+
+    def _thinking_always_on(self) -> bool:
+        """Is thinking a property of this build rather than a request option?
+
+        A chat template with no ``enable_thinking`` variable renders the same
+        prompt whatever the server passes, so ``enable_thinking=False`` there is
+        a lie the rest of the server then believes: the budget criteria refuses
+        to force a close (``pop_forced_token_id`` returns None when thinking is
+        off) and the thinking-aware structured processor never arms.  This is
+        exactly the GLM-5.3-Flash case -- the vendor documents that thinking
+        cannot be disabled -- so the server reads the template instead of a
+        default.  A template that DOES reference the variable keeps the old
+        behaviour, unchanged.
+
+        Cached per loaded processor: the answer is a string search over the
+        template and cannot change without a reload.
+        """
+        processor = getattr(self, "processor", None)
+        if processor is None:
+            return False
+        cached = getattr(self, "_thinking_always_on_cache", None)
+        if cached is not None and cached[0] is processor:
+            return cached[1]
+        has_template = (
+            getattr(processor, "chat_template", None) is not None
+            or getattr(
+                getattr(processor, "tokenizer", None), "chat_template", None
+            )
+            is not None
+        )
+        answer = bool(has_template) and not template_references_kw(
+            processor, "enable_thinking"
+        )
+        self._thinking_always_on_cache = (processor, answer)
+        return answer
+
+    def _apply_always_on_thinking(self, args: GenerationArguments) -> None:
+        """Turn thinking on for a build whose template cannot turn it off.
+
+        Only when nobody named a mode: an explicit request field, an explicit
+        ``MLX_VLM_ENABLE_THINKING``, or a reasoning-effort decision all win.
+        """
+        if args.enable_thinking or getattr(args, "enable_thinking_explicit", False):
+            return
+        if server_enable_thinking_is_explicit():
+            return
+        if self._thinking_always_on():
+            args.enable_thinking = True
 
     def _make_thinking_budget_criteria(
         self, args: GenerationArguments, input_ids: mx.array

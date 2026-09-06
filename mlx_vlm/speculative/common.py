@@ -132,10 +132,95 @@ class _SpeculativeSamplerRNG:
         self._target_rng_state = _copy_rng_state()
 
 
+def place_forced_draft_prefix(
+    draft_tokens: mx.array, forced_rows: List[List[int]]
+) -> mx.array:
+    """Overwrite the front of each row's draft with the caller's forced ids.
+
+    Costs one host round-trip, paid only on a round that actually forces
+    something (the thinking-budget boundary), never on the steady state.
+    """
+    if not any(forced_rows):
+        return draft_tokens
+    rows = draft_tokens.tolist()
+    width = int(draft_tokens.shape[1])
+    for row, forced in enumerate(forced_rows):
+        for position, token in enumerate(forced[:width]):
+            rows[row][position] = int(token)
+    return mx.array(rows, dtype=draft_tokens.dtype)
+
+
+def _forced_prefix_len(forced_prefix_lens, row: int, n_draft: int) -> int:
+    """One row's forced-draft prefix length, clamped to the drafted width.
+
+    ``forced_prefix_lens`` is the R3 hook: positions ``[0, p)`` of a row's draft
+    were PLACED by the caller (the thinking-budget closing sequence) rather than
+    proposed by the drafter, and are accepted unconditionally so the target's
+    bonus is conditioned on them.  ``None`` -- the shipped path -- means zero.
+    """
+    if not forced_prefix_lens:
+        return 0
+    if row >= len(forced_prefix_lens):
+        return 0
+    return max(0, min(int(forced_prefix_lens[row] or 0), int(n_draft)))
+
+
+def round_emit_plan(
+    row: int,
+    emit_limit: Optional[Callable[[int], Optional[int]]],
+    forced_draft_ids: Optional[Callable[[int], List[int]]],
+    n_draft: int,
+    max_budget: int,
+) -> Tuple[int, List[int]]:
+    """One row's ``(emit budget, forced draft ids)`` for the round about to run.
+
+    ``emit_limit(row)`` returning 0 means "this row may emit nothing of its own
+    next": the criteria has ids it must place.  Those ids become the front of
+    the row's draft and the round is allowed ``len(forced) + 1`` emissions --
+    the forced run plus the target's bonus, which is then conditioned on it.
+
+    Never returns a 0 budget without forced ids: a row that can emit nothing
+    and force nothing would spin the round loop forever.
+    """
+    limit = None if emit_limit is None else emit_limit(row)
+    forced: List[int] = []
+    if limit is not None and int(limit) <= 0 and forced_draft_ids is not None:
+        forced = [int(token) for token in (forced_draft_ids(row) or [])][
+            : max(0, int(n_draft))
+        ]
+    if forced:
+        return min(int(max_budget), len(forced) + 1), forced
+    if limit is not None:
+        return min(int(max_budget), max(1, int(limit))), []
+    return int(max_budget), []
+
+
+def accepted_from_emitted(new_tokens: List[int]) -> int:
+    """The acceptance count a row's EMITTED tokens actually imply.
+
+    A walk's raw ``accepted`` describes the block it verified; ``new_tokens``
+    describes what the round is allowed to emit.  They diverge the moment a
+    budget truncates the row mid-block, and every cache consumer downstream
+    (hidden-window trim, rollback length, MTP's positions ledger) is keyed to
+    the EMITTED prefix, not to the verified one.  Feeding those consumers the
+    pre-truncation number leaves live KV for tokens the stream never emitted.
+
+    ``len(new_tokens) - 1`` because a committed round is ``accepted`` drafted
+    tokens plus one target token; an empty row accepted nothing.
+    """
+    return max(0, len(new_tokens) - 1)
+
+
+def accepted_list_from_emitted(new_tokens_list: List[List[int]]) -> List[int]:
+    """``accepted_from_emitted`` per row."""
+    return [accepted_from_emitted(new_tokens) for new_tokens in new_tokens_list]
+
+
 def _speculative_walk(
     draft_tokens: mx.array,
     target_tokens: mx.array,
     budget: int,
+    forced_prefix_len: int = 0,
 ) -> Tuple[int, List[int]]:
     """Exact-greedy speculative-decoding walk.
 
@@ -143,13 +228,19 @@ def _speculative_walk(
     greedy choice, then take the target's bonus at that position.
     Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
     truncated to ``budget``.
+
+    ``forced_prefix_len`` positions at the front are accepted without
+    comparison: the caller placed them, so the mismatch scan starts after them.
     """
     n_draft = int(draft_tokens.shape[1])
     draft_row = draft_tokens.reshape(-1).tolist()[:n_draft]
     target_row = target_tokens.reshape(-1).tolist()
+    forced = _forced_prefix_len([forced_prefix_len], 0, n_draft)
 
     accepted = n_draft
     for i, (draft_tok, target_tok) in enumerate(zip(draft_row, target_row)):
+        if i < forced:
+            continue
         if draft_tok != target_tok:
             accepted = i
             break
@@ -162,6 +253,7 @@ def _speculative_walk_batch(
     draft_tokens: mx.array,
     target_tokens: mx.array,
     budgets: List[int],
+    forced_prefix_lens: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Per-sequence speculative walk for B > 1.
 
@@ -175,10 +267,13 @@ def _speculative_walk_batch(
     accepted_list = []
     new_tokens_list: List[List[int]] = []
     for i in range(B):
+        forced = _forced_prefix_len(forced_prefix_lens, i, n_draft)
         accepted = n_draft
         for j, (draft_tok, target_tok) in enumerate(
             zip(draft_rows[i][:n_draft], target_rows[i])
         ):
+            if j < forced:
+                continue
             if draft_tok != target_tok:
                 accepted = j
                 break
@@ -193,9 +288,26 @@ def _speculative_walk_batch_uniform_acceptance(
     target_tokens: mx.array,
     accepted_list: List[int],
     budgets: List[int],
+    forced_prefix_lens: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
-    """Clamp a batch to the earliest rejection with verifier-token fallback."""
+    """Clamp a batch to the earliest rejection with verifier-token fallback.
+
+    A forced prefix survives the clamp only where EVERY row carries one: the
+    clamp emits a single accept count for the whole batch, so a forced position
+    in one row would silently force an unverified drafted token in the others.
+    ``min`` is therefore the floor, and a mixed batch simply does not force this
+    round -- the criteria still has its pending ids and retries next round.
+    """
     accepted = min(accepted_list)
+    if forced_prefix_lens:
+        n_draft = int(draft_tokens.shape[1])
+        accepted = max(
+            accepted,
+            min(
+                _forced_prefix_len(forced_prefix_lens, i, n_draft)
+                for i in range(len(accepted_list))
+            ),
+        )
     new_tokens_list: List[List[int]] = []
     for i, budget in enumerate(budgets):
         accepted_prefix = draft_tokens[i : i + 1, :accepted]
@@ -309,6 +421,31 @@ def _record_uniform_clamp(draft_model: nn.Module, clamped_tokens: int) -> None:
     draft_model.speculative_total_clamped = (
         getattr(draft_model, "speculative_total_clamped", 0) + clamped_tokens
     )
+
+
+def _record_budget_clamp(draft_model: nn.Module, clamped_tokens: int) -> None:
+    """Record accepted tokens an EMIT budget took back before the consumers.
+
+    Distinct from ``clamped_tokens`` (the uniform-acceptance clamp, a batch
+    property): this one counts tokens a row had verified and then did not emit
+    because ``max_tokens`` or a thinking budget stopped the walk mid-block.  It
+    is the receipt for R1 -- until the emit-derived acceptance landed, a nonzero
+    value here meant live KV for tokens the stream never produced.
+    """
+    clamped_tokens = int(clamped_tokens)
+    if clamped_tokens <= 0:
+        return
+    draft_model.budget_clamped_tokens = (
+        getattr(draft_model, "budget_clamped_tokens", 0) + clamped_tokens
+    )
+    draft_model.speculative_total_budget_clamped = (
+        getattr(draft_model, "speculative_total_budget_clamped", 0) + clamped_tokens
+    )
+
+
+def _reset_budget_clamp(draft_model: nn.Module) -> None:
+    """Zero the per-request emit-budget counter, alongside ``clamped_tokens``."""
+    draft_model.budget_clamped_tokens = 0
 
 
 def _reset_uniform_clamp(draft_model: nn.Module) -> None:

@@ -535,7 +535,20 @@ def run_speculative_server_rounds(
     target_hidden_offset: int = 0,
     logits_processors: Optional[List[Any]] = None,
     structured_ledger: Optional[Any] = None,
+    emit_limit: Optional[Callable[[int], Optional[int]]] = None,
+    forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+    """Server-side speculative rounds for one batch.
+
+    ``emit_limit(row)`` returns how many tokens the NEXT round may emit for that
+    row, or ``None`` for uncapped; ``forced_draft_ids(row)`` returns the ids the
+    round must place at the front of the draft when the cap is 0.  Together they
+    are how a thinking budget rides the speculative loop instead of disabling
+    it: a budget only has to stop the accepted walk at an exact position, and
+    ``draft[:k]`` is the target's own continuation for every ``j < accepted``.
+    Only the continuous-batching kinds (dflash, mtp) honour them; eagle3 and
+    lookup ignore them, which is why the server still refuses a budget there.
+    """
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
     structured_ledger = _resolve_structured_ledger(
@@ -620,6 +633,8 @@ def run_speculative_server_rounds(
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
             prompt_tokens=prompt_tokens,
+            emit_limit=emit_limit,
+            forced_draft_ids=forced_draft_ids,
         )
         return
 
@@ -638,6 +653,8 @@ def run_speculative_server_rounds(
                 greedy_sampling=greedy_sampling,
                 target_hidden_offset=target_hidden_offset,
                 structured_ledger=structured_ledger,
+                emit_limit=emit_limit,
+                forced_draft_ids=forced_draft_ids,
             ):
                 yield [tok], state
                 if stop_check is not None and stop_check(0, tok):
@@ -658,6 +675,8 @@ def run_speculative_server_rounds(
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
             target_hidden_offset=target_hidden_offset,
+            emit_limit=emit_limit,
+            forced_draft_ids=forced_draft_ids,
         )
         return
 

@@ -1749,6 +1749,7 @@ class SpeculativeGenerationBatch:
         greedy_sampling: bool = False,
         target_hidden_offset: int = 0,
         logits_processors: Optional[List[Any]] = None,
+        thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1779,6 +1780,12 @@ class SpeculativeGenerationBatch:
         # absolute RoPE positions move.  Same contract the single-stream path
         # carries as ``target_hidden_offset`` (``generate_step``).
         self.target_hidden_offset = int(target_hidden_offset or 0)
+        # One thinking-budget criteria per ROW, indexed like ``_all_uids`` (the
+        # speculative loops call back with the original row index, never the
+        # active slot).  ``None`` rows have no budget.
+        criteria = list(thinking_budget_criteria or [])
+        criteria.extend([None] * (len(uids) - len(criteria)))
+        self.thinking_budget_criteria = criteria[: len(uids)]
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1794,6 +1801,38 @@ class SpeculativeGenerationBatch:
                 draft_kind=draft_kind,
                 call_site="SpeculativeGenerationBatch",
             )
+
+    def _criteria_for(self, row: int):
+        if row < 0 or row >= len(self.thinking_budget_criteria):
+            return None
+        return self.thinking_budget_criteria[row]
+
+    def _emit_limit(self, row: int) -> Optional[int]:
+        """Tokens the next round may emit for ``row`` (``None`` = uncapped).
+
+        This is the whole thinking-budget mechanism on the speculative path: a
+        budget never needs to change what the target would have produced, only
+        to stop the accepted walk at an exact position -- and ``draft[:k]`` is
+        the target's own token for every ``j < accepted``, so a truncated round
+        is token-identical to the autoregressive reference cut at the same
+        point.
+        """
+        criteria = self._criteria_for(row)
+        if criteria is None:
+            return None
+        tokens_left = getattr(criteria, "tokens_before_budget_stop", None)
+        if not callable(tokens_left):
+            return None
+        return tokens_left()
+
+    def _forced_draft_ids(self, row: int) -> List[int]:
+        criteria = self._criteria_for(row)
+        if criteria is None:
+            return []
+        pending = getattr(criteria, "pending_forced_sequence", None)
+        if not callable(pending):
+            return []
+        return list(pending())
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1853,12 +1892,20 @@ class SpeculativeGenerationBatch:
             return
 
         def stop_check(seq_idx, token_id):
+            # The rounds call this once per EMITTED token, in order, per row --
+            # the same contract the autoregressive loop gives the criteria, so
+            # the criteria's own ``_forced_index`` ledger advances exactly once
+            # per forced id as that id is emitted.
+            criteria = self._criteria_for(seq_idx)
+            if criteria is not None:
+                criteria(int(token_id))
             return (
                 self._finished[seq_idx]
                 or self.stop_criteria(token_id)
                 or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
             )
 
+        has_budget = any(c is not None for c in self.thinking_budget_criteria)
         self._rounds_iter = run_speculative_server_rounds(
             self.model,
             self.draft_model,
@@ -1878,6 +1925,8 @@ class SpeculativeGenerationBatch:
             row_ids=[0] * len(self._all_uids),
             target_hidden_offset=self.target_hidden_offset,
             logits_processors=self.logits_processors,
+            emit_limit=self._emit_limit if has_budget else None,
+            forced_draft_ids=self._forced_draft_ids if has_budget else None,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -3025,6 +3074,7 @@ class PromptProcessingBatch:
                 greedy_sampling=self.greedy_sampling,
                 target_hidden_offset=self.target_hidden_offset,
                 logits_processors=list(self.logits_processors),
+                thinking_budget_criteria=list(self.thinking_budget_criteria),
             )
             compute_logprobs = False
         else:

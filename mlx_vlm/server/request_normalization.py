@@ -10,6 +10,7 @@ from ..generate import (
 from ..structured import build_json_schema_logits_processor
 from .generation import (
     GenerationArguments,
+    get_server_clear_thinking,
     get_server_enable_thinking,
     get_server_max_tokens,
     get_server_thinking_budget,
@@ -155,12 +156,20 @@ def _build_gen_args(
         _standard_reasoning_control(request)
     )
     server_enable_thinking = get_server_enable_thinking()
+    # ``explicit`` = somebody NAMED a thinking mode. When nobody did, a chat
+    # template with no ``enable_thinking`` variable gets to decide for itself
+    # (``ResponseGenerator._apply_always_on_thinking``); an explicit choice --
+    # request field, reasoning effort, or MLX_VLM_ENABLE_THINKING -- is honoured
+    # as written.
+    enable_thinking_explicit = False
     if _request_field_is_set(request, "enable_thinking"):
         enable_thinking = bool(getattr(request, "enable_thinking", False))
         template_reasoning = enable_thinking
+        enable_thinking_explicit = True
     elif has_standard_reasoning:
         enable_thinking = bool(standard_reasoning)
         template_reasoning = enable_thinking
+        enable_thinking_explicit = True
     else:
         enable_thinking = server_enable_thinking
         # Preserve a model template's native default when the server default is
@@ -229,6 +238,10 @@ def _build_gen_args(
         min_threshold=_request_field_or_default(request, "min_threshold", None),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
+        enable_thinking_explicit=enable_thinking_explicit,
+        clear_thinking=_request_field_or_default(
+            request, "clear_thinking", get_server_clear_thinking()
+        ),
         reasoning=template_reasoning,
         reasoning_effort=reasoning_effort,
         thinking_budget=_request_field_or_default(

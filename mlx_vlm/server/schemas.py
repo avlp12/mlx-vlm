@@ -370,6 +370,14 @@ class OpenAIRequest(FlexibleBaseModel):
         description="OpenAI-compatible reasoning effort.",
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    clear_thinking: Optional[bool] = Field(
+        None,
+        description=(
+            "Drop earlier turns' reasoning from the rendered prompt. Only "
+            "reaches templates that reference the variable; server default "
+            "MLX_VLM_CLEAR_THINKING (false)."
+        ),
+    )
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
@@ -770,6 +778,14 @@ class VLMRequest(FlexibleBaseModel):
         description="OpenAI-compatible reasoning effort.",
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
+    clear_thinking: Optional[bool] = Field(
+        None,
+        description=(
+            "Drop earlier turns' reasoning from the rendered prompt. Only "
+            "reaches templates that reference the variable; server default "
+            "MLX_VLM_CLEAR_THINKING (false)."
+        ),
+    )
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
@@ -947,6 +963,7 @@ class AnthropicRequest(FlexibleBaseModel):
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
+    clear_thinking: Optional[bool] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
     response_format: Optional[Any] = None

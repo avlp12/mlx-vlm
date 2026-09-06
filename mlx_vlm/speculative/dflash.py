@@ -13,18 +13,25 @@ from ..sampling_coupling import (
 from .common import (
     _batch_acceptance_must_be_uniform,
     _dflash_block_total,
+    _forced_prefix_len,
     _record_batch_round,
+    _record_budget_clamp,
     _record_draft_seconds,
     _record_per_row_rollback,
     _record_speculative_round,
     _record_uniform_clamp,
     _record_verify_seconds,
+    _reset_budget_clamp,
     _reset_per_row_rollback,
     _reset_uniform_clamp,
     _speculative_walk,
     _speculative_walk_batch,
     _SpeculativeSamplerRNG,
+    accepted_from_emitted,
+    accepted_list_from_emitted,
     generation_stream,
+    place_forced_draft_prefix,
+    round_emit_plan,
 )
 from .structured_ledger import apply_block_mask
 
@@ -811,6 +818,7 @@ def _sample_dflash_target_walk(
     *,
     row_ids: List[int],
     base_positions: List[int],
+    forced_prefix_lens: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     if _supports_positioned_target_sampling(sampler):
         target_tokens = _sample_dflash_target_block(
@@ -820,7 +828,9 @@ def _sample_dflash_target_walk(
             base_positions=base_positions,
         )
         mx.async_eval(target_tokens)
-        return _speculative_walk_batch(draft_tokens, target_tokens, budgets)
+        return _speculative_walk_batch(
+            draft_tokens, target_tokens, budgets, forced_prefix_lens
+        )
 
     batch, length, _ = logits.shape
     draft_count = int(draft_tokens.shape[1])
@@ -831,8 +841,13 @@ def _sample_dflash_target_walk(
         target_tokens = sampler(logprobs[:, position, :])
         mx.eval(target_tokens)
         target_rows = [int(token) for token in target_tokens.reshape(-1).tolist()]
+        # This walk draws one sample per position for the WHOLE batch and stops
+        # at the first row that rejects, so a forced position is "accepted" here
+        # by suppressing that row's rejection rather than per row.
         if position < draft_count and all(
-            target_rows[row] == draft_rows[row][position] for row in range(batch)
+            target_rows[row] == draft_rows[row][position]
+            or position < _forced_prefix_len(forced_prefix_lens, row, draft_count)
+            for row in range(batch)
         ):
             continue
 
@@ -868,21 +883,52 @@ def _dflash_deferred_walk_enabled(
 
 
 def _dflash_pack_greedy_walk(
-    draft_tokens: mx.array, target_tokens: mx.array, batch: int
+    draft_tokens: mx.array,
+    target_tokens: mx.array,
+    batch: int,
+    forced_prefix_lens: Optional[List[int]] = None,
 ) -> mx.array:
     """Resolve the greedy walk on device into one flat host transfer.
 
-    Layout is ``[accepted per row..., target row per row...]``. Acceptance is
+    Layout is ``[accepted per row..., committed row per row...]``. Acceptance is
     the length of the leading run where the drafter matched the target's
     greedy choice, so every committed token is already a prefix of the target
     row and the drafted tokens never have to come back to the host.
+
+    A forced prefix is the one case where that identity does NOT hold: the
+    caller placed those tokens, the target may disagree with them, and they are
+    accepted anyway.  Both the match mask and the committed row are patched at
+    those positions, so the unpacking side stays a pure slice.
     """
     target_rows = target_tokens.reshape(batch, -1)
     n_draft = int(draft_tokens.size) // batch
     if n_draft == 0:
         accepted = mx.zeros((batch,), dtype=mx.int32)
     else:
-        matched = draft_tokens.reshape(batch, -1) == target_rows[:, :n_draft]
+        drafts = draft_tokens.reshape(batch, -1)
+        matched = drafts == target_rows[:, :n_draft]
+        if forced_prefix_lens and any(forced_prefix_lens):
+            forced = mx.array(
+                [
+                    _forced_prefix_len(forced_prefix_lens, row, n_draft)
+                    for row in range(batch)
+                ],
+                dtype=mx.int32,
+            )[:, None]
+            matched = mx.logical_or(
+                matched, mx.arange(n_draft, dtype=mx.int32)[None, :] < forced
+            )
+            width = int(target_rows.shape[1])
+            committed = (
+                mx.concatenate([drafts, target_rows[:, n_draft:]], axis=1)
+                if width > n_draft
+                else drafts
+            )
+            target_rows = mx.where(
+                mx.arange(width, dtype=mx.int32)[None, :] < forced,
+                committed,
+                target_rows,
+            )
         accepted = mx.sum(mx.cumprod(matched.astype(mx.int32), axis=1), axis=1)
     return mx.concatenate(
         [accepted.astype(mx.int32), target_rows.reshape(-1).astype(mx.int32)],
@@ -955,6 +1001,8 @@ def _dflash_rounds(
     greedy_sampling: bool = True,
     target_hidden_offset: int = 0,
     structured_ledger: Optional[Any] = None,
+    emit_limit: Optional[Callable[[int], Optional[int]]] = None,
+    forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -976,6 +1024,16 @@ def _dflash_rounds(
     Correctness lives entirely in the target mask: even an unmasked drafter can
     only ever have its illegal proposals rejected, because the target mask at
     that position excludes them.
+
+    ``emit_limit(row)`` caps how many tokens the round may EMIT for that row
+    (``None`` = uncapped) and ``forced_draft_ids(row)`` supplies the ids the
+    round must place at the front of the draft when the cap is 0.  Together
+    they are the thinking-budget hook: a budget only needs to stop the accepted
+    walk at an exact position and then condition the target's bonus on the
+    closing sequence.  The two forced runs are independent -- a grammar
+    fast-forward is the whole block, a budget close is a prefix of it -- and the
+    grammar's takes precedence when both fire, because an ungrammatical
+    ``</think>`` would be rejected by the target mask anyway.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -992,6 +1050,7 @@ def _dflash_rounds(
     _adopt_pretruncated_context(draft_model, [draft_cache], target_hidden_offset)
     _reset_uniform_clamp(draft_model)
     _reset_per_row_rollback(draft_model)
+    _reset_budget_clamp(draft_model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     # Gumbel noise is indexed by array slot, so a coupled proposal and the
     # target must share one vocabulary axis.  Resolved once per loop; None
@@ -1031,10 +1090,18 @@ def _dflash_rounds(
         structured_ledger.commit([b])
 
     while emitted < max_tokens:
+        # An emit cap narrows the block the same way a nearly-exhausted
+        # ``max_tokens`` does: there is no point drafting past what the round is
+        # allowed to emit.  A cap of 0 (a forced round) does NOT narrow it --
+        # that round still emits the forced run plus a bonus.
+        width_room = max_tokens - emitted + 1
+        row_limit = emit_limit(0) if emit_limit is not None else None
+        if row_limit is not None and int(row_limit) > 0:
+            width_room = min(width_room, int(row_limit) + 1)
         bs = _dflash_next_block_size(
             draft_model,
             block_total,
-            max_tokens - emitted + 1,
+            width_room,
             (
                 getattr(draft_model, "dflash_initial_block_size", None)
                 if use_model_initial_block_size
@@ -1043,6 +1110,15 @@ def _dflash_rounds(
         )
         if bs <= 1:
             break
+
+        round_budget, forced_ids = round_emit_plan(
+            0, emit_limit, forced_draft_ids, bs - 1, max_tokens - emitted
+        )
+        forced_lens = [len(forced_ids)]
+        # Passed only on a round that actually forces something: the walks are
+        # a stubbing seam in the test suite and the steady state must keep the
+        # signature it has always had.
+        forced_kw = {"forced_prefix_lens": forced_lens} if forced_ids else {}
 
         draft_kwargs = {"target_hidden_prepared": True} if hidden_is_prepared else {}
         draft_sampler = (
@@ -1096,8 +1172,19 @@ def _dflash_rounds(
                 token_dtype,
                 **draft_kwargs,
             )
+            if forced_ids:
+                draft_tokens = place_forced_draft_prefix(draft_tokens, [forced_ids])
             mx.async_eval(draft_tokens)
             draft_host = None
+
+        if forced:
+            # Both forced runs fired.  The grammar owns the whole block, so the
+            # budget's closing run waits a round rather than overwriting tokens
+            # the grammar authorised -- and an ungrammatical ``</think>`` would
+            # have been rejected by the target mask anyway.  ``draft_host``
+            # below therefore still describes what was actually drafted.
+            forced_lens = [0]
+            forced_kw = {}
 
         block_mask = None
         if structured_ledger is not None:
@@ -1137,7 +1224,7 @@ def _dflash_rounds(
                 target_tokens = sampler(target_logits)
                 if deferred_walk:
                     walk_packed = _dflash_pack_greedy_walk(
-                        draft_tokens, target_tokens, 1
+                        draft_tokens, target_tokens, 1, **forced_kw
                     )
         if greedy_sampling:
             mx.async_eval(walk_packed if deferred_walk else target_tokens, hidden)
@@ -1146,28 +1233,44 @@ def _dflash_rounds(
 
         if greedy_sampling and deferred_walk:
             accepted, new_tokens = _speculative_walk_deferred_greedy(
-                walk_packed, max_tokens - emitted
+                walk_packed, round_budget
             )
         elif greedy_sampling:
             accepted, new_tokens = _speculative_walk(
-                draft_tokens, target_tokens, max_tokens - emitted
+                draft_tokens,
+                target_tokens,
+                round_budget,
+                **({"forced_prefix_len": forced_lens[0]} if forced_ids else {}),
             )
         else:
             accepted_list, new_tokens_list = _sample_dflash_target_walk(
                 target_logits,
                 draft_tokens,
                 sampler,
-                [max_tokens - emitted],
+                [round_budget],
                 row_ids=[0],
                 base_positions=[emitted],
+                **forced_kw,
             )
             accepted = accepted_list[0]
             new_tokens = new_tokens_list[0]
             sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+        # The grammar is advanced by what the round EMITS, so this has to run
+        # on ``new_tokens`` (post-truncation), not on the verified block.
         if structured_ledger is not None:
             structured_ledger.commit(new_tokens)
+        # Stats keep the walk's own number; the CACHE keeps the emitted one.
+        # A budget that stops the row mid-block leaves ``new_tokens`` shorter
+        # than ``accepted`` claims, and every consumer below (hidden window,
+        # bonus, rollback length) is keyed to what was actually emitted -- feed
+        # them the pre-truncation count and the round leaves live KV for tokens
+        # the stream never produced.
         _record_speculative_round(draft_model, accepted, bs - 1)
         _record_batch_round(draft_model, 1)
+        emitted_accepted = accepted_from_emitted(new_tokens)
+        if emitted_accepted != accepted:
+            _record_budget_clamp(draft_model, accepted - emitted_accepted)
+            accepted = emitted_accepted
 
         if accepted < bs - 1:
             hidden = hidden[:, : accepted + 1, :]
@@ -1210,6 +1313,8 @@ def _dflash_rounds_batch(
     greedy_sampling: bool = True,
     row_ids: Optional[List[int]] = None,
     target_hidden_offset: int = 0,
+    emit_limit: Optional[Callable[[int], Optional[int]]] = None,
+    forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -1239,6 +1344,7 @@ def _dflash_rounds_batch(
     draft_model.reset(model)
     _reset_uniform_clamp(draft_model)
     _reset_per_row_rollback(draft_model)
+    _reset_budget_clamp(draft_model)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     # Gumbel noise is indexed by array slot, so a coupled proposal and the
     # target must share one vocabulary axis.  Resolved once per loop; None
@@ -1285,10 +1391,18 @@ def _dflash_rounds_batch(
     total_emitted = sum(emitted)
 
     while len(active_idx) > 0:
-        remaining = [
-            max(1, max_tokens - emitted[active_idx[j]] + 1)
-            for j in range(len(active_idx))
-        ]
+        remaining = []
+        for j in range(len(active_idx)):
+            room = max_tokens - emitted[active_idx[j]] + 1
+            # A positive emit cap narrows the drafted width the same way a
+            # nearly-exhausted max_tokens does; a cap of 0 (a forced round) does
+            # not, because that round still emits its forced run plus a bonus.
+            row_limit = (
+                emit_limit(active_idx[j]) if emit_limit is not None else None
+            )
+            if row_limit is not None and int(row_limit) > 0:
+                room = min(room, int(row_limit) + 1)
+            remaining.append(max(1, room))
         bs = _dflash_next_block_size(draft_model, block_total, min(remaining))
         if bs <= 1:
             break
@@ -1296,6 +1410,25 @@ def _dflash_rounds_batch(
         n_active = len(active_idx)
         b_active = [b[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
+        round_plans = [
+            round_emit_plan(
+                active_idx[j],
+                emit_limit,
+                forced_draft_ids,
+                bs - 1,
+                max_tokens - emitted[active_idx[j]],
+            )
+            for j in range(n_active)
+        ]
+        budgets = [plan[0] for plan in round_plans]
+        forced_rows = [plan[1] for plan in round_plans]
+        forced_lens = [len(forced) for forced in forced_rows]
+        # Only a round that forces something changes the walk call: the walks
+        # are a stubbing seam in the test suite, and the steady state keeps the
+        # signature it has always had.
+        forced_kw = (
+            {"forced_prefix_lens": forced_lens} if any(forced_lens) else {}
+        )
 
         # Draft rowwise unless the batched path is on: historically the DFlash
         # drafter cache was scalar-offset, so B rows meant B sequential
@@ -1356,6 +1489,8 @@ def _dflash_rounds_batch(
         draft_tokens = sampler_rng.draft_tokens(
             draft_batched_rows if batched_draft else draft_active_rows,
         )
+        if any(forced_lens):
+            draft_tokens = place_forced_draft_prefix(draft_tokens, forced_rows)
         if timed:
             mx.eval(draft_tokens)
             draft_finished = time.perf_counter()
@@ -1374,7 +1509,7 @@ def _dflash_rounds_batch(
                 target_tokens = sampler(verify_out.logits)
                 if deferred_walk:
                     walk_packed = _dflash_pack_greedy_walk(
-                        draft_tokens, target_tokens, n_active
+                        draft_tokens, target_tokens, n_active, **forced_kw
                     )
         if greedy_sampling:
             mx.async_eval(walk_packed if deferred_walk else target_tokens, hidden_full)
@@ -1384,14 +1519,13 @@ def _dflash_rounds_batch(
             mx.eval(walk_packed if (greedy_sampling and deferred_walk) else hidden_full)
             _record_verify_seconds(draft_model, time.perf_counter() - draft_finished)
 
-        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
         if greedy_sampling and deferred_walk:
             accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
                 walk_packed, n_active, budgets
             )
         elif greedy_sampling:
             accepted_list, new_tokens_list = _speculative_walk_batch(
-                draft_tokens, target_tokens, budgets
+                draft_tokens, target_tokens, budgets, **forced_kw
             )
         else:
             accepted_list, new_tokens_list = _sample_dflash_target_walk(
@@ -1401,6 +1535,7 @@ def _dflash_rounds_batch(
                 budgets,
                 row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
                 base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+                **forced_kw,
             )
             sampler_rng.target_sampled(sync_draft=not positioned_sampling)
 
@@ -1439,6 +1574,26 @@ def _dflash_rounds_batch(
                     sum(a - min(accepted_list) for a in accepted_list),
                 )
 
+        # Stats read the post-clamp, pre-truncation acceptance; the CACHE reads
+        # the emitted one.  An emit budget (max_tokens, or a thinking budget)
+        # can stop a row mid-block, and ``accepted_arr`` is what the rollback
+        # trims to -- hand it the walk's number and the row keeps live KV for
+        # tokens it never emitted.
+        for a in accepted_list:
+            _record_speculative_round(draft_model, a, bs - 1)
+        _record_batch_round(draft_model, n_active)
+
+        emitted_accepted_list = accepted_list_from_emitted(new_tokens_list)
+        _record_budget_clamp(
+            draft_model,
+            sum(
+                a - e
+                for a, e in zip(accepted_list, emitted_accepted_list)
+                if a > e
+            ),
+        )
+        accepted_list = emitted_accepted_list
+
         min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
 
@@ -1449,10 +1604,6 @@ def _dflash_rounds_batch(
             orig = active_idx[j]
             if hidden_segments[j].shape[1] > 0:
                 hidden_by_orig[orig] = hidden_segments[j]
-
-        for a in accepted_list:
-            _record_speculative_round(draft_model, a, bs - 1)
-        _record_batch_round(draft_model, n_active)
 
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0

@@ -204,6 +204,15 @@ def _speculative_stats_snapshot() -> dict:
         "drafted": drafted,
         "accepted": accepted,
         "clamped": int(getattr(drafter, "speculative_total_clamped", 0) or 0),
+        # Tokens a row VERIFIED and then did not emit because an emit budget
+        # (max_tokens, or a thinking budget) stopped it mid-block. Reported next
+        # to ``clamped`` because the two are different give-backs: that one is
+        # the batch's uniform-acceptance clamp, this one is the row's own
+        # budget, and this one is what a thinking-budget panel reads to see the
+        # budget actually bite.
+        "budget_clamped": int(
+            getattr(drafter, "speculative_total_budget_clamped", 0) or 0
+        ),
         "per_row_kept": int(
             getattr(drafter, "speculative_total_per_row_kept", 0) or 0
         ),

@@ -2348,6 +2348,45 @@ class ThinkingBudgetCriteria:
         self.forced_token_id = None
         return forced_token_id
 
+    def pending_forced_sequence(self) -> List[int]:
+        """The ids that must be emitted next, in order, WITHOUT consuming them.
+
+        The autoregressive path injects one forced id per step and re-enters
+        ``__call__`` on it, so ``_forced_index`` advances as a side effect of
+        emission.  A speculative round has to know the whole remaining run up
+        front -- it places those ids as the front of the draft so the target's
+        bonus is conditioned on the closed thinking block -- but it must not
+        advance the ledger, because the ids are consumed later by the same
+        ``__call__`` when they are actually emitted.
+        """
+        if not self.enable_thinking or not self.budget_exceeded:
+            # ``budget_exceeded`` is the authority, not ``forced_token_id``:
+            # closing the block resets the former but leaves the latter holding
+            # the id it just consumed, so reading that field alone would keep
+            # re-forcing ``</think>`` after the block was already closed.
+            return []
+        pending: List[int] = []
+        if self.forced_token_id is not None:
+            pending.append(int(self.forced_token_id))
+        pending.extend(int(t) for t in self._forced_sequence[self._forced_index :])
+        return pending
+
+    def tokens_before_budget_stop(self) -> Optional[int]:
+        """How many free tokens may still be emitted before forcing starts.
+
+        ``None`` when the budget does not apply right now (thinking off, or the
+        model is outside a thinking block).  ``0`` means the closing sequence is
+        already pending.  The count mirrors ``__call__``: the budget trips on
+        the ``budget + 1``-th thinking token.
+        """
+        if not self.enable_thinking:
+            return None
+        if self.pending_forced_sequence():
+            return 0
+        if not self.in_thinking:
+            return None
+        return max(0, self.thinking_budget + 1 - self.thinking_token_count)
+
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     """

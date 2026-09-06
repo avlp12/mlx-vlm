@@ -10,14 +10,20 @@ from ..models import cache
 from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
+    _forced_prefix_len,
+    _record_budget_clamp,
     _record_draft_seconds,
     _record_speculative_round,
     _record_verify_seconds,
+    _reset_budget_clamp,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
     _SpeculativeSamplerRNG,
+    accepted_list_from_emitted,
     generation_stream,
+    place_forced_draft_prefix,
+    round_emit_plan,
 )
 
 _MTP_ROUND_TIMERS_ENV = None
@@ -287,12 +293,16 @@ def _speculative_walk_batch_deferred_greedy(
     budgets: List[int],
     row_ids: Optional[List[int]] = None,
     base_positions: Optional[List[int]] = None,
+    forced_prefix_lens: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Batched greedy walk that projects target logits only until all rows stop."""
     B = draft_tokens.shape[0]
     n_draft = draft_tokens.shape[1]
     draft_lists = [[int(token) for token in row] for row in draft_tokens.tolist()]
     budgets = [int(budget) for budget in budgets]
+    forced = [
+        _forced_prefix_len(forced_prefix_lens, row, n_draft) for row in range(B)
+    ]
     accepted = [0] * B
     new_tokens: List[List[int]] = [[] for _ in range(B)]
     done = [False] * B
@@ -326,6 +336,14 @@ def _speculative_walk_batch_deferred_greedy(
         for row, token in enumerate(target_list):
             if done[row]:
                 continue
+            # A forced position was PLACED by the caller: it is accepted
+            # unconditionally, and the token committed there is the placed one,
+            # not the target's disagreeing draw.
+            if pos < forced[row]:
+                accepted[row] += 1
+                if len(new_tokens[row]) < budgets[row]:
+                    new_tokens[row].append(draft_lists[row][pos])
+                continue
             if pos < n_draft and token == draft_lists[row][pos]:
                 accepted[row] += 1
                 if len(new_tokens[row]) < budgets[row]:
@@ -345,16 +363,27 @@ def _speculative_walk_batch_deferred_uniform(
     draft_tokens: mx.array,
     sampler: Callable[[mx.array], mx.array],
     budgets: List[int],
+    forced_prefix_lens: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Deferred walk for models whose batched drafter cache needs lockstep rows.
 
     Stop at the first rejection in any row. This avoids consuming target sampler
     RNG for verifier positions that will be thrown away by the uniform clamp.
+
+    One accept count covers the whole batch, so a forced prefix is honoured only
+    up to ``min`` over the rows: forcing a position for one row would force an
+    unverified drafted token in every other.  A mixed batch simply does not
+    force this round and the criteria retries next round.
     """
     B = draft_tokens.shape[0]
     n_draft = draft_tokens.shape[1]
     draft_lists = [[int(token) for token in row] for row in draft_tokens.tolist()]
     budgets = [int(budget) for budget in budgets]
+    forced_floor = (
+        min(_forced_prefix_len(forced_prefix_lens, row, n_draft) for row in range(B))
+        if forced_prefix_lens and B > 0
+        else 0
+    )
 
     accepted = 0
     for pos in range(n_draft + 1):
@@ -369,8 +398,9 @@ def _speculative_walk_batch_deferred_uniform(
         mx.eval(target_tokens)
         target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
 
-        if pos < n_draft and all(
-            target_list[row] == draft_lists[row][pos] for row in range(B)
+        if pos < n_draft and (
+            pos < forced_floor
+            or all(target_list[row] == draft_lists[row][pos] for row in range(B))
         ):
             accepted += 1
             continue
@@ -1071,6 +1101,8 @@ def _mtp_rounds_batch(
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
     prompt_tokens: Optional[mx.array] = None,
+    emit_limit: Optional[Callable[[int], Optional[int]]] = None,
+    forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1107,6 +1139,7 @@ def _mtp_rounds_batch(
         draft_model.reset(model, left_padding=[0] * B)
     else:
         draft_model.reset(model)
+    _reset_budget_clamp(draft_model)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling
@@ -1176,10 +1209,16 @@ def _mtp_rounds_batch(
     timed = _mtp_round_timers_enabled()
 
     while len(active_idx) > 0:
-        remaining = [
-            max(1, max_tokens - emitted[active_idx[j]] + 1)
-            for j in range(len(active_idx))
-        ]
+        remaining = []
+        for j in range(len(active_idx)):
+            room = max_tokens - emitted[active_idx[j]] + 1
+            # A positive emit cap narrows the drafted width; a cap of 0 (a
+            # forced round) does not -- that round still emits its forced run
+            # plus the target's bonus.
+            row_limit = emit_limit(active_idx[j]) if emit_limit is not None else None
+            if row_limit is not None and int(row_limit) > 0:
+                room = min(room, int(row_limit) + 1)
+            remaining.append(max(1, room))
         if pause_ctl is not None:
             pause_ctl.mark()
             bs = pause_ctl.block_total(min(remaining))
@@ -1201,6 +1240,25 @@ def _mtp_rounds_batch(
         b_active = [b[active_idx[j]] for j in range(n_active)]
         positions_active = [positions[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
+        round_plans = [
+            round_emit_plan(
+                active_idx[j],
+                emit_limit,
+                forced_draft_ids,
+                bs - 1,
+                max_tokens - emitted[active_idx[j]],
+            )
+            for j in range(n_active)
+        ]
+        budgets = [plan[0] for plan in round_plans]
+        forced_rows = [plan[1] for plan in round_plans]
+        forced_lens = [len(forced) for forced in forced_rows]
+        # Only a round that forces something changes the walk call: the walks
+        # are a stubbing seam in the test suite, and the steady state keeps the
+        # signature it has always had.
+        forced_kw = (
+            {"forced_prefix_lens": forced_lens} if any(forced_lens) else {}
+        )
 
         # Draft (autoregressive K-step). hidden / shared_kv state was set
         # via set_shared_kv above; the drafter pulls it from there.
@@ -1216,6 +1274,8 @@ def _mtp_rounds_batch(
             positions_active,
             greedy_sampling=greedy_sampling,
         )
+        if any(forced_lens):
+            draft_tokens = place_forced_draft_prefix(draft_tokens, forced_rows)
         if timed:
             mx.eval(draft_tokens)
             draft_finished = time.perf_counter()
@@ -1237,11 +1297,10 @@ def _mtp_rounds_batch(
             _record_verify_seconds(draft_model, time.perf_counter() - draft_finished)
 
         # Walk per-row
-        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
         if verify.target_tokens is not None:
             sampler_rng.target_eval(verify.target_tokens, hidden_full)
             accepted_list, new_tokens_list = _speculative_walk_batch(
-                draft_tokens, verify.target_tokens, budgets
+                draft_tokens, verify.target_tokens, budgets, **forced_kw
             )
             sampler_rng.sync_draft_to_target()
             if (
@@ -1255,6 +1314,7 @@ def _mtp_rounds_batch(
                         verify.target_tokens,
                         accepted_list,
                         budgets,
+                        **forced_kw,
                     )
                 )
         else:
@@ -1272,6 +1332,7 @@ def _mtp_rounds_batch(
                         draft_tokens,
                         sampler,
                         budgets,
+                        **forced_kw,
                     )
                 )
             else:
@@ -1286,6 +1347,7 @@ def _mtp_rounds_batch(
                         base_positions=[
                             emitted[active_idx[j]] for j in range(n_active)
                         ],
+                        **forced_kw,
                     )
                 )
             sampler_rng.target_sampled(
@@ -1301,6 +1363,20 @@ def _mtp_rounds_batch(
         )
         if pause_ctl is not None:
             pause_ctl.record(bs, accepted=min(accepted_list), n_draft=bs - 1)
+
+        # The drafter-quality receipts above keep the walk's own number; from
+        # here down every consumer is a CACHE consumer -- the drafter's accepted
+        # replay, the per-row hidden column, the positions ledger the sampled
+        # coupling is keyed to, and the rollback length -- and each of those is
+        # defined by what the round EMITS.  A budget that cut the row mid-block
+        # makes the two differ; using the walk's number there leaves live KV
+        # (and a position ledger) for tokens the stream never produced.
+        emitted_accepted_list = accepted_list_from_emitted(new_tokens_list)
+        _record_budget_clamp(
+            draft_model,
+            sum(a - e for a, e in zip(accepted_list, emitted_accepted_list) if a > e),
+        )
+        accepted_list = emitted_accepted_list
 
         max_a = max(accepted_list)
 
@@ -1347,12 +1423,17 @@ def _mtp_rounds_batch(
                         finished[orig] = True
             yield tokens_out, {"round_pos": pos, "round_len": max_new}
 
-        # Update bonus tokens and per-row positions
+        # Update bonus tokens and per-row positions.  The ledger advances by
+        # the EMITTED count, which is the sampled-coupling key: the target draw
+        # at absolute position p must be reproducible, so a round that emitted
+        # fewer tokens than it verified must not skip the positions it threw
+        # away.  ``len(new_tokens)`` is that count; ``accepted + 1`` is only
+        # equal to it when nothing truncated the row.
         for j in range(n_active):
             orig = active_idx[j]
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
-            positions[orig] = positions[orig] + accepted_list[j] + 1
+            positions[orig] = positions[orig] + len(new_tokens_list[j])
 
         # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
         # per-row tail-zero on rows that accepted less).

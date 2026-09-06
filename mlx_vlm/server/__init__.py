@@ -79,6 +79,7 @@ from .generation import (
     get_quantized_kv_bits,
     get_quantized_kv_split_bits,
     get_quantized_kv_start,
+    get_server_clear_thinking,
     get_server_enable_thinking,
     get_server_max_tokens,
     get_server_thinking_budget,
