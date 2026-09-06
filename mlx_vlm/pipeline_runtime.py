@@ -9,7 +9,7 @@ everything else has a default::
     MLX_VLM_PIPELINE_HOSTS=10.0.0.2:39210          # required, enables the feature
     MLX_VLM_PIPELINE_RING=10.0.0.1:39400,10.0.0.2:39401   # ring backend (default transport)
     MLX_VLM_PIPELINE_SPLIT=23                      # int, or "auto" for the micro-sweep
-    MLX_VLM_PIPELINE_MIN_TOKENS=4096               # below this, stay single-box
+    MLX_VLM_PIPELINE_MIN_TOKENS=16384              # below this, stay single-box
     MLX_VLM_PIPELINE_CALIB=~/.cache/mlx_vlm/pipeline_splits.json
     MLX_VLM_PIPELINE_MODEL_SHA256=<verified manifest SHA256>  # required
     MLX_VLM_PIPELINE_SOURCE_REVISION=<source commit SHA1>     # required
@@ -92,6 +92,8 @@ from .pipeline_prefill import (
 )
 
 _DISABLED = object()
+# Kept as a module attribute because tests patch it, but it no longer LATCHES a
+# decision: see ``maybe_open_pipeline``.
 _CTX = None
 
 
@@ -115,6 +117,15 @@ def pipeline_language_model(model):
 
 
 # ------------------------------------------------------------------ settings
+
+# ``docs/POLICY_long_prompt_pp_routing_2026-09-05.md`` rule 1: a first prefill
+# of >= 16k tokens routes to the two-box path.  The pairs behind that rule are
+# 32,779 tok (339.1 -> 743.1 input tok/s, 2.19x) and 131,072 tok (~295 -> 756.9,
+# 2.57x); 16k-32k has no PP measurement yet (the doc queues it as L5-a), so 16k
+# is the policy FLOOR and not a measured crossover.  The old 4096 default sat
+# below every number in that table and would have routed prompts the policy
+# says nothing about.
+DEFAULT_MIN_TOKENS = 16384
 
 
 class PipelineSettings:
@@ -158,7 +169,9 @@ class PipelineSettings:
             peer=(host, int(port or 39210)),
             ring=ring,
             split=split,
-            min_tokens=int(os.environ.get("MLX_VLM_PIPELINE_MIN_TOKENS", "4096")),
+            min_tokens=int(
+                os.environ.get("MLX_VLM_PIPELINE_MIN_TOKENS", str(DEFAULT_MIN_TOKENS))
+            ),
             calib_path=calib,
             transport="ring" if ring else "socket",
             model_sha256=os.environ.get("MLX_VLM_PIPELINE_MODEL_SHA256"),
@@ -1013,12 +1026,16 @@ def maybe_open_pipeline(model, total_tokens: int, verbose: bool = False):
     this function may raise on a peer problem: a tail that is down, slow or
     tripped must cost the request a fallback, not a failure.
     """
-    global _CTX
-    if _CTX is _DISABLED:
-        return None
+    # NO STICKY DISABLE.  This used to latch ``_CTX = _DISABLED`` on the first
+    # refusal and return None forever after, so a process that reached here once
+    # before ``MLX_VLM_PIPELINE_HOSTS`` was set -- a test module, a server whose
+    # peer is configured after the model loads, an operator turning the feature
+    # on -- could never enable the pipeline again.  Worse, the later requests
+    # were not even COUNTED: the latch returned before ``note_bypass``, so the
+    # histogram an operator reads to find out which gate refused went silent.
+    # The whole check is a few environment reads against a >= 16k-token prefill.
     settings = PipelineSettings.from_env()
     if settings is None:
-        _CTX = _DISABLED
         METRICS.note_bypass("disabled")
         return None
     lm = pipeline_language_model(model)
@@ -1027,7 +1044,6 @@ def maybe_open_pipeline(model, total_tokens: int, verbose: bool = False):
             print(
                 "[pipeline] model has no pipeline hook; staying single-box", flush=True
             )
-        _CTX = _DISABLED
         METRICS.note_bypass("no_pipeline_hook")
         return None
     if total_tokens < settings.min_tokens:

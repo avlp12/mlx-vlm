@@ -354,15 +354,45 @@ def test_the_apc_exact_checkpoint_is_a_ladder_too(monkeypatch):
 
 
 def test_a_short_prompt_stays_on_one_box(monkeypatch):
-    """The gate honours ``MLX_VLM_PIPELINE_MIN_TOKENS``.
-
-    The number itself is the routing policy's, and A8 wires the default to it.
-    """
+    """A8: ``MLX_VLM_PIPELINE_MIN_TOKENS`` is the routing policy's 16k rule."""
     _arm(monkeypatch, min_tokens=16384)
     lm = _lm()
     batch = _batch(lm)
     batch._pipeline_open()
     assert batch._pipeline is None and _hist() == {"below_min_tokens": 1}
+
+
+def test_the_default_min_tokens_is_the_policy_number(monkeypatch):
+    """A8.  ``POLICY_long_prompt_pp_routing_2026-09-05.md`` rule 1 is >= 16k."""
+    monkeypatch.delenv("MLX_VLM_PIPELINE_MIN_TOKENS", raising=False)
+    monkeypatch.setenv("MLX_VLM_PIPELINE_HOSTS", "127.0.0.1:1")
+    assert pr.DEFAULT_MIN_TOKENS == 16384
+    assert pr.PipelineSettings.from_env().min_tokens == 16384
+
+
+def test_turning_the_pipeline_on_later_in_the_process_works(monkeypatch):
+    """A8.  The ``_CTX = _DISABLED`` latch made ``disabled`` permanent.
+
+    A process that reached ``maybe_open_pipeline`` once before
+    ``MLX_VLM_PIPELINE_HOSTS`` was set -- a test module, a server whose peer is
+    configured after the model loads -- could never use the pipeline again, and
+    its later requests were not even counted, because the latch returned before
+    the bypass was recorded.
+    """
+    monkeypatch.delenv("MLX_VLM_PIPELINE_HOSTS", raising=False)
+    assert pr.maybe_open_pipeline(object(), 100000) is None
+    assert _hist() == {"disabled": 1}
+
+    _arm(monkeypatch)  # the peer is configured NOW
+    lease = pr.maybe_open_pipeline(_lm(), 100000)
+    assert lease is not None, "the disabled decision must not have latched"
+    lease.close()
+
+    # and a refusal after that is still counted, every time
+    monkeypatch.delenv("MLX_VLM_PIPELINE_HOSTS", raising=False)
+    pr.maybe_open_pipeline(object(), 100000)
+    pr.maybe_open_pipeline(object(), 100000)
+    assert _hist()["disabled"] == 3
 
 
 def test_a_second_eligible_request_falls_back_instead_of_queueing(monkeypatch):
