@@ -1247,6 +1247,101 @@ def test_a_useful_prefix_is_still_stored():
     assert reused == 128
 
 
+# ---------------------------------------------------------------- hidden tail
+#
+# The drafter's round-1 window over the tail of the stored prefix, carried on
+# the RAM entry so a warm request can prime its drafter on the whole window
+# instead of on the 16-token suffix it is about to forward (I1312).
+
+
+def _hidden_tail(rows, layers=2, dim=4):
+    """One bf16 ``[1, rows, dim]`` array per captured target layer."""
+    return [
+        mx.full((1, rows, dim), float(i + 1), dtype=mx.bfloat16) for i in range(layers)
+    ]
+
+
+def test_exact_lookup_returns_the_stored_hidden_tail():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(1, 200))
+    tail = _hidden_tail(32)
+
+    assert manager.store_exact_cache(
+        tokens[:128],
+        _tiny_exact_cache(tokens[:128]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=tail,
+    )
+
+    out = []
+    cache, reused = manager.lookup_exact_cache(tokens, hidden_tail_out=out)
+
+    assert cache is not None and reused == 128
+    # The return tuple is unchanged -- the tail rides the out-parameter, so the
+    # dozen call sites that unpack ``(cache, prefix_len)`` keep working.
+    assert len(out) == len(tail)
+    for got, want in zip(out, tail):
+        assert got.dtype == mx.bfloat16
+        assert got.shape == (1, 32, 4)
+        assert mx.array_equal(got, want)
+
+
+def test_exact_lookup_reports_no_tail_when_none_was_stored():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(1, 200))
+
+    assert manager.store_exact_cache(
+        tokens[:128], _tiny_exact_cache(tokens[:128]), harvest_provenance=_HARVEST_W1
+    )
+
+    out = ["stale"]
+    cache, reused = manager.lookup_exact_cache(tokens, hidden_tail_out=out)
+
+    assert cache is not None and reused == 128
+    # Cleared, not appended to: the caller reads "empty" as "no tail", and a
+    # reused list must not make the previous request's tail look like this one's.
+    assert out == []
+
+    # A miss clears it too.
+    out = ["stale"]
+    assert manager.lookup_exact_cache([9000, 9001, 9002], hidden_tail_out=out) == (
+        None,
+        0,
+    )
+    assert out == []
+
+
+def test_a_hidden_tail_does_not_change_exact_lru_eviction(monkeypatch):
+    """The tail rides the entry; it must not add a slot or keep one alive."""
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
+    manager = APCManager(num_blocks=8, block_size=16)
+    a = list(range(1, 200))
+    b = list(range(500, 700))
+
+    assert manager.store_exact_cache(
+        a[:128],
+        _tiny_exact_cache(a[:128]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=_hidden_tail(32),
+    )
+    assert manager.store_exact_cache(
+        b[:128],
+        _tiny_exact_cache(b[:128]),
+        harvest_provenance=_HARVEST_W1,
+        hidden_tail=_hidden_tail(8),
+    )
+
+    # One slot: the newer entry is the only one left, and it carries ITS tail.
+    out = []
+    cache, reused = manager.lookup_exact_cache(b, hidden_tail_out=out)
+    assert cache is not None and reused == 128
+    assert [int(t.shape[1]) for t in out] == [8, 8]
+
+    out = ["stale"]
+    assert manager.lookup_exact_cache(a, hidden_tail_out=out) == (None, 0)
+    assert out == []
+
+
 def test_positive_desired_prefix_is_unchanged():
     tokens = list(range(1, 100))
 

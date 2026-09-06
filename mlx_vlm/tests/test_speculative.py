@@ -2057,6 +2057,48 @@ def test_prefill_from_target_hidden_aligns_on_the_trailing_tail_when_hidden_is_l
     assert mx.array_equal(aligned_hidden, hidden[:, -prompt_len:, :])
 
 
+@pytest.mark.parametrize("hidden_len", [457, 16])
+def test_prefill_from_target_hidden_primes_on_exactly_as_many_rows_as_it_is_given(
+    hidden_len,
+):
+    """The contract the APC hidden tail exists to satisfy, both sides of it.
+
+    ``min(len(prompt), len(hidden))`` is the drafter's alignment rule and it is
+    not changing: with a whole-prompt hidden it primes on the whole prompt, and
+    with a suffix-width hidden it primes on the suffix and says nothing about
+    it.  That silence is the measured defect (I1312): a 457-token APC-warm
+    request forwards 16 tokens through the target, so the only hidden that
+    exists is 16 rows wide and the drafter is primed on 16 of 457 positions --
+    acceptance 1.67 -> 1.25 per round, -10% tok/s.  Nothing here is broken, so
+    nothing here is fixed; the row count has to be supplied UPSTREAM, by handing
+    the drafter the stored prefix tail in front of the suffix capture
+    (``PromptProcessingBatch._prepend_apc_hidden_tail``).  This test pins the
+    dependency so a later edit to the alignment rule cannot silently move it.
+    """
+    from mlx_vlm.speculative.drafters.glm5_next_mtp.glm5_next_mtp import (
+        Glm5NextMTPDraftModel,
+    )
+
+    spy = _ForwardTokensSpy()
+    prompt_len, hidden_dim = 457, 4
+    input_ids = mx.arange(prompt_len, dtype=mx.int32)[None, :]
+    hidden = mx.zeros((1, hidden_len, hidden_dim), dtype=mx.float32)
+
+    Glm5NextMTPDraftModel.prefill_from_target_hidden(
+        spy,
+        input_ids,
+        hidden,
+        bonus_token=11,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+    )
+
+    assert len(spy.forward_calls) == 1
+    tokens, aligned_hidden, _ = spy.forward_calls[0]
+    assert tokens.shape == (1, hidden_len)
+    assert aligned_hidden.shape == (1, hidden_len, hidden_dim)
+
+
 def test_prefill_from_target_hidden_is_a_noop_on_empty_hidden():
     from mlx_vlm.speculative.drafters.glm5_next_mtp.glm5_next_mtp import (
         Glm5NextMTPDraftModel,

@@ -365,6 +365,44 @@ class PrefillHiddenAccumulator:
             return []
         return [slot[-1] for slot in self._layers if slot]
 
+    def tail(self, row: int, k: Optional[int] = None) -> List[mx.array]:
+        """Per-layer copies of the last ``k`` captured rows of batch row ``row``.
+
+        A READ taken while the prefill is still running -- at an APC exact
+        checkpoint, so the copy can be stored alongside the prompt-cache
+        snapshot and handed back to the drafter on a later warm request whose
+        target forward only covers the suffix.  It is non-destructive: the chunk
+        pieces it copies from are still owed to :meth:`finish`.
+
+        ``k`` of ``None`` (or ``<= 0``) means "every row still resident"; the
+        caller is expected to pass the drafter's own window
+        (:func:`prefill_context_keep`), because the result is about to be stored
+        on a cache entry that outlives the request.
+
+        Same "never hand back a bare slice" rule as :meth:`finish`, and for the
+        same reason twice over: an ``mx`` slice is a view that pins its parent
+        buffer, and an unevaluated slice is a graph node that pins every
+        intermediate behind it.  So each layer is copied with ``mx.contiguous``
+        and the copies are evaluated before they leave -- otherwise a stored tail
+        would retain the whole prefill it was cut from.
+
+        Returns ``[]`` when nothing has been captured (no drafter, or a forward
+        that carried no capture kwargs), which the caller reads as "no tail".
+        """
+        if self._layers is None:
+            return []
+        out: List[mx.array] = []
+        for slot in self._layers:
+            if not slot:
+                return []
+            h = slot[0] if len(slot) == 1 else mx.concatenate(slot, axis=1)
+            h = h[row : row + 1]
+            if k is not None and 0 < int(k) < int(h.shape[1]):
+                h = h[:, -int(k) :]
+            out.append(mx.contiguous(h))
+        mx.eval(out)
+        return out
+
     def finish(self) -> Tuple[Optional[List[mx.array]], int]:
         """``(per-layer hidden, rows dropped off the front)``.
 

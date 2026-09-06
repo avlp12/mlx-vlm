@@ -2137,7 +2137,16 @@ class PromptProcessingBatch:
         self._capture_refusal: Optional[str] = None
         self._capture_refusal_declines_chunking = False
         if self._chunk_capture_kwargs:
-            if right_pad_per_row is not None:
+            # ``is not None`` alone is the WRONG test, and it was spuriously
+            # refusing the commonest warm shape: a single warm request is
+            # ``right_pad_per_row == [0]``, which is a batch with no padding in
+            # it at all.  The refusal's whole argument is "the trailing rows are
+            # padding for a short row", so it has to ask whether any row IS
+            # short -- the same ``is not None and any(...)`` the two other
+            # right-padding sites in this class already use (the ``prepare()``
+            # declaration above and the last-real-token selection in
+            # ``generate()``).
+            if right_pad_per_row is not None and any(right_pad_per_row):
                 self._capture_refusal = (
                     "right-padded batch (mixed warm/cold prefill): the drafter's "
                     "window is the trailing rows, which are padding for a short row"
@@ -2366,8 +2375,56 @@ class PromptProcessingBatch:
                 prompt_cache,
                 extra_hash=meta.get("extra_hash", 0),
                 harvest_provenance=self._harvest_provenance(batch_idx),
+                hidden_tail=self._hidden_tail_for_store(batch_idx, meta),
             )
             meta["checkpoint_done"] = True
+
+    def _hidden_tail_for_store(self, batch_idx: int, meta: dict) -> Optional[list]:
+        """The drafter's round-1 window over this checkpoint's tail, or ``None``.
+
+        Stored beside the prompt-cache snapshot so a LATER warm request -- which
+        forwards only its suffix and therefore has no hidden for the cached part
+        of its prompt -- can still prime the drafter on the whole window instead
+        of on the 16-token suffix (I1312).
+
+        Four conditions, all of them about the tail being the thing it claims:
+
+        * ``self._chunk_capture_kwargs`` non-empty: there is a hidden-reading
+          drafter and the capture rides every chunk, so the accumulator holds
+          rows and not just the final forward's.
+        * the row is COLD (``prefix_len == 0``): the accumulator's rows for a
+          warm row start at ``prefix_len``, so its "last k rows at the
+          checkpoint" would be a window with a hole in it.
+        * ``self._right_pad_per_row is None``: a right-padded row's trailing
+          capture rows are padding (the same objection ``_capture_refusal``
+          makes), and a cold row cannot be in a right-padded batch anyway
+          without a warm sibling to right-pad against.
+        * the drafter declares a finite window.  ``prefill_context_keep`` of
+          ``None`` means "no bound", and an unbounded tail is not a 16.8 MB MTP
+          window but the whole prompt's activations kept alive for the life of
+          the entry -- gigabytes on a 131k prompt.  Refusing to store is
+          fail-safe: that request warms exactly as it does today.
+
+        Every attribute is read through ``getattr``, as ``_harvest_provenance``
+        does and for the same reason: several tests build this batch with
+        ``__new__`` and set only what the method under test reads, so a store
+        must not start depending on the drafter wiring being present.
+        """
+        if not getattr(self, "_chunk_capture_kwargs", None):
+            return None
+        if getattr(self, "_right_pad_per_row", None) is not None:
+            return None
+        if int(meta.get("prefix_len", 0) or 0) != 0:
+            return None
+        keep = prefill_context_keep(
+            getattr(self, "draft_kind", None), getattr(self, "draft_model", None)
+        )
+        if keep is None or keep <= 0:
+            return None
+        accumulator = getattr(self, "_prefill_hidden", None)
+        if accumulator is None:
+            return None
+        return accumulator.tail(batch_idx, keep) or None
 
     def _store_vault_checkpoints(self) -> None:
         """Store every vault rung this chunk landed on, per row.
@@ -2554,6 +2611,109 @@ class PromptProcessingBatch:
             )
         ]
 
+    def _prepend_apc_hidden_tail(
+        self, stitched: List[mx.array], offset: int
+    ) -> Tuple[List[mx.array], int]:
+        """Put the APC entry's stored hidden tail back in front of a warm capture.
+
+        A warm row forwards only its SUFFIX, so ``stitched`` covers prompt
+        positions ``prefix_len ..`` and a drafter primed off it sees 16 rows of a
+        457-token prompt (I1312: 1.67 -> 1.25 accepted/round).  The entry that
+        served this row carries the target hidden of the prefix's last
+        ``len(tail)`` rows -- positions ``prefix_len - len(tail) .. prefix_len -
+        1`` -- which is exactly the piece missing from the front.  Concatenate,
+        then apply the drafter's window to the join.
+
+        THE OFFSET.  ``target_hidden_offset`` keeps the meaning it has on the
+        cold path and the one ``adopt_pretruncated_context`` implements: the
+        number of leading rows of the WHOLE prompt's hidden that the caller
+        already dropped, i.e. the absolute prompt position of row 0 of what the
+        drafter is handed.  Cold and untrimmed that is 0; cold and trimmed to
+        ``keep`` it is ``S - keep``; here row 0 sits at ``prefix_len - len(tail)``
+        (plus whatever the window then trims off the join), so that is what this
+        returns.  The two readings coincide because the drafter's ideal context
+        is the whole prompt starting at position 0 in both cases.
+
+        Refusals, each logged once in the ``_capture_refusal`` style and each
+        leaving the batch EXACTLY as it is today:
+
+        * ``B > 1``.  The tails are per row and generally differ in width, so
+          there is no single time axis to concatenate on and no single offset to
+          hand ``_dflash_rounds_batch`` (which applies one to every row's draft
+          cache).  Fixing that means a per-row offset, which is a wider change
+          than this one.
+        * a tail that does not match the capture (layer count, feature width,
+          dtype, batch dim), or one wider than the prefix it claims to cover.
+          A tail is stored per drafter target-layer set; a mismatch means the
+          entry was harvested under a different drafter and joining it would be
+          silently wrong rather than merely short.
+        * ``offset != 0``, i.e. the suffix capture alone already overflowed the
+          drafter's window.  The tail would be trimmed away entirely, and
+          prepending it before a capture that has already lost rows off its
+          front would put a hole in the middle of the context.
+        """
+        metas = self._apc_meta or []
+        if not any((m or {}).get("hidden_tail") for m in metas):
+            return stitched, offset
+
+        meta = metas[0] or {}
+        tail = meta.get("hidden_tail") or []
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        reason: Optional[str] = None
+        if len(metas) != 1 or len(self.uids) != 1 or int(stitched[0].shape[0]) != 1:
+            reason = (
+                "the stored hidden tails are per row and differ in width, so a "
+                "B > 1 batch has no single time axis to prepend on"
+            )
+        elif offset:
+            reason = (
+                f"the suffix capture already overflowed the drafter's window "
+                f"(offset {offset}), so the stored tail would be trimmed away"
+            )
+        elif len(tail) != len(stitched):
+            reason = (
+                f"the stored tail has {len(tail)} captured layers, this prefill "
+                f"has {len(stitched)}"
+            )
+        elif any(
+            int(t.shape[0]) != 1
+            or int(t.shape[-1]) != int(h.shape[-1])
+            or t.dtype != h.dtype
+            for t, h in zip(tail, stitched)
+        ):
+            reason = (
+                "the stored tail's shape or dtype does not match this prefill's "
+                "capture"
+            )
+        elif len({int(t.shape[1]) for t in tail}) != 1:
+            reason = "the stored tail's layers disagree on length"
+        elif int(tail[0].shape[1]) > prefix_len:
+            reason = (
+                f"the stored tail is {int(tail[0].shape[1])} rows but the cached "
+                f"prefix is only {prefix_len}"
+            )
+        if reason is not None:
+            logger.info(
+                "speculative prefill: declining the stored APC hidden tail for "
+                "this batch -- %s. The drafter is primed on the suffix only, as "
+                "it was before the tail existed.",
+                reason,
+            )
+            return stitched, offset
+
+        tail_rows = int(tail[0].shape[1])
+        joined = [mx.concatenate([t, h], axis=1) for t, h in zip(tail, stitched)]
+        start = prefix_len - tail_rows
+        keep = prefill_context_keep(self.draft_kind, self.draft_model)
+        width = int(joined[0].shape[1])
+        if keep is not None and 0 < keep < width:
+            # Same trim ``finish()`` applies, on the same end, for the same
+            # reason -- the drafter only ever reads its trailing ``keep`` rows.
+            # ``mx.contiguous`` because a bare slice would pin the join.
+            joined = [mx.contiguous(h[:, -keep:]) for h in joined]
+            start += width - keep
+        return joined, start
+
     def generate(
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
@@ -2577,6 +2737,9 @@ class PromptProcessingBatch:
             self._prefill_hidden.append(output)
             stitched, self.target_hidden_offset = self._prefill_hidden.finish()
             if stitched is not None:
+                stitched, self.target_hidden_offset = self._prepend_apc_hidden_tail(
+                    stitched, self.target_hidden_offset
+                )
                 output.hidden_states = stitched
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
@@ -3490,6 +3653,12 @@ class BatchGenerator:
                 "harvest_provenance": (
                     picks[i].get("harvest_provenance") if picks[i] else None
                 ),
+                # The drafter's window over the tail of the PREFIX this row is
+                # being served from, when the entry carries one.  The prefill
+                # below only covers the suffix, so without this the drafter is
+                # primed on the suffix alone (I1312).  ``None`` on every cold
+                # row and on any warm row whose entry predates the tail.
+                "hidden_tail": (picks[i].get("hidden_tail") if picks[i] else None),
             }
             for i in range(len(sequences))
         ]

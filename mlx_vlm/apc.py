@@ -551,6 +551,21 @@ class APCExactCacheEntry:
     # every policy in ``harvest_provenance`` treats it as such, because the one
     # measured failure (L1b-1) is an entry that looks exactly like a good one.
     provenance: Optional[Dict[str, Any]] = None
+    # The target model's hidden over the LAST rows of ``token_ids``, one array
+    # per captured layer, or ``None``.  It has exactly one consumer: a
+    # speculative drafter primed off the prefill hidden.  A warm request only
+    # forwards the SUFFIX, so the only hidden that exists on that request covers
+    # the suffix -- the drafter is primed on 16 rows instead of the whole prompt
+    # and acceptance drops (measured, I1312: 1.67 -> 1.25 accepted/round, -10%
+    # tok/s).  Stashing the prefix's tail here is what lets the warm path hand
+    # the drafter the same window the cold path gave it.
+    #
+    # RAM ONLY, deliberately.  It is bf16 activations rather than cache state,
+    # it is bounded by the drafter's own window rather than by the prompt, and a
+    # shard captured for one drafter's target layers would be wrong for another.
+    # ``save_exact_cache`` is never handed it, and an entry promoted back from
+    # disk carries ``None`` -- that request simply behaves as it does today.
+    hidden_tail: Optional[List[Any]] = None
 
 
 @dataclass(frozen=True)
@@ -3065,6 +3080,7 @@ class APCManager:
         min_prefix_tokens: int = 0,
         require_harvest_width_1: bool = False,
         provenance_out: Optional[Dict[str, Any]] = None,
+        hidden_tail_out: Optional[List[Any]] = None,
     ) -> Tuple[Optional[List[Any]], int]:
         """Return an exact-prefix prompt-cache snapshot for custom caches.
 
@@ -3082,9 +3098,21 @@ class APCManager:
         the entry that served (or left empty on a miss), so the caller can report
         ``cached_from_width`` without a second lookup and without a
         last-lookup attribute that two request threads would race on.
+
+        ``hidden_tail_out`` follows the same out-parameter shape, and for the
+        same reason: the return tuple is ``(cache, prefix_len)`` in a dozen call
+        sites and tests, several of which compare it to ``(None, 0)`` whole, so
+        widening it would be a breaking change for a field only the speculative
+        path reads.  It is EXTENDED in place with the served entry's
+        ``hidden_tail`` (left empty on a miss, on a block-mode hit, and on a
+        disk restore -- shards carry no tail).  The arrays are the entry's own,
+        not copies: the drafter reads them and never writes them, and copying
+        per hit would pay the tail's bytes on every warm request.
         """
         if provenance_out is not None:
             provenance_out.clear()
+        if hidden_tail_out is not None:
+            del hidden_tail_out[:]
 
         disk = self.disk
         if self._exact_cache_max <= 0 and disk is None:
@@ -3099,6 +3127,7 @@ class APCManager:
         source_cache: Optional[List[Any]] = None
         prefix_len = 0
         served_provenance: Optional[Dict[str, Any]] = None
+        served_hidden_tail: Optional[List[Any]] = None
         refused_width = 0
         with self.lock:
             best_key: Optional[int] = None
@@ -3132,6 +3161,7 @@ class APCManager:
                     prefix_len = len(best_entry.token_ids)
                     source_cache = best_entry.prompt_cache
                     served_provenance = best_entry.provenance
+                    served_hidden_tail = best_entry.hidden_tail
 
         can_try_disk = disk is not None and prefix_len < max_len
         if can_try_disk and self._disk_min_free_ram_bytes > 0:
@@ -3243,6 +3273,8 @@ class APCManager:
             self.stats.matched_tokens += prefix_len
         if provenance_out is not None and served_provenance:
             provenance_out.update(served_provenance)
+        if hidden_tail_out is not None and served_hidden_tail:
+            hidden_tail_out.extend(served_hidden_tail)
         return prompt_cache, prefix_len
 
     def store_exact_cache(
@@ -3252,8 +3284,15 @@ class APCManager:
         *,
         extra_hash: int = 0,
         harvest_provenance: Optional[Dict[str, Any]] = None,
+        hidden_tail: Optional[List[Any]] = None,
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        ``hidden_tail`` is the drafter's round-1 window over the tail of
+        ``token_ids`` (see :class:`APCExactCacheEntry`).  It rides the RAM entry
+        and nothing else: it is never written to a disk shard, so a store that
+        only reaches disk stores no tail, and the caller owns bounding it to the
+        drafter's window before handing it over.
 
         ``harvest_provenance`` names the prefill this snapshot was taken inside
         (see :mod:`mlx_vlm.harvest_provenance`).  It is recorded on the RAM
@@ -3295,6 +3334,7 @@ class APCManager:
                     prompt_cache=copied,
                     last_used=time.time(),
                     provenance=provenance,
+                    hidden_tail=list(hidden_tail) if hidden_tail else None,
                 )
                 self._exact_cache.move_to_end(key)
                 while len(self._exact_cache) > self._exact_cache_max:
@@ -4381,12 +4421,14 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_prov: Dict[str, Any] = {}
+        exact_tail: List[Any] = []
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
             ids_list,
             extra_hash=extra_hash,
             min_prefix_tokens=safe_lookup_min,
             require_harvest_width_1=require_w1,
             provenance_out=exact_prov,
+            hidden_tail_out=exact_tail,
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
@@ -4398,6 +4440,14 @@ def apc_lookup_plan(
                 "extra_hash": extra_hash,
                 "full_input_ids": list(ids_list),
                 "harvest_provenance": _prov.normalise(exact_prov),
+                # The drafter's round-1 window over the tail of the PREFIX, or
+                # ``None``.  Rows ``prefix_len - len(tail) .. prefix_len - 1``:
+                # the prefill about to run covers only the suffix, so this is the
+                # only hidden the drafter can be given for the cached part of
+                # the prompt.  ``None`` is the ordinary case (no drafter when
+                # the entry was stored, an entry restored from disk, a drafter
+                # that declares no window) and means "warm as before".
+                "hidden_tail": list(exact_tail) if exact_tail else None,
             }
         return None
 
