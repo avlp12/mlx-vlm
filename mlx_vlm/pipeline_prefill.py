@@ -81,6 +81,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import numpy as np
 
+from . import pipeline_admission as admission
 from .models.base import create_attention_mask, create_ssm_mask
 from .utils import load_model
 
@@ -88,6 +89,7 @@ MAGIC = b"GP51"
 HDR = struct.Struct("!4sIIIIIQ")  # magic, chunk_idx, B, S, HC, D, nbytes
 EOF_IDX = 0xFFFFFFFF
 MAX_JSON_BYTES = 4 * 1024 * 1024
+ADMISSION_REFUSED_EXIT = 3  # a refused start is not a crash and not a success
 
 
 def _hex(value, length, name):
@@ -1031,6 +1033,8 @@ class TailDaemon:
         unload=None,
         log=None,
         clock=time.monotonic,
+        admission_report=None,
+        sampler=None,
     ):
         self.srv = srv
         self.session = session
@@ -1040,6 +1044,11 @@ class TailDaemon:
         self.unload = unload
         self.log = log or (lambda line: print(line, flush=True))
         self.clock = clock
+        # A7: what the start-time gates decided, and the live rail verdict.
+        # Both ride the health line so an operator (and, via ``ping``, the head)
+        # never has to guess why a tail is up or whether it is worth using.
+        self.admission_report = admission_report
+        self.sampler = sampler
         self.state = "starting"
         self.peer = None
         self.shutdown_reason = None
@@ -1065,6 +1074,15 @@ class TailDaemon:
         return self._stop.is_set()
 
     def status(self) -> dict:
+        """The health line.  Schema (every key always present):
+
+        ``role`` str, ``state`` one of starting/listening/serving/stopping/
+        stopped, ``peer`` str|null, ``uptime_s`` float, ``idle_s`` float,
+        ``shutdown_reason`` str|null, ``connections`` int, ``requests`` int,
+        ``connection_errors`` int, ``last_error`` str|null, ``degraded`` bool,
+        ``rail`` object|null (:meth:`RailSampler.snapshot`), ``admission``
+        object|null (:meth:`AdmissionReport.to_dict`).
+        """
         return {
             "role": "tail",
             "state": self.state,
@@ -1072,8 +1090,19 @@ class TailDaemon:
             "uptime_s": round(self.clock() - self.started, 3),
             "idle_s": round(self.clock() - self.last_active, 3),
             "shutdown_reason": self.shutdown_reason,
+            "degraded": self.degraded,
+            "rail": self.sampler.snapshot() if self.sampler is not None else None,
+            "admission": (
+                self.admission_report.to_dict()
+                if self.admission_report is not None
+                else None
+            ),
             **self.counters,
         }
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.sampler is not None and self.sampler.degraded)
 
     def _emit_status(self):
         self.log("[tail-health] " + json.dumps(self.status()))
@@ -1220,7 +1249,7 @@ def serve_health(daemon, port: int, bind: str = "127.0.0.1"):
     return hs
 
 
-def tail_session_factory(args, stage, n_layers, load_s, stop_file):
+def tail_session_factory(args, stage, n_layers, load_s, stop_file, sampler=None):
     """Build the per-connection handler: hello, then run/bye until the peer
     leaves.  Returns the number of requests the connection served."""
 
@@ -1253,7 +1282,29 @@ def tail_session_factory(args, stage, n_layers, load_s, stop_file):
                     # Liveness for a pooled head: the connection outlives the
                     # request now, so the head must be able to ask whether it
                     # still has a peer before it commits a prefill to it.
-                    _send_json(sock, {"cmd": "ping", "ok": True})
+                    #
+                    # A7: a head that ASKS gets the tail's own rail verdict
+                    # back with the ack.  ``degraded`` true means the tail is
+                    # alive and still serving, but its recent p95 wire time is
+                    # past the bound -- the head should feed that to its
+                    # CircuitBreaker (record_failure) and prefill single-box
+                    # rather than commit a request to a rail it already knows is
+                    # slow.  ``rail`` is the evidence behind the flag; see
+                    # pipeline_admission.RailSampler.snapshot for the fields.
+                    #
+                    # Opt-in, not unconditional: the shipped head compares the
+                    # ack for EQUALITY with {"cmd": "ping", "ok": True}
+                    # (pipeline_runtime.PipelineHead.ping), so an extra key on
+                    # every reply would break every head that has not been
+                    # updated yet.  The head side of this is a one-line change:
+                    # send {"cmd": "ping", "rail": True} and read ``degraded``.
+                    ack = {"cmd": "ping", "ok": True}
+                    if req.get("rail"):
+                        ack["degraded"] = bool(
+                            sampler is not None and sampler.degraded
+                        )
+                        ack["rail"] = sampler.snapshot() if sampler else None
+                    _send_json(sock, ack)
                     continue
                 if req.get("cmd") != "run" or req.get("transport") != args.transport:
                     raise ValueError("invalid pipeline run")
@@ -1273,6 +1324,10 @@ def tail_session_factory(args, stage, n_layers, load_s, stop_file):
                 _send_json(sock, {"ok": True, "request_id": envelope.request_id})
                 rep = _tail_one(args, stage, sock, req)
                 served += 1
+                if sampler is not None:
+                    # Sample AFTER the work and BEFORE the reply, so the next
+                    # ping already reflects the request that just ran.
+                    sampler.observe(rep.get("wire_recv_s"), rep.get("tail_total_s"))
                 _send_json(sock, rep)
                 print(json.dumps(rep), flush=True)
         finally:
@@ -1291,6 +1346,32 @@ def run_tail(args, on_ready=None):
     _hex(args.source_revision, 40, "source_revision")
     stop_file = getattr(args, "stop_file", None)
     _check_stop(stop_file)
+    # A7 service-start admission. Every gate here answers a question that stops
+    # being answerable the moment weights are resident, so all three run first
+    # and a refusal costs nothing but a process start: one tail per box (flock),
+    # one heavy model per box (process scan), and the registered wired budget.
+    # Off by default for programmatic callers; ``main()`` turns it on for the
+    # service, and MLX_VLM_PIPELINE_ADMISSION=0 turns it back off.
+    report = None
+    if _admission_enabled(args):
+        report = admission.admit(args)
+        print("[tail-admission] " + json.dumps(report.to_dict()), flush=True)
+    try:
+        return _run_tail_admitted(args, stop_file, report, on_ready)
+    except BaseException:
+        if report is not None:
+            report.release()
+        raise
+
+
+def _admission_enabled(args) -> bool:
+    value = getattr(args, "admission", None)
+    if value is None:
+        value = os.environ.get("MLX_VLM_PIPELINE_ADMISSION", "0")
+    return str(value).lower() not in ("0", "false", "no", "none", "")
+
+
+def _run_tail_admitted(args, stop_file, report, on_ready):
     lo, hi = args.split, args.layers
     model, caches, local, n_layers, load_s = load_stage(args.model, lo, hi, args.prune)
     stage = Stage(model, caches, local, n_layers)
@@ -1320,13 +1401,24 @@ def run_tail(args, on_ready=None):
         gc.collect()
         mx.clear_cache()
 
+    def unload_and_unlock():
+        # The lock is released only AFTER the weights are gone: a successor
+        # that grabbed the lock the instant we set the flag would load its own
+        # shard against ours and blow the box's wired budget.
+        unload()
+        if report is not None:
+            report.release()
+
+    sampler = admission.rail_sampler_from_args(args)
     daemon = TailDaemon(
         srv,
-        tail_session_factory(args, stage, n_layers, load_s, stop_file),
+        tail_session_factory(args, stage, n_layers, load_s, stop_file, sampler),
         connect_timeout=getattr(args, "connect_timeout", 0.0) or 0.0,
         idle_timeout=getattr(args, "idle_timeout", 0.0) or 0.0,
         once=bool(getattr(args, "once", False)),
-        unload=unload,
+        unload=unload_and_unlock,
+        admission_report=report,
+        sampler=sampler,
     )
     install_tail_signal_handlers(daemon)
     serve_health(daemon, getattr(args, "health_port", 0) or 0, bind=args.bind)
@@ -1591,6 +1683,63 @@ def main(argv=None):
         default=0,
         help="tail-role: one-line JSON status socket; 0 = stdout only",
     )
+    # -- A7: service-start admission ------------------------------------
+    p.add_argument(
+        "--admission",
+        dest="admission",
+        action="store_true",
+        default=os.environ.get("MLX_VLM_PIPELINE_ADMISSION", "1") not in ("0", ""),
+        help="tail-role: run the start-time gates (flock, heavy-process "
+        "preflight, wired budget) before loading weights [default on]",
+    )
+    p.add_argument(
+        "--no-admission", dest="admission", action="store_false",
+        help="skip the start-time gates entirely",
+    )
+    p.add_argument(
+        "--lock-file",
+        default=None,
+        help="one-tail-per-box flock path "
+        f"[default {admission.DEFAULT_LOCK_PATH}, env MLX_VLM_PIPELINE_LOCK]",
+    )
+    p.add_argument(
+        "--no-lock", action="store_true",
+        help="do not take the per-box tail lock (a deliberate second service)",
+    )
+    p.add_argument(
+        "--allow-shared-box", action="store_true",
+        help="admit even when another heavy MLX model process is resident",
+    )
+    p.add_argument(
+        "--wired-cap-bytes",
+        type=int,
+        default=None,
+        help="wired budget this box may reach after loading "
+        f"[default {admission.REGISTERED_WIRED_POLICY['requested_limit_bytes']} "
+        "(450 GiB, the registered run05 policy), env "
+        "MLX_VLM_PIPELINE_WIRED_CAP_BYTES]",
+    )
+    p.add_argument(
+        "--shard-bytes",
+        type=int,
+        default=None,
+        help="override the measured stage footprint (env "
+        "MLX_VLM_PIPELINE_SHARD_BYTES); default is read from the safetensors "
+        "headers, no tensor data",
+    )
+    p.add_argument(
+        "--allow-wired-overcommit", action="store_true",
+        help="record the wired refusal but start anyway",
+    )
+    p.add_argument(
+        "--rail-window", type=int, default=None,
+        help=f"requests in the rail p95 window [default {admission.DEFAULT_RAIL_WINDOW}]",
+    )
+    p.add_argument(
+        "--rail-p95-s", type=float, default=None,
+        help="p95 wire seconds above which the tail reports degraded "
+        f"[default {admission.DEFAULT_RAIL_P95_BOUND_S}]",
+    )
     p.add_argument("--io-timeout", type=float, default=120.0)
     p.add_argument(
         "--model-sha256", default=os.environ.get("MLX_VLM_PIPELINE_MODEL_SHA256")
@@ -1622,7 +1771,21 @@ def main(argv=None):
     if args.role == "head":
         run_head(args)
     elif args.role == "tail":
-        run_tail(args)
+        try:
+            run_tail(args)
+        except admission.AdmissionRefused as exc:
+            # Exit non-zero with the sentence, not a traceback: the caller of a
+            # refused start is a launchd job or an operator, and neither is
+            # served by a stack.
+            print(f"[tail-admission] REFUSED {exc}", file=sys.stderr, flush=True)
+            print(
+                "[tail-admission] "
+                + json.dumps({"admitted": False, "gate": exc.gate,
+                              "detail": exc.detail}, default=str),
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(ADMISSION_REFUSED_EXIT)
     else:
         run_single(args)
 
