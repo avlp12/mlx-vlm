@@ -73,7 +73,16 @@ so a disk blob and a peer-tier payload are the same bytes in the same order.
 
 Environment
 -----------
-``MLX_VLM_VAULT_DISK_DIR``          root directory; unset = feature OFF (default)
+``MLX_VLM_VAULT_DISK_DIR``          root directory.  **Unset** (the variable is
+                                    not in the environment at all) defaults the
+                                    tier ON at ``~/glm53flash/vaultdisk``
+                                    whenever the RAM vault is on
+                                    (``MLX_VLM_GLM5_VAULT=1``; if the RAM vault
+                                    is off there is nothing to spill, so the
+                                    disk tier stays off too).  Set to ``""`` or
+                                    ``"0"`` to opt out explicitly even with the
+                                    RAM vault on.  Any other value is the
+                                    literal path and wins over the default.
 ``MLX_VLM_VAULT_DISK_MAX_GB``       disk cap, default 200
 ``MLX_VLM_VAULT_DISK_SAVE_ON_INSERT`` also save when a rung is inserted (default 0;
                                     the default policy is save-on-eviction only)
@@ -82,9 +91,17 @@ Environment
 ``MLX_VLM_VAULT_DISK_NOCACHE``      F_NOCACHE on every fd (default 1, macOS only)
 ``MLX_VLM_VAULT_DISK_STRICT_GIT``   refuse an entry from another git head (default 1)
 
+The defaults above (200 GB / 4 MiB / NOCACHE on / FSYNC off / save-on-eviction
+only) are the P2-measured-good knobs and apply identically whether the
+directory came from the default or an explicit ``MLX_VLM_VAULT_DISK_DIR``.
+
 Put the root on the internal NVMe. The external X10 works and is honest about
 it in the counters, but it is 8x slower on this box (0.82 vs 6.7 GB/s measured,
-and its rated 2.1 GB/s was refuted -- P2b).
+and its rated 2.1 GB/s was refuted -- P2b).  The default path is under
+``~/glm53flash`` specifically because that tree lives on the internal SSD on
+this fleet; the directory is created lazily on first attach and a vault fault
+(including "could not create the directory") must never fail a model load --
+:func:`attach_disk_vault` already logs a warning and falls back to RAM-only.
 """
 
 from __future__ import annotations
@@ -108,6 +125,7 @@ import mlx.core as mx
 from . import harvest_provenance as _harvest_prov
 from .apc_adapters import ADAPTER_SCHEMA_VERSION, StateFragment, dedup_enabled
 from .context_vault import VaultCheckpoint, VaultTier
+from .context_vault import vault_enabled as _ram_vault_enabled
 from .context_vault_wire import _DTYPES, plan_fragments, unpack_fragments
 
 logger = logging.getLogger(__name__)
@@ -157,15 +175,40 @@ _DEFAULT_MAX_GB = 200.0
 # 4 MiB. Four is the floor, not the default-that-can-be-lowered.
 MIN_CHUNK_BYTES = 4 << 20
 
+# Default cold-tier root when MLX_VLM_VAULT_DISK_DIR is unset and the RAM
+# vault is on.  Under ~/glm53flash because that tree lives on the internal
+# NVMe on this fleet (see the module docstring's P2 table for why that
+# matters).  Expanded lazily by every caller -- never cached as a Path at
+# import time -- so $HOME overrides in tests take effect.
+_DEFAULT_DISK_DIR = "~/glm53flash/vaultdisk"
+
 
 def _env_truthy(name: str, default: str = "") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 def disk_vault_dir() -> Optional[Path]:
-    """Root for disk entries, or ``None`` (the default) meaning the tier is off."""
-    raw = os.environ.get(_ENV_DIR, "").strip()
-    return Path(raw).expanduser() if raw else None
+    """Root for disk entries, or ``None`` meaning the tier is off.
+
+    Resolution:
+
+    - ``MLX_VLM_VAULT_DISK_DIR`` set to ``""`` or ``"0"`` -- explicit opt-out,
+      always off, regardless of the RAM vault.
+    - ``MLX_VLM_VAULT_DISK_DIR`` set to anything else -- that literal path,
+      expanded.  Wins over the default unconditionally.
+    - ``MLX_VLM_VAULT_DISK_DIR`` unset (the key is not in the environment at
+      all) -- defaults to :data:`_DEFAULT_DISK_DIR` when the RAM vault is on
+      (``context_vault.vault_enabled()``, which owns its own default), else
+      off.  A RAM vault that never turns on has nothing to spill to disk.
+    """
+    if _ENV_DIR in os.environ:
+        raw = os.environ[_ENV_DIR].strip()
+        if raw in ("", "0"):
+            return None
+        return Path(raw).expanduser()
+    if not _ram_vault_enabled():
+        return None
+    return Path(_DEFAULT_DISK_DIR).expanduser()
 
 
 def disk_vault_enabled() -> bool:

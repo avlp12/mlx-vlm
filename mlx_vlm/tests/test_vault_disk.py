@@ -33,6 +33,7 @@ from mlx_vlm.context_vault import (
 )
 from mlx_vlm.context_vault_wire import pack_fragments, plan_fragments
 from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_vlm import context_vault as CV
 from mlx_vlm import harvest_provenance as HP
 from mlx_vlm import vault_disk as VD
 
@@ -141,7 +142,7 @@ class DiskVaultTestCase(unittest.TestCase):
             for k in (
                 VD._ENV_DIR, VD._ENV_MAX_GB, VD._ENV_SAVE_ON_INSERT,
                 VD._ENV_FSYNC, VD._ENV_CHUNK_MB, VD._ENV_NOCACHE,
-                VD._ENV_STRICT_GIT,
+                VD._ENV_STRICT_GIT, CV._ENV_ENABLE, "HOME",
             )
         }
         self._open = []
@@ -828,6 +829,87 @@ class TestEnvAndWiring(DiskVaultTestCase):
         self.assertIsNotNone(dv)
         self._open.append(dv)
         self.assertIs(vault.disk, dv)
+
+    def test_ram_vault_off_and_dir_unset_stays_off(self):
+        """Confirms the no-vault default is unaffected: this is the ambient
+        state of every other test in this file, so it also guards against a
+        regression the rest of the suite would not otherwise catch."""
+        os.environ.pop(VD._ENV_DIR, None)
+        os.environ.pop(CV._ENV_ENABLE, None)
+        self.assertFalse(CV.vault_enabled())
+        self.assertIsNone(VD.disk_vault_dir())
+        self.assertFalse(VD.disk_vault_enabled())
+
+    def test_dir_unset_and_ram_vault_on_defaults_the_disk_tier_on(self):
+        os.environ.pop(VD._ENV_DIR, None)
+        os.environ[CV._ENV_ENABLE] = "1"
+        os.environ["HOME"] = str(self.root)
+        self.assertTrue(CV.vault_enabled())
+        resolved = VD.disk_vault_dir()
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved, self.root / "glm53flash" / "vaultdisk")
+        self.assertTrue(VD.disk_vault_enabled())
+
+    def test_explicit_empty_string_opts_out_even_with_ram_vault_on(self):
+        os.environ[CV._ENV_ENABLE] = "1"
+        os.environ["HOME"] = str(self.root)
+        os.environ[VD._ENV_DIR] = ""
+        self.assertIsNone(VD.disk_vault_dir())
+        self.assertFalse(VD.disk_vault_enabled())
+
+    def test_explicit_zero_opts_out_even_with_ram_vault_on(self):
+        os.environ[CV._ENV_ENABLE] = "1"
+        os.environ["HOME"] = str(self.root)
+        os.environ[VD._ENV_DIR] = "0"
+        self.assertIsNone(VD.disk_vault_dir())
+        self.assertFalse(VD.disk_vault_enabled())
+
+    def test_explicit_path_wins_over_the_default(self):
+        os.environ[CV._ENV_ENABLE] = "1"
+        os.environ["HOME"] = str(self.root)
+        explicit = self.root / "explicit-dir"
+        os.environ[VD._ENV_DIR] = str(explicit)
+        self.assertEqual(VD.disk_vault_dir(), explicit)
+        # And it still wins when the default's own directory happens to exist.
+        (self.root / "glm53flash" / "vaultdisk").mkdir(parents=True)
+        self.assertEqual(VD.disk_vault_dir(), explicit)
+
+    def test_attach_uses_the_default_dir_and_creates_it_lazily(self):
+        os.environ.pop(VD._ENV_DIR, None)
+        os.environ[CV._ENV_ENABLE] = "1"
+        os.environ["HOME"] = str(self.root)
+        target = self.root / "glm53flash" / "vaultdisk"
+        self.assertFalse(target.exists())
+        vault = ContextVault("default-dir-x", budget_bytes=1 << 20)
+        dv = VD.attach_disk_vault(vault)
+        self.assertIsNotNone(dv)
+        self._open.append(dv)
+        self.assertEqual(dv.dir, target)
+        self.assertTrue(target.is_dir(), "created lazily on first attach")
+
+    def test_a_directory_that_cannot_be_created_refuses_gracefully(self):
+        """A vault fault must never fail a load (module docstring, attach_disk_vault
+        docstring): an uncreatable default dir logs a warning and leaves the
+        vault RAM-only rather than raising."""
+        os.environ.pop(VD._ENV_DIR, None)
+        os.environ[CV._ENV_ENABLE] = "1"
+        os.environ["HOME"] = str(self.root)
+        blocker = self.root / "glm53flash"
+        blocker.write_text("not a directory")  # occupies the parent path
+        vault = ContextVault("blocked-x", budget_bytes=1 << 20)
+        with self.assertLogs("mlx_vlm.vault_disk", level="WARNING") as cm:
+            dv = VD.attach_disk_vault(vault)
+        self.assertIsNone(dv)
+        self.assertIsNone(vault.disk)
+        self.assertTrue(any("could not open" in m for m in cm.output))
+
+    def test_resolved_dir_and_enabled_flag_are_in_the_snapshot(self):
+        os.environ.pop(VD._ENV_DIR, None)
+        os.environ[CV._ENV_ENABLE] = "1"
+        os.environ["HOME"] = str(self.root)
+        snap = VD.disk_stats_snapshot()
+        self.assertTrue(snap["enabled"])
+        self.assertEqual(snap["dir"], str(self.root / "glm53flash" / "vaultdisk"))
 
     def test_defaults_match_the_documented_policy(self):
         for k in (VD._ENV_MAX_GB, VD._ENV_SAVE_ON_INSERT, VD._ENV_FSYNC,
