@@ -314,6 +314,12 @@ def resolve_split(model, settings: PipelineSettings, tokens: int, verbose=False)
 # --------------------------------------------------------------- head client
 
 
+# The keys a ping ack may carry.  The check stays as strict as the equality it
+# replaces -- an unknown key is still a protocol error -- but ``degraded`` and
+# ``rail`` are now part of the contract (pipeline_prefill.tail_session_factory).
+_PING_ACK_KEYS = frozenset({"cmd", "ok", "degraded", "rail"})
+
+
 class PipelineHead:
     def __init__(self, settings: PipelineSettings, split: int, n_layers: int):
         self.settings = settings
@@ -329,6 +335,13 @@ class PipelineHead:
         self._stop = threading.Event()
         self.envelope = None
         self._model = None
+        # The tail's own verdict on its rail, as of the last ``ping`` that
+        # asked for it.  ``False``/``None`` on a tail that predates A7 and on a
+        # connection that has not been pinged, which is the same thing an
+        # operator would assume: no evidence of degradation is not evidence of
+        # degradation, and the request goes ahead.
+        self.peer_degraded = False
+        self.peer_rail = None
 
     # -- connection ---------------------------------------------------------
     def connect(self, timeout=60.0):
@@ -378,17 +391,40 @@ class PipelineHead:
         return self
 
     def ping(self):
-        """Is this connection still a connection?  Cheap enough to run before
-        every reuse, which is the only way a pooled socket's death can be
-        discovered while falling back is still free."""
+        """Is this connection still a connection, and is its rail worth using?
+
+        Cheap enough to run before every reuse, which is the only way a pooled
+        socket's death can be discovered while falling back is still free.
+
+        ``rail: true`` asks the A7 tail to ride its own rail verdict on the
+        ack.  It is a REQUEST rather than a standing arrangement because the
+        tail answers a bare ping with exactly ``{"cmd": "ping", "ok": True}``
+        and the head used to compare the reply for equality: an unconditional
+        extra key would have broken every head not updated in the same breath.
+        Asking makes the compatibility run the other way too -- a tail that
+        predates A7 ignores the flag and answers the two-key form, which is
+        read here as "no rail evidence" and NOT as a fault, because a tail that
+        cannot report a degraded rail is not thereby a degraded tail.
+
+        Returns ``True`` for "the connection is alive"; the verdict is left on
+        ``peer_degraded``/``peer_rail`` rather than returned, so a caller that
+        only wanted liveness (and every existing one did) is unchanged.
+        """
         if self.sock is None:
             raise OSError("pipeline connection is closed")
         if self._active:
             raise RuntimeError("pipeline ping requires an idle peer")
-        _send_json(self.sock, {"cmd": "ping"})
+        _send_json(self.sock, {"cmd": "ping", "rail": True})
         ack = _recv_json(self.sock)
-        if ack != {"cmd": "ping", "ok": True}:
+        if (
+            not isinstance(ack, dict)
+            or ack.get("cmd") != "ping"
+            or ack.get("ok") is not True
+            or set(ack) - _PING_ACK_KEYS
+        ):
             raise ValueError("pipeline ping not acknowledged")
+        self.peer_degraded = bool(ack.get("degraded"))
+        self.peer_rail = ack.get("rail")
         return True
 
     def close(self):
@@ -784,12 +820,35 @@ class PipelinePool:
             # here, where falling back is still free, not inside ``begin``.
             try:
                 head.ping()
-                return head
             except (OSError, ValueError, TimeoutError) as exc:
                 if verbose:
                     print(f"[pipeline] pooled peer stale: {exc!r}", flush=True)
                 _discard(head)
                 METRICS.note_reconnect()
+            else:
+                if not getattr(head, "peer_degraded", False):
+                    return head
+                # The tail is ALIVE and answering; what it is telling us is that
+                # its own rail p95 is past the bound.  Committing a >= 16k
+                # prefill to it would buy a slow request in exchange for a fast
+                # fallback, so the connection goes back in the pool (nothing is
+                # wrong with the socket, and discarding it would make the
+                # recovery cost a reconnect) and the request stays single-box.
+                #
+                # It is fed to the breaker rather than merely counted because
+                # the breaker is the thing that already knows how to stop
+                # ASKING: without it, every request pays a ping round trip and a
+                # bypass for a rail whose verdict has hysteresis on it anyway.
+                with self._lock:
+                    self._idle.setdefault(key, []).append(head)
+                self.breaker.record_failure()
+                METRICS.note_bypass("peer_degraded")
+                if verbose:
+                    print(
+                        f"[pipeline] bypass=peer_degraded rail={head.peer_rail!r}",
+                        flush=True,
+                    )
+                return None
         if not self.breaker.allow():
             METRICS.note_bypass("breaker_open")
             if verbose:

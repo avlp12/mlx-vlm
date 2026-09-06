@@ -390,3 +390,210 @@ def test_unloading_the_server_says_bye_to_the_pooled_tails(monkeypatch):
     monkeypatch.setattr(pr, "shutdown_pipeline_pool", lambda: called.append(1))
     app._shutdown_pipeline_pool()
     assert called == [1]
+
+
+# ------------------------------------------------------ A7 head side: the rail
+#
+# A7 gave the tail a RailSampler and put its verdict on the ping ack, on
+# request.  These pin the head half: ask for it, read the four-key reply, and
+# treat a degraded rail as a reason to stay single-box rather than as a fault.
+
+
+class _RailHead(_FakeHead):
+    """A pooled head whose peer reports a rail verdict that can change."""
+
+    def __init__(self, settings, split, n_layers, degraded=False):
+        super().__init__(settings, split, n_layers)
+        self.peer_degraded = degraded
+        self.peer_rail = {"degraded": degraded, "samples": 8}
+
+    def connect(self):
+        return self
+
+
+def test_a_degraded_peer_is_a_bypass_and_a_breaker_failure(monkeypatch):
+    """The tail is up and answering.  It is telling us its rail is slow, and a
+    slow rail is worth less than the fallback -- so the request stays on one
+    box and the breaker hears about it."""
+    made = []
+
+    class Factory(_RailHead):
+        def __init__(self, settings, split, n_layers):
+            super().__init__(settings, split, n_layers, degraded=True)
+            made.append(self)
+
+    pool = _pool(monkeypatch, Factory)
+    s = _settings()
+    key = pr._pool_key(s, 1, 3)
+    lease = pr.PooledPipelineHead(pool, pool.acquire(s, 1, 3), key)
+    lease.finalize(cache=None)  # a finished request is what pools a connection
+    lease.close()
+    assert pool.idle_count() == 1
+
+    assert pool.acquire(s, 1, 3) is None, "a degraded rail is not handed out"
+    assert made[0].pings == 1
+    assert not made[0].aborted, "the socket is fine; only its rail is not"
+    assert pool.idle_count() == 1, "the connection stays pooled for the recovery"
+    assert pr.METRICS.snapshot()["pp_bypass_reason"]["peer_degraded"] == 1
+    assert pool.breaker.failures == 1
+
+
+def test_a_degraded_peer_trips_the_breaker_and_then_recovers(monkeypatch):
+    """Hysteresis lives on the tail; what the head must not do is latch.  When
+    the tail stops saying degraded the SAME connection is handed out again --
+    no reconnect, because nothing was ever wrong with the socket."""
+    made = []
+
+    class Factory(_RailHead):
+        def __init__(self, settings, split, n_layers):
+            super().__init__(settings, split, n_layers, degraded=True)
+            made.append(self)
+
+    pool = _pool(monkeypatch, Factory)  # breaker threshold=2
+    s = _settings()
+    key = pr._pool_key(s, 1, 3)
+    lease = pr.PooledPipelineHead(pool, pool.acquire(s, 1, 3), key)
+    lease.finalize(cache=None)
+    lease.close()
+
+    assert pool.acquire(s, 1, 3) is None
+    assert pool.acquire(s, 1, 3) is None
+    assert pool.breaker.state == "open", "two refusals at threshold 2"
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_bypass_reason"]["peer_degraded"] == 2
+    assert snap["pp_reconnects"] == 0, "a degraded rail is not a stale socket"
+
+    made[0].peer_degraded = False
+    got = pool.acquire(s, 1, 3)
+    assert got is made[0], "the recovered peer is the same connection"
+    assert len(made) == 1, "and it was never re-dialled"
+
+
+def test_the_ping_asks_the_tail_for_its_rail(monkeypatch):
+    """Over a real socket to a real tail: the head sends ``rail: true`` and the
+    tail's answer lands on ``peer_degraded``."""
+    from mlx_vlm import pipeline_admission as pa
+    from mlx_vlm import pipeline_prefill as pp
+    from mlx_vlm.tests.test_pipeline_tail_daemon import (
+        _FakeModel,
+        _free_port,
+        _head,
+        _tail_args,
+    )
+
+    tail_model = _FakeModel()
+    monkeypatch.setattr(
+        pp,
+        "load_stage",
+        lambda *a: (tail_model, tail_model.make_cache(), [1, 2], 3, 0.0),
+    )
+    sampler = pa.RailSampler(window=4, p95_bound_s=0.001, min_samples=1)
+    monkeypatch.setattr(pa, "rail_sampler_from_args", lambda args: sampler)
+    port = _free_port()
+    args = _tail_args(port)
+    box = {}
+    errors = []
+
+    def tail():
+        try:
+            pp.run_tail(args, on_ready=lambda d: box.__setitem__("daemon", d))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    th = threading.Thread(target=tail, daemon=True)
+    th.start()
+    deadline = time.monotonic() + 5
+    while "daemon" not in box and time.monotonic() < deadline:
+        time.sleep(0.01)
+    head = _head(port)
+    try:
+        head.connect(timeout=5)
+        assert head.ping() is True
+        assert head.peer_degraded is False, "no samples yet is not degraded"
+        assert head.peer_rail is not None and head.peer_rail["samples"] == 0
+
+        sampler.observe(1.0, 1.0)  # p95 1.0 s against a 1 ms bound
+        assert head.ping() is True, "a degraded tail is still a live connection"
+        assert head.peer_degraded is True
+        assert head.peer_rail["p95_wire_s"] == 1.0
+
+        sampler.reset()
+        assert head.ping() is True
+        assert head.peer_degraded is False, "the flag follows the tail, not a latch"
+        head.close()
+    finally:
+        head.abort()
+        box["daemon"].request_shutdown("test")
+        th.join(5)
+    assert not errors
+
+
+def test_a_tail_that_predates_the_rail_reply_is_not_degraded():
+    """Compatibility runs both ways: the old two-key ack is still an ack, and
+    it reads as no evidence rather than as a fault."""
+    srv, port = _listener_pair()
+    replies = [{"cmd": "ping", "ok": True}]
+    th = threading.Thread(target=_answer_pings, args=(srv, replies), daemon=True)
+    th.start()
+    head = _connected_head(port)
+    try:
+        assert head.ping() is True
+        assert head.peer_degraded is False
+        assert head.peer_rail is None
+    finally:
+        head.abort()
+        srv.close()
+        th.join(5)
+
+
+def test_an_unknown_key_in_the_ping_ack_is_still_a_protocol_error():
+    """The equality check became a whitelist, not a shrug: a reply carrying a
+    key this head does not know is a peer it does not understand."""
+    srv, port = _listener_pair()
+    replies = [{"cmd": "ping", "ok": True, "degraded": False, "surprise": 1}]
+    th = threading.Thread(target=_answer_pings, args=(srv, replies), daemon=True)
+    th.start()
+    head = _connected_head(port)
+    try:
+        with pytest.raises(ValueError):
+            head.ping()
+    finally:
+        head.abort()
+        srv.close()
+        th.join(5)
+
+
+def _listener_pair():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    return srv, srv.getsockname()[1]
+
+
+def _answer_pings(srv, replies):
+    """A tail double that only speaks ``ping``: takes one connection, checks
+    the head asked for the rail, and answers each ping from ``replies``."""
+    from mlx_vlm import pipeline_prefill as pp
+
+    try:
+        sock, _ = srv.accept()
+    except OSError:
+        return
+    try:
+        for reply in replies:
+            req = pp._recv_json(sock)
+            assert req.get("cmd") == "ping" and req.get("rail") is True
+            pp._send_json(sock, reply)
+    except (OSError, ValueError, AssertionError):
+        pass
+    finally:
+        sock.close()
+
+
+def _connected_head(port):
+    """A head with a socket but no hello: ``ping`` needs neither."""
+    head = pr.PipelineHead(_settings(port), 1, 3)
+    head.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    head.sock.settimeout(5)
+    return head
