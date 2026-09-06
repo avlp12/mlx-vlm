@@ -98,14 +98,168 @@ def _segment_align_order(sorted_indices, num_experts, align):
     return mx.array(order_pad.astype(np.uint32)), mx.array(real_pos.astype(np.uint32))
 
 
-def _gather_sort(x, indices, num_experts=None):
+_SMALL_M_ENV = None
+
+
+def _small_m_policy():
+    """(enabled, max_rows_per_expert) for the small-M expert-GEMM dispatch policy.
+
+    THE BRANCH WE ARE STEERING.  ``mlx/backend/metal/quantized.cpp:1583`` (v0.32.0; the same
+    condition at :1904 in the 0.32.1 dev build) dispatches ``GatherQMM`` as::
+
+        if (M == 1 && B >= 16 && right_sorted_ && B / E >= 4) -> gather_qmm_rhs
+        else if (M >= vector_limit)                           -> gather_qmm
+        else if (transpose_)                                  -> gather_qmv
+
+    ``B`` is the ROW count (``indices.size``) and ``E`` the expert count, so the switch is a
+    pure function of **rows per expert**: ``rpe = B / E``, threshold ``rpe >= 4``.  For
+    GLM-5.3-Flash (E=288, top_k=8) that is exactly ``tokens >= 144``.
+
+    THE LOSS BAND.  ``affine_gather_qmm_rhs`` tiles rows at BM=16 and runs a full K-loop per
+    distinct expert inside a tile, so its cost is (K-loop passes) = rows/16 + (boundary passes
+    ~ one per expert that owns any row).  With E=288 the boundary term is a CONSTANT ~288
+    passes; the useful term is rows/16 = tokens/2.  At the moment the branch turns on
+    (tokens=144) the useful term is 72 passes against 288 boundary passes -- 80% overhead --
+    so ``gather_qmv``, whose cost is linear in rows with no per-expert constant, is far cheaper.
+    The probe (docs/logs/glm53_kernels/{gesicht,epsilon}/moe_dispatch_probe.json, mlx 0.32.0,
+    E=288 top_k=8 K=4096 N=2048 q4 g64, whole SwitchGLU = 3 gather_qmm) measures the cliff::
+
+        tokens   rpe   sorted us/token   branch
+          142    3.94       75.16        gather_qmv
+          143    3.97       75.06        gather_qmv
+          144    4.00      113.37        gather_qmm_rhs      <- +51% per token, in one token
+          160    4.44      108.50        gather_qmm_rhs
+          256    7.11       74.97        gather_qmm_rhs      <- back to the 143 level
+          512   14.22       48.99        gather_qmm_rhs
+         2048   56.89       28.89        gather_qmm_rhs
+
+    Fitting those two arms (gesicht; epsilon is within 3%) gives
+
+        gather_qmv, sorted :  ms = 0.803 + 0.01096 * E_touched + 0.005897 * rows
+        gather_qmm_rhs     :  ms = 13.39 + 0.02233 * tokens   ( = 0.0447 ms x (rows/16 + 288) )
+
+    and the rhs fit's 13.39 ms intercept is 288 x 0.0465 ms, i.e. exactly the per-expert
+    boundary-pass constant -- the same pass model that reproduces the L2 receipt's measured
+    pass counts (rows/16 + 288 = 544 / 1312 / 4384 against the measured 532 / 1296 / 4360 at
+    T = 512 / 2048 / 8192).  Two independent receipts, one cost model.
+
+    WHAT THE FORK CAN DO WITHOUT TOUCHING MLX.  Three candidates, only one survives:
+
+      (i)   don't sort -> MLX takes gather_qmv.  REJECTED by the probe: unsorted gather_qmv is
+            153-163 us/token at every size (23.4 ms at tokens=144 against 16.3 ms for rhs).
+            Sorting is what makes gather_qmv cheap; the sort is not the problem, the branch is.
+      (ii)  keep the sort, SPLIT the sorted rows into k contiguous slabs each with fewer than
+            4*E rows, so every slab takes gather_qmv on already-sorted rows.  Each slab spans
+            ~1/k of the expert range, so the k slabs together touch the same experts once --
+            the weight traffic does NOT multiply by k, only the k kernel launches do.  This is
+            the shipped mechanism.
+      (iii) pad up to a size where rhs wins.  REJECTED analytically: rhs ms is monotonically
+            increasing in rows, so padding rows can only add cost.  (The other padding lever,
+            MLX_VLM_MOE_SEGMENT_ALIGN, is actively harmful here: at rpe=4 nearly every expert
+            has fewer than 16 rows, so aligning to 16 inflates 1152 rows to ~4608.  This policy
+            therefore suppresses segment alignment on the slabs it creates.)
+
+    CROSSOVER.  With slab count k = ceil(rows / (4E - 1)) and E_touched ~ E:
+
+        split(T, k) = k*0.803 + 0.01096*(E + k-1) + 0.005897*8T
+        rhs(T)      = 0.02233*T + 13.39
+
+    k=2 crosses rhs at T ~ 325 tokens (rpe ~ 9.0) and k=3 at T ~ 292 (rpe ~ 8.1); since k steps
+    2 -> 3 exactly at rpe = 8, the win region is exactly the k=2 regime, ``4 <= rpe < 8``.
+    A deliberately pessimistic model that re-pays the FULL per-slab expert traffic (i.e. treats
+    each slab as if it touched all 288 experts, which is what k copies of the probe's own
+    tokens=T/k point would cost) crosses earlier, at rpe ~ 6.7.  The default threshold is the
+    pessimistic one -- 6.0 -- so that the shipped band is a win under BOTH models; the
+    6.0 - 8.0 stretch is model-dependent and is what the GPU sweep is for.
+
+        rpe   tokens   k   split(loc)   split(pess)   rhs      gain vs rhs
+        4.00     144   2     11.51 ms     13.86 ms   16.61 ms  +44% / +20%
+        4.44     160   2     12.28        14.78      16.97     +38% / +15%
+        5.33     192   2     13.81        16.54      17.68     +28% / +7%
+        6.00     216   2     14.94        17.86      18.21     +22% / +2%     <- default cut
+        7.11     256   2     16.85        19.81      19.11     +13% / -4%
+        8.00     288   3     19.17        24.81      19.83      +3% / -20%    <- hard cap
+
+    NUMERICS.  This changes WHICH GPU KERNEL runs, so it is NOT bit-identical to the default on
+    a Metal device: gather_qmv and the steel-tiled gather_qmm_rhs reduce K in different orders.
+    It IS exactly output-preserving as an ALGEBRAIC transform -- slabbing partitions rows, and
+    every row's expert GEMM is independent of every other row -- which is what the CPU tests
+    assert (on CPU there is no branch at all, so split and unsplit run the identical kernel and
+    the outputs are bitwise equal).  Note the default already has this discontinuity: MLX itself
+    changes kernel between 143 and 144 tokens today.  Promotion past default-off therefore owes
+    the speculative-acceptance rail, not just a greedy tok/s number.
+
+    GPU ONLY.  The branch being steered lives in the METAL backend; the CPU backend ignores
+    ``sorted_indices`` entirely (asserted by
+    tests/test_moe_small_m_policy.py::test_cpu_backend_has_no_sorted_branch), so on CPU the
+    slabs buy nothing and cost the extra launches: measured 2-6% slower on the CPU smoke arm of
+    bench/l37_moe_small_m.py (E=32 top_k=4, tokens 32/40/56, speedup 0.978 / 0.964 / 0.944
+    against a 1.3% control floor).  Deliberately NOT device-gated in code -- the decision stays
+    a pure function of shapes, which is what keeps it sync-free and compile-safe -- so do not
+    turn it on for a CPU-served box.
+
+    TP.  ``shard_experts_out``/``_in`` (mlx_vlm/tp/shard.py:133,145) split axis 1/2 of the
+    (num_experts, out, in) weight, never axis 0, so ``num_experts`` and therefore this decision
+    are identical at TP1 and TP2.
+
+    ``MLX_VLM_MOE_SMALL_M_POLICY=auto`` to enable (``1``/``true``/``on`` also accepted),
+    ``off``/``0`` to disable.  DEFAULT OFF.  ``MLX_VLM_MOE_SMALL_M_MAX_RPE`` overrides the
+    upper edge (default 6.0, hard-capped at 8.0 because k=3 is a loss under both models).
+    """
+    global _SMALL_M_ENV
+    if _SMALL_M_ENV is None:
+        v = os.environ.get("MLX_VLM_MOE_SMALL_M_POLICY", "off").strip().lower()
+        enabled = v in ("auto", "1", "true", "yes", "on")
+        try:
+            rpe = float(os.environ.get("MLX_VLM_MOE_SMALL_M_MAX_RPE", "6.0"))
+        except ValueError:
+            rpe = 6.0
+        # Below 4.0 the policy can never fire (MLX is already on gather_qmv); above 8.0 the
+        # slab count is 3+, which both cost models call a loss.
+        rpe = min(max(rpe, 4.0), 8.0)
+        _SMALL_M_ENV = (enabled, rpe)
+    return _SMALL_M_ENV
+
+
+def _small_m_slabs(n_rows, num_experts):
+    """Number of contiguous slabs to cut the sorted rows into; 1 means "leave MLX alone".
+
+    Decided from SHAPES ONLY (``indices.size`` and the expert count), never from index VALUES,
+    so it costs no host sync and is stable under ``mx.compile`` (which retraces per shape).
+    """
+    if not num_experts:
+        return 1
+    enabled, max_rpe = _small_m_policy()
+    if not enabled:
+        return 1
+    rpe = n_rows / num_experts
+    # rpe < 4: MLX already takes gather_qmv, nothing to steer.
+    # rpe >= max_rpe: the rhs branch has amortised its per-expert boundary constant; leave it.
+    if rpe < 4.0 or rpe >= max_rpe:
+        return 1
+    # Every slab must fall strictly below the branch condition B / E >= 4, i.e. <= 4E-1 rows.
+    limit = 4 * num_experts - 1
+    k = -(-n_rows // limit)  # ceil
+    return k if k > 1 else 1
+
+
+def _slab_bounds(n_rows, k):
+    """``k`` near-equal contiguous [start, stop) row ranges covering ``n_rows``."""
+    step = -(-n_rows // k)  # ceil, so every slab is <= step rows and the last one is short
+    return [(a, min(a + step, n_rows)) for a in range(0, n_rows, step)]
+
+
+def _gather_sort(x, indices, num_experts=None, allow_align=True):
     *_, M = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
     inv_order = mx.argsort(order)
     sorted_indices = indices[order]
 
-    align = _moe_segment_align() if num_experts else 0
+    # ``allow_align`` is False when the small-M policy is going to slab these rows onto
+    # gather_qmv: BM=16 segment padding exists only to help gather_qmm_rhs, and in the small-M
+    # band it would inflate the row count several-fold for a kernel that never runs.
+    align = _moe_segment_align() if (num_experts and allow_align) else 0
     # Only worth it where the model actually reaches affine_gather_qmm_rhs: that branch needs
     # B / E >= 4 (mlx quantized.cpp:1904). Below it the kernel is a different one and padding
     # would add rows for nothing.
@@ -274,25 +428,45 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def _experts(self, x, idx, sorted_indices):
+        x_up = self.up_proj(x, idx, sorted_indices=sorted_indices)
+        x_gate = self.gate_proj(x, idx, sorted_indices=sorted_indices)
+        return self.down_proj(
+            self.activation(x_up, x_gate), idx, sorted_indices=sorted_indices
+        )
+
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
         do_sort = indices.size >= 64
+        # THE DISPATCH DECISION (see _small_m_policy for the cost model and the receipts).
+        # Shapes only -- no host sync, safe under mx.compile.
+        n_slabs = (
+            _small_m_slabs(indices.size, self.gate_proj.num_experts) if do_sort else 1
+        )
         idx = indices
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(
-                x, indices, num_experts=self.gate_proj.num_experts
+                x,
+                indices,
+                num_experts=self.gate_proj.num_experts,
+                allow_align=(n_slabs == 1),
             )
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(
-            self.activation(x_up, x_gate),
-            idx,
-            sorted_indices=do_sort,
-        )
+        if n_slabs > 1:
+            # Rows are sorted, so a contiguous slab is sorted too and spans ~1/k of the expert
+            # range; running gate/up/down per slab also halves the peak intermediate transient.
+            x = mx.concatenate(
+                [
+                    self._experts(x[a:b], idx[a:b], True)
+                    for a, b in _slab_bounds(idx.size, n_slabs)
+                ],
+                axis=0,
+            )
+        else:
+            x = self._experts(x, idx, do_sort)
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
@@ -315,21 +489,37 @@ class SwitchMLP(nn.Module):
         self.fc2 = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def _experts(self, x, idx, sorted_indices):
+        x = self.fc1(x, idx, sorted_indices=sorted_indices)
+        x = self.activation(x)
+        return self.fc2(x, idx, sorted_indices=sorted_indices)
+
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
         do_sort = indices.size >= 64
+        n_slabs = _small_m_slabs(indices.size, self.fc1.num_experts) if do_sort else 1
         idx = indices
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(
-                x, indices, num_experts=self.fc1.num_experts
+                x,
+                indices,
+                num_experts=self.fc1.num_experts,
+                allow_align=(n_slabs == 1),
             )
         if self.training:
             idx = mx.stop_gradient(idx)
-        x = self.fc1(x, idx, sorted_indices=do_sort)
-        x = self.activation(x)
-        x = self.fc2(x, idx, sorted_indices=do_sort)
+        if n_slabs > 1:
+            x = mx.concatenate(
+                [
+                    self._experts(x[a:b], idx[a:b], True)
+                    for a, b in _slab_bounds(idx.size, n_slabs)
+                ],
+                axis=0,
+            )
+        else:
+            x = self._experts(x, idx, do_sort)
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
