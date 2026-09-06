@@ -1075,6 +1075,12 @@ def prefill_batch_refusal_counts() -> Dict[str, int]:
     right-padded and were split instead); ``right_pad_kda_rows_deferred``
     counts the rows those events pushed back into the pending queue, which is
     the number the throughput cost is actually proportional to.
+
+    ``dflash_warm_multirow`` counts multi-row warm batches declined because a
+    dflash drafter would read padded rows as its round-1 context; its
+    ``_rows_deferred`` companion counts the rows served COLD instead (they are
+    not pushed back, so that name is a slight abuse -- the cost is a cold
+    prefill, not a deferral).
     """
     return dict(_PREFILL_BATCH_REFUSALS)
 
@@ -2072,6 +2078,24 @@ class PromptProcessingBatch:
         # _run_chunked_speculative_prefill`` for the identical shape.
         self._prefill_capture_kwargs: dict = {}
         self._chunk_capture_kwargs: dict = {}
+        # Rows THIS PREFILL trimmed off the front of the drafter's context --
+        # not rows APC never forwarded.  On an APC-warm row the capture covers
+        # the SUFFIX only (the prefix was served from K/V and never went through
+        # the target), so ``finish()`` reports 0 here and the dflash drafter
+        # starts its context at absolute position 0 while the target's row-0
+        # token actually sits at ``prefix_len``.  RoPE is relative, so the
+        # drafter's attention scores over its own contiguous context are
+        # unchanged and the emitted tokens cannot change (acceptance is resolved
+        # against the target's argmax) -- but it is not the same arithmetic the
+        # cold arm does, and acceptance is free to move.  Note the asymmetry:
+        # the drafter's OWN trim (``_pretruncate_ctx``) drops rows AND advances
+        # every layer cache's offset by the same amount, so the analogous value
+        # for an APC-served prefix would be ``prefix_len``, not 0.  Left at 0
+        # here because that is the status quo this dispatch change inherits
+        # (MTP's warm rows have run this way and its head is NoPE-MLA, so it
+        # cannot see the difference at all), and moving it is a change to the
+        # drafter's absolute positions that cannot be settled without a live
+        # acceptance measurement.
         self.target_hidden_offset = 0
         if draft_model is not None and draft_kind is not None:
             # Prefill leg: hidden captures yes, KDA rollback stash no.
@@ -3524,6 +3548,49 @@ class BatchGenerator:
         any_warm = any(p is not None for p in picks)
         if not any_warm:
             return None  # caller falls back to cold-only path
+
+        # A MULTI-ROW warm batch with a dflash drafter is refused outright, and
+        # the whole window goes cold.  Three facts, only the first of which is
+        # about padding:
+        #
+        # 1. A mixed batch is RIGHT-padded, and ``PromptProcessingBatch``
+        #    already declines the trailing-context TRIM for exactly that shape
+        #    (``_capture_refusal``, "the drafter's window is the trailing rows,
+        #    which are padding for a short row").  For MTP that refusal is
+        #    harmless -- ``mtp`` primes from ``hidden_states[-1]`` and its head
+        #    is NoPE-MLA -- but dflash CONSUMES the trailing rows as its
+        #    round-1 context (``_hidden`` -> ``fc`` -> ``hidden_norm`` over the
+        #    last ``sliding_window - 1`` rows), so a short row would be primed
+        #    on the zero embeddings that were padded onto it.  The refusal above
+        #    only stops the trim; nothing stops the drafter from reading those
+        #    rows.
+        # 2. The whole point of admitting a warm dflash row is APC, and at B=1
+        #    ``right_pad_per_row == [0]`` -- no padding exists, so the hazard in
+        #    (1) is vacuous and the B=1 warm row is admitted normally.  B=1 is
+        #    also the shape the served rail actually runs: the idle coalescing
+        #    window is 5 ms.
+        # 3. ``make_speculative_prompt_cache`` being bypassed on a warm batch
+        #    (see ``PromptProcessingBatch.__init__``, ``warm_cache is not None``
+        #    wins over the speculative constructor) is NOT a dflash-specific
+        #    hazard: that helper ignores ``draft_kind`` entirely and at B=1
+        #    returns a plain ``make_prompt_cache``.  Whatever it means for MTP
+        #    it means identically for dflash.
+        #
+        # Refusing rather than splitting keeps this to one branch; the rows are
+        # not deferred, they are served cold in the caller's LEFT-padded path,
+        # so nothing starves.
+        if getattr(self, "draft_kind", None) == "dflash" and len(sequences) > 1:
+            _note_prefill_batch_refusal("dflash_warm_multirow", len(sequences))
+            logger.info(
+                "prefill batch refusal dflash_warm_multirow: a dflash drafter "
+                "reads the TRAILING context rows of the prefill capture, which "
+                "on a right-padded mixed warm/cold batch are padding for the "
+                "short rows; declining the warm batch for %d row(s) and "
+                "serving them cold (left-padded). B=1 warm rows are unaffected "
+                "(right_pad_per_row == [0]).",
+                len(sequences),
+            )
+            return None
 
         sequences, picks = self._apply_right_pad_policy(sequences, picks)
         if sequences is None:
