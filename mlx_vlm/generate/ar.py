@@ -1319,6 +1319,24 @@ class GenerationBatch:
         # Per-sequence MRoPE delta
         self._rope_deltas = None
 
+        # A row that just finished is filtered out of ``uids``/``prompt_cache``
+        # at the TOP of the *next* call to next() (see next()), not at the end
+        # of THIS one -- so it stays fully present, cache and all, for exactly
+        # the window between this next() call returning and the next one
+        # being made. That window is what generate/server generation.py's
+        # _step() uses to call capture_session/note_generated for the row
+        # that just finished (LW5, 2026-09-07: capture_session's own docstring
+        # already claimed this window existed -- "between finish_reason being
+        # emitted and remove()" -- but remove() is never called on the normal
+        # completion path, and this class used to filter() immediately at the
+        # end of next(), so the window was empty and every capture refused
+        # with uid_gone_from_batch, every time, for every plain-GenerationBatch
+        # row). SpeculativeGenerationBatch needed no equivalent change: its
+        # _refresh_uids() only recomputes the visible uids list and never
+        # compacts prompt_cache/_all_uids, so a finished row's cache is
+        # already intact there until an explicit remove().
+        self._pending_filter_keep: Optional[List[int]] = None
+
     def __len__(self):
         return len(self.uids)
 
@@ -1626,6 +1644,14 @@ class GenerationBatch:
 
     def next(self) -> List[Response]:
         """Generate the next batch of tokens."""
+        # Apply the PREVIOUS call's deferred filter now, before doing any new
+        # work -- see the comment on _pending_filter_keep in __init__ for why
+        # this is deferred by exactly one call rather than applied at the end
+        # of the call that computed it.
+        if self._pending_filter_keep is not None:
+            self.filter(self._pending_filter_keep)
+            self._pending_filter_keep = None
+
         if not self.uids:
             return []
 
@@ -1683,7 +1709,13 @@ class GenerationBatch:
             mx.async_eval(self._next_tokens)
 
         if len(keep) < len(self.uids):
-            self.filter(keep)
+            # NOT self.filter(keep) here -- deferred to the top of the NEXT
+            # call (see __init__/_pending_filter_keep) so a row that just
+            # finished (its uid and cache still fully present in
+            # uids/prompt_cache) is visible to the caller's own
+            # capture_session/note_generated for the response this call is
+            # about to return, before it is ever compacted away.
+            self._pending_filter_keep = keep
 
         return responses
 
@@ -1720,6 +1752,7 @@ class GenerationBatch:
         batch._next_top_idx = None
         batch._next_top_lp = None
         batch._rope_deltas = None
+        batch._pending_filter_keep = None
         return batch
 
 
@@ -4286,7 +4319,22 @@ class BatchGenerator:
                     mx.clear_cache()
                     return True
 
-            # Already decoding.
+            # Already decoding. A plain GenerationBatch defers its own
+            # end-of-turn filter by one next() call (see
+            # GenerationBatch._pending_filter_keep) so capture_session has a
+            # window to read a just-finished row's cache; flush that deferred
+            # filter FIRST, before computing our own keep list, so both
+            # filters apply against the same, current uids/prompt_cache
+            # indexing rather than one going stale under the other. Always
+            # safe here: remove() is only ever called for a DIFFERENT uid's
+            # cancellation, reached from the server's outer loop strictly
+            # after the _step() call that would have captured any row whose
+            # filter is pending -- capture_session for that row has already
+            # run by the time control could reach here.
+            pending = getattr(self._generation_batch, "_pending_filter_keep", None)
+            if pending is not None:
+                self._generation_batch.filter(pending)
+                self._generation_batch._pending_filter_keep = None
             if uid in self._generation_batch.uids:
                 idx = self._generation_batch.uids.index(uid)
                 keep = [i for i in range(len(self._generation_batch.uids)) if i != idx]
