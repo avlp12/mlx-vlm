@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 import mlx.core as mx
 import mlx.nn as nn
 
+from ....sampling_coupling import scatter_candidates_to_vocab
 from ..compatibility import validate_dflash_target
 from ..qwen3_dflash.dflash import DFlashDecoderLayer, DFlashDraftModel
 from .config import DFlash2Config
@@ -219,9 +220,20 @@ class CandidateSelector(nn.Module):
         predecessor = anchor_ids.reshape(-1)
         path = []
         sample_proposal = getattr(sampler, "sample_proposal", None)
+        # F2: a shared key only couples the proposal to the target if both draw
+        # on the same index space.  These scores are indexed by CANDIDATE SLOT,
+        # so slot j is a different token for the drafter than for the target and
+        # the shared Gumbel would couple nothing.  Lift them onto the full
+        # token-id axis first.  Off unless the sampler asks for it.
+        full_vocab_proposal = callable(sample_proposal) and bool(
+            getattr(sampler, "coupled_full_vocab", False)
+        )
+        vocab_size = int(logits.shape[-1])
         # Only the greedy walk is fused.  A caller-supplied sample_proposal is an
         # opaque callable that may draw randomness, and mx.compile freezes an RNG
-        # key into the trace, so that path stays eager.
+        # key into the trace, so that path stays eager.  An argmax draft sampler
+        # (MLX_VLM_DFLASH_SAMPLED_DRAFT=argmax) exposes no sample_proposal, so
+        # sampled rounds get the fused step back.
         step = None
         if _compile_enabled() and not callable(sample_proposal):
             if self._fused_step is None:
@@ -241,6 +253,18 @@ class CandidateSelector(nn.Module):
                 predecessor, hidden[:, position], candidates[:, position],
                 unary[:, position],
             )
+            if full_vocab_proposal:
+                predecessor = (
+                    sample_proposal(
+                        scatter_candidates_to_vocab(
+                            scores, candidates[:, position], vocab_size
+                        )
+                    )
+                    .reshape(-1)
+                    .astype(candidates.dtype)
+                )
+                path.append(predecessor)
+                continue
             selected = (
                 sample_proposal(scores)
                 if callable(sample_proposal)

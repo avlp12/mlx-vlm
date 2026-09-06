@@ -5,6 +5,11 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..sampling_coupling import (
+    DRAFT_MODE_ARGMAX,
+    DRAFT_MODE_GUMBEL,
+    dflash_sampled_draft_mode,
+)
 from .common import (
     _batch_acceptance_must_be_uniform,
     _dflash_block_total,
@@ -611,6 +616,42 @@ def _supports_positioned_target_sampling(sampler: Callable) -> bool:
     return callable(getattr(sampler, "sample_target", None))
 
 
+class _ArgmaxDraftSampler:
+    """F1 ``MLX_VLM_DFLASH_SAMPLED_DRAFT=argmax``: draft the argmax under sampling.
+
+    Exact-match verification against an *independently* sampled proposal accepts
+    with the collision probability ``sum_t p_t q_t``, which is bounded by
+    ``max_t p_t``.  Collapsing the proposal onto its own argmax makes
+    ``q = delta_{t*}`` and the acceptance ``sum_t min(p_t, q_t) = p_{t*}``: the
+    maximal coupling for a deterministic proposal, and never worse than the
+    collision probability of a sampled one.  This is the rule MTP already uses
+    under sampling (``mtp.py:971``).
+
+    It deliberately exposes no ``sample_proposal``, so DFlash2's fused/compiled
+    Viterbi step -- skipped whenever a ``sample_proposal`` callable is present
+    (``drafters/dflash2/dflash2.py:222-229``) -- is used again.
+    """
+
+    def __call__(self, logits: mx.array) -> mx.array:
+        return mx.argmax(logits, axis=-1)
+
+
+def _make_draft_sampler(
+    sampler: Callable,
+    *,
+    row_ids: List[int],
+    positions: List[int],
+    mode: Optional[str] = None,
+) -> Callable:
+    """Build the drafter-side sampler for one sampled round (F1/F2)."""
+    resolved = dflash_sampled_draft_mode() if mode is None else mode
+    if resolved == DRAFT_MODE_ARGMAX:
+        return _ArgmaxDraftSampler()
+    return _PositionedDraftSampler(
+        sampler, row_ids=row_ids, positions=positions, mode=resolved
+    )
+
+
 class _PositionedDraftSampler:
     def __init__(
         self,
@@ -618,10 +659,16 @@ class _PositionedDraftSampler:
         *,
         row_ids: List[int],
         positions: List[int],
+        mode: Optional[str] = None,
     ):
         self.sampler = sampler
         self.row_ids = [int(row_id) for row_id in row_ids]
         self.positions = [int(position) for position in positions]
+        self.mode = dflash_sampled_draft_mode() if mode is None else str(mode)
+        # F2: the drafter must draw on the *token-id* axis for a shared key to
+        # couple anything, so the DFlash2 selector lifts its per-candidate
+        # scores onto the full vocabulary before calling ``sample_proposal``.
+        self.coupled_full_vocab = self.mode == DRAFT_MODE_GUMBEL
 
     def __call__(self, logits: mx.array) -> mx.array:
         if logits.ndim == 1:
@@ -915,7 +962,7 @@ def _dflash_rounds(
 
         draft_kwargs = {"target_hidden_prepared": True} if hidden_is_prepared else {}
         draft_sampler = (
-            _PositionedDraftSampler(
+            _make_draft_sampler(
                 sampler,
                 row_ids=[0],
                 positions=[emitted],
@@ -1118,7 +1165,7 @@ def _dflash_rounds_batch(
                         draft_caches[active_idx[j]],
                         bs,
                         (
-                            _PositionedDraftSampler(
+                            _make_draft_sampler(
                                 sampler,
                                 row_ids=[row_ids[active_idx[j]]],
                                 positions=[emitted[active_idx[j]]],
@@ -1143,7 +1190,7 @@ def _dflash_rounds_batch(
                 batched_caches,
                 bs,
                 (
-                    _PositionedDraftSampler(
+                    _make_draft_sampler(
                         sampler,
                         row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
                         positions=[emitted[active_idx[j]] for j in range(n_active)],

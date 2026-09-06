@@ -22,6 +22,11 @@ from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sampling_coupling import (
+    PROPOSAL_KEY_XOR,
+    sample_top_p_token_order,
+    sampled_coupling_enabled,
+)
 from ..speculative.utils import (
     PrefillHiddenAccumulator,
     chunk_capture_kwargs_for,
@@ -94,10 +99,22 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 class _PositionedTargetSampler:
     """Sampler with stateless target draws keyed by generated-token position."""
 
-    def __init__(self, *, temperature: float, top_p: float, seed: int):
+    def __init__(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        seed: int,
+        coupled: Optional[bool] = None,
+    ):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.seed = int(seed)
+        # F2: shared-key Gumbel coupling between the proposal and the target.
+        # Off by default -- unset env == the previous independent streams.
+        self.coupled = (
+            sampled_coupling_enabled() if coupled is None else bool(coupled)
+        )
 
     def __call__(self, logprobs: mx.array) -> mx.array:
         if self.top_p > 0 and self.top_p < 1.0:
@@ -114,9 +131,7 @@ class _PositionedTargetSampler:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
         keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
-            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
-        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+        return self._draw(logprobs, keys)
 
     def sample_proposal(
         self,
@@ -125,11 +140,33 @@ class _PositionedTargetSampler:
         row_ids: List[int],
         positions: List[int],
     ) -> mx.array:
-        keys = _position_keys(self.seed ^ 0x0DFA5202, row_ids, positions)
+        if self.coupled:
+            # Same key, same nucleus mask, same token-id axis as the target:
+            # mx.random.categorical is Gumbel-max, so the two draws agree
+            # whenever the shared Gumbel argmax agrees -- close to the maximal
+            # coupling sum_t min(p_t, q_t) instead of the collision
+            # probability sum_t p_t q_t.
+            keys = _position_keys(self.seed, row_ids, positions)
+            return self._draw(logprobs, keys)
+        keys = _position_keys(self.seed ^ PROPOSAL_KEY_XOR, row_ids, positions)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
+    def _draw(self, logprobs: mx.array, keys: mx.array) -> mx.array:
+        if self.top_p > 0 and self.top_p < 1.0:
+            if self.coupled:
+                return mx.vmap(self._sample_top_p_one_token_order, in_axes=(0, 0))(
+                    logprobs, keys
+                )
+            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
     def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
         return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
+
+    def _sample_top_p_one_token_order(
+        self, logprobs: mx.array, key: mx.array
+    ) -> mx.array:
+        return sample_top_p_token_order(logprobs, key, self.top_p, self.temperature)
 
     def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
         if logprobs.dtype == mx.bfloat16:
