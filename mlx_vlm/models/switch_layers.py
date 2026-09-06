@@ -1,5 +1,6 @@
 import math
 import os
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,6 +9,294 @@ import numpy as np
 from .activations import swiglu
 
 _SEG_ALIGN_ENV = None
+
+# --------------------------------------------------------------------------- #
+# MLX_VLM_GLM5_PREFILL_CPU_FRACTION: hand a leading slice of the routed-expert
+# rows of each prefill MoE chunk to the CPU, concurrently with the GPU.
+#
+# WHY.  Prefill is COMPUTE-bound, not bandwidth-bound: at chunk 8192 the box runs
+# at 410-443 input tok/s against a 700 tok/s GEMM ceiling (33.5 GFLOP/token over a
+# measured 23.5 TFLOP/s 4-bit qmm peak), i.e. ~58 % of the GPU's compute.  The CPU
+# (M3 Ultra, 32 cores, AMX) is idle and sustains a measured 4.6-5.3 TFLOP/s on
+# bf16 GEMM at the exact shapes this path issues.  Weight traffic in prefill is
+# ~2 % of the chunk (weights are read once per 8192-token chunk, not once per
+# token as in decode), so the 730 GB/s unified-memory read ceiling that killed CPU
+# co-STREAMING for decode (dossier P1) does not bind here.  The routed experts are
+# the largest single block: 38.0 % of prefill wall at 32k / chunk 8192 (L7-c).
+#
+# MECHANISM (option A' -- see docs/CPU_COCOMPUTE_L27_2026-09-06.md for the
+# alternatives that were rejected and why).  ``_gather_sort`` has already sorted
+# the chunk's rows by expert id, so a CONTIGUOUS PREFIX of rows is exactly a set
+# of whole experts.  The split point is chosen on the row cumsum, so the CPU gets
+# the requested FRACTION OF ROWS whatever the router skew, while touching only the
+# leading ``E_cpu`` experts' weights.  That distinction is the whole design:
+#
+#   * a within-expert row split (take the first f rows of EVERY expert) would need
+#     all 288 experts' weights in bf16 -- 609 GB per chunk of dequantisation.
+#     Dead.
+#   * a whole-expert split by index (option B) touches the same weights as this
+#     one but load-balances on expert COUNT, and the real router is skewed enough
+#     (L7A: p10 rows/expert 9.0 against a 57 mean at chunk 2048) that a fixed
+#     expert count is not a fixed row count.  This path is option B's memory
+#     behaviour with option A's load balance.
+#   * a layer split (option C) has nothing of the right size: the three dense
+#     layers plus the shared expert are 4.3 % of prefill, against the ~15-25 % the
+#     CPU needs to be worth its own latency.
+#
+# THE DEQUANTISATION RUNS ON THE GPU, NOT THE CPU.  Measured on this box, MLX
+# 0.32.1, 32 cores (all numbers CPU-stream, 4096x2048 4-bit g64 affine):
+#
+#     mx.dequantize      ->  0.53 Gparam/s bf16 out, 1.24 Gparam/s f32 out
+#     mx.gather_qmm      ->  0.39 GFLOP/s   (21.8 s for one 512x4096x2048 call)
+#     mx.gather_mm       ->  0.06 TFLOP/s, and f32 only
+#     mx.matmul bf16     ->  4.62 (M=227) / 5.10 (M=512) / 5.34 (M=2048) TFLOP/s
+#     mx.matmul f32      ->  2.00 (M=512) / 4.64 (M=2048) TFLOP/s
+#
+# So the CPU's ONLY fast primitive here is a plain dense ``matmul`` on an already
+# dequantised, natively-laid-out ``(N, K)`` weight -- which is why this path
+# dequantises the leading experts on the ACCELERATOR stream (a pure bandwidth op:
+# 2.56 B/param read+write, ~1.07 s per 8192-token chunk if the CPU took ALL 288
+# experts, so ~0.2 s at the useful fractions) and then issues one CPU ``matmul``
+# per expert segment.  Dequantising on the CPU instead would cost ~98,000 s per
+# chunk; ``gather_qmm`` on the CPU reproduces the dossier's C14 kill (20.05 s)
+# exactly.  Both are permanently closed by the numbers above.
+#
+# NUMERICS.  The CPU arm is NOT bit-identical to the GPU arm: the weights are
+# rounded to bf16 (or f32, see MLX_VLM_GLM5_PREFILL_CPU_DTYPE) by ``mx.dequantize``
+# before the GEMM, where ``gather_qmm`` dequantises inside the kernel, and the
+# accumulation order differs.  This path therefore CANNOT be defended by a logits
+# sha and must pass the campaign's KL gate (KL <= 0.042075 against the unchunked
+# reference, docs/PERF_BASELINE_B0_2026-09-05.md rule 2) before any default-on
+# proposal.  At fraction 0 the path is not entered at all and the graph is
+# byte-identical to the arm without this commit.
+_PREFILL_CPU_FRACTION_ENV = None
+_PREFILL_CPU_MIN_ROWS_ENV = None
+_PREFILL_CPU_DTYPE_ENV = None
+_PREFILL_CPU_STREAM = None
+
+PREFILL_CPU_FRACTION_ENV = "MLX_VLM_GLM5_PREFILL_CPU_FRACTION"
+PREFILL_CPU_MIN_ROWS_ENV = "MLX_VLM_GLM5_PREFILL_CPU_MIN_ROWS"
+PREFILL_CPU_DTYPE_ENV = "MLX_VLM_GLM5_PREFILL_CPU_DTYPE"
+
+# Default row floor.  Decode at B=1 routes 8 rows and never sorts; a 8192-token
+# prefill chunk routes 65,536.  4096 keeps the whole lever on the prefill side of
+# that gap with three orders of magnitude of margin, so no decode step can pay the
+# one host sync ``_cpu_cocompute_plan`` costs.
+DEFAULT_PREFILL_CPU_MIN_ROWS = 4096
+
+# Hard cap.  Past 0.5 the CPU is the critical path by construction (it is ~4x
+# slower per FLOP than the GPU on the same GEMM), so the knob refuses to express
+# a configuration that can only lose.
+MAX_PREFILL_CPU_FRACTION = 0.5
+
+
+def _prefill_cpu_fraction() -> float:
+    """Fraction of each sorted prefill MoE chunk's ROWS to run on the CPU.  0 = off.
+
+    Parsed once per process (module reload resets it, as the tests do).  Anything
+    unparseable, negative, or NaN reads as 0.0 -- OFF -- rather than raising, so a
+    typo in a serving env can never fail a request; values above
+    ``MAX_PREFILL_CPU_FRACTION`` clamp down to it.
+    """
+    global _PREFILL_CPU_FRACTION_ENV
+    if _PREFILL_CPU_FRACTION_ENV is None:
+        raw = os.environ.get(PREFILL_CPU_FRACTION_ENV, "0").strip()
+        try:
+            f = float(raw)
+        except ValueError:
+            f = 0.0
+        if not (f == f) or f <= 0.0:  # NaN or off
+            f = 0.0
+        _PREFILL_CPU_FRACTION_ENV = min(f, MAX_PREFILL_CPU_FRACTION)
+    return _PREFILL_CPU_FRACTION_ENV
+
+
+def set_prefill_cpu_fraction(value) -> float:
+    """Set the CPU co-compute fraction IN-PROCESS; returns the effective value.
+
+    The A/B for this lever has to be paired arms inside ONE model load -- a
+    process-per-arm comparison puts a ~6 % effect back into the cross-process noise
+    [I892], and reloading this module mid-run would orphan the already-constructed
+    ``SwitchGLU`` instances from their class.  So the knob is settable, exactly as
+    ``MLX_VLM_GLM5_FUSED_KDA_BLOCK`` is.  Same clamping and same defensive parse as
+    the env path; ``None`` restores the env value on the next read.
+    """
+    global _PREFILL_CPU_FRACTION_ENV
+    if value is None:
+        _PREFILL_CPU_FRACTION_ENV = None
+        return _prefill_cpu_fraction()
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        f = 0.0
+    if not (f == f) or f <= 0.0:
+        f = 0.0
+    _PREFILL_CPU_FRACTION_ENV = min(f, MAX_PREFILL_CPU_FRACTION)
+    return _PREFILL_CPU_FRACTION_ENV
+
+
+# Per-call accounting for the co-compute arm.  Pure Python ints, touched only when
+# the path is entered, so the OFF arm pays nothing.  The harness turns these into
+# the per-fraction CPU/GPU busy estimates without a second instrumented pass --
+# the row counts are exact, so only the TFLOP/s constants are assumptions.
+_COCOMPUTE_STATS = {
+    "calls": 0,
+    "cpu_rows": 0,
+    "gpu_rows": 0,
+    "cpu_experts": 0,
+    "cpu_weight_params": 0,
+}
+
+
+def reset_cocompute_stats() -> None:
+    for k in _COCOMPUTE_STATS:
+        _COCOMPUTE_STATS[k] = 0
+
+
+def cocompute_stats() -> Dict[str, Any]:
+    """Snapshot of the co-compute accounting since the last reset.
+
+    ``cpu_weight_params`` is the number of weight parameters dequantised on the
+    accelerator stream for the CPU arm -- the term that has to be charged BACK to
+    the GPU when the split is priced, and the reason a large fraction is not free.
+    """
+    s = dict(_COCOMPUTE_STATS)
+    total = s["cpu_rows"] + s["gpu_rows"]
+    s["total_rows"] = total
+    s["cpu_row_fraction"] = (s["cpu_rows"] / total) if total else 0.0
+    return s
+
+
+def _prefill_cpu_min_rows() -> int:
+    """Row floor below which the CPU co-compute path is skipped (decode guard)."""
+    global _PREFILL_CPU_MIN_ROWS_ENV
+    if _PREFILL_CPU_MIN_ROWS_ENV is None:
+        raw = os.environ.get(PREFILL_CPU_MIN_ROWS_ENV, "").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            n = DEFAULT_PREFILL_CPU_MIN_ROWS
+        _PREFILL_CPU_MIN_ROWS_ENV = max(1, n)
+    return _PREFILL_CPU_MIN_ROWS_ENV
+
+
+def _prefill_cpu_dtype():
+    """Compute dtype for the CPU arm, or ``None`` to follow the activation dtype.
+
+    ``bfloat16`` (the activation dtype in this build) keeps the dequantised weight
+    at 2 B/param, so the accelerator-side dequantisation reads+writes 2.56 B/param.
+    ``float32`` doubles that traffic but was measured slightly faster on the CPU at
+    large M (4.64 vs 2.76 TFLOP/s at M=2048) and rounds the weight once instead of
+    twice; it is the arm to try if the KL gate is tight.
+    """
+    global _PREFILL_CPU_DTYPE_ENV
+    if _PREFILL_CPU_DTYPE_ENV is None:
+        raw = os.environ.get(PREFILL_CPU_DTYPE_ENV, "").strip().lower()
+        _PREFILL_CPU_DTYPE_ENV = {
+            "": None,
+            "auto": None,
+            "bf16": mx.bfloat16,
+            "bfloat16": mx.bfloat16,
+            "f32": mx.float32,
+            "fp32": mx.float32,
+            "float32": mx.float32,
+            "f16": mx.float16,
+            "fp16": mx.float16,
+            "float16": mx.float16,
+        }.get(raw, None)
+    return _PREFILL_CPU_DTYPE_ENV
+
+
+def _prefill_cpu_stream():
+    """The dedicated CPU stream the co-compute arm runs on.
+
+    A NEW stream rather than ``mx.default_stream(mx.cpu)`` for two reasons: it can
+    never contend with whatever else in the process uses the default CPU stream,
+    and it stays a genuinely distinct stream when the default device is itself the
+    CPU -- which is how the CPU-only tests exercise this plumbing without a GPU.
+    """
+    global _PREFILL_CPU_STREAM
+    if _PREFILL_CPU_STREAM is None:
+        _PREFILL_CPU_STREAM = mx.new_stream(mx.cpu)
+    return _PREFILL_CPU_STREAM
+
+
+def _cpu_cocompute_plan(
+    sorted_indices,
+    num_experts: int,
+    fraction: Optional[float] = None,
+    min_rows: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Where to cut the expert-sorted rows so the CPU gets ~``fraction`` of them.
+
+    Returns ``None`` when the split is not worth taking (too few rows, fraction
+    off, no expert boundary at or below the target, or the cut would hand the CPU
+    every expert).  Otherwise a dict with:
+
+      ``rows``    -- number of leading rows for the CPU (an exact expert boundary)
+      ``experts`` -- number of leading experts those rows cover
+      ``counts``  -- ``numpy`` row count per leading expert, summing to ``rows``
+
+    COSTS ONE HOST SYNC, like ``_segment_align_order`` and for the same reason: the
+    cut point depends on the VALUES of ``sorted_indices``.  Measured at ~0.45 ms
+    per MoE layer, ~19 ms per 8192-token chunk against a ~18.5 s chunk (0.1 %).
+    The cut is taken on the row CUMSUM rather than on the expert index, so a skewed
+    router (L7A measured p10 rows/expert 9.0 against a mean of 57) still yields the
+    requested share of ROWS -- which is what the load balance is actually about.
+    """
+    if fraction is None:
+        fraction = _prefill_cpu_fraction()
+    if fraction <= 0.0:
+        return None
+    if min_rows is None:
+        min_rows = _prefill_cpu_min_rows()
+
+    idx = np.array(sorted_indices, copy=False)  # <- the sync
+    total = int(idx.shape[0])
+    if total < min_rows:
+        return None
+    target = int(fraction * total)
+    if target < 1:
+        return None
+
+    counts = np.bincount(idx, minlength=num_experts)[:num_experts]
+    cum = np.cumsum(counts)
+    # Largest prefix of experts whose rows still fit under the target.
+    n_experts = int(np.searchsorted(cum, target, side="right"))
+    if n_experts <= 0 or n_experts >= num_experts:
+        return None
+    rows = int(cum[n_experts - 1])
+    if rows <= 0:
+        return None
+    return {"rows": rows, "experts": n_experts, "counts": counts[:n_experts]}
+
+
+def _cpu_segment_mm(x, w, counts, bias=None):
+    """``x @ w[e].T`` per expert segment, on whatever stream the caller is in.
+
+    ``x`` is ``(R, K)`` with rows already grouped by expert in ``counts`` order;
+    ``w`` is ``(E, N, K)`` -- the NATIVE ``SwitchLinear`` layout, deliberately not
+    pre-transposed.  ``w[e].swapaxes(-1, -2)`` measured 4.62-5.34 TFLOP/s on the
+    CPU against 3.64 for a materialised ``(K, N)`` copy, so the transpose is a view
+    and stays one.
+
+    Zero-row experts are skipped: the router routinely leaves experts empty in a
+    chunk, and a 0-row ``matmul`` is a dispatch for nothing.
+    """
+    outs = []
+    start = 0
+    for e in range(len(counts)):
+        c = int(counts[e])
+        if c == 0:
+            continue
+        seg = mx.matmul(x[start : start + c], w[e].swapaxes(-1, -2))
+        if bias is not None:
+            seg = seg + bias[e]
+        outs.append(seg)
+        start += c
+    if not outs:
+        return None
+    return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
 
 
 def _moe_segment_align() -> int:
@@ -173,6 +462,29 @@ class QuantizedSwitchLinear(nn.Module):
     def num_experts(self):
         return self.weight.shape[0]
 
+    def dequantized_prefix(self, n_experts: int, dtype=None):
+        """bf16/f32 ``(n_experts, output_dims, input_dims)`` weights for experts ``[0, n)``.
+
+        Used by the CPU co-compute arm, and issued on the CALLER's stream -- which
+        is the accelerator, deliberately: ``mx.dequantize`` is a pure bandwidth op
+        there (2.56 B/param at bf16) but runs at 0.53 Gparam/s on the CPU, which is
+        ~4 orders of magnitude too slow to be on the co-compute critical path.
+        """
+        biases = self.get("biases")
+        return mx.dequantize(
+            self["weight"][:n_experts],
+            self["scales"][:n_experts],
+            None if biases is None else biases[:n_experts],
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            dtype=dtype,
+        )
+
+    def bias_prefix(self, n_experts: int):
+        """Per-expert output bias for experts ``[0, n)``, or ``None`` if unbiased."""
+        return self["bias"][:n_experts] if "bias" in self else None
+
     def __call__(self, x, indices, sorted_indices=False):
         x = mx.gather_qmm(
             x,
@@ -217,6 +529,14 @@ class SwitchLinear(nn.Module):
     @property
     def num_experts(self):
         return self.weight.shape[0]
+
+    def dequantized_prefix(self, n_experts: int, dtype=None):
+        """Weights for experts ``[0, n)``; already dense, so this is a slice + cast."""
+        w = self["weight"][:n_experts]
+        return w if dtype is None or w.dtype == dtype else w.astype(dtype)
+
+    def bias_prefix(self, n_experts: int):
+        return self["bias"][:n_experts] if "bias" in self else None
 
     def __call__(self, x, indices, sorted_indices=False):
         x = mx.gather_mm(
@@ -274,6 +594,70 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def _cocompute(self, x, idx, plan):
+        """Run the leading ``plan['rows']`` expert-sorted rows on the CPU stream,
+        the rest on the accelerator stream, and concatenate.
+
+        ORDER IS THE MECHANISM, so it is spelled out.  (1) The accelerator
+        dequantises the CPU arm's three weight prefixes and is told to start
+        immediately (``mx.async_eval``), because everything the CPU does depends on
+        them.  (2) The CPU graph is built and handed to its own stream, also with
+        ``async_eval``, so it is enqueued BEFORE the accelerator's own MoE half is
+        built rather than at the join.  (3) Only then is the accelerator's tail
+        built.  The two arms are on different streams with no edge between them, so
+        MLX runs them concurrently and the only synchronisation is the final
+        ``concatenate``.
+
+        The accelerator therefore waits exactly as long as the CPU arm overruns the
+        accelerator arm -- which is why the fraction must be chosen at (or just
+        under) the balance point rather than as high as possible.  See the
+        prediction table in docs/CPU_COCOMPUTE_L27_2026-09-06.md.
+        """
+        n, n_experts, counts = plan["rows"], plan["experts"], plan["counts"]
+        _COCOMPUTE_STATS["calls"] += 1
+        _COCOMPUTE_STATS["cpu_rows"] += n
+        _COCOMPUTE_STATS["gpu_rows"] += int(x.shape[0]) - n
+        _COCOMPUTE_STATS["cpu_experts"] += n_experts
+        _COCOMPUTE_STATS["cpu_weight_params"] += n_experts * (
+            self.up_proj.input_dims * self.up_proj.output_dims
+            + self.gate_proj.input_dims * self.gate_proj.output_dims
+            + self.down_proj.input_dims * self.down_proj.output_dims
+        )
+        main = mx.default_stream(mx.default_device())
+        cpu = _prefill_cpu_stream()
+        dtype = _prefill_cpu_dtype() or x.dtype
+
+        with mx.stream(main):
+            w_up = self.up_proj.dequantized_prefix(n_experts, dtype=dtype)
+            w_gate = self.gate_proj.dequantized_prefix(n_experts, dtype=dtype)
+            w_down = self.down_proj.dequantized_prefix(n_experts, dtype=dtype)
+            b_up = self.up_proj.bias_prefix(n_experts)
+            b_gate = self.gate_proj.bias_prefix(n_experts)
+            b_down = self.down_proj.bias_prefix(n_experts)
+            x_cpu = x[:n]
+        mx.async_eval(w_up, w_gate, w_down, x_cpu)
+
+        out_dtype = x.dtype
+        with mx.stream(cpu):
+            xs = x_cpu.reshape(n, -1)
+            if xs.dtype != dtype:
+                xs = xs.astype(dtype)
+            h_up = _cpu_segment_mm(xs, w_up, counts, b_up)
+            h_gate = _cpu_segment_mm(xs, w_gate, counts, b_gate)
+            h = self.activation(h_up, h_gate)
+            y_cpu = _cpu_segment_mm(h, w_down, counts, b_down)
+            y_cpu = mx.expand_dims(y_cpu.astype(out_dtype), -2)
+        mx.async_eval(y_cpu)
+
+        with mx.stream(main):
+            x_gpu, idx_gpu = x[n:], idx[n:]
+            g_up = self.up_proj(x_gpu, idx_gpu, sorted_indices=True)
+            g_gate = self.gate_proj(x_gpu, idx_gpu, sorted_indices=True)
+            y_gpu = self.down_proj(
+                self.activation(g_up, g_gate), idx_gpu, sorted_indices=True
+            )
+            return mx.concatenate([y_cpu, y_gpu], axis=0)
+
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
@@ -286,13 +670,24 @@ class SwitchGLU(nn.Module):
             )
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(
-            self.activation(x_up, x_gate),
-            idx,
-            sorted_indices=do_sort,
+        # DEFAULT OFF.  One float compare when the knob is unset; the co-compute
+        # plan (and its host sync) is never built, and the graph below is the one
+        # that shipped before this lever existed.
+        plan = (
+            _cpu_cocompute_plan(idx, self.gate_proj.num_experts)
+            if do_sort and not self.training and _prefill_cpu_fraction() > 0.0
+            else None
         )
+        if plan is not None:
+            x = self._cocompute(x, idx, plan)
+        else:
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+            x = self.down_proj(
+                self.activation(x_up, x_gate),
+                idx,
+                sorted_indices=do_sort,
+            )
 
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
