@@ -95,6 +95,25 @@ _DISABLED = object()
 _CTX = None
 
 
+def pipeline_language_model(model):
+    """The half of ``model`` that owns the pipeline hooks, or ``None``.
+
+    ``generate_step`` is handed the VLM wrapper, so every hook here used to be
+    spelled ``model.language_model.<hook>``.  The SERVER does not: it builds its
+    ``BatchGenerator`` on ``model.language_model`` directly
+    (``server/generation.py:2454``), so the object that reaches
+    ``PromptProcessingBatch`` -- and therefore the batch-path pipeline call site --
+    IS the language model.  Both spellings have to resolve to the same object or
+    the served path would bypass itself forever with ``no_pipeline_hook``.
+    """
+    lm = getattr(model, "language_model", None)
+    if lm is not None and hasattr(lm, "pipeline_prefill_head"):
+        return lm
+    if hasattr(model, "pipeline_prefill_head"):
+        return model
+    return None
+
+
 # ------------------------------------------------------------------ settings
 
 
@@ -171,8 +190,9 @@ def _prime_dsa_caches(model, caches, prefix_tokens: int):
     """
     if prefix_tokens <= 0:
         return
-    cfg = model.language_model.args
-    layers = model.language_model.model.layers
+    lm = pipeline_language_model(model)
+    cfg = lm.args
+    layers = lm.model.layers
     idx_dim = 2 * cfg.index_head_dim + 1
     for i, layer in enumerate(layers):
         if layer is None or layer.is_linear:
@@ -205,7 +225,7 @@ def calibrate_split(
     speed differences from the comparison -- ``peer_speed`` scales the tail if
     the boxes are not twins.
     """
-    lm = model.language_model.model
+    lm = pipeline_language_model(model).model
     n = len(lm.layers)
     if candidates is None:
         mid = n // 2
@@ -256,7 +276,7 @@ def calibrate_split(
 def resolve_split(model, settings: PipelineSettings, tokens: int, verbose=False) -> int:
     if settings.split != "auto":
         return int(settings.split)
-    n = model.language_model.pipeline_num_layers
+    n = pipeline_language_model(model).pipeline_num_layers
     bucket = _ctx_bucket(tokens)
     key = f"{getattr(model, 'model_path', '?')}|{n}|{bucket}"
     path = Path(os.path.expanduser(settings.calib_path))
@@ -475,7 +495,7 @@ class PipelineHead:
         self._model = model
         self._token_hash.update(token_bytes(input_ids))
         t0 = time.perf_counter()
-        h = model.language_model.pipeline_prefill_head(
+        h = pipeline_language_model(model).pipeline_prefill_head(
             inputs=input_ids,
             inputs_embeds=inputs_embeds,
             cache=cache,
@@ -809,6 +829,28 @@ def _discard(head):
 
 POOL = PipelinePool()
 
+# One pipelined prefill at a time.  The tail is ONE stage-B stack: a second
+# concurrent request cannot be served by it, and queueing behind the first would
+# turn a fallback (cheap, single-box, correct) into a wait of up to a whole
+# 131k prefill.  Non-blocking by construction, therefore.
+_PP_INFLIGHT = threading.Lock()
+
+
+def acquire_pipeline_slot() -> bool:
+    """Take the single PP prefill slot, or count ``pp_busy`` and refuse."""
+    if _PP_INFLIGHT.acquire(blocking=False):
+        return True
+    note_pipeline_bypass("pp_busy")
+    return False
+
+
+def release_pipeline_slot() -> None:
+    """Give the slot back.  Idempotent: it runs in a ``finally``."""
+    try:
+        _PP_INFLIGHT.release()
+    except RuntimeError:
+        pass
+
 
 class PooledPipelineHead:
     """A per-request lease over a pooled connection.
@@ -881,8 +923,30 @@ def pipeline_bypass_reason(*args, **kwargs):
     return reason
 
 
+def note_pipeline_bypass(reason: Optional[str]) -> Optional[str]:
+    """Count a refusal that is a RESOURCE fact rather than a request fact.
+
+    ``breaker_open``, ``peer_unreachable`` and ``disabled`` are already counted
+    where they are decided rather than inside ``pipeline_bypass_reason`` -- they
+    are not properties of the request.  ``pp_busy`` is the same kind of fact and
+    is counted the same way, so the histogram stays the single place an operator
+    reads to learn WHICH gate refused.
+    """
+    METRICS.note_bypass(reason)
+    return reason
+
+
 def _pipeline_bypass_reason(
-    *, ladder, capture, warm, pixel_values, mask, cache, input_ids, kv_quantized
+    *,
+    ladder,
+    capture,
+    warm,
+    pixel_values,
+    mask,
+    cache,
+    input_ids,
+    kv_quantized,
+    right_pad=False,
 ):
     if ladder:
         return "apc_checkpoint_ladder"
@@ -890,6 +954,14 @@ def _pipeline_bypass_reason(
         return "speculative_hidden_capture"
     if warm:
         return "warm_prefix"
+    # New in the batch call site (A4) and additive: ``generate_step`` never sees
+    # a right-padded batch, so it leaves this at its default and its reason
+    # strings are unchanged.  ``prompt_step``'s batch can be right-padded (mixed
+    # warm/cold prefill), and a right pad is invisible to every check below --
+    # the mask is None, the cache carries the padding as metadata the handoff
+    # schema has no field for, and B is still 1.
+    if right_pad:
+        return "right_pad_batch"
     if pixel_values is not None:
         return "multimodal_input"
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -949,8 +1021,8 @@ def maybe_open_pipeline(model, total_tokens: int, verbose: bool = False):
         _CTX = _DISABLED
         METRICS.note_bypass("disabled")
         return None
-    lm = getattr(model, "language_model", None)
-    if lm is None or not hasattr(lm, "pipeline_prefill_head"):
+    lm = pipeline_language_model(model)
+    if lm is None:
         if verbose:
             print(
                 "[pipeline] model has no pipeline hook; staying single-box", flush=True
@@ -963,8 +1035,18 @@ def maybe_open_pipeline(model, total_tokens: int, verbose: bool = False):
             print("[pipeline] bypass=below_min_tokens", flush=True)
         METRICS.note_bypass("below_min_tokens")
         return None
-    _hex(settings.model_sha256, 64, "model_sha256")
-    _hex(settings.source_revision, 40, "source_revision")
+    try:
+        _hex(settings.model_sha256, 64, "model_sha256")
+        _hex(settings.source_revision, 40, "source_revision")
+    except (ValueError, TypeError) as exc:
+        # An unset or malformed pin is a MISCONFIGURATION, and this function's
+        # contract is that a peer problem costs a fallback and never a failure.
+        # It used to propagate, which turned a missing launcher variable into a
+        # 500 on a request this box can serve by itself.
+        METRICS.note_bypass("identity_unpinned")
+        if verbose:
+            print(f"[pipeline] bypass=identity_unpinned ({exc!r})", flush=True)
+        return None
     try:
         split = resolve_split(model, settings, total_tokens, verbose=verbose)
     except Exception as exc:  # noqa: BLE001

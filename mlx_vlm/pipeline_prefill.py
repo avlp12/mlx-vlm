@@ -597,7 +597,13 @@ def expected_state_meta(model, envelope):
         return dict(k="seq", items=list(items))
 
     result = []
-    layers = model.language_model.model.layers
+    # The head may be the VLM wrapper (``generate_step``) or the language model
+    # itself (the server hands ``BatchGenerator`` ``model.language_model``), and
+    # the tail always passes its own loaded wrapper; resolve rather than assume.
+    lm = getattr(model, "language_model", None)
+    if lm is None or not hasattr(lm, "pipeline_prefill_head"):
+        lm = model
+    layers = lm.model.layers
     if len(layers) != envelope.n_layers:
         raise ValueError("pipeline model layer count mismatch")
     for i in range(envelope.split, envelope.n_layers):
@@ -605,7 +611,7 @@ def expected_state_meta(model, envelope):
         if layer is None:
             # Prototype heads prune tail modules before loading weights, but
             # retain the validated architecture config needed for the schema.
-            cfg = model.language_model.args
+            cfg = lm.args
             linear = cfg.layer_types[i] == "linear_attention"
             if linear:
                 h, d, k = (

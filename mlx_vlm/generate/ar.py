@@ -2207,37 +2207,41 @@ class PromptProcessingBatch:
                 harvest_width if prefix_len > 0 else None
             )
 
-        if warm_cache is not None:
-            self.prompt_cache = warm_cache
-        elif draft_model is not None and draft_kind is not None:
-            self.prompt_cache = make_speculative_prompt_cache(
-                model,
-                draft_kind=draft_kind,
-                batch_size=len(input_ids),
-                left_padding=left_padding,
-                make_cache=lambda lm, lp: _make_cache(
-                    lm,
-                    lp,
-                    kv_bits=kv_bits,
-                    kv_key_bits=kv_key_bits,
-                    kv_value_bits=kv_value_bits,
-                    kv_key_scheme=kv_key_scheme,
-                    kv_value_scheme=kv_value_scheme,
-                    kv_group_size=kv_group_size,
-                    kv_quant_scheme=kv_quant_scheme,
-                    quantized_kv_start=quantized_kv_start,
-                    prefill_length=max_length,
-                ),
-            )
-        elif (
-            len(input_ids) == 1
-            and right_pad_per_row is None
-            and kv_bits is None
-            and hasattr(model, "make_cache")
-        ):
-            self.prompt_cache = cache.make_prompt_cache(model)
-        else:
-            self.prompt_cache = _make_cache(
+        # A FACTORY, not a statement, because the pipelined-prefill fallback has
+        # to be able to build this cache a SECOND time: a mid-prefill peer
+        # failure leaves half the layers written on this box and half never
+        # written, and that cache can only be thrown away (see
+        # ``_pipeline_fallback``).  Called immediately below, so with the
+        # pipeline off nothing about the construction moved.
+        def _build_prompt_cache():
+            if draft_model is not None and draft_kind is not None:
+                return make_speculative_prompt_cache(
+                    model,
+                    draft_kind=draft_kind,
+                    batch_size=len(input_ids),
+                    left_padding=left_padding,
+                    make_cache=lambda lm, lp: _make_cache(
+                        lm,
+                        lp,
+                        kv_bits=kv_bits,
+                        kv_key_bits=kv_key_bits,
+                        kv_value_bits=kv_value_bits,
+                        kv_key_scheme=kv_key_scheme,
+                        kv_value_scheme=kv_value_scheme,
+                        kv_group_size=kv_group_size,
+                        kv_quant_scheme=kv_quant_scheme,
+                        quantized_kv_start=quantized_kv_start,
+                        prefill_length=max_length,
+                    ),
+                )
+            if (
+                len(input_ids) == 1
+                and right_pad_per_row is None
+                and kv_bits is None
+                and hasattr(model, "make_cache")
+            ):
+                return cache.make_prompt_cache(model)
+            return _make_cache(
                 model,
                 left_padding,
                 kv_bits=kv_bits,
@@ -2250,6 +2254,27 @@ class PromptProcessingBatch:
                 quantized_kv_start=quantized_kv_start,
                 prefill_length=max_length,
             )
+
+        self._build_prompt_cache = _build_prompt_cache
+        self._kv_quantized = any(
+            v is not None for v in (kv_bits, kv_key_bits, kv_value_bits)
+        )
+        # Two-box pipelined prefill (A4).  Decided ONCE per request, at the top
+        # of the first chunk; ``_pipeline_declined`` latches that decision so no
+        # later chunk pays the gate again.  A batch that never meets the gate --
+        # every batch, with ``MLX_VLM_PIPELINE_HOSTS`` unset -- carries these
+        # five attributes and executes one ``os.environ.get``.
+        self._pipeline = None
+        self._pipeline_declined = False
+        self._pipeline_slot = False
+        self._pipeline_chunks: List[int] = []
+        self._pipeline_chunks_done = 0
+        self._pipeline_restore: Optional[dict] = None
+
+        if warm_cache is not None:
+            self.prompt_cache = warm_cache
+        else:
+            self.prompt_cache = _build_prompt_cache()
 
         # Declare per-row right-padding on each cache so finalize() can roll
         # it into left-padding once the prefill forward pass is complete.
@@ -2820,6 +2845,264 @@ class PromptProcessingBatch:
             captured.append(row_logits)
         return captured
 
+    # ------------------------------------------------- two-box pipelined prefill
+    #
+    # The server does NOT prefill through ``generate_step``: its GPU thread runs
+    # ``BatchGenerator``, whose prefill is the chunk loop below.  The pipeline
+    # was wired only into ``generate_step``, so every served request bypassed it
+    # by construction.  This is the second call site, and it is gated on THIS
+    # batch's own facts rather than on ``generate_step``'s arguments.
+    #
+    # WHAT THE PEER GETS.  ``prompt_step`` stops once the remainder fits in one
+    # step and ``generate()`` runs that remainder as the final forward, so the
+    # pipelined part is exactly the chunk loop's part: ``ceil(T/C) - 1`` chunks
+    # of ``C``.  The remainder is prefilled here AFTER ``finalize`` has installed
+    # all 45 layers, so no token is ever forwarded by half a stack, and decode is
+    # untouched single-box code.
+
+    def _pipeline_warm_prefix(self) -> bool:
+        """Is any part of this prompt already in the cache?
+
+        Three ways it can be, and the handoff schema supports none of them: an
+        APC/vault prefix hit (``prefix_len``), a resumed cache
+        (``existing_left_padding``, which is why a non-zero left pad counts),
+        and a chunk loop that has already run (defensive; the gate is only ever
+        evaluated at column 0).
+        """
+        if self._processed_prompt_columns:
+            return True
+        if any(int((m or {}).get("prefix_len") or 0) > 0 for m in (self._apc_meta or [])):
+            return True
+        return any(int(p or 0) > 0 for p in self._left_padding_per_row)
+
+    def _pipeline_has_checkpoint_ladder(self) -> bool:
+        """Is a mid-prefill checkpoint owed to APC or the vault?
+
+        PP cannot serve one: at any chunk boundary half the KV lives on the peer,
+        so a checkpoint taken there would store a half-populated cache.  A5 adds
+        the one checkpoint PP CAN take -- a single full-depth one after
+        ``finalize`` -- and this refusal narrows to the rungs alone then.
+        """
+        if not self._apc_meta:
+            return False
+        apc_on = self._apc_manager is not None and self._apc_mode == "exact"
+        for meta in self._apc_meta:
+            if meta is None:
+                continue
+            if self._vault is not None and meta.get("vault_rungs"):
+                return True
+            if apc_on and not meta.get("checkpoint_done"):
+                if int(meta.get("checkpoint_len") or 0) > int(
+                    meta.get("prefix_len") or 0
+                ):
+                    return True
+        return False
+
+    def _pipeline_chunk_schedule(self) -> List[int]:
+        """The chunks this loop will hand the peer, in order.
+
+        ``needs_processing`` stops the loop while ``remaining > step``, and
+        ``n = min(step, remaining - 1)`` equals ``step`` on every one of those
+        iterations, so the schedule is fixed the moment the batch is built:
+        ``k = ceil(T/C) - 1`` chunks of ``C``.  ``begin`` re-derives the same
+        tuple from the token ids and ``finalize`` refuses a mismatch, so a drift
+        between this arithmetic and the loop is a failure, never a silent
+        divergence.
+        """
+        step = self.prefill_step_size
+        total = int(self._inputs_embeds.shape[1]) if self._inputs_embeds is not None else 0
+        if not step or total <= step:
+            return []
+        return [int(step)] * (-(-total // int(step)) - 1)
+
+    def _pipeline_should_open(self) -> bool:
+        return (
+            self._pipeline is None
+            and not self._pipeline_declined
+            and self._processed_prompt_columns == 0
+            and self.prefill_step_size is not None
+        )
+
+    def _pipeline_open(self) -> None:
+        """Evaluate the admission gate once and, if it passes, take the lease."""
+        from ..pipeline_runtime import (
+            acquire_pipeline_slot,
+            maybe_open_pipeline,
+            note_pipeline_bypass,
+            pipeline_bypass_reason,
+            pipeline_language_model,
+        )
+
+        self._pipeline_declined = True
+        if not os.environ.get("MLX_VLM_PIPELINE_HOSTS", "").strip():
+            # The feature is off.  Nothing above this line touched an mx array
+            # and nothing below runs, so the statement sequence of the prefill
+            # is the one it was before this call site existed.
+            return
+        total_tokens = int(self._inputs_embeds.shape[1])
+        if (
+            pipeline_bypass_reason(
+                ladder=self._pipeline_has_checkpoint_ladder(),
+                capture=bool(self._chunk_capture_kwargs),
+                warm=self._pipeline_warm_prefix(),
+                right_pad=(
+                    self._right_pad_per_row is not None
+                    and any(self._right_pad_per_row)
+                ),
+                pixel_values=self._prompt_kwargs.get("pixel_values"),
+                mask=self._prompt_kwargs.get("mask"),
+                cache=self.prompt_cache,
+                input_ids=self._input_ids,
+                kv_quantized=self._kv_quantized,
+            )
+            is not None
+        ):
+            return
+        lm = pipeline_language_model(self.model)
+        if lm is None:
+            note_pipeline_bypass("no_pipeline_hook")
+            return
+        if len(self.prompt_cache) != int(lm.pipeline_num_layers):
+            # ``install_state`` refuses a cache that is not exactly n_layers
+            # long, and it refuses it at FINALIZE -- after the whole prefill has
+            # been paid for.  Refuse it here, where a fallback is still free.
+            note_pipeline_bypass("cache_depth_mismatch")
+            return
+        chunks = self._pipeline_chunk_schedule()
+        if not chunks:
+            note_pipeline_bypass("no_pipelined_chunks")
+            return
+        if not acquire_pipeline_slot():
+            return
+        self._pipeline_slot = True
+        try:
+            pipeline = maybe_open_pipeline(self.model, total_tokens, verbose=False)
+            if pipeline is None:
+                self._pipeline_release()
+                return
+            self._pipeline = pipeline
+            depth = sum(chunks)
+            # ``begin`` hashes ``input_ids[:, :-1]``, so hand it the pipelined
+            # prefix PLUS one token and it derives exactly ``chunks``.
+            pipeline.begin(
+                depth + 1,
+                int(self.prefill_step_size),
+                input_ids=self._input_ids[:, : depth + 1],
+            )
+        except Exception as exc:  # noqa: BLE001 - a peer must not fail a request
+            logger.warning(
+                "pipeline: opening the two-box prefill failed (%r); this request "
+                "prefills single-box", exc,
+            )
+            note_pipeline_bypass("pp_begin_failed")
+            self._pipeline_release()
+            return
+        self._pipeline_chunks = chunks
+        self._pipeline_chunks_done = 0
+        # Everything the fallback needs to start over.  ``_inputs_embeds`` is
+        # the whole prompt's embedding and is held for the duration of the
+        # pipelined prefill (1.07 GB at 131k) -- the price of being able to
+        # re-prefill without re-embedding.
+        self._pipeline_restore = {
+            "input_ids": self._input_ids,
+            "inputs_embeds": self._inputs_embeds,
+            "columns": self._processed_prompt_columns,
+            "prompt_kwargs": dict(self._prompt_kwargs),
+        }
+
+    def _pipeline_release(self) -> None:
+        """End the lease.  Idempotent, and never raises: it runs in failure paths.
+
+        ``close`` returns the connection to the pool if the request finalized and
+        discards it (counting ``pp_failed``) if it did not, so the caller does
+        not have to know which happened.
+        """
+        pipeline, self._pipeline = self._pipeline, None
+        try:
+            if pipeline is not None:
+                pipeline.close()
+        finally:
+            if self._pipeline_slot:
+                self._pipeline_slot = False
+                from ..pipeline_runtime import release_pipeline_slot
+
+                release_pipeline_slot()
+            self._pipeline_chunks = []
+            self._pipeline_chunks_done = 0
+
+    def _pipeline_fallback(self, exc: BaseException) -> None:
+        """Throw the half-filled cache away and restart this request single-box.
+
+        ``PipelineHead.abort`` already refuses to reuse a partially filled cache
+        and it is right to: layers ``[0, split)`` hold this box's writes for the
+        chunks that got through and layers ``[split, n)`` hold nothing at all.
+        There is no state to salvage and no way to tell the client, so the
+        request pays the prefill again, from column 0, on a fresh cache -- which
+        is what makes the fallback bit-identical to a run that never tried.
+        """
+        logger.warning(
+            "pipeline: two-box prefill failed after %d/%d chunks (%r); discarding "
+            "the partial cache and re-prefilling single-box",
+            self._pipeline_chunks_done,
+            len(self._pipeline_chunks),
+            exc,
+        )
+        restore = self._pipeline_restore or {}
+        self._pipeline_release()
+        self._pipeline_restore = None
+        self.prompt_cache = self._build_prompt_cache()
+        if restore:
+            self._input_ids = restore["input_ids"]
+            self._inputs_embeds = restore["inputs_embeds"]
+            self._processed_prompt_columns = restore["columns"]
+            self._prompt_kwargs = dict(restore["prompt_kwargs"])
+        mx.clear_cache()
+
+    def _pipeline_step(self, n: int) -> Optional[int]:
+        """One pipelined chunk, or ``None`` if the request fell back to one box.
+
+        Advances the batch by exactly what the single-box branch advances it by;
+        the two differ only in WHERE layers ``[split, n_layers)`` ran.
+        """
+        try:
+            idx = self._pipeline_chunks_done
+            if idx >= len(self._pipeline_chunks) or n != self._pipeline_chunks[idx]:
+                raise RuntimeError(
+                    f"pipeline chunk {idx} is {n} tokens, schedule says "
+                    f"{self._pipeline_chunks[idx:idx + 1] or '(end)'}"
+                )
+            self._pipeline.prefill_chunk(
+                self.model,
+                self._input_ids[:, :n],
+                self._inputs_embeds[:, :n],
+                self.prompt_cache,
+            )
+            # Only stage A's caches exist on this box until finalize, so
+            # scheduling the whole list would evaluate empty tail entries.
+            mx.eval([c.state for c in self._pipeline.local_caches(self.prompt_cache)])
+            self._pipeline_chunks_done += 1
+            if self._pipeline_chunks_done == len(self._pipeline_chunks):
+                # Pull stage B's KDA/DSA caches back and install them: from here
+                # the remainder forward, the last token and all of decode run
+                # locally over the full stack.
+                self._pipeline.finalize(self.prompt_cache)
+                self._pipeline_restore = None
+                self._pipeline_release()
+        except Exception as exc:  # noqa: BLE001 - never surface a peer fault
+            self._pipeline_fallback(exc)
+            return None
+        self._processed_prompt_columns += n
+        self._store_apc_exact_checkpoints()
+        self._store_vault_checkpoints()
+        self._inputs_embeds = self._inputs_embeds[:, n:]
+        self._input_ids = self._input_ids[:, n:]
+        for k in self._prompt_length_aware_keys:
+            self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
+                k, self._prompt_kwargs[k], start=n
+            )
+        mx.clear_cache()
+        return n
+
     def prompt_step(self) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
@@ -2832,6 +3115,20 @@ class PromptProcessingBatch:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
+        if self._pipeline_should_open():
+            self._pipeline_open()
+        if self._pipeline is not None:
+            processed = self._pipeline_step(n)
+            if processed is not None:
+                return processed
+            # The peer failed mid-prefill: the batch is back at column 0 on a
+            # fresh cache, so re-derive this chunk and run it on one box.
+            n = min(step, self._inputs_embeds.shape[1] - 1)
+            checkpoint_col = self._next_apc_checkpoint_column()
+            if checkpoint_col is not None:
+                n = min(n, checkpoint_col - self._processed_prompt_columns)
+            if n <= 0:
+                return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
         # Which rows END in this chunk (right-padded batches only).  Reading it
         # off the recorded absolute column adds NOTHING to the forward's
@@ -3003,6 +3300,13 @@ class PromptProcessingBatch:
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        if self._pipeline is not None:
+            # Unreachable by the schedule (``_pipeline_chunk_schedule``'s last
+            # chunk is the loop's last chunk, and ``_pipeline_step`` finalizes
+            # there), so this is a guard and not a path: half the KV would be on
+            # the peer.  Falling back restores the whole prompt, which the
+            # forward below then runs unchunked on a fresh cache.
+            self._pipeline_fallback(RuntimeError("prefill ended with the peer open"))
         call_kwargs = dict(self._prompt_kwargs)
         # Prefill leg: hidden captures yes, KDA rollback stash no.  Computed once in
         # ``__init__`` so this forward and every chunk before it carry byte-identical
@@ -4126,7 +4430,26 @@ class BatchGenerator:
     def stream(self):
         return self._stream
 
+    @staticmethod
+    def _release_prompt_batch_pipeline(prompt_batch) -> None:
+        """Give back a pipelined prefill's lease, if it holds one.
+
+        ``getattr`` rather than an attribute access because several tests build a
+        ``PromptProcessingBatch`` with ``__new__`` and set only the fields the
+        method under test reads.
+        """
+        release = getattr(prompt_batch, "_pipeline_release", None)
+        if callable(release) and getattr(prompt_batch, "_pipeline", None) is not None:
+            try:
+                release()
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                logger.warning("pipeline: releasing a cancelled lease failed",
+                               exc_info=True)
+
     def close(self):
+        # ``__del__`` calls this, and it can run on a half-built generator.
+        if getattr(self, "_prompt_batch", None) is not None:
+            self._release_prompt_batch_pipeline(self._prompt_batch)
         if self._wire_stack is not None:
             self._wire_stack.close()
             self._wire_stack = None
@@ -4337,6 +4660,10 @@ class BatchGenerator:
             # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
                 if len(self._prompt_batch.uids) == 1:
+                    # A cancelled pipelined prefill still holds the peer's only
+                    # slot and a pooled socket the peer thinks is mid-request;
+                    # dropping the batch without saying so would strand both.
+                    self._release_prompt_batch_pipeline(self._prompt_batch)
                     self._prompt_batch.uids = []
                     self._prompt_batch.prompt_cache = []
                     self._prompt_batch = None
