@@ -344,6 +344,20 @@ class PipelineHead:
             raise
         return self
 
+    def ping(self):
+        """Is this connection still a connection?  Cheap enough to run before
+        every reuse, which is the only way a pooled socket's death can be
+        discovered while falling back is still free."""
+        if self.sock is None:
+            raise OSError("pipeline connection is closed")
+        if self._active:
+            raise RuntimeError("pipeline ping requires an idle peer")
+        _send_json(self.sock, {"cmd": "ping"})
+        ack = _recv_json(self.sock)
+        if ack != {"cmd": "ping", "ok": True}:
+            raise ValueError("pipeline ping not acknowledged")
+        return True
+
     def close(self):
         if self.sock is not None:
             try:
@@ -530,13 +544,346 @@ class PipelineHead:
         return self.stats
 
 
+# ------------------------------------------------------------------ receipts
+
+
+class PipelineMetrics:
+    """Counters a running server can be asked for.
+
+    A pipeline that silently bypassed itself for a month looks exactly like a
+    pipeline that was never enabled, so the bypass reasons are counted by name
+    rather than logged: ``pp_bypass_reason`` is the histogram that tells an
+    operator WHICH gate refused, not merely that something did.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.used = 0
+            self.failed = 0
+            self.reconnects = 0
+            self.breaker_trips = 0
+            self.handoff_bytes = 0
+            self.wire_s = 0.0
+            self.bypass = {}
+            self.breaker_state = "closed"
+
+    def note_bypass(self, reason: Optional[str]):
+        if not reason:
+            return
+        with self._lock:
+            self.bypass[reason] = self.bypass.get(reason, 0) + 1
+
+    def note_reconnect(self):
+        with self._lock:
+            self.reconnects += 1
+
+    def note_trip(self):
+        with self._lock:
+            self.breaker_trips += 1
+
+    def note_failure(self):
+        with self._lock:
+            self.failed += 1
+
+    def note_success(self, stats: Optional[dict] = None):
+        with self._lock:
+            self.used += 1
+            if not stats:
+                return
+            self.wire_s += float(stats.get("wire_send_s") or 0.0)
+            handoff = stats.get("handoff") or {}
+            self.handoff_bytes += int(handoff.get("handoff_bytes") or 0)
+            self.wire_s += float(handoff.get("handoff_wire_recv_s") or 0.0)
+
+    def set_breaker_state(self, state: str):
+        with self._lock:
+            self.breaker_state = state
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "pp_used": self.used,
+                "pp_failed": self.failed,
+                "pp_reconnects": self.reconnects,
+                "pp_bypass_reason": dict(self.bypass),
+                "pp_handoff_bytes": self.handoff_bytes,
+                "pp_wire_s": round(self.wire_s, 6),
+                "pp_breaker_state": self.breaker_state,
+                "pp_breaker_trips": self.breaker_trips,
+            }
+
+
+METRICS = PipelineMetrics()
+
+
+def pipeline_metrics_snapshot() -> dict:
+    """Read-only receipts for the server runtime snapshot."""
+    snap = METRICS.snapshot()
+    snap["pp_pool_idle"] = POOL.idle_count()
+    snap["pp_enabled"] = bool(os.environ.get("MLX_VLM_PIPELINE_HOSTS", "").strip())
+    return snap
+
+
+# ------------------------------------------------------------ circuit breaker
+
+
+class CircuitBreaker:
+    """N consecutive failures disable the peer for T seconds.
+
+    Without it, a tail that died at 03:00 is re-dialled once per request until
+    someone notices: every request pays the full connect timeout before falling
+    back to the single box, which is strictly worse than never having had a
+    peer.  Open trips straight to bypass; after the cooldown ONE request is let
+    through (half-open) and its outcome decides.
+    """
+
+    def __init__(self, threshold: int = 3, cooldown: float = 60.0, clock=time.monotonic):
+        self.threshold = max(1, int(threshold))
+        self.cooldown = float(cooldown)
+        self.clock = clock
+        self._lock = threading.Lock()
+        self.failures = 0
+        self.opened_at = None
+        self._trial = False
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state_locked()
+
+    def _state_locked(self) -> str:
+        if self.opened_at is None:
+            return "closed"
+        if self._trial or self.clock() - self.opened_at >= self.cooldown:
+            return "half_open"
+        return "open"
+
+    def allow(self) -> bool:
+        with self._lock:
+            state = self._state_locked()
+            if state == "open":
+                return False
+            if state == "half_open":
+                # exactly one probe in flight
+                if self._trial:
+                    return False
+                self._trial = True
+            return True
+
+    def record_success(self):
+        with self._lock:
+            self.failures = 0
+            self.opened_at = None
+            self._trial = False
+            state = "closed"
+        METRICS.set_breaker_state(state)
+
+    def record_failure(self):
+        tripped = False
+        with self._lock:
+            self._trial = False
+            self.failures += 1
+            if self.failures >= self.threshold:
+                tripped = self.opened_at is None
+                self.opened_at = self.clock()
+            state = self._state_locked()
+        if tripped:
+            METRICS.note_trip()
+        METRICS.set_breaker_state(state)
+
+    def reset(self):
+        with self._lock:
+            self.failures = 0
+            self.opened_at = None
+            self._trial = False
+        METRICS.set_breaker_state("closed")
+
+
+# --------------------------------------------------------------- connection pool
+
+
+def _pool_key(settings: PipelineSettings, split: int, n_layers: int):
+    return (
+        settings.peer,
+        settings.transport,
+        int(split),
+        int(n_layers),
+        settings.model_sha256,
+        settings.source_revision,
+    )
+
+
+class PipelinePool:
+    """One live connection per tail, reused across requests.
+
+    ``maybe_open_pipeline`` used to open a socket per request and ``close()``
+    sent ``bye``, which is why the cooperation driver had to monkey-patch
+    ``close`` to keep the peer alive.  The connection is now a resource with a
+    lifetime longer than the request: ``close()`` on a leased head returns it
+    here, and only ``shutdown()`` says ``bye``.
+    """
+
+    def __init__(self, breaker: Optional[CircuitBreaker] = None):
+        self._lock = threading.Lock()
+        self._idle = {}
+        self.breaker = breaker or CircuitBreaker(
+            threshold=int(os.environ.get("MLX_VLM_PIPELINE_BREAKER_FAILS", "3")),
+            cooldown=float(os.environ.get("MLX_VLM_PIPELINE_BREAKER_COOLDOWN", "60")),
+        )
+
+    def idle_count(self) -> int:
+        with self._lock:
+            return sum(len(v) for v in self._idle.values())
+
+    def acquire(self, settings, split, n_layers, *, verbose=False):
+        """A connected, verified-idle head, or None (caller stays single-box)."""
+        key = _pool_key(settings, split, n_layers)
+        with self._lock:
+            pooled = self._idle.get(key) or []
+            head = pooled.pop() if pooled else None
+            self._idle[key] = pooled
+        if head is not None:
+            # A pooled socket can have died since the last request; find out
+            # here, where falling back is still free, not inside ``begin``.
+            try:
+                head.ping()
+                return head
+            except (OSError, ValueError, TimeoutError) as exc:
+                if verbose:
+                    print(f"[pipeline] pooled peer stale: {exc!r}", flush=True)
+                _discard(head)
+                METRICS.note_reconnect()
+        if not self.breaker.allow():
+            METRICS.note_bypass("breaker_open")
+            if verbose:
+                print("[pipeline] bypass=breaker_open", flush=True)
+            return None
+        try:
+            head = PipelineHead(settings, split, n_layers).connect()
+        except (OSError, ValueError, TimeoutError) as exc:
+            # The request falls back to single-box prefill; a peer that is down
+            # must never be able to fail a request that this box can serve.
+            self.breaker.record_failure()
+            METRICS.note_bypass("peer_unreachable")
+            if verbose:
+                print(f"[pipeline] bypass=peer_unreachable ({exc!r})", flush=True)
+            return None
+        self.breaker.record_success()
+        return head
+
+    def release(self, head, key, ok: bool):
+        """Give a connection back.  A request that did not finish leaves the
+        peer's state undefined, so its connection is discarded, never reused."""
+        if head is None:
+            return
+        if not ok or head.sock is None:
+            _discard(head)
+            self.breaker.record_failure()
+            METRICS.note_failure()
+            return
+        with self._lock:
+            self._idle.setdefault(key, []).append(head)
+
+    def shutdown(self):
+        """Say ``bye`` to every pooled peer.  The only place that does."""
+        with self._lock:
+            heads = [h for hs in self._idle.values() for h in hs]
+            self._idle = {}
+        for head in heads:
+            try:
+                head.close()
+            except Exception:  # noqa: BLE001
+                _discard(head)
+
+
+def _discard(head):
+    try:
+        head.abort()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+POOL = PipelinePool()
+
+
+class PooledPipelineHead:
+    """A per-request lease over a pooled connection.
+
+    Presents exactly the surface ``generate_step`` already uses -- ``begin``,
+    ``prefill_chunk``, ``local_caches``, ``finalize``, ``close`` -- so the call
+    site does not learn that the socket outlives it.  ``close`` is the request
+    boundary and NEVER raises: it runs in the caller's ``finally``, where an
+    exception would replace the real failure with a bookkeeping one.
+    """
+
+    def __init__(self, pool: PipelinePool, head: PipelineHead, key):
+        self._pool = pool
+        self._head = head
+        self._key = key
+        self._ok = False
+        self.stats = head.stats
+
+    # -- delegation ---------------------------------------------------------
+    @property
+    def split(self):
+        return self._head.split
+
+    def begin(self, tokens, chunk, *, input_ids):
+        self._ok = False
+        return self._head.begin(tokens, chunk, input_ids=input_ids)
+
+    def local_caches(self, cache):
+        return self._head.local_caches(cache)
+
+    def prefill_chunk(self, model, input_ids, inputs_embeds, cache):
+        return self._head.prefill_chunk(model, input_ids, inputs_embeds, cache)
+
+    def finalize(self, cache):
+        stats = self._head.finalize(cache)
+        self.stats = stats
+        self._ok = True
+        METRICS.note_success(stats)
+        return stats
+
+    # -- lifetime -----------------------------------------------------------
+    def close(self):
+        try:
+            self._pool.release(self._head, self._key, self._ok)
+        except Exception as exc:  # noqa: BLE001
+            _discard(self._head)
+            print(f"[pipeline] release failed: {exc!r}", flush=True)
+        finally:
+            self._head = None
+
+    def shutdown(self):
+        """Explicit end of life for the whole pool: sends ``bye``."""
+        if self._head is not None:
+            self._pool.release(self._head, self._key, self._ok)
+            self._head = None
+        self._pool.shutdown()
+
+
 # ------------------------------------------------------------------ factory
 
 
-def pipeline_bypass_reason(
+def pipeline_bypass_reason(*args, **kwargs):
+    """The handoff only represents cold, unpadded, unquantized text B=1 state.
+
+    Counted here rather than at the call site: this function is the single
+    gate, so the histogram cannot drift away from the decision it describes.
+    """
+    reason = _pipeline_bypass_reason(*args, **kwargs)
+    METRICS.note_bypass(reason)
+    return reason
+
+
+def _pipeline_bypass_reason(
     *, ladder, capture, warm, pixel_values, mask, cache, input_ids, kv_quantized
 ):
-    """The handoff only represents cold, unpadded, unquantized text B=1 state."""
     if ladder:
         return "apc_checkpoint_ladder"
     if capture:
@@ -588,13 +935,19 @@ def pipeline_bypass_reason(
 
 
 def maybe_open_pipeline(model, total_tokens: int, verbose: bool = False):
-    """Return a connected PipelineHead, or None to stay single-box."""
+    """Return a leased, connected pipeline head, or None to stay single-box.
+
+    Every ``None`` here is a named bypass in ``pp_bypass_reason``.  Nothing in
+    this function may raise on a peer problem: a tail that is down, slow or
+    tripped must cost the request a fallback, not a failure.
+    """
     global _CTX
     if _CTX is _DISABLED:
         return None
     settings = PipelineSettings.from_env()
     if settings is None:
         _CTX = _DISABLED
+        METRICS.note_bypass("disabled")
         return None
     lm = getattr(model, "language_model", None)
     if lm is None or not hasattr(lm, "pipeline_prefill_head"):
@@ -603,19 +956,36 @@ def maybe_open_pipeline(model, total_tokens: int, verbose: bool = False):
                 "[pipeline] model has no pipeline hook; staying single-box", flush=True
             )
         _CTX = _DISABLED
+        METRICS.note_bypass("no_pipeline_hook")
         return None
     if total_tokens < settings.min_tokens:
         if verbose:
             print("[pipeline] bypass=below_min_tokens", flush=True)
+        METRICS.note_bypass("below_min_tokens")
         return None
     _hex(settings.model_sha256, 64, "model_sha256")
     _hex(settings.source_revision, 40, "source_revision")
-    split = resolve_split(model, settings, total_tokens, verbose=verbose)
-    head = PipelineHead(settings, split, lm.pipeline_num_layers).connect()
+    try:
+        split = resolve_split(model, settings, total_tokens, verbose=verbose)
+    except Exception as exc:  # noqa: BLE001
+        METRICS.note_bypass("split_unresolved")
+        if verbose:
+            print(f"[pipeline] bypass=split_unresolved ({exc!r})", flush=True)
+        return None
+    head = POOL.acquire(settings, split, lm.pipeline_num_layers, verbose=verbose)
+    if head is None:
+        return None
     if verbose:
         print(
             f"[pipeline] split={split} transport={settings.transport} "
             f"peer={settings.peer[0]}:{settings.peer[1]}",
             flush=True,
         )
-    return head
+    return PooledPipelineHead(
+        POOL, head, _pool_key(settings, split, lm.pipeline_num_layers)
+    )
+
+
+def shutdown_pipeline_pool():
+    """Say ``bye`` to every pooled tail.  Server shutdown calls this."""
+    POOL.shutdown()

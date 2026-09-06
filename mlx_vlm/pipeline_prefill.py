@@ -1243,6 +1243,12 @@ def tail_session_factory(args, stage, n_layers, load_s, stop_file):
                 if req.get("cmd") == "bye":
                     _send_json(sock, {"cmd": "bye", "ok": True})
                     return served
+                if req.get("cmd") == "ping":
+                    # Liveness for a pooled head: the connection outlives the
+                    # request now, so the head must be able to ask whether it
+                    # still has a peer before it commits a prefill to it.
+                    _send_json(sock, {"cmd": "ping", "ok": True})
+                    continue
                 if req.get("cmd") != "run" or req.get("transport") != args.transport:
                     raise ValueError("invalid pipeline run")
                 envelope = PrefillEnvelope.from_dict(req.get("envelope"))
