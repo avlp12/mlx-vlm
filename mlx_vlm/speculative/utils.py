@@ -319,7 +319,17 @@ class PrefillHiddenAccumulator:
 
     def append(self, outputs) -> None:
         """Collect one forward's captures.  A forward without captures is a no-op."""
-        captured = getattr(outputs, "hidden_states", None)
+        self.append_layers(getattr(outputs, "hidden_states", None))
+
+    def append_layers(self, captured) -> None:
+        """:meth:`append` for a caller that holds the per-layer list itself.
+
+        The two-box prefill does: its chunks are captured on the peer (and on
+        this box's own half of the stack) into a plain list rather than into a
+        ``LanguageModelOutput``, and the window that survives them is stitched
+        by exactly this arithmetic -- so it must BE this arithmetic and not a
+        second copy of it.
+        """
         if not captured:
             return
         if self._layers is None:
@@ -431,6 +441,51 @@ class PrefillHiddenAccumulator:
             out.append(mx.contiguous(h))
         mx.eval(out)
         return out
+
+    def adopt_window(self, layers: List[mx.array], *, rows_covered: int) -> None:
+        """Seed the accumulator with a window ANOTHER box computed (two-box prefill).
+
+        The pipelined part of a prefill runs ``k`` chunks across two machines, so
+        the per-chunk captures this class normally collects never exist on the
+        head at all.  What comes back instead is the one thing :meth:`finish`
+        could still have used them for: the trailing ``keep`` rows of those ``k``
+        chunks, already merged across the split.  Adopting it as a single piece
+        and remembering how many rows it stands for reproduces the state ``k``
+        real appends would have left -- and therefore reproduces :meth:`finish`
+        exactly, including the offset it reports:
+
+            single box   dropped_rows = k*C - resident,  skip = resident + r - keep
+            two box      dropped_rows = k*C - W,         skip = W + r - keep
+                         => dropped + skip = k*C + r - keep, both times.
+
+        Refused (loudly, because a silently short context is a silently worse
+        drafter) unless nothing has been appended yet, the layers agree on width,
+        and the width is exactly the window the trim would have kept:
+        ``min(keep, rows_covered)``.
+        """
+        if self._layers is not None:
+            raise RuntimeError(
+                "pipelined prefill: the hidden accumulator already holds chunks"
+            )
+        if not layers:
+            raise RuntimeError("pipelined prefill: empty hidden window")
+        rows_covered = int(rows_covered)
+        width = int(layers[0].shape[1])
+        if any(int(h.shape[1]) != width for h in layers):
+            raise RuntimeError(
+                "pipelined prefill: the merged hidden window's layers disagree "
+                "on length"
+            )
+        want = rows_covered if self.keep is None else min(self.keep, rows_covered)
+        if width != want or rows_covered <= 0:
+            raise RuntimeError(
+                f"pipelined prefill: hidden window is {width} rows over "
+                f"{rows_covered}, expected {want}"
+            )
+        self._layers = [[h] for h in layers]
+        self._widths = [width]
+        self.total_rows = rows_covered
+        self.dropped_rows = rows_covered - width
 
     def finish(self) -> Tuple[Optional[List[mx.array]], int]:
         """``(per-layer hidden, rows dropped off the front)``.

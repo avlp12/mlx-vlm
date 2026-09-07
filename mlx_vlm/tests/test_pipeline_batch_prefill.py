@@ -203,8 +203,12 @@ class _LoopbackHead:
         self.sock = None
 
     # -- request surface
-    def begin(self, tokens, chunk, *, input_ids):
+    def begin(self, tokens, chunk, *, input_ids, capture=None):
+        self.capture = capture
         self.calls.append(("begin", int(tokens), int(chunk), tuple(input_ids.shape)))
+
+    def take_hidden(self):
+        return None
 
     def local_caches(self, cache):
         return []

@@ -3050,6 +3050,81 @@ class PromptProcessingBatch:
                 "prefill itself is complete and the request continues", exc,
             )
 
+    def _pipeline_capture_plan(self):
+        """``(capture spec, refusal)`` for this batch's hidden-reading drafter.
+
+        A6.  Until now ANY such drafter refused the pipeline outright
+        (``speculative_hidden_capture``), which in the default served config --
+        DFlash2 -- is every request, so the feature was unreachable twice over
+        (A5 removed the other block).  What the drafter actually needs from a
+        prefill is a bounded window of the target's own activations, and both
+        boxes can produce their share of it:
+
+        * ``layers``: a per-layer capture (``capture_layer_ids``; dflash and
+          eagle3).  DFlash2's ``[5, 14, 24, 33, 42]`` STRADDLES the shipped
+          split of 23, so the head keeps 5/14 and the tail returns 24/33/42.
+          ``sorted(set(...))`` is not a normalisation of the drafter's list but
+          a reproduction of the model's own order: ``Glm5NextModel.__call__``
+          tests membership of a SET inside an ascending layer loop, so the
+          single-box capture is ascending and deduplicated whatever order the
+          drafter declared.
+        * ``hidden``: MTP's ``return_hidden`` -- the pre-final-norm,
+          mHC-collapsed hidden after the LAST layer, so the tail owns it whole.
+
+        Two refusals survive, and they are different questions:
+
+        * ``speculative_hidden_capture`` (the historical name, kept for the
+          historical reason) when the drafter declares NO finite window.
+          ``self._prefill_hidden.keep`` is read rather than
+          ``prefill_context_keep`` recomputed, because the window that comes
+          back has to be the window the accumulator would have trimmed to --
+          including when ``_capture_refusal`` already forced it to ``None`` for
+          a right-padded batch.  An unbounded window is not merely large, it is
+          the whole prompt's activations on the wire: 3.2 GB at 131k for
+          DFlash2, against 50.3 MB for the trailing 2047 rows.
+        * ``capture_unsupported`` when the capture is a shape this rail has no
+          merge for.  Additive: nothing produces it today (``chunk_capture_
+          kwargs_for`` emits only the two forms above), which is exactly why it
+          exists -- a third form added later must fall out of the pipeline by
+          name rather than be handed a merge that was written for two.
+        """
+        kwargs = self._chunk_capture_kwargs
+        if not kwargs:
+            return None, None
+        layer_ids = kwargs.get("capture_layer_ids")
+        if layer_ids:
+            kind, ids = "layers", sorted({int(i) for i in layer_ids})
+        elif kwargs.get("return_hidden"):
+            kind, ids = "hidden", []
+        else:
+            return None, "capture_unsupported"
+        keep = getattr(self._prefill_hidden, "keep", None)
+        if not keep or int(keep) <= 0:
+            return None, "speculative_hidden_capture"
+        return {"schema": 1, "kind": kind, "layers": ids, "keep": int(keep)}, None
+
+    def _pipeline_adopt_capture(self, hidden, depth: int) -> None:
+        """Seed the accumulator with the merged window, as ``depth`` appends would.
+
+        The pipelined chunks never ran on this box, so the accumulator has
+        nothing in it; what it gets instead is the one thing those chunks would
+        have left behind -- the trailing ``keep`` rows of ``depth`` tokens,
+        merged across the split -- plus the row count they stand for.  After
+        this, ``generate()``'s post-finalize remainder forward appends its own
+        capture exactly as it does on one box, and ``finish()`` returns the same
+        arrays and the same ``target_hidden_offset``.
+
+        Raises on anything unexpected, and the caller turns that into the
+        single-box fallback: a drafter primed on a short or misordered context
+        is a quietly worse answer, which is the failure mode this whole rail is
+        built to avoid.
+        """
+        if not hidden:
+            raise RuntimeError(
+                "pipelined prefill: the peer returned no speculative capture"
+            )
+        self._prefill_hidden.adopt_window(hidden, rows_covered=depth)
+
     def _pipeline_chunk_schedule(self) -> List[int]:
         """The chunks this loop will hand the peer, in order.
 
@@ -3092,10 +3167,11 @@ class PromptProcessingBatch:
             # is the one it was before this call site existed.
             return
         total_tokens = int(self._inputs_embeds.shape[1])
+        capture, capture_refusal = self._pipeline_capture_plan()
         if (
             pipeline_bypass_reason(
                 ladder=self._pipeline_has_checkpoint_ladder(),
-                capture=bool(self._chunk_capture_kwargs),
+                capture=capture_refusal,
                 warm=self._pipeline_warm_prefix(),
                 right_pad=(
                     self._right_pad_per_row is not None
@@ -3140,6 +3216,7 @@ class PromptProcessingBatch:
                 depth + 1,
                 int(self.prefill_step_size),
                 input_ids=self._input_ids[:, : depth + 1],
+                capture=capture,
             )
         except Exception as exc:  # noqa: BLE001 - a peer must not fail a request
             logger.warning(
@@ -3206,6 +3283,14 @@ class PromptProcessingBatch:
         restore = self._pipeline_restore or {}
         self._pipeline_release()
         self._pipeline_restore = None
+        # The re-prefill runs every chunk on this box and captures each one, so
+        # the accumulator has to start where a request that never tried starts.
+        # It is empty already on every path that reaches here today (the chunk
+        # loop's ``append`` runs only in the single-box branch, and PP adopts
+        # its window after the last chunk) -- reset anyway, because "empty
+        # already" is a property of the caller and a stale window here would be
+        # rows of a prompt prefix stitched in front of the whole prompt.
+        self._prefill_hidden = PrefillHiddenAccumulator(keep=self._prefill_hidden.keep)
         # The single-box re-prefill can serve every rung, including the ones the
         # collapse dropped, so it gets the whole ladder back.
         self._pipeline_restore_ladder()
@@ -3245,6 +3330,15 @@ class PromptProcessingBatch:
                 # the remainder forward, the last token and all of decode run
                 # locally over the full stack.
                 self._pipeline.finalize(self.prompt_cache)
+                # A6.  The drafter's context for the pipelined part, merged
+                # from both halves and adopted BEFORE the lease is released --
+                # inside this handler, so a window that did not arrive or does
+                # not fit costs the request a single-box re-prefill rather than
+                # a silently short drafter context.
+                if self._chunk_capture_kwargs:
+                    self._pipeline_adopt_capture(
+                        self._pipeline.take_hidden(), sum(self._pipeline_chunks)
+                    )
                 # A5.  Here and nowhere else: all 45 layers are on this box,
                 # the cache is exactly ``sum(chunks)`` tokens deep, and the
                 # batch has not advanced past it yet.

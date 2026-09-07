@@ -332,10 +332,25 @@ class Stage:
             (i for i in local if not self.lm.layers[i].is_linear), None
         )
 
-    def __call__(self, h: mx.array, inputs: Optional[mx.array] = None) -> mx.array:
-        """Run this stage over one chunk (delegates to Glm5NextModel)."""
+    def __call__(
+        self,
+        h: mx.array,
+        inputs: Optional[mx.array] = None,
+        hidden_sink: Optional[list] = None,
+        capture_layer_ids: Optional[list] = None,
+    ) -> mx.array:
+        """Run this stage over one chunk (delegates to Glm5NextModel).
+
+        The capture arguments are passed on ONLY when a sink is open, so a
+        request with no hidden-reading drafter -- and every model whose
+        ``pipeline_forward`` predates the capture -- sees exactly the call it
+        saw before.
+        """
+        kwargs = {}
+        if hidden_sink is not None:
+            kwargs = dict(hidden_sink=hidden_sink, capture_layer_ids=capture_layer_ids)
         return self.lm.pipeline_forward(
-            h, self.caches, self.local[0], self.local[-1] + 1, inputs=inputs
+            h, self.caches, self.local[0], self.local[-1] + 1, inputs=inputs, **kwargs
         )
 
     def finish(self, h: mx.array) -> mx.array:
@@ -352,6 +367,265 @@ class Stage:
 
 def boundary_bytes(S: int, hc: int, D: int, itemsize: int = 2) -> int:
     return S * hc * D * itemsize
+
+
+# ------------------------------------------------ speculative hidden capture
+#
+# A hidden-reading drafter (DFlash2, MTP) is primed on the target's own
+# activations over the prompt, so a prefill that ran half its layers on another
+# box has to bring that half back or the request cannot use the drafter at all.
+# Until A6 it did not: ``speculative_hidden_capture`` refused every such request,
+# which in the DEFAULT served config (DFlash2) is every request.
+#
+# WHAT IS SENT, and why it is not the whole capture.  The drafter reads only its
+# trailing ``keep`` rows (DFlash2: ``sliding_window - 1`` = 2047; MTP:
+# ``mtp_prime_window()`` = 2048), so only those rows have to cross -- once, at
+# the end of the request.  Per captured layer that is ``keep * hidden * 2`` B:
+# 16.8 MB at 2047x4096 bf16, so 50.3 MB for DFlash2's three tail-side layers and
+# 16.8 MB for MTP's one.  The alternative -- shipping each chunk's capture with
+# the chunk -- is 3.22 GB on a 131k prompt, 1.55x the KV handoff itself, for rows
+# that are thrown away as soon as a later chunk covers the window.
+#
+# WHICH BOX CAPTURES WHAT.  DFlash2's ``target_layer_ids`` are [5, 14, 24, 33,
+# 42] and the shipped split is 23, so the set STRADDLES the boundary: 5 and 14
+# are on the head, 24/33/42 on the tail.  Both halves therefore capture, each
+# over its own layers, and the head merges the two ordered lists.  MTP's capture
+# is the pre-final-norm hidden after the LAST layer, which only the tail has.
+
+
+class CaptureUnsupported(ValueError):
+    """The peer cannot serve the capture this request asked for."""
+
+
+@dataclass(frozen=True)
+class CaptureSpec:
+    """What a request wants captured, in the form both boxes agree on.
+
+    ``kind`` is ``"layers"`` (a per-layer capture: dflash/eagle3
+    ``capture_layer_ids``) or ``"hidden"`` (MTP's ``return_hidden``, the
+    pre-final-norm mHC-collapsed hidden after the last layer).  ``keep`` is the
+    drafter's own window; the head derives it from
+    ``PrefillHiddenAccumulator.keep`` so the window that comes back is the one
+    the accumulator would have trimmed to, and never a different one.
+    """
+
+    kind: str
+    layers: tuple
+    keep: int
+
+    MAX_KEEP = 1 << 20
+
+    @classmethod
+    def parse(cls, obj, *, n_layers: int) -> "CaptureSpec":
+        if not isinstance(obj, dict) or set(obj) - {"schema", "kind", "layers", "keep"}:
+            raise CaptureUnsupported("invalid capture request")
+        if obj.get("schema") != 1:
+            raise CaptureUnsupported("unsupported capture schema")
+        kind = obj.get("kind")
+        if kind not in ("layers", "hidden"):
+            raise CaptureUnsupported(f"unsupported capture kind {kind!r}")
+        keep = obj.get("keep")
+        if type(keep) is not int or not 0 < keep <= cls.MAX_KEEP:
+            raise CaptureUnsupported("invalid capture window")
+        layers = obj.get("layers") or []
+        if not isinstance(layers, list) or any(type(i) is not int for i in layers):
+            raise CaptureUnsupported("invalid capture layer ids")
+        if any(not 0 <= i < n_layers for i in layers):
+            raise CaptureUnsupported("capture layer id outside the stack")
+        if kind == "layers" and not layers:
+            raise CaptureUnsupported("a per-layer capture names no layers")
+        if kind == "hidden" and layers:
+            raise CaptureUnsupported("a whole-hidden capture names layers")
+        if list(layers) != sorted(set(layers)):
+            raise CaptureUnsupported("capture layer ids are not ascending/unique")
+        return cls(kind, tuple(layers), int(keep))
+
+    def to_dict(self) -> dict:
+        return {
+            "schema": 1,
+            "kind": self.kind,
+            "layers": list(self.layers),
+            "keep": self.keep,
+        }
+
+    def head_layers(self, split: int) -> list:
+        """Captured layers stage A owns.  Empty for ``hidden``."""
+        return [i for i in self.layers if i < split]
+
+    def tail_layers(self, split: int) -> list:
+        return [i for i in self.layers if i >= split]
+
+    def tail_tensors(self, split: int) -> int:
+        return 1 if self.kind == "hidden" else len(self.tail_layers(split))
+
+
+class TrailingHiddenWindow:
+    """The last ``keep`` captured rows of a chunked prefill, and nothing else.
+
+    Deliberately the same arithmetic as
+    ``speculative.utils.PrefillHiddenAccumulator``: hold the chunk pieces, drop
+    a whole leading piece as soon as what follows it already covers the window,
+    and trim once at the end -- never per chunk, because a chunk boundary is not
+    the prompt end.  It is a SECOND implementation only because it has to run in
+    the tail process, which loads no drafter and must not import the speculative
+    package to serve a prefill; ``test_pipeline_hidden_capture`` pins the two
+    against each other on random data so they cannot drift.
+
+    Bounded memory is the point: ``keep`` rows per captured layer, so a 131k
+    prompt costs the same as a 16k one (16.8 MB per layer at 2047x4096 bf16).
+    """
+
+    def __init__(self, keep: int):
+        self.keep = int(keep) if keep and int(keep) > 0 else None
+        self._layers = None
+        self._widths = []
+        self.total_rows = 0
+        self.dropped_rows = 0
+
+    def append(self, captured) -> None:
+        if not captured:
+            return
+        if self._layers is None:
+            self._layers = [[] for _ in captured]
+        if len(captured) != len(self._layers):
+            raise ValueError("pipeline capture width changed mid-prompt")
+        width = int(captured[0].shape[1])
+        for slot, h in zip(self._layers, captured):
+            if int(h.shape[1]) != width:
+                raise ValueError("pipeline capture layers disagree on length")
+            slot.append(h)
+        self._widths.append(width)
+        self.total_rows += width
+        resident = self.total_rows - self.dropped_rows
+        while len(self._widths) > 1 and (
+            self.keep is not None and resident - self._widths[0] >= self.keep
+        ):
+            head = self._widths.pop(0)
+            for slot in self._layers:
+                slot.pop(0)
+            self.dropped_rows += head
+            resident -= head
+
+    def pending(self) -> list:
+        """The most recent chunk's pieces, for ``mx.eval``."""
+        if self._layers is None:
+            return []
+        return [slot[-1] for slot in self._layers if slot]
+
+    def window(self) -> list:
+        """Per-layer copies of the trailing ``min(keep, total_rows)`` rows.
+
+        Copied (``mx.contiguous``) and evaluated for the reason the accumulator
+        gives: an mx slice is a view that pins its parent buffer, and an
+        unevaluated one pins every intermediate behind it -- either would keep
+        the whole prefill alive behind a 16.8 MB window.
+        """
+        if self._layers is None:
+            return []
+        out = []
+        for slot in self._layers:
+            h = slot[0] if len(slot) == 1 else mx.concatenate(slot, axis=1)
+            if self.keep is not None and self.keep < int(h.shape[1]):
+                h = h[:, -self.keep :]
+            out.append(mx.contiguous(h))
+        mx.eval(out)
+        return out
+
+
+def capture_meta(spec: CaptureSpec, ids: list, window: list, rows: int) -> dict:
+    """Describe a window so the receiver can size the payload before reading it."""
+    if not window:
+        return {"schema": 1, "kind": spec.kind, "layers": [], "rows": int(rows),
+                "width": 0, "dim": 0, "dtype": "bfloat16"}
+    dtype = str(window[0].dtype).rsplit(".", 1)[-1]
+    if dtype not in _ITEMSIZES:
+        raise ValueError("unsupported capture dtype")
+    if any(h.ndim != 3 or h.shape[0] != 1 for h in window):
+        raise ValueError("a capture window is [1, rows, dim]")
+    if any(str(h.dtype).rsplit(".", 1)[-1] != dtype for h in window):
+        raise ValueError("capture window layers disagree on dtype")
+    if any(int(h.shape[1]) != int(window[0].shape[1]) for h in window) or any(
+        int(h.shape[2]) != int(window[0].shape[2]) for h in window
+    ):
+        raise ValueError("capture window layers disagree on shape")
+    return {
+        "schema": 1,
+        "kind": spec.kind,
+        "layers": [int(i) for i in ids],
+        "rows": int(rows),
+        "width": int(window[0].shape[1]),
+        "dim": int(window[0].shape[2]),
+        "dtype": dtype,
+    }
+
+
+def capture_send(sock, window: list) -> int:
+    """Raw payloads, in the order ``meta["layers"]`` names them."""
+    total = 0
+    for h in window:
+        nb = np.array(h.view(mx.uint8), copy=False)
+        sock.sendall(memoryview(nb).cast("B"))
+        total += int(h.nbytes)
+    return total
+
+
+def capture_recv(sock, meta, *, spec: CaptureSpec, expect_ids, expect_rows, expect_dim):
+    """Read the peer's window, or refuse it.  Never trusts the peer's arithmetic.
+
+    Every number the sender supplies is compared against one the receiver
+    derived independently (which layers it asked the peer for, how many rows the
+    schedule it dictated covers, how wide its own capture is).  A window that
+    does not match is not a slower prefill, it is a drafter primed on the wrong
+    rows -- so it fails the request into the single-box fallback instead.
+    """
+    if not isinstance(meta, dict) or set(meta) != {
+        "schema", "kind", "layers", "rows", "width", "dim", "dtype",
+    }:
+        raise ValueError("invalid pipeline capture descriptor")
+    if meta["schema"] != 1 or meta["kind"] != spec.kind:
+        raise ValueError("pipeline capture schema/kind mismatch")
+    ids, rows, width, dim = meta["layers"], meta["rows"], meta["width"], meta["dim"]
+    if not isinstance(ids, list) or [int(i) for i in ids] != list(expect_ids):
+        raise ValueError("pipeline capture layer ids mismatch")
+    if type(rows) is not int or rows != int(expect_rows):
+        raise ValueError("pipeline capture depth mismatch")
+    # How many tensors the peer owes: one per layer it was asked for, or exactly
+    # one for the whole-hidden (MTP) capture, which lives after the last layer
+    # and therefore always on the tail.
+    n = 1 if spec.kind == "hidden" else len(expect_ids)
+    if type(width) is not int or type(dim) is not int:
+        raise ValueError("invalid pipeline capture shape")
+    if n == 0:
+        # The split left this peer none of the captured layers.  It still has to
+        # say so, and say it in the empty form, so a peer that simply forgot the
+        # window cannot pass for one that had nothing to send.
+        if (width, dim, meta["dtype"]) != (0, 0, "bfloat16"):
+            raise ValueError("pipeline capture claims rows for no layers")
+        return [], {"capture_bytes": 0, "capture_recv_s": 0.0,
+                    "capture_rows": 0, "capture_tensors": 0}
+    if width != min(spec.keep, int(expect_rows)):
+        raise ValueError("pipeline capture window width mismatch")
+    if expect_dim is not None and dim != int(expect_dim):
+        raise ValueError("pipeline capture feature width mismatch")
+    if not 0 < dim <= 2 ** 20 or meta["dtype"] not in _ITEMSIZES:
+        raise ValueError("invalid pipeline capture shape/dtype")
+    dt = _DTYPES[meta["dtype"]]
+    nbytes = width * dim * _ITEMSIZES[meta["dtype"]]
+    if nbytes * n > 8 * 2 ** 30:
+        raise ValueError("pipeline capture exceeds byte limit")
+    out = []
+    t0 = time.perf_counter()
+    for _ in range(n):
+        buf = bytearray(nbytes)
+        _recv_exact(sock, memoryview(buf), nbytes)
+        flat = mx.array(np.frombuffer(buf, dtype=np.uint8))
+        out.append(flat.view(dt).reshape((1, width, dim)))
+    return out, {
+        "capture_bytes": nbytes * n,
+        "capture_recv_s": time.perf_counter() - t0,
+        "capture_rows": width,
+        "capture_tensors": n,
+    }
 
 
 # ------------------------------------------------------------- wire helpers
@@ -1316,13 +1590,38 @@ def tail_session_factory(args, stage, n_layers, load_s, stop_file, sampler=None)
                     args.split,
                     n_layers,
                 )
+                # A6.  The capture is negotiated BEFORE the ack, where a refusal
+                # is free: the head has not sent a chunk yet, so it can prefill
+                # the whole prompt on one box for the price of this round trip.
+                # A refusal that arrived at ``done`` instead would have cost the
+                # request its entire pipelined prefill.  Named, and not a raised
+                # connection error, so the head can put the reason in its
+                # bypass histogram and this connection survives to serve the
+                # next request.
+                capture = None
+                if req.get("capture") is not None:
+                    try:
+                        capture = CaptureSpec.parse(
+                            req["capture"], n_layers=n_layers
+                        )
+                    except CaptureUnsupported as exc:
+                        _send_json(
+                            sock,
+                            {
+                                "ok": False,
+                                "error": "capture_unsupported",
+                                "detail": str(exc),
+                                "request_id": envelope.request_id,
+                            },
+                        )
+                        continue
                 _check_stop(stop_file)
                 # Reset BEFORE acknowledging ownership of every request,
                 # including the first/no-prune request. No stale head layers
                 # enter handoff.
                 _reset_caches(stage, args.model)
                 _send_json(sock, {"ok": True, "request_id": envelope.request_id})
-                rep = _tail_one(args, stage, sock, req)
+                rep = _tail_one(args, stage, sock, req, capture)
                 served += 1
                 if sampler is not None:
                     # Sample AFTER the work and BEFORE the reply, so the next
@@ -1432,8 +1731,21 @@ def _run_tail_admitted(args, stop_file, report, on_ready):
     return daemon.serve_forever()
 
 
-def _tail_one(args, stage: Stage, sock, req):
+def _tail_one(args, stage: Stage, sock, req, capture: Optional[CaptureSpec] = None):
     envelope = PrefillEnvelope.from_dict(req.get("envelope"))
+    # A6.  This half's share of a hidden-reading drafter's capture: the layers
+    # of ``capture.layers`` that live on THIS side of the split, or -- for MTP's
+    # whole-hidden capture -- the pre-final-norm hidden after the last layer,
+    # which is always here.  ``capture_ids`` is ascending, because the merge on
+    # the head is a concatenation of the two halves' ordered lists and that is
+    # only layer-id order if each half is ordered.
+    capture_ids = []
+    capture_window = None
+    if capture is not None:
+        local = set(stage.local)
+        capture_ids = [i for i in capture.layers if i in local]
+        if capture.kind == "hidden" or capture_ids:
+            capture_window = TrailingHiddenWindow(capture.keep)
     recvq: "queue.Queue" = queue.Queue(maxsize=args.depth)
     recv_times = []
     err = []
@@ -1510,8 +1822,15 @@ def _tail_one(args, stage: Stage, sock, req):
             mx.eval(h)
             t_deser = time.perf_counter() - t1
             t2 = time.perf_counter()
-            out = stage(h)
-            mx.eval(out)
+            sink = [] if capture_window is not None else None
+            out = stage(h, hidden_sink=sink, capture_layer_ids=capture_ids)
+            # The capture is evaluated WITH the chunk, never later: an
+            # unevaluated capture is a graph node that pins every intermediate
+            # behind it, so a window of lazy pieces would hold the whole
+            # prefill's activations instead of ``keep`` rows per layer.
+            mx.eval(out if sink is None else [out, *sink])
+            if capture_window is not None:
+                capture_window.append(sink)
             stage.eval_state()
             t_gpu = time.perf_counter() - t2
             last_logits = out
@@ -1543,7 +1862,22 @@ def _tail_one(args, stage: Stage, sock, req):
         lg = stage.finish(last_logits)
         mx.eval(lg)
         tok = int(mx.argmax(lg[0, -1]).item())
-    _send_json(sock, {"cmd": "done", "envelope": envelope.to_dict()})
+    done = {"cmd": "done", "envelope": envelope.to_dict()}
+    window = capture_window.window() if capture_window is not None else []
+    cap = None
+    if capture is not None:
+        # ONE end-of-request frame, and it rides on ``done`` because there is
+        # nothing else going back before it: between the run ack and here the
+        # tail sends nothing at all, and the head does not read until finalize.
+        # A per-chunk reply would be 3.22 GB on a 131k prompt for rows the very
+        # next chunk makes unreachable.
+        rows = sum(envelope.chunks)
+        done["capture"] = capture_meta(capture, capture_ids, window, rows)
+    _send_json(sock, done)
+    cap_bytes = capture_send(sock, window) if window else 0
+    window = None
+    if capture is not None:
+        cap = {"capture_bytes": cap_bytes, "capture_tensors": len(capture_ids)}
     ho = (
         handoff_send(sock, stage.caches, envelope=envelope)
         if req.get("handoff")
@@ -1552,6 +1886,7 @@ def _tail_one(args, stage: Stage, sock, req):
     return {
         "envelope": envelope.to_dict(),
         "handoff": ho,
+        "capture": cap,
         "tail_gpu_s": sum(c["gpu_s"] for c in per_chunk),
         "tail_wait_s": sum(c["wait_s"] for c in per_chunk),
         "tail_deser_s": sum(c["deser_s"] for c in per_chunk),

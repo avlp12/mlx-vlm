@@ -454,7 +454,11 @@ def test_a_slow_request_flips_the_flag_a_later_ping_reports(monkeypatch):
     monkeypatch.setattr(pp, "StopAwareSocket", lambda raw, stop, to: raw)
     monkeypatch.setattr(
         pp, "_tail_one",
-        lambda a, stage, sock, req: {"wire_recv_s": 40.0, "tail_total_s": 90.0},
+        # ``capture`` is A6's speculative hidden window, negotiated before the
+        # ack and handed to the request; this sampler test cares about neither.
+        lambda a, stage, sock, req, capture=None: {
+            "wire_recv_s": 40.0, "tail_total_s": 90.0
+        },
     )
     session = pp.tail_session_factory(args, object(), 3, 0.0, None, sampler)
     assert session(_FakeSock([]), ("127.0.0.1", 1)) == 1

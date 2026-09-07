@@ -74,7 +74,10 @@ from .pipeline_prefill import (
     EOF_IDX,
     HDR,
     MAGIC,
+    CaptureSpec,
     PrefillEnvelope,
+    TrailingHiddenWindow,
+    capture_recv,
     _abort_socket,
     _check_peer_identity,
     _hex,
@@ -342,6 +345,11 @@ class PipelineHead:
         # degradation, and the request goes ahead.
         self.peer_degraded = False
         self.peer_rail = None
+        # A6 speculative hidden capture, per request; see ``begin``.
+        self._capture = None
+        self._capture_ids = []
+        self._capture_window = None
+        self._captured_hidden = None
 
     # -- connection ---------------------------------------------------------
     def connect(self, timeout=60.0):
@@ -450,13 +458,44 @@ class PipelineHead:
             self.sock = None
         self._active = False
         self._q = None
+        # A window is ``keep`` rows per captured layer (16.8 MB at 2047x4096
+        # bf16).  A pooled connection outlives its request, so an aborted one
+        # that kept it would keep it until the next request overwrote it.
+        self._capture_window = None
+        self._captured_hidden = None
 
     # -- one prefill --------------------------------------------------------
-    def begin(self, tokens: int, chunk: int, *, input_ids):
+    def begin(self, tokens: int, chunk: int, *, input_ids, capture=None):
+        """Open one request.  ``capture`` is A6's speculative hidden capture.
+
+        A hidden-reading drafter (the DEFAULT served config's DFlash2, and MTP)
+        is primed on the target's activations over the prompt, and a pipelined
+        prefill runs half the stack on the peer -- so unless both halves capture
+        and the halves are merged, such a request cannot use the pipeline at
+        all.  The spec is agreed HERE, before a single chunk is sent, so a peer
+        that cannot serve it costs a round trip and not a prefill.
+        """
         if self._active or self.sock is None:
             raise RuntimeError("pipeline begin requires an idle connected peer")
         if input_ids.shape != (1, tokens):
             raise ValueError("pipeline prompt/token count mismatch")
+        # Validated on the way OUT as well as the way in: the spec is built from
+        # a drafter's config, and an unserveable one must fail here (a free
+        # fallback) rather than on the peer (a discarded connection).
+        self._capture = (
+            CaptureSpec.parse(capture, n_layers=self.n_layers)
+            if capture is not None
+            else None
+        )
+        self._capture_ids = (
+            self._capture.head_layers(self.split) if self._capture else []
+        )
+        self._capture_window = (
+            TrailingHiddenWindow(self._capture.keep)
+            if self._capture is not None and self._capture_ids
+            else None
+        )
+        self._captured_hidden = None
         self.envelope = PrefillEnvelope.create(
             model_sha256=self.settings.model_sha256,
             source_revision=self.settings.source_revision,
@@ -477,22 +516,28 @@ class PipelineHead:
         self._stop.clear()
         self._active = True
         self._started = time.perf_counter()
-        _send_json(
-            self.sock,
-            {
-                "cmd": "run",
-                "tokens": tokens,
-                "chunk": chunk,
-                "split": self.split,
-                "envelope": self.envelope.to_dict(),
-                "handoff": True,
-                "transport": self.transport,
-            },
-        )
+        run = {
+            "cmd": "run",
+            "tokens": tokens,
+            "chunk": chunk,
+            "split": self.split,
+            "envelope": self.envelope.to_dict(),
+            "handoff": True,
+            "transport": self.transport,
+        }
+        if self._capture is not None:
+            # Added only when asked for, so a request with no drafter sends the
+            # message it has always sent, to a tail of any vintage.
+            run["capture"] = self._capture.to_dict()
+        _send_json(self.sock, run)
         ack = _recv_json(self.sock)
         if not ack.get("ok") or ack.get("request_id") != self.envelope.request_id:
+            error = ack.get("error") if isinstance(ack, dict) else None
             self.abort()
-            raise ValueError("pipeline run not acknowledged")
+            raise ValueError(
+                "pipeline run not acknowledged"
+                + (f": {error} ({ack.get('detail')})" if error else "")
+            )
         self._q = queue.Queue(maxsize=2)
         self._err = []
         self._th = threading.Thread(target=self._sender, daemon=True)
@@ -544,13 +589,27 @@ class PipelineHead:
         self._model = model
         self._token_hash.update(token_bytes(input_ids))
         t0 = time.perf_counter()
+        # This half's share of the drafter capture (A6).  ``None`` on every
+        # request without one, and then this is the call it has always been.
+        sink = [] if self._capture_window is not None else None
+        kwargs = {} if sink is None else dict(
+            hidden_sink=sink, capture_layer_ids=self._capture_ids
+        )
         h = pipeline_language_model(model).pipeline_prefill_head(
             inputs=input_ids,
             inputs_embeds=inputs_embeds,
             cache=cache,
             split=self.split,
+            **kwargs,
         )
-        mx.eval(h)
+        # Evaluated together with the boundary tensor: an unevaluated capture
+        # pins every intermediate behind it, which on a 131k prefill is the
+        # whole prompt's activations rather than a bounded window.
+        mx.eval(h if sink is None else [h, *sink])
+        if self._capture_window is not None:
+            if len(sink) != len(self._capture_ids):
+                raise ValueError("pipeline head capture width mismatch")
+            self._capture_window.append(sink)
         self.stats["head_gpu_s"] += time.perf_counter() - t0
         if self._err:
             raise RuntimeError(f"pipeline peer failed: {self._err[0]}")
@@ -585,6 +644,14 @@ class PipelineHead:
         if done.get("cmd") != "done":
             raise ValueError("pipeline did not complete")
         PrefillEnvelope.from_dict(done.get("envelope")).require_match(self.envelope)
+        # A6, and it is read HERE -- before the cache handoff -- because that is
+        # where the tail sends it and because a capture that did not arrive must
+        # fail the request BEFORE ``install_state`` puts a cache on this box
+        # that the fallback would then have to throw away.
+        if self._capture is not None:
+            self.stats["capture"] = self._merge_capture(done)
+        elif done.get("capture") is not None:
+            raise ValueError("pipeline peer returned an unrequested capture")
         t0 = time.perf_counter()
         schema = expected_state_meta(self._model, self.envelope)
         ho = handoff_recv(
@@ -611,6 +678,67 @@ class PipelineHead:
         self.stats["prefill_wall_s"] = time.perf_counter() - self._started
         self._active = False
         return self.stats
+
+    def _merge_capture(self, done) -> dict:
+        """Both halves' windows, in layer-id order, or a raised fallback.
+
+        THE MERGE IS A CONCATENATION, and that is not a shortcut: every head
+        layer id is ``< split`` and every tail id is ``>= split``, and each half
+        emits its own in ascending order (the stage loops ascend), so head list
+        followed by tail list IS ascending layer-id order -- which is the order
+        ``Glm5NextModel.__call__`` fills ``hidden_sink`` in on one box, and
+        therefore the order the drafter's ``mx.concatenate(hidden_states, -1)``
+        expects.  For MTP's whole-hidden capture the head list is empty and the
+        tail's single tensor is the whole answer.
+
+        Everything is checked against a number derived on THIS side: how many
+        rows the schedule this head dictated covers, how wide the window has to
+        be (``min(keep, rows)`` -- the same trim ``PrefillHiddenAccumulator``
+        would have applied), how many tensors each half owes.  A peer that
+        cannot satisfy it fails the request into the single-box fallback, where
+        the answer is merely slower.
+        """
+        spec = self._capture
+        rows = sum(self.envelope.chunks)
+        want = min(spec.keep, rows)
+        head_window = []
+        if self._capture_window is not None:
+            head_window = self._capture_window.window()
+            if (
+                len(head_window) != len(self._capture_ids)
+                or self._capture_window.total_rows != rows
+                or any(int(h.shape[1]) != want for h in head_window)
+            ):
+                raise ValueError("pipeline head capture window mismatch")
+        self._capture_window = None
+        tail_window, stats = capture_recv(
+            self.sock,
+            done.get("capture"),
+            spec=spec,
+            expect_ids=spec.tail_layers(self.split),
+            expect_rows=rows,
+            expect_dim=int(head_window[0].shape[2]) if head_window else None,
+        )
+        merged = head_window + tail_window
+        expected = 1 if spec.kind == "hidden" else len(spec.layers)
+        if len(merged) != expected or any(int(h.shape[1]) != want for h in merged):
+            raise ValueError("pipeline merged capture is not the whole capture")
+        mx.eval(merged)
+        self._captured_hidden = merged
+        stats["capture_layers"] = expected
+        stats["capture_head_layers"] = len(head_window)
+        stats["capture_rows_covered"] = rows
+        return stats
+
+    def take_hidden(self):
+        """The merged capture, once.  ``None`` if this request asked for none.
+
+        Handing it over rather than leaving it on ``stats`` is deliberate: the
+        connection is POOLED, so a reference left here would keep the window
+        (50.3 MB for DFlash2) alive between requests.
+        """
+        hidden, self._captured_hidden = self._captured_hidden, None
+        return hidden
 
 
 # ------------------------------------------------------------------ receipts
@@ -669,6 +797,15 @@ class PipelineMetrics:
             handoff = stats.get("handoff") or {}
             self.handoff_bytes += int(handoff.get("handoff_bytes") or 0)
             self.wire_s += float(handoff.get("handoff_wire_recv_s") or 0.0)
+            # A6's hidden window crosses the same wire in the same direction at
+            # the same moment as the KV handoff, so it is counted in the same
+            # place: 50.3 MB per DFlash2 request, 16.8 MB per MTP one, against
+            # the ~2 GB the KV handoff costs at 131k.  Counting it separately
+            # would mean an operator reading ``pp_handoff_bytes`` was reading
+            # less than what the link carried.
+            capture = stats.get("capture") or {}
+            self.handoff_bytes += int(capture.get("capture_bytes") or 0)
+            self.wire_s += float(capture.get("capture_recv_s") or 0.0)
 
     def note_ladder_collapsed(self, skipped: int = 0):
         """One request's vault ladder replaced by a single full-depth rung.
@@ -962,9 +1099,14 @@ class PooledPipelineHead:
     def split(self):
         return self._head.split
 
-    def begin(self, tokens, chunk, *, input_ids):
+    def begin(self, tokens, chunk, *, input_ids, capture=None):
         self._ok = False
-        return self._head.begin(tokens, chunk, input_ids=input_ids)
+        return self._head.begin(
+            tokens, chunk, input_ids=input_ids, capture=capture
+        )
+
+    def take_hidden(self):
+        return self._head.take_hidden()
 
     def local_caches(self, cache):
         return self._head.local_caches(cache)
@@ -1049,7 +1191,16 @@ def _pipeline_bypass_reason(
     if ladder:
         return "apc_checkpoint_ladder"
     if capture:
-        return "speculative_hidden_capture"
+        # A6.  ``capture`` used to be a bare "a hidden-reading drafter is
+        # attached", which refused the DEFAULT served config outright.  Both
+        # halves can capture now, so what reaches here is the residue: the
+        # caller passes a REASON string when it has looked at the capture and
+        # found one it cannot serve (``speculative_hidden_capture`` when the
+        # drafter names no finite window, ``capture_unsupported`` when the kind
+        # is one this rail has no merge for).  ``generate_step``'s call site
+        # still passes a bool -- it has no merge at all -- and that keeps its
+        # historical name.
+        return capture if isinstance(capture, str) else "speculative_hidden_capture"
     if warm:
         return "warm_prefix"
     # New in the batch call site (A4) and additive: ``generate_step`` never sees
