@@ -279,6 +279,30 @@ def _speculative_stats_snapshot() -> dict:
     return snapshot
 
 
+def _shutdown_pipeline_pool():
+    """Say ``bye`` to every pooled tail.  Never raises: unload must finish."""
+    try:
+        from ..pipeline_runtime import shutdown_pipeline_pool
+
+        shutdown_pipeline_pool()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pipeline_prefill_snapshot() -> dict:
+    """Two-box prefill counters, or ``{"pp_enabled": False}``.
+
+    Defensive for the same reason the vault block is: a stats read must never
+    fail a health check.
+    """
+    try:
+        from ..pipeline_runtime import pipeline_metrics_snapshot
+
+        return pipeline_metrics_snapshot()
+    except Exception:  # noqa: BLE001
+        return {"pp_enabled": False}
+
+
 def _server_runtime_snapshot() -> dict:
     registry = _model_cache_registry()
     default_cache = registry.for_kind("text_generation")
@@ -353,6 +377,11 @@ def _server_runtime_snapshot() -> dict:
         # (``generate/ar.py::_apply_right_pad_policy``).  A deployment that sees
         # this climb is a deployment whose APC admission is being split.
         "prefill_batch_refusals": _prefill_batch_refusal_counts(),
+        # Two-box prefill receipts.  ``pp_bypass_reason`` is the load
+        # bearing one: a pipeline that quietly refuses every request is
+        # indistinguishable from one that was never configured, unless
+        # the refusal has a name and a count.
+        "pipeline_prefill": _pipeline_prefill_snapshot(),
     }
 
 
@@ -1279,6 +1308,10 @@ def unload_model_sync():
 
     runtime.response_generator = None
     runtime.apc_manager = None
+    # The pooled two-box connections outlive a request by design, so they
+    # also outlive the model unless somebody says bye: an unloaded server
+    # holding an open prefill socket keeps a peer's stage pinned.
+    _shutdown_pipeline_pool()
     gc.collect()
     mx.clear_cache()
     if unloaded_any:

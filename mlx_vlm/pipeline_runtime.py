@@ -9,8 +9,20 @@ everything else has a default::
     MLX_VLM_PIPELINE_HOSTS=10.0.0.2:39210          # required, enables the feature
     MLX_VLM_PIPELINE_RING=10.0.0.1:39400,10.0.0.2:39401   # ring backend (default transport)
     MLX_VLM_PIPELINE_SPLIT=23                      # int, or "auto" for the micro-sweep
-    MLX_VLM_PIPELINE_MIN_TOKENS=4096               # below this, stay single-box
+    MLX_VLM_PIPELINE_MIN_TOKENS=16384              # below this, stay single-box
+    MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS=2        # A5c: floor on a SHORTENED schedule
     MLX_VLM_PIPELINE_CALIB=~/.cache/mlx_vlm/pipeline_splits.json
+    MLX_VLM_PIPELINE_MODEL_SHA256=<verified manifest SHA256>  # required
+    MLX_VLM_PIPELINE_SOURCE_REVISION=<source commit SHA1>     # required
+    MLX_VLM_PIPELINE_IO_TIMEOUT=120               # socket/queue timeout seconds
+    MLX_VLM_PIPELINE_PING_TIMEOUT=2               # A3b: liveness ping deadline
+
+The model/source identities are caller attestations: the launcher must verify
+the actual local files on each host before supplying these pins. Schema 1 only
+supports cold, unpadded B=1 text with bf16 activations and ordinary KDA/DSA caches.
+Socket I/O and queue waits are bounded; an in-flight Metal kernel or ring call
+cannot be preempted by this Python protocol. Use socket transport for supervised
+cooperative runs. A failed request's partially filled head cache is unusable.
 
 Prefill only. When prefill ends, stage B ships its caches back and decode
 continues on this box with all layers resident -- single-stream decode gains
@@ -47,7 +59,9 @@ mx.array instead of a 64 MiB host copy.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import queue
 import socket
@@ -62,31 +76,141 @@ from .pipeline_prefill import (
     EOF_IDX,
     HDR,
     MAGIC,
+    CaptureSpec,
+    PrefillEnvelope,
+    TrailingHiddenWindow,
+    capture_recv,
+    _abort_socket,
+    _check_peer_identity,
+    _hex,
+    _queue_put,
     _recv_json,
     _send_json,
     handoff_recv,
+    expected_state_meta,
     install_state,
     ring_group,
     ring_send,
     setup_ring_env,
     to_wire,
+    token_bytes,
 )
 
 _DISABLED = object()
+# Kept as a module attribute because tests patch it, but it no longer LATCHES a
+# decision: see ``maybe_open_pipeline``.
 _CTX = None
+
+
+def pipeline_language_model(model):
+    """The half of ``model`` that owns the pipeline hooks, or ``None``.
+
+    ``generate_step`` is handed the VLM wrapper, so every hook here used to be
+    spelled ``model.language_model.<hook>``.  The SERVER does not: it builds its
+    ``BatchGenerator`` on ``model.language_model`` directly
+    (``server/generation.py:2454``), so the object that reaches
+    ``PromptProcessingBatch`` -- and therefore the batch-path pipeline call site --
+    IS the language model.  Both spellings have to resolve to the same object or
+    the served path would bypass itself forever with ``no_pipeline_hook``.
+    """
+    lm = getattr(model, "language_model", None)
+    if lm is not None and hasattr(lm, "pipeline_prefill_head"):
+        return lm
+    if hasattr(model, "pipeline_prefill_head"):
+        return model
+    return None
 
 
 # ------------------------------------------------------------------ settings
 
+# ``docs/POLICY_long_prompt_pp_routing_2026-09-05.md`` rule 1: a first prefill
+# of >= 16k tokens routes to the two-box path.  The pairs behind that rule are
+# 32,779 tok (339.1 -> 743.1 input tok/s, 2.19x) and 131,072 tok (~295 -> 756.9,
+# 2.57x); 16k-32k has no PP measurement yet (the doc queues it as L5-a), so 16k
+# is the policy FLOOR and not a measured crossover.  The old 4096 default sat
+# below every number in that table and would have routed prompts the policy
+# says nothing about.
+DEFAULT_MIN_TOKENS = 16384
+
+# A5c.  The floor on the SHORTENED schedule only (a full-depth schedule is not
+# affected by it, and no request that is admitted today is refused by it).
+#
+# Shortening moves one chunk of C off the peer and onto the head, and the head
+# runs it AFTER finalize -- serially, in the TTFT.  At the served rate that is
+# about ``C / 450`` s, i.e. +18 s at ``C = 8192`` (the module receipts bracket
+# it: the chunk costs ``C / 348`` s on one box and saved ``C / 556`` s
+# pipelined, so +9..+24 s), against a whole-request PP saving of ~35 s at 32k
+# and ~2 min at 131k.  So the trade is worth taking only while the pipelined
+# part still dominates what is left of it: keep at least two chunks on the
+# peer, which is ``T >= ~3C``.  Below that the request stays single-box under
+# its own name (``below_min_pipelined_chunks``) rather than pretending its
+# shape is unserveable.
+DEFAULT_MIN_PIPELINED_CHUNKS = 2
+
+# A3b.  The liveness ping is not an I/O timeout: ``io_timeout`` (120 s) bounds a
+# 64 MiB boundary transfer, and a request that spends it waiting to find out
+# whether it HAS a peer has already lost more than the fallback would have cost.
+# A tail that is up answers this round trip in microseconds on the TB rail, so a
+# ping that is still unanswered after a couple of seconds is a peer to reconnect
+# to, not a peer to wait for.  The field case is the half-open one the B3b
+# drills left open: a peer whose kernel is gone but whose socket sends nothing
+# back (a hung box, a dropped rail) never resets the connection, so only a
+# deadline distinguishes it from a peer that is merely quiet.
+DEFAULT_PING_TIMEOUT_S = 2.0
+
+
+def min_pipelined_chunks() -> int:
+    """``MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS``, read fresh, never below 1.
+
+    Read per call rather than off ``PipelineSettings`` because the schedule is
+    derived on the BATCH, which has no settings object -- and because a policy
+    an operator can move at runtime is one they can move without a restart.
+    """
+    try:
+        value = int(
+            os.environ.get(
+                "MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS",
+                str(DEFAULT_MIN_PIPELINED_CHUNKS),
+            )
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_PIPELINED_CHUNKS
+    return max(1, value)
+
 
 class PipelineSettings:
-    def __init__(self, peer, ring, split, min_tokens, calib_path, transport):
+    def __init__(
+        self,
+        peer,
+        ring,
+        split,
+        min_tokens,
+        calib_path,
+        transport,
+        model_sha256=None,
+        source_revision=None,
+        io_timeout=120.0,
+        ping_timeout=None,
+    ):
         self.peer = peer
         self.ring = ring
         self.split = split
         self.min_tokens = min_tokens
         self.calib_path = calib_path
         self.transport = transport
+        self.model_sha256 = model_sha256
+        self.source_revision = source_revision
+        self.io_timeout = float(io_timeout)
+        if not math.isfinite(self.io_timeout) or self.io_timeout <= 0:
+            raise ValueError("pipeline io_timeout must be positive and finite")
+        # Never longer than the I/O timeout it is a cheaper version of, and
+        # never zero: a non-blocking ping would report every live peer stale.
+        self.ping_timeout = min(
+            self.io_timeout,
+            float(DEFAULT_PING_TIMEOUT_S if ping_timeout is None else ping_timeout),
+        )
+        if not math.isfinite(self.ping_timeout) or self.ping_timeout <= 0:
+            raise ValueError("pipeline ping_timeout must be positive and finite")
 
     @classmethod
     def from_env(cls):
@@ -104,9 +228,19 @@ class PipelineSettings:
             peer=(host, int(port or 39210)),
             ring=ring,
             split=split,
-            min_tokens=int(os.environ.get("MLX_VLM_PIPELINE_MIN_TOKENS", "4096")),
+            min_tokens=int(
+                os.environ.get("MLX_VLM_PIPELINE_MIN_TOKENS", str(DEFAULT_MIN_TOKENS))
+            ),
             calib_path=calib,
             transport="ring" if ring else "socket",
+            model_sha256=os.environ.get("MLX_VLM_PIPELINE_MODEL_SHA256"),
+            source_revision=os.environ.get("MLX_VLM_PIPELINE_SOURCE_REVISION"),
+            io_timeout=float(os.environ.get("MLX_VLM_PIPELINE_IO_TIMEOUT", "120")),
+            ping_timeout=float(
+                os.environ.get(
+                    "MLX_VLM_PIPELINE_PING_TIMEOUT", str(DEFAULT_PING_TIMEOUT_S)
+                )
+            ),
         )
 
 
@@ -133,8 +267,9 @@ def _prime_dsa_caches(model, caches, prefix_tokens: int):
     """
     if prefix_tokens <= 0:
         return
-    cfg = model.language_model.args
-    layers = model.language_model.model.layers
+    lm = pipeline_language_model(model)
+    cfg = lm.args
+    layers = lm.model.layers
     idx_dim = 2 * cfg.index_head_dim + 1
     for i, layer in enumerate(layers):
         if layer is None or layer.is_linear:
@@ -167,7 +302,7 @@ def calibrate_split(
     speed differences from the comparison -- ``peer_speed`` scales the tail if
     the boxes are not twins.
     """
-    lm = model.language_model.model
+    lm = pipeline_language_model(model).model
     n = len(lm.layers)
     if candidates is None:
         mid = n // 2
@@ -191,12 +326,16 @@ def calibrate_split(
         mx.clear_cache()
 
     # median across reps, per boundary
-    merged = [sorted(c[j] for c in per_rep)[len(per_rep) // 2] for j in range(len(bounds) + 1)]
+    merged = [
+        sorted(c[j] for c in per_rep)[len(per_rep) // 2] for j in range(len(bounds) + 1)
+    ]
     total = merged[-1]
     scored = []
     for j, k in enumerate(bounds):
         head, tail = merged[j], (total - merged[j]) * peer_speed
-        scored.append({"split": k, "head_s": head, "tail_s": tail, "max_s": max(head, tail)})
+        scored.append(
+            {"split": k, "head_s": head, "tail_s": tail, "max_s": max(head, tail)}
+        )
     best = min(scored, key=lambda d: d["max_s"])
     out = {
         "split": best["split"],
@@ -214,7 +353,7 @@ def calibrate_split(
 def resolve_split(model, settings: PipelineSettings, tokens: int, verbose=False) -> int:
     if settings.split != "auto":
         return int(settings.split)
-    n = model.language_model.pipeline_num_layers
+    n = pipeline_language_model(model).pipeline_num_layers
     bucket = _ctx_bucket(tokens)
     key = f"{getattr(model, 'model_path', '?')}|{n}|{bucket}"
     path = Path(os.path.expanduser(settings.calib_path))
@@ -239,6 +378,12 @@ def resolve_split(model, settings: PipelineSettings, tokens: int, verbose=False)
 # --------------------------------------------------------------- head client
 
 
+# The keys a ping ack may carry.  The check stays as strict as the equality it
+# replaces -- an unknown key is still a protocol error -- but ``degraded`` and
+# ``rail`` are now part of the contract (pipeline_prefill.tail_session_factory).
+_PING_ACK_KEYS = frozenset({"cmd", "ok", "degraded", "rail"})
+
+
 class PipelineHead:
     def __init__(self, settings: PipelineSettings, split: int, n_layers: int):
         self.settings = settings
@@ -250,55 +395,231 @@ class PipelineHead:
         self._q = None
         self._th = None
         self._err = []
+        self._active = False
+        self._stop = threading.Event()
+        self.envelope = None
+        self._model = None
+        # The tail's own verdict on its rail, as of the last ``ping`` that
+        # asked for it.  ``False``/``None`` on a tail that predates A7 and on a
+        # connection that has not been pinged, which is the same thing an
+        # operator would assume: no evidence of degradation is not evidence of
+        # degradation, and the request goes ahead.
+        self.peer_degraded = False
+        self.peer_rail = None
+        # A6 speculative hidden capture, per request; see ``begin``.
+        self._capture = None
+        self._capture_ids = []
+        self._capture_window = None
+        self._captured_hidden = None
 
     # -- connection ---------------------------------------------------------
     def connect(self, timeout=60.0):
+        identity = dict(
+            schema=1,
+            model_sha256=_hex(self.settings.model_sha256, 64, "model_sha256"),
+            source_revision=_hex(self.settings.source_revision, 40, "source_revision"),
+            split=self.split,
+            n_layers=self.n_layers,
+        )
         if self.transport == "ring":
             setup_ring_env(self.settings.ring, 0)
-        s = socket.socket()
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
             try:
-                s.connect(self.settings.peer)
+                s = socket.create_connection(
+                    self.settings.peer,
+                    timeout=min(
+                        self.settings.io_timeout, max(0.01, deadline - time.monotonic())
+                    ),
+                )
                 break
             except OSError:
-                if time.time() > deadline:
+                if time.monotonic() >= deadline:
                     raise
-                time.sleep(1.0)
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+        s.settimeout(self.settings.io_timeout)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock = s
-        _send_json(s, {"cmd": "hello", "transport": self.transport, "split": self.split})
-        ack = _recv_json(s)
-        assert ack.get("ok"), ack
-        if self.transport == "ring":
-            ring_group()
+        try:
+            _send_json(s, {"cmd": "hello", "transport": self.transport, **identity})
+            ack = _recv_json(s)
+            if not ack.get("ok"):
+                raise ValueError("pipeline hello refused")
+            _check_peer_identity(
+                ack,
+                self.settings.model_sha256,
+                self.settings.source_revision,
+                self.split,
+                self.n_layers,
+            )
+            if self.transport == "ring":
+                ring_group()
+        except BaseException:
+            self.abort()
+            raise
         return self
+
+    def ping(self):
+        """Is this connection still a connection, and is its rail worth using?
+
+        Cheap enough to run before every reuse, which is the only way a pooled
+        socket's death can be discovered while falling back is still free.
+
+        ``rail: true`` asks the A7 tail to ride its own rail verdict on the
+        ack.  It is a REQUEST rather than a standing arrangement because the
+        tail answers a bare ping with exactly ``{"cmd": "ping", "ok": True}``
+        and the head used to compare the reply for equality: an unconditional
+        extra key would have broken every head not updated in the same breath.
+        Asking makes the compatibility run the other way too -- a tail that
+        predates A7 ignores the flag and answers the two-key form, which is
+        read here as "no rail evidence" and NOT as a fault, because a tail that
+        cannot report a degraded rail is not thereby a degraded tail.
+
+        Returns ``True`` for "the connection is alive"; the verdict is left on
+        ``peer_degraded``/``peer_rail`` rather than returned, so a caller that
+        only wanted liveness (and every existing one did) is unchanged.
+        """
+        if self.sock is None:
+            raise OSError("pipeline connection is closed")
+        if self._active:
+            raise RuntimeError("pipeline ping requires an idle peer")
+        # A3b: bounded by ``ping_timeout`` (2 s), not by ``io_timeout`` (120 s).
+        # A peer that has stopped answering must cost this request a couple of
+        # seconds and a reconnect, not two minutes and a stall -- and the
+        # timeout has to be RESTORED, because the same socket is about to carry
+        # a 64 MiB chunk that legitimately takes longer than a ping.
+        previous = self.sock.gettimeout()
+        try:
+            self.sock.settimeout(self.settings.ping_timeout)
+            _send_json(self.sock, {"cmd": "ping", "rail": True})
+            ack = _recv_json(self.sock)
+        finally:
+            try:
+                self.sock.settimeout(previous)
+            except OSError:
+                pass
+        if (
+            not isinstance(ack, dict)
+            or ack.get("cmd") != "ping"
+            or ack.get("ok") is not True
+            or set(ack) - _PING_ACK_KEYS
+        ):
+            raise ValueError("pipeline ping not acknowledged")
+        self.peer_degraded = bool(ack.get("degraded"))
+        self.peer_rail = ack.get("rail")
+        return True
 
     def close(self):
         if self.sock is not None:
             try:
-                _send_json(self.sock, {"cmd": "bye"})
-                self.sock.close()
-            except OSError:
-                pass
+                if not self._active:
+                    _send_json(self.sock, {"cmd": "bye"})
+                    ack = _recv_json(self.sock)
+                    if ack != {"cmd": "bye", "ok": True}:
+                        raise ValueError("pipeline bye not acknowledged")
+            finally:
+                self.abort()
+
+    def abort(self):
+        """Cancel I/O; never retry using this request's partially filled cache."""
+        self._stop.set()
+        if self.sock is not None:
+            _abort_socket(self.sock)
+        if self._th is not None and self._th.is_alive():
+            self._th.join(timeout=self.settings.io_timeout)
+        if self.sock is not None:
+            self.sock.close()
             self.sock = None
+        self._active = False
+        self._q = None
+        # A window is ``keep`` rows per captured layer (16.8 MB at 2047x4096
+        # bf16).  A pooled connection outlives its request, so an aborted one
+        # that kept it would keep it until the next request overwrote it.
+        self._capture_window = None
+        self._captured_hidden = None
 
     # -- one prefill --------------------------------------------------------
-    def begin(self, tokens: int, chunk: int):
-        _send_json(
-            self.sock,
-            {
-                "cmd": "run",
-                "tokens": tokens,
-                "chunk": chunk,
-                "split": self.split,
-                "n_chunks": -1,          # ar.py drives the schedule; EOF ends it
-                "handoff": True,
-                "transport": self.transport,
-            },
+    def begin(self, tokens: int, chunk: int, *, input_ids, capture=None, chunks=None):
+        """Open one request.  ``capture`` is A6's speculative hidden capture.
+
+        ``chunks`` (A11b) is the caller's own chunk plan for the ``tokens - 1``
+        pipelined columns.  ``None`` keeps the uniform ``min(C, depth - p)``
+        derivation, which is what the bench roles and ``generate_step`` send;
+        the served loop passes the plan it will actually run, because its last
+        chunk may be merged or clamped and the peer has to run the SAME
+        decomposition or the two-box cache is not the one-box cache.
+
+        A hidden-reading drafter (the DEFAULT served config's DFlash2, and MTP)
+        is primed on the target's activations over the prompt, and a pipelined
+        prefill runs half the stack on the peer -- so unless both halves capture
+        and the halves are merged, such a request cannot use the pipeline at
+        all.  The spec is agreed HERE, before a single chunk is sent, so a peer
+        that cannot serve it costs a round trip and not a prefill.
+        """
+        if self._active or self.sock is None:
+            raise RuntimeError("pipeline begin requires an idle connected peer")
+        if input_ids.shape != (1, tokens):
+            raise ValueError("pipeline prompt/token count mismatch")
+        # Validated on the way OUT as well as the way in: the spec is built from
+        # a drafter's config, and an unserveable one must fail here (a free
+        # fallback) rather than on the peer (a discarded connection).
+        self._capture = (
+            CaptureSpec.parse(capture, n_layers=self.n_layers)
+            if capture is not None
+            else None
         )
+        self._capture_ids = (
+            self._capture.head_layers(self.split) if self._capture else []
+        )
+        self._capture_window = (
+            TrailingHiddenWindow(self._capture.keep)
+            if self._capture is not None and self._capture_ids
+            else None
+        )
+        self._captured_hidden = None
+        self.envelope = PrefillEnvelope.create(
+            model_sha256=self.settings.model_sha256,
+            source_revision=self.settings.source_revision,
+            split=self.split,
+            n_layers=self.n_layers,
+            input_ids=input_ids[:, :-1],
+            chunk=chunk,
+            chunks=chunks,
+        )
+        self.stats = {
+            "chunks": [],
+            "wire_send_s": 0.0,
+            "head_gpu_s": 0.0,
+            "envelope": self.envelope.to_dict(),
+            "pipeline_used": True,
+        }
+        self._token_hash = hashlib.sha256()
+        self._model = None
+        self._stop.clear()
+        self._active = True
+        self._started = time.perf_counter()
+        run = {
+            "cmd": "run",
+            "tokens": tokens,
+            "chunk": chunk,
+            "split": self.split,
+            "envelope": self.envelope.to_dict(),
+            "handoff": True,
+            "transport": self.transport,
+        }
+        if self._capture is not None:
+            # Added only when asked for, so a request with no drafter sends the
+            # message it has always sent, to a tail of any vintage.
+            run["capture"] = self._capture.to_dict()
+        _send_json(self.sock, run)
         ack = _recv_json(self.sock)
-        assert ack.get("ok"), ack
+        if not ack.get("ok") or ack.get("request_id") != self.envelope.request_id:
+            error = ack.get("error") if isinstance(ack, dict) else None
+            self.abort()
+            raise ValueError(
+                "pipeline run not acknowledged"
+                + (f": {error} ({ack.get('detail')})" if error else "")
+            )
         self._q = queue.Queue(maxsize=2)
         self._err = []
         self._th = threading.Thread(target=self._sender, daemon=True)
@@ -308,7 +629,12 @@ class PipelineHead:
         try:
             stream = mx.new_stream(mx.cpu) if self.transport == "ring" else None
             while True:
-                item = self._q.get()
+                if self._stop.is_set():
+                    return
+                try:
+                    item = self._q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if item is None:
                     self.sock.sendall(HDR.pack(MAGIC, EOF_IDX, 0, 0, 0, 0, 0))
                     return
@@ -325,71 +651,913 @@ class PipelineHead:
                 self.stats["wire_send_s"] += time.perf_counter() - t0
         except Exception as e:  # noqa: BLE001
             self._err.append(repr(e))
+            if self.sock is not None:
+                _abort_socket(self.sock)
 
     def local_caches(self, cache):
         return [c for c in cache[: self.split] if c is not None]
 
     def prefill_chunk(self, model, input_ids, inputs_embeds, cache):
+        if not self._active:
+            raise RuntimeError("pipeline request is not active")
+        idx = len(self.stats["chunks"])
+        if idx >= len(self.envelope.chunks) or input_ids.shape != (
+            1,
+            self.envelope.chunks[idx],
+        ):
+            raise ValueError("pipeline input chunk schedule mismatch")
+        if self._model is not None and self._model is not model:
+            raise ValueError("pipeline model changed during request")
+        self._model = model
+        self._token_hash.update(token_bytes(input_ids))
         t0 = time.perf_counter()
-        h = model.language_model.pipeline_prefill_head(
+        # This half's share of the drafter capture (A6).  ``None`` on every
+        # request without one, and then this is the call it has always been.
+        sink = [] if self._capture_window is not None else None
+        kwargs = {} if sink is None else dict(
+            hidden_sink=sink, capture_layer_ids=self._capture_ids
+        )
+        h = pipeline_language_model(model).pipeline_prefill_head(
             inputs=input_ids,
             inputs_embeds=inputs_embeds,
             cache=cache,
             split=self.split,
+            **kwargs,
         )
-        mx.eval(h)
+        # Evaluated together with the boundary tensor: an unevaluated capture
+        # pins every intermediate behind it, which on a 131k prefill is the
+        # whole prompt's activations rather than a bounded window.
+        mx.eval(h if sink is None else [h, *sink])
+        if self._capture_window is not None:
+            if len(sink) != len(self._capture_ids):
+                raise ValueError("pipeline head capture width mismatch")
+            self._capture_window.append(sink)
         self.stats["head_gpu_s"] += time.perf_counter() - t0
         if self._err:
             raise RuntimeError(f"pipeline peer failed: {self._err[0]}")
-        idx = len(self.stats["chunks"])
+        if h.ndim != 4 or h.shape[:2] != input_ids.shape or h.dtype != mx.bfloat16:
+            raise ValueError(
+                "pipeline boundary must be B=1 bf16 with matching chunk length"
+            )
         self.stats["chunks"].append(h.shape[1])
-        self._q.put((idx, h, None if self.transport == "ring" else to_wire(h)))
+        _queue_put(
+            self._q,
+            (idx, h, None if self.transport == "ring" else to_wire(h)),
+            self._err,
+            self.settings.io_timeout,
+        )
 
     def finalize(self, cache):
         """End the stream, pull stage B's caches back, install them for decode."""
-        self._q.put(None)
-        self._th.join()
+        if (
+            not self._active
+            or tuple(self.stats["chunks"]) != self.envelope.chunks
+            or self._token_hash.hexdigest() != self.envelope.token_sha256
+        ):
+            raise ValueError("pipeline completed token/depth/chunk mismatch")
+        _queue_put(self._q, None, self._err, self.settings.io_timeout)
+        self._th.join(timeout=self.settings.io_timeout)
+        if self._th.is_alive():
+            self.abort()
+            raise TimeoutError("pipeline sender did not retire")
         if self._err:
             raise RuntimeError(f"pipeline peer failed: {self._err[0]}")
         done = _recv_json(self.sock)
-        assert done.get("cmd") == "done", done
+        if done.get("cmd") != "done":
+            raise ValueError("pipeline did not complete")
+        PrefillEnvelope.from_dict(done.get("envelope")).require_match(self.envelope)
+        # A6, and it is read HERE -- before the cache handoff -- because that is
+        # where the tail sends it and because a capture that did not arrive must
+        # fail the request BEFORE ``install_state`` puts a cache on this box
+        # that the fallback would then have to throw away.
+        if self._capture is not None:
+            self.stats["capture"] = self._merge_capture(done)
+        elif done.get("capture") is not None:
+            raise ValueError("pipeline peer returned an unrequested capture")
         t0 = time.perf_counter()
-        ho = handoff_recv(self.sock, rebuild=True)
-        install_state(cache, ho.pop("states"))
-        mx.eval([c.state for c in cache])
-        ho["handoff_install_s"] = time.perf_counter() - t0
+        schema = expected_state_meta(self._model, self.envelope)
+        ho = handoff_recv(
+            self.sock, rebuild=True, expected=self.envelope, expected_meta=schema
+        )
+        states = ho.pop("states")
         report = _recv_json(self.sock)
+        PrefillEnvelope.from_dict(report.get("envelope")).require_match(self.envelope)
+        t_eval = time.perf_counter()
+        mx.eval(list(states.values()))
+        ho["handoff_eval_s"] = time.perf_counter() - t_eval
+        t_install = time.perf_counter()
+        install_state(
+            cache,
+            states,
+            fresh_caches=self._model.make_cache(),
+            expected=self.envelope,
+            expected_meta=schema,
+        )
+        ho["handoff_install_s"] = time.perf_counter() - t_install
+        ho["handoff_total_s"] = time.perf_counter() - t0
         self.stats["handoff"] = ho
         self.stats["tail"] = report
+        self.stats["prefill_wall_s"] = time.perf_counter() - self._started
+        self._active = False
         return self.stats
+
+    def _merge_capture(self, done) -> dict:
+        """Both halves' windows, in layer-id order, or a raised fallback.
+
+        THE MERGE IS A CONCATENATION, and that is not a shortcut: every head
+        layer id is ``< split`` and every tail id is ``>= split``, and each half
+        emits its own in ascending order (the stage loops ascend), so head list
+        followed by tail list IS ascending layer-id order -- which is the order
+        ``Glm5NextModel.__call__`` fills ``hidden_sink`` in on one box, and
+        therefore the order the drafter's ``mx.concatenate(hidden_states, -1)``
+        expects.  For MTP's whole-hidden capture the head list is empty and the
+        tail's single tensor is the whole answer.
+
+        Everything is checked against a number derived on THIS side: how many
+        rows the schedule this head dictated covers, how wide the window has to
+        be (``min(keep, rows)`` -- the same trim ``PrefillHiddenAccumulator``
+        would have applied), how many tensors each half owes.  A peer that
+        cannot satisfy it fails the request into the single-box fallback, where
+        the answer is merely slower.
+        """
+        spec = self._capture
+        rows = sum(self.envelope.chunks)
+        want = min(spec.keep, rows)
+        head_window = []
+        if self._capture_window is not None:
+            head_window = self._capture_window.window()
+            if (
+                len(head_window) != len(self._capture_ids)
+                or self._capture_window.total_rows != rows
+                or any(int(h.shape[1]) != want for h in head_window)
+            ):
+                raise ValueError("pipeline head capture window mismatch")
+        self._capture_window = None
+        tail_window, stats = capture_recv(
+            self.sock,
+            done.get("capture"),
+            spec=spec,
+            expect_ids=spec.tail_layers(self.split),
+            expect_rows=rows,
+            expect_dim=int(head_window[0].shape[2]) if head_window else None,
+        )
+        merged = head_window + tail_window
+        expected = 1 if spec.kind == "hidden" else len(spec.layers)
+        if len(merged) != expected or any(int(h.shape[1]) != want for h in merged):
+            raise ValueError("pipeline merged capture is not the whole capture")
+        mx.eval(merged)
+        self._captured_hidden = merged
+        stats["capture_layers"] = expected
+        stats["capture_head_layers"] = len(head_window)
+        stats["capture_rows_covered"] = rows
+        return stats
+
+    def take_hidden(self):
+        """The merged capture, once.  ``None`` if this request asked for none.
+
+        Handing it over rather than leaving it on ``stats`` is deliberate: the
+        connection is POOLED, so a reference left here would keep the window
+        (50.3 MB for DFlash2) alive between requests.
+        """
+        hidden, self._captured_hidden = self._captured_hidden, None
+        return hidden
+
+
+# ------------------------------------------------------------------ receipts
+
+
+# A10-0.  Bucket EDGES for the warm-suffix histogram, in the order they are
+# tested; the first one a suffix fits is the bucket it lands in.  Two of them
+# are absolute (512, 2048) because they are the band the A10 analysis says
+# cannot be pipelined at any sane chunk size, and four are relative to the
+# chunk size C because C is what actually decides it (``ceil(S/C) - 1`` chunks)
+# and C is configurable (``PREFILL_STEP_SIZE``; 8192 served, 2048 on the PP05
+# driver).  When C <= 2048 the ``le_c`` bucket is unreachable -- an absolute
+# edge catches those suffixes first -- and that is a property of the ordering,
+# not a lost count: every request lands in exactly one bucket and the buckets
+# sum to ``pp_warm_requests``.
+WARM_SUFFIX_BUCKETS = ("le_512", "le_2048", "le_c", "le_2c", "le_4c", "gt_4c")
+
+
+def warm_suffix_bucket(suffix_len, chunk_size) -> str:
+    """Which :data:`WARM_SUFFIX_BUCKETS` name this suffix belongs to.
+
+    ``chunk_size <= 0`` (no chunked prefill configured) leaves the C-relative
+    edges undefined, so only the absolute ones are tested and everything above
+    them reads ``gt_4c``.  Named rather than raising: this is instrumentation
+    on a refusal path and it must never be the thing that fails a request.
+    """
+    s = int(suffix_len or 0)
+    c = int(chunk_size or 0)
+    if s <= 512:
+        return "le_512"
+    if s <= 2048:
+        return "le_2048"
+    if c > 0:
+        for mult, name in ((1, "le_c"), (2, "le_2c"), (4, "le_4c")):
+            if s <= mult * c:
+                return name
+    return "gt_4c"
+
+
+class PipelineMetrics:
+    """Counters a running server can be asked for.
+
+    A pipeline that silently bypassed itself for a month looks exactly like a
+    pipeline that was never enabled, so the bypass reasons are counted by name
+    rather than logged: ``pp_bypass_reason`` is the histogram that tells an
+    operator WHICH gate refused, not merely that something did.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.used = 0
+            self.failed = 0
+            self.reconnects = 0
+            self.breaker_trips = 0
+            self.handoff_bytes = 0
+            self.wire_s = 0.0
+            self.bypass = {}
+            self.breaker_state = "closed"
+            self.ladder_collapsed = 0
+            self.ladder_rungs_skipped = 0
+            self.schedule_shortened = 0
+            self.schedule_shortened_reasons = {}
+            self.warm_requests = 0
+            self.warm_suffix_hist = {}
+
+    def note_bypass(self, reason: Optional[str]):
+        if not reason:
+            return
+        with self._lock:
+            self.bypass[reason] = self.bypass.get(reason, 0) + 1
+
+    def note_reconnect(self):
+        with self._lock:
+            self.reconnects += 1
+
+    def note_trip(self):
+        with self._lock:
+            self.breaker_trips += 1
+
+    def note_failure(self):
+        with self._lock:
+            self.failed += 1
+
+    def note_success(self, stats: Optional[dict] = None):
+        with self._lock:
+            self.used += 1
+            if not stats:
+                return
+            self.wire_s += float(stats.get("wire_send_s") or 0.0)
+            handoff = stats.get("handoff") or {}
+            self.handoff_bytes += int(handoff.get("handoff_bytes") or 0)
+            self.wire_s += float(handoff.get("handoff_wire_recv_s") or 0.0)
+            # A6's hidden window crosses the same wire in the same direction at
+            # the same moment as the KV handoff, so it is counted in the same
+            # place: 50.3 MB per DFlash2 request, 16.8 MB per MTP one, against
+            # the ~2 GB the KV handoff costs at 131k.  Counting it separately
+            # would mean an operator reading ``pp_handoff_bytes`` was reading
+            # less than what the link carried.
+            capture = stats.get("capture") or {}
+            self.handoff_bytes += int(capture.get("capture_bytes") or 0)
+            self.wire_s += float(capture.get("capture_recv_s") or 0.0)
+
+    def note_ladder_collapsed(self, skipped: int = 0):
+        """One request's vault ladder replaced by a single full-depth rung.
+
+        Two numbers because they answer different questions: how many requests
+        traded their ladder for the peer, and how many rungs the vault does not
+        have as a result.  Without the second, a collapse that quietly dropped a
+        five-rung ladder reads the same as one that dropped nothing.
+        """
+        with self._lock:
+            self.ladder_collapsed += 1
+            self.ladder_rungs_skipped += max(0, int(skipped))
+
+    def note_schedule_shortened(self, reason: str):
+        """One request whose pipelined schedule gave a chunk back to the head.
+
+        A5c.  Counted by REASON as well as in total because the two reasons are
+        different fleet facts: ``exact_column`` is the APC guard remainder
+        (``T mod C < 16``, ~0.73 % of lengths at C=2048 and 100 % of the
+        exact-multiple harness targets), ``vault_rung`` is a ladder rung inside
+        the last pipelined chunk.  A shortening that suddenly fires on every
+        request is a chunk-size or ladder-policy change, and without the reason
+        an operator cannot tell which.
+        """
+        with self._lock:
+            self.schedule_shortened += 1
+            key = str(reason or "unknown")
+            self.schedule_shortened_reasons[key] = (
+                self.schedule_shortened_reasons.get(key, 0) + 1
+            )
+
+    def note_warm(self, suffix_len: int, chunk_size: int):
+        """One warm-prefix refusal, bucketed by the suffix it did not pipeline.
+
+        A10-0's gate is a FREQUENCY question -- "does this fleet ever send a
+        warm request with a suffix big enough to pipeline?" -- and the bypass
+        histogram can only answer it two ways round (below C / above C).  The
+        buckets carry the distribution, so a decision to build A10-1..7 can be
+        read off one ``/metrics`` diff instead of a log scrape.
+        """
+        bucket = warm_suffix_bucket(suffix_len, chunk_size)
+        with self._lock:
+            self.warm_requests += 1
+            self.warm_suffix_hist[bucket] = self.warm_suffix_hist.get(bucket, 0) + 1
+
+    def set_breaker_state(self, state: str):
+        with self._lock:
+            self.breaker_state = state
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "pp_used": self.used,
+                "pp_failed": self.failed,
+                "pp_reconnects": self.reconnects,
+                "pp_bypass_reason": dict(self.bypass),
+                "pp_handoff_bytes": self.handoff_bytes,
+                "pp_wire_s": round(self.wire_s, 6),
+                "pp_breaker_state": self.breaker_state,
+                "pp_breaker_trips": self.breaker_trips,
+                "pp_ladder_collapsed": self.ladder_collapsed,
+                "pp_ladder_rungs_skipped": self.ladder_rungs_skipped,
+                "pp_schedule_shortened": self.schedule_shortened,
+                "pp_schedule_shortened_reason": dict(
+                    self.schedule_shortened_reasons
+                ),
+                "pp_warm_requests": self.warm_requests,
+                "pp_warm_suffix_tokens_hist": dict(self.warm_suffix_hist),
+            }
+
+
+METRICS = PipelineMetrics()
+
+
+def pipeline_metrics_snapshot() -> dict:
+    """Read-only receipts for the server runtime snapshot."""
+    snap = METRICS.snapshot()
+    snap["pp_pool_idle"] = POOL.idle_count()
+    snap["pp_enabled"] = bool(os.environ.get("MLX_VLM_PIPELINE_HOSTS", "").strip())
+    return snap
+
+
+# ------------------------------------------------------------ circuit breaker
+
+
+class CircuitBreaker:
+    """N consecutive failures disable the peer for T seconds.
+
+    Without it, a tail that died at 03:00 is re-dialled once per request until
+    someone notices: every request pays the full connect timeout before falling
+    back to the single box, which is strictly worse than never having had a
+    peer.  Open trips straight to bypass; after the cooldown ONE request is let
+    through (half-open) and its outcome decides.
+    """
+
+    def __init__(self, threshold: int = 3, cooldown: float = 60.0, clock=time.monotonic):
+        self.threshold = max(1, int(threshold))
+        self.cooldown = float(cooldown)
+        self.clock = clock
+        self._lock = threading.Lock()
+        self.failures = 0
+        self.opened_at = None
+        self._trial = False
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state_locked()
+
+    def _state_locked(self) -> str:
+        if self.opened_at is None:
+            return "closed"
+        if self._trial or self.clock() - self.opened_at >= self.cooldown:
+            return "half_open"
+        return "open"
+
+    def allow(self) -> bool:
+        with self._lock:
+            state = self._state_locked()
+            if state == "open":
+                return False
+            if state == "half_open":
+                # exactly one probe in flight
+                if self._trial:
+                    return False
+                self._trial = True
+            return True
+
+    def record_success(self):
+        with self._lock:
+            self.failures = 0
+            self.opened_at = None
+            self._trial = False
+            state = "closed"
+        METRICS.set_breaker_state(state)
+
+    def record_failure(self):
+        tripped = False
+        with self._lock:
+            self._trial = False
+            self.failures += 1
+            if self.failures >= self.threshold:
+                tripped = self.opened_at is None
+                self.opened_at = self.clock()
+            state = self._state_locked()
+        if tripped:
+            METRICS.note_trip()
+        METRICS.set_breaker_state(state)
+
+    def reset(self):
+        with self._lock:
+            self.failures = 0
+            self.opened_at = None
+            self._trial = False
+        METRICS.set_breaker_state("closed")
+
+
+# --------------------------------------------------------------- connection pool
+
+
+def _pool_key(settings: PipelineSettings, split: int, n_layers: int):
+    return (
+        settings.peer,
+        settings.transport,
+        int(split),
+        int(n_layers),
+        settings.model_sha256,
+        settings.source_revision,
+    )
+
+
+class PipelinePool:
+    """One live connection per tail, reused across requests.
+
+    ``maybe_open_pipeline`` used to open a socket per request and ``close()``
+    sent ``bye``, which is why the cooperation driver had to monkey-patch
+    ``close`` to keep the peer alive.  The connection is now a resource with a
+    lifetime longer than the request: ``close()`` on a leased head returns it
+    here, and only ``shutdown()`` says ``bye``.
+    """
+
+    def __init__(self, breaker: Optional[CircuitBreaker] = None):
+        self._lock = threading.Lock()
+        self._idle = {}
+        self.breaker = breaker or CircuitBreaker(
+            threshold=int(os.environ.get("MLX_VLM_PIPELINE_BREAKER_FAILS", "3")),
+            cooldown=float(os.environ.get("MLX_VLM_PIPELINE_BREAKER_COOLDOWN", "60")),
+        )
+
+    def idle_count(self) -> int:
+        with self._lock:
+            return sum(len(v) for v in self._idle.values())
+
+    def acquire(self, settings, split, n_layers, *, verbose=False):
+        """A connected, verified-idle head, or None (caller stays single-box)."""
+        key = _pool_key(settings, split, n_layers)
+        with self._lock:
+            pooled = self._idle.get(key) or []
+            head = pooled.pop() if pooled else None
+            self._idle[key] = pooled
+        if head is not None:
+            # A pooled socket can have died since the last request; find out
+            # here, where falling back is still free, not inside ``begin``.
+            #
+            # A3b: any failure of that check -- a closed peer, a ping that did
+            # not answer inside ``ping_timeout``, a reply this head does not
+            # understand -- is a RECONNECT and not a request failure.  The
+            # request is only counted failed (``release(ok=False)``) when the
+            # peer dies with the prefill already committed to it, because only
+            # then has the request actually lost work.
+            try:
+                head.ping()
+            except Exception as exc:  # noqa: BLE001
+                if verbose:
+                    print(f"[pipeline] pooled peer stale: {exc!r}", flush=True)
+                _discard(head)
+                METRICS.note_reconnect()
+            else:
+                if not getattr(head, "peer_degraded", False):
+                    return head
+                # The tail is ALIVE and answering; what it is telling us is that
+                # its own rail p95 is past the bound.  Committing a >= 16k
+                # prefill to it would buy a slow request in exchange for a fast
+                # fallback, so the connection goes back in the pool (nothing is
+                # wrong with the socket, and discarding it would make the
+                # recovery cost a reconnect) and the request stays single-box.
+                #
+                # It is fed to the breaker rather than merely counted because
+                # the breaker is the thing that already knows how to stop
+                # ASKING: without it, every request pays a ping round trip and a
+                # bypass for a rail whose verdict has hysteresis on it anyway.
+                with self._lock:
+                    self._idle.setdefault(key, []).append(head)
+                self.breaker.record_failure()
+                METRICS.note_bypass("peer_degraded")
+                if verbose:
+                    print(
+                        f"[pipeline] bypass=peer_degraded rail={head.peer_rail!r}",
+                        flush=True,
+                    )
+                return None
+        if not self.breaker.allow():
+            METRICS.note_bypass("breaker_open")
+            if verbose:
+                print("[pipeline] bypass=breaker_open", flush=True)
+            return None
+        try:
+            head = PipelineHead(settings, split, n_layers).connect()
+        except (OSError, ValueError, TimeoutError) as exc:
+            # The request falls back to single-box prefill; a peer that is down
+            # must never be able to fail a request that this box can serve.
+            self.breaker.record_failure()
+            METRICS.note_bypass("peer_unreachable")
+            if verbose:
+                print(f"[pipeline] bypass=peer_unreachable ({exc!r})", flush=True)
+            return None
+        self.breaker.record_success()
+        return head
+
+    def release(self, head, key, ok: bool):
+        """Give a connection back.  A request that did not finish leaves the
+        peer's state undefined, so its connection is discarded, never reused."""
+        if head is None:
+            return
+        if not ok or head.sock is None:
+            _discard(head)
+            self.breaker.record_failure()
+            METRICS.note_failure()
+            return
+        with self._lock:
+            self._idle.setdefault(key, []).append(head)
+
+    def shutdown(self):
+        """Say ``bye`` to every pooled peer.  The only place that does."""
+        with self._lock:
+            heads = [h for hs in self._idle.values() for h in hs]
+            self._idle = {}
+        for head in heads:
+            try:
+                head.close()
+            except Exception:  # noqa: BLE001
+                _discard(head)
+
+
+def _discard(head):
+    try:
+        head.abort()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+POOL = PipelinePool()
+
+# One pipelined prefill at a time.  The tail is ONE stage-B stack: a second
+# concurrent request cannot be served by it, and queueing behind the first would
+# turn a fallback (cheap, single-box, correct) into a wait of up to a whole
+# 131k prefill.  Non-blocking by construction, therefore.
+_PP_INFLIGHT = threading.Lock()
+
+
+def acquire_pipeline_slot() -> bool:
+    """Take the single PP prefill slot, or count ``pp_busy`` and refuse."""
+    if _PP_INFLIGHT.acquire(blocking=False):
+        return True
+    note_pipeline_bypass("pp_busy")
+    return False
+
+
+def release_pipeline_slot() -> None:
+    """Give the slot back.  Idempotent: it runs in a ``finally``."""
+    try:
+        _PP_INFLIGHT.release()
+    except RuntimeError:
+        pass
+
+
+class PooledPipelineHead:
+    """A per-request lease over a pooled connection.
+
+    Presents exactly the surface ``generate_step`` already uses -- ``begin``,
+    ``prefill_chunk``, ``local_caches``, ``finalize``, ``close`` -- so the call
+    site does not learn that the socket outlives it.  ``close`` is the request
+    boundary and NEVER raises: it runs in the caller's ``finally``, where an
+    exception would replace the real failure with a bookkeeping one.
+    """
+
+    def __init__(self, pool: PipelinePool, head: PipelineHead, key):
+        self._pool = pool
+        self._head = head
+        self._key = key
+        self._ok = False
+        self.stats = head.stats
+
+    # -- delegation ---------------------------------------------------------
+    @property
+    def split(self):
+        return self._head.split
+
+    def begin(self, tokens, chunk, *, input_ids, capture=None, chunks=None):
+        self._ok = False
+        return self._head.begin(
+            tokens, chunk, input_ids=input_ids, capture=capture, chunks=chunks
+        )
+
+    def take_hidden(self):
+        return self._head.take_hidden()
+
+    def local_caches(self, cache):
+        return self._head.local_caches(cache)
+
+    def prefill_chunk(self, model, input_ids, inputs_embeds, cache):
+        return self._head.prefill_chunk(model, input_ids, inputs_embeds, cache)
+
+    def finalize(self, cache):
+        stats = self._head.finalize(cache)
+        self.stats = stats
+        self._ok = True
+        METRICS.note_success(stats)
+        return stats
+
+    # -- lifetime -----------------------------------------------------------
+    def close(self):
+        try:
+            self._pool.release(self._head, self._key, self._ok)
+        except Exception as exc:  # noqa: BLE001
+            _discard(self._head)
+            print(f"[pipeline] release failed: {exc!r}", flush=True)
+        finally:
+            self._head = None
+
+    def shutdown(self):
+        """Explicit end of life for the whole pool: sends ``bye``."""
+        if self._head is not None:
+            self._pool.release(self._head, self._key, self._ok)
+            self._head = None
+        self._pool.shutdown()
 
 
 # ------------------------------------------------------------------ factory
 
 
+def pipeline_bypass_reason(*args, **kwargs):
+    """The handoff only represents cold, unpadded, unquantized text B=1 state.
+
+    Counted here rather than at the call site: this function is the single
+    gate, so the histogram cannot drift away from the decision it describes.
+    """
+    reason = _pipeline_bypass_reason(*args, **kwargs)
+    METRICS.note_bypass(reason)
+    return reason
+
+
+def note_pipeline_ladder_collapsed(skipped: int = 0) -> None:
+    """A PP request kept the deepest vault rung and skipped ``skipped`` others.
+
+    Counted rather than logged for the same reason the bypass reasons are: a
+    vault that quietly stopped storing its halving tail on every long prompt
+    looks exactly like a vault whose ladder policy changed.
+    """
+    METRICS.note_ladder_collapsed(skipped)
+
+
+def note_pipeline_schedule_shortened(
+    *, reason: str, full_chunks: int, chunks: int, chunk_size: int
+) -> dict:
+    """Record ONE request whose schedule was shortened; return its stats.
+
+    A5c, and the same two-things-at-once shape ``note_pipeline_warm`` has: the
+    aggregate (``pp_schedule_shortened`` + its reason histogram) is what an
+    operator diffs out of ``/metrics``, the return value is the per-request
+    record the batch keeps on itself so a test can read the exact numbers the
+    schedule was derived from.
+
+    Called from the ADMITTED path only -- after ``begin`` has succeeded -- so
+    the counter never counts a shortening that no peer ever ran.
+    """
+    METRICS.note_schedule_shortened(reason)
+    return {
+        "reason": str(reason),
+        "full_chunks": int(full_chunks),
+        "chunks": int(chunks),
+        "chunk_size": int(chunk_size),
+    }
+
+
+def note_pipeline_warm(*, prefix_len: int, suffix_len: int, chunk_size: int) -> dict:
+    """Record ONE warm request's prefix/suffix/chunk split; return its stats.
+
+    A10-0 is instrumentation, so this is deliberately two things at once.  The
+    return value is the PER-REQUEST record -- ``warm_prefix_len``,
+    ``warm_suffix_len``, ``chunk_size`` -- which the batch keeps on itself so a
+    test (and, later, A10-1's protocol) can read the exact numbers the gate
+    decided on.  The side effect is the AGGREGATE the smoke driver diffs out of
+    ``/metrics``: ``pp_warm_requests`` and the ``pp_warm_suffix_tokens_hist``
+    bucket, which is the only receipt that answers the question the whole plan
+    is gated on (unknown 6.1: how often does a warm request carry a suffix
+    worth pipelining?).
+
+    Called ONLY when the gate actually returned one of the two warm names, so
+    ``pp_warm_requests`` equals their sum equals what ``warm_prefix`` counted
+    before this split.  A warm request that a shape reason ABOVE warm in the
+    gate refused (``apc_checkpoint_ladder``, a capture) is not counted here for
+    the same reason it was never counted as ``warm_prefix``: the gate names one
+    refusal, and this histogram has to stay reconcilable with it.
+    """
+    stats = {
+        "warm_prefix_len": int(prefix_len or 0),
+        "warm_suffix_len": int(suffix_len or 0),
+        "chunk_size": int(chunk_size or 0),
+    }
+    METRICS.note_warm(stats["warm_suffix_len"], stats["chunk_size"])
+    return stats
+
+
+def note_pipeline_bypass(reason: Optional[str]) -> Optional[str]:
+    """Count a refusal that is a RESOURCE fact rather than a request fact.
+
+    ``breaker_open``, ``peer_unreachable`` and ``disabled`` are already counted
+    where they are decided rather than inside ``pipeline_bypass_reason`` -- they
+    are not properties of the request.  ``pp_busy`` is the same kind of fact and
+    is counted the same way, so the histogram stays the single place an operator
+    reads to learn WHICH gate refused.
+    """
+    METRICS.note_bypass(reason)
+    return reason
+
+
+def _pipeline_bypass_reason(
+    *,
+    ladder,
+    capture,
+    warm,
+    pixel_values,
+    mask,
+    cache,
+    input_ids,
+    kv_quantized,
+    right_pad=False,
+):
+    if ladder:
+        # A5c, and the same string-or-bool idiom ``capture`` and ``warm`` use.
+        # The BATCH call site derives the schedule, so it is the only place that
+        # can tell "this request's checkpoints are unserveable at any admissible
+        # depth" (``apc_checkpoint_ladder``, unchanged) from "shortening the
+        # schedule by one chunk WOULD serve them, and the TTFT floor says that
+        # trade is not worth taking at this length"
+        # (``below_min_pipelined_chunks``, which is a policy refusal like
+        # ``below_min_tokens`` and not a shape one).  ``generate_step``'s call
+        # site passes a bool and keeps the historical name.
+        return ladder if isinstance(ladder, str) else "apc_checkpoint_ladder"
+    if capture:
+        # A6.  ``capture`` used to be a bare "a hidden-reading drafter is
+        # attached", which refused the DEFAULT served config outright.  Both
+        # halves can capture now, so what reaches here is the residue: the
+        # caller passes a REASON string when it has looked at the capture and
+        # found one it cannot serve (``speculative_hidden_capture`` when the
+        # drafter names no finite window, ``capture_unsupported`` when the kind
+        # is one this rail has no merge for).  ``generate_step``'s call site
+        # still passes a bool -- it has no merge at all -- and that keeps its
+        # historical name.
+        return capture if isinstance(capture, str) else "speculative_hidden_capture"
+    if warm:
+        # A10-0, and the same string-or-bool idiom ``capture`` above uses.  The
+        # BATCH call site knows the two numbers that decide whether a warm
+        # request could EVER be pipelined -- the uncached suffix ``S`` it is
+        # about to prefill and the chunk size ``C`` -- so it names the refusal
+        # itself: ``warm_suffix_lt_chunk`` (S <= C, which yields
+        # ``ceil(S/C) - 1 == 0`` chunks and is therefore unpipelinable at this
+        # C no matter what A10 ships) or ``warm_suffix_ge_chunk`` (S > C, the
+        # shape A10 would pay for).  The two names REPLACE ``warm_prefix`` in
+        # that path and sum to exactly what it counted.
+        # ``generate_step``'s call site passes a bool -- it has no suffix
+        # length to hand over, its ``warm_prefix`` argument is the caller's
+        # flag -- so it keeps the historical ``warm_prefix`` string unchanged.
+        return warm if isinstance(warm, str) else "warm_prefix"
+    # New in the batch call site (A4) and additive: ``generate_step`` never sees
+    # a right-padded batch, so it leaves this at its default and its reason
+    # strings are unchanged.  ``prompt_step``'s batch can be right-padded (mixed
+    # warm/cold prefill), and a right pad is invisible to every check below --
+    # the mask is None, the cache carries the padding as metadata the handoff
+    # schema has no field for, and B is still 1.
+    if right_pad:
+        return "right_pad_batch"
+    if pixel_values is not None:
+        return "multimodal_input"
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        return "batch_not_one"
+    if kv_quantized:
+        return "quantized_kv"
+    if mask is not None and not bool(mx.all(mask).item()):
+        return "padded_or_custom_mask"
+    from .models.cache import ArraysCache, CacheList, KVCache
+
+    def supported(c):
+        return (
+            type(c) in (ArraysCache, KVCache)
+            or type(c) is CacheList
+            and all(supported(child) for child in c.caches)
+        )
+
+    if not all(supported(c) for c in cache):
+        return "unsupported_cache_type"
+
+    def padded(c):
+        if type(c) is CacheList:
+            return any(padded(child) for child in c.caches)
+        return any(
+            getattr(c, attr, None) is not None for attr in ("left_padding", "lengths")
+        )
+
+    if any(padded(c) for c in cache):
+        return "cache_padding_metadata"
+
+    # state dereferences fresh KV keys; empty() checks only the first slot of
+    # composite caches. Inspect every typed component and its offset instead.
+    def populated(c):
+        if type(c) is CacheList:
+            return any(populated(child) for child in c.caches)
+        if type(c) is ArraysCache:
+            return any(value is not None for value in c.cache)
+        return c.keys is not None or c.values is not None or c.offset != 0
+
+    if any(populated(c) for c in cache):
+        return "populated_prompt_cache"
+    return None
+
+
 def maybe_open_pipeline(model, total_tokens: int, verbose: bool = False):
-    """Return a connected PipelineHead, or None to stay single-box."""
-    global _CTX
-    if _CTX is _DISABLED:
-        return None
+    """Return a leased, connected pipeline head, or None to stay single-box.
+
+    Every ``None`` here is a named bypass in ``pp_bypass_reason``.  Nothing in
+    this function may raise on a peer problem: a tail that is down, slow or
+    tripped must cost the request a fallback, not a failure.
+    """
+    # NO STICKY DISABLE.  This used to latch ``_CTX = _DISABLED`` on the first
+    # refusal and return None forever after, so a process that reached here once
+    # before ``MLX_VLM_PIPELINE_HOSTS`` was set -- a test module, a server whose
+    # peer is configured after the model loads, an operator turning the feature
+    # on -- could never enable the pipeline again.  Worse, the later requests
+    # were not even COUNTED: the latch returned before ``note_bypass``, so the
+    # histogram an operator reads to find out which gate refused went silent.
+    # The whole check is a few environment reads against a >= 16k-token prefill.
     settings = PipelineSettings.from_env()
     if settings is None:
-        _CTX = _DISABLED
+        METRICS.note_bypass("disabled")
         return None
-    lm = getattr(model, "language_model", None)
-    if lm is None or not hasattr(lm, "pipeline_prefill_head"):
+    lm = pipeline_language_model(model)
+    if lm is None:
         if verbose:
-            print("[pipeline] model has no pipeline hook; staying single-box", flush=True)
-        _CTX = _DISABLED
+            print(
+                "[pipeline] model has no pipeline hook; staying single-box", flush=True
+            )
+        METRICS.note_bypass("no_pipeline_hook")
         return None
     if total_tokens < settings.min_tokens:
+        if verbose:
+            print("[pipeline] bypass=below_min_tokens", flush=True)
+        METRICS.note_bypass("below_min_tokens")
         return None
-    split = resolve_split(model, settings, total_tokens, verbose=verbose)
-    head = PipelineHead(settings, split, lm.pipeline_num_layers).connect()
+    try:
+        _hex(settings.model_sha256, 64, "model_sha256")
+        _hex(settings.source_revision, 40, "source_revision")
+    except (ValueError, TypeError) as exc:
+        # An unset or malformed pin is a MISCONFIGURATION, and this function's
+        # contract is that a peer problem costs a fallback and never a failure.
+        # It used to propagate, which turned a missing launcher variable into a
+        # 500 on a request this box can serve by itself.
+        METRICS.note_bypass("identity_unpinned")
+        if verbose:
+            print(f"[pipeline] bypass=identity_unpinned ({exc!r})", flush=True)
+        return None
+    try:
+        split = resolve_split(model, settings, total_tokens, verbose=verbose)
+    except Exception as exc:  # noqa: BLE001
+        METRICS.note_bypass("split_unresolved")
+        if verbose:
+            print(f"[pipeline] bypass=split_unresolved ({exc!r})", flush=True)
+        return None
+    head = POOL.acquire(settings, split, lm.pipeline_num_layers, verbose=verbose)
+    if head is None:
+        return None
     if verbose:
         print(
             f"[pipeline] split={split} transport={settings.transport} "
             f"peer={settings.peer[0]}:{settings.peer[1]}",
             flush=True,
         )
-    return head
+    return PooledPipelineHead(
+        POOL, head, _pool_key(settings, split, lm.pipeline_num_layers)
+    )
+
+
+def shutdown_pipeline_pool():
+    """Say ``bye`` to every pooled tail.  Server shutdown calls this."""
+    POOL.shutdown()

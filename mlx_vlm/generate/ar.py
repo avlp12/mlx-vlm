@@ -569,79 +569,108 @@ def generate_step(
             # ``_chunk_capture_kwargs`` disables it too: ``pipeline.prefill_chunk``
             # returns no output object, so a pipelined chunk's hidden capture
             # cannot be accumulated and the drafter would lose the prompt.
-            if not ladder and not _chunk_capture_kwargs:
-                from ..pipeline_runtime import maybe_open_pipeline
+            from ..pipeline_runtime import maybe_open_pipeline, pipeline_bypass_reason
 
+            bypass = (
+                pipeline_bypass_reason(
+                    ladder=bool(ladder),
+                    capture=bool(_chunk_capture_kwargs),
+                    warm=warm_prefix,
+                    pixel_values=pixel_values,
+                    mask=mask,
+                    cache=prompt_cache,
+                    input_ids=input_ids,
+                    kv_quantized=any(
+                        v is not None for v in (kv_bits, kv_key_bits, kv_value_bits)
+                    ),
+                )
+                if os.environ.get("MLX_VLM_PIPELINE_HOSTS", "").strip()
+                else "disabled"
+            )
+            if bypass is None:
                 pipeline = maybe_open_pipeline(model, total_tokens, verbose=verbose)
+            elif verbose and os.environ.get("MLX_VLM_PIPELINE_HOSTS"):
+                print(f"[pipeline] bypass={bypass}", flush=True)
+            try:
                 if pipeline is not None:
-                    pipeline.begin(total_tokens, prefill_step_size)
-            with tqdm(
-                total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
-            ) as pbar:
-                while inputs_embeds.shape[1] > 1:
-                    # L35(b).  The tail merge is ON by default (I1437): a short
-                    # final tail is folded into the chunk before it (last grid
-                    # cell only).  ``MLX_VLM_GLM5_PREFILL_TAIL_MERGE=0`` returns
-                    # this to ``min(step, remaining)``.  ``batch`` is passed so a
-                    # grown chunk can be re-planned under the TP=2 forward cap
-                    # instead of raising there.
-                    n_to_process = next_prefill_chunk(
-                        inputs_embeds.shape[1] - 1,
-                        prefill_step_size,
-                        batch=inputs_embeds.shape[0],
-                    )
-                    # Land exactly on the next boundary. Vault boundaries are
-                    # multiples of prefill_step_size, so this clamp is a no-op
-                    # for them and the chunk decomposition -- and thus
-                    # bit-identity against a straight-through prefill -- is
-                    # preserved. An unaligned caller-supplied boundary still
-                    # works, but trades that guarantee away.
-                    n_to_process = ladder.clamp(processed_tokens, n_to_process)
-                    chunk_kwargs = kwargs
-                    if getattr(model.language_model, "supports_logits_to_keep", False):
-                        chunk_kwargs = {**kwargs, "logits_to_keep": 1}
-                    if _chunk_capture_kwargs:
-                        chunk_kwargs = {**chunk_kwargs, **_chunk_capture_kwargs}
-                    if pipeline is not None:
-                        pipeline.prefill_chunk(
-                            model,
-                            input_ids[:, :n_to_process],
-                            inputs_embeds[:, :n_to_process],
-                            prompt_cache,
+                    pipeline.begin(total_tokens, prefill_step_size, input_ids=input_ids)
+                with tqdm(
+                    total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
+                ) as pbar:
+                    while inputs_embeds.shape[1] > 1:
+                        # L35(b) x PP (A11).  The tail merge is ON by default
+                        # (I1437) and folds a short final tail into the chunk
+                        # before it -- but a PIPELINED chunk's width is not this
+                        # loop's to choose.  ``PrefillEnvelope.create`` derives
+                        # the peer's schedule as ``min(C, depth - p)`` per chunk
+                        # and ``PipelineClient.prefill_chunk`` RAISES on any
+                        # other width, so a grown chunk would fail the request
+                        # here (no fallback on this path) rather than merely
+                        # cost it a re-prefill.  With the peer open the width is
+                        # therefore exactly ``min(step, remaining)``, which is
+                        # the envelope's own arithmetic; with no peer this is
+                        # the unified single-box path unchanged.
+                        n_to_process = next_prefill_chunk(
+                            inputs_embeds.shape[1] - 1,
+                            prefill_step_size,
+                            batch=inputs_embeds.shape[0],
+                            enabled=False if pipeline is not None else None,
                         )
-                        # only stage A's caches exist on this box until finalize
-                        mx.eval([c.state for c in pipeline.local_caches(prompt_cache)])
-                    else:
-                        chunk_out = model.language_model(
-                            inputs=input_ids[:, :n_to_process],
-                            inputs_embeds=inputs_embeds[:, :n_to_process],
-                            cache=prompt_cache,
-                            n_to_process=n_to_process,
-                            **chunk_kwargs,
-                        )
-                        _prefill_hidden.append(chunk_out)
-                        # Drop the chunk's logits (and any gdn stash) BEFORE the
-                        # eval, so the vocab-wide projection is never materialised
-                        # for a chunk nobody samples from.
-                        chunk_out = None
-                        quantize_cache_fn(prompt_cache)
-                        mx.eval(
-                            [c.state for c in prompt_cache] + _prefill_hidden.pending()
-                        )
-                    processed_tokens += n_to_process
-                    for reached in ladder.reached(processed_tokens):
-                        prompt_cache_checkpoint(reached, prompt_cache)
-                    inputs_embeds = inputs_embeds[:, n_to_process:]
-                    input_ids = input_ids[:, n_to_process:]
-                    mx.clear_cache()
-                    pbar.update(n_to_process)
+                        # Land exactly on the next boundary. Vault boundaries are
+                        # multiples of prefill_step_size, so this clamp is a no-op
+                        # for them and the chunk decomposition -- and thus
+                        # bit-identity against a straight-through prefill -- is
+                        # preserved. An unaligned caller-supplied boundary still
+                        # works, but trades that guarantee away.
+                        n_to_process = ladder.clamp(processed_tokens, n_to_process)
+                        chunk_kwargs = kwargs
+                        if getattr(model.language_model, "supports_logits_to_keep", False):
+                            chunk_kwargs = {**kwargs, "logits_to_keep": 1}
+                        if _chunk_capture_kwargs:
+                            chunk_kwargs = {**chunk_kwargs, **_chunk_capture_kwargs}
+                        if pipeline is not None:
+                            pipeline.prefill_chunk(
+                                model,
+                                input_ids[:, :n_to_process],
+                                inputs_embeds[:, :n_to_process],
+                                prompt_cache,
+                            )
+                            # only stage A's caches exist on this box until finalize
+                            mx.eval([c.state for c in pipeline.local_caches(prompt_cache)])
+                        else:
+                            chunk_out = model.language_model(
+                                inputs=input_ids[:, :n_to_process],
+                                inputs_embeds=inputs_embeds[:, :n_to_process],
+                                cache=prompt_cache,
+                                n_to_process=n_to_process,
+                                **chunk_kwargs,
+                            )
+                            _prefill_hidden.append(chunk_out)
+                            # Drop the chunk's logits (and any gdn stash) BEFORE the
+                            # eval, so the vocab-wide projection is never materialised
+                            # for a chunk nobody samples from.
+                            chunk_out = None
+                            quantize_cache_fn(prompt_cache)
+                            mx.eval(
+                                [c.state for c in prompt_cache] + _prefill_hidden.pending()
+                            )
+                        processed_tokens += n_to_process
+                        for reached in ladder.reached(processed_tokens):
+                            prompt_cache_checkpoint(reached, prompt_cache)
+                        inputs_embeds = inputs_embeds[:, n_to_process:]
+                        input_ids = input_ids[:, n_to_process:]
+                        mx.clear_cache()
+                        pbar.update(n_to_process)
 
-            if pipeline is not None:
-                # pull stage B's KDA/DSA caches back and install them, so the
-                # last token and all of decode run locally over the full stack
-                pipeline.finalize(prompt_cache)
-                quantize_cache_fn(prompt_cache)
-                pipeline.close()
+                if pipeline is not None:
+                    # pull stage B's KDA/DSA caches back and install them, so the
+                    # last token and all of decode run locally over the full stack
+                    pipeline.finalize(prompt_cache)
+                    quantize_cache_fn(prompt_cache)
+
+            finally:
+                if pipeline is not None:
+                    pipeline.close()
 
             input_ids = input_ids[:, -1:]
 
@@ -2213,37 +2242,41 @@ class PromptProcessingBatch:
                 harvest_width if prefix_len > 0 else None
             )
 
-        if warm_cache is not None:
-            self.prompt_cache = warm_cache
-        elif draft_model is not None and draft_kind is not None:
-            self.prompt_cache = make_speculative_prompt_cache(
-                model,
-                draft_kind=draft_kind,
-                batch_size=len(input_ids),
-                left_padding=left_padding,
-                make_cache=lambda lm, lp: _make_cache(
-                    lm,
-                    lp,
-                    kv_bits=kv_bits,
-                    kv_key_bits=kv_key_bits,
-                    kv_value_bits=kv_value_bits,
-                    kv_key_scheme=kv_key_scheme,
-                    kv_value_scheme=kv_value_scheme,
-                    kv_group_size=kv_group_size,
-                    kv_quant_scheme=kv_quant_scheme,
-                    quantized_kv_start=quantized_kv_start,
-                    prefill_length=max_length,
-                ),
-            )
-        elif (
-            len(input_ids) == 1
-            and right_pad_per_row is None
-            and kv_bits is None
-            and hasattr(model, "make_cache")
-        ):
-            self.prompt_cache = cache.make_prompt_cache(model)
-        else:
-            self.prompt_cache = _make_cache(
+        # A FACTORY, not a statement, because the pipelined-prefill fallback has
+        # to be able to build this cache a SECOND time: a mid-prefill peer
+        # failure leaves half the layers written on this box and half never
+        # written, and that cache can only be thrown away (see
+        # ``_pipeline_fallback``).  Called immediately below, so with the
+        # pipeline off nothing about the construction moved.
+        def _build_prompt_cache():
+            if draft_model is not None and draft_kind is not None:
+                return make_speculative_prompt_cache(
+                    model,
+                    draft_kind=draft_kind,
+                    batch_size=len(input_ids),
+                    left_padding=left_padding,
+                    make_cache=lambda lm, lp: _make_cache(
+                        lm,
+                        lp,
+                        kv_bits=kv_bits,
+                        kv_key_bits=kv_key_bits,
+                        kv_value_bits=kv_value_bits,
+                        kv_key_scheme=kv_key_scheme,
+                        kv_value_scheme=kv_value_scheme,
+                        kv_group_size=kv_group_size,
+                        kv_quant_scheme=kv_quant_scheme,
+                        quantized_kv_start=quantized_kv_start,
+                        prefill_length=max_length,
+                    ),
+                )
+            if (
+                len(input_ids) == 1
+                and right_pad_per_row is None
+                and kv_bits is None
+                and hasattr(model, "make_cache")
+            ):
+                return cache.make_prompt_cache(model)
+            return _make_cache(
                 model,
                 left_padding,
                 kv_bits=kv_bits,
@@ -2256,6 +2289,43 @@ class PromptProcessingBatch:
                 quantized_kv_start=quantized_kv_start,
                 prefill_length=max_length,
             )
+
+        self._build_prompt_cache = _build_prompt_cache
+        self._kv_quantized = any(
+            v is not None for v in (kv_bits, kv_key_bits, kv_value_bits)
+        )
+        # Two-box pipelined prefill (A4).  Decided ONCE per request, at the top
+        # of the first chunk; ``_pipeline_declined`` latches that decision so no
+        # later chunk pays the gate again.  A batch that never meets the gate --
+        # every batch, with ``MLX_VLM_PIPELINE_HOSTS`` unset -- carries these
+        # seven attributes and executes one ``os.environ.get``.
+        self._pipeline = None
+        self._pipeline_declined = False
+        self._pipeline_slot = False
+        self._pipeline_chunks: List[int] = []
+        self._pipeline_chunks_done = 0
+        self._pipeline_restore: Optional[dict] = None
+        # A10-0: the per-request warm split (``warm_prefix_len``,
+        # ``warm_suffix_len``, ``chunk_size``) for a request the warm arm of the
+        # gate refused, or ``None``.  Instrumentation only -- nothing reads it
+        # to make a decision -- and it is the per-request twin of the aggregate
+        # ``pp_warm_suffix_tokens_hist`` an operator diffs out of ``/metrics``.
+        self._pipeline_warm_stats: Optional[dict] = None
+        # A5c: the per-request record of a SHORTENED schedule -- ``reason``
+        # (``exact_column`` / ``vault_rung``), ``full_chunks``, ``chunks``,
+        # ``chunk_size`` -- or ``None`` on every request whose schedule is the
+        # full ``k``.  Per-request twin of ``pp_schedule_shortened``.
+        self._pipeline_schedule_stats: Optional[dict] = None
+        # A5: the vault ladder this request took out of the chunk loop's way,
+        # kept so the post-finalize checkpoint knows which rows to store and so
+        # a fallback can put the original rungs BACK (a peer that dies must not
+        # turn a vault-on request into a silently vault-off one).
+        self._pipeline_ladder: Optional[dict] = None
+
+        if warm_cache is not None:
+            self.prompt_cache = warm_cache
+        else:
+            self.prompt_cache = _build_prompt_cache()
 
         # Declare per-row right-padding on each cache so finalize() can roll
         # it into left-padding once the prefill forward pass is complete.
@@ -2515,20 +2585,30 @@ class PromptProcessingBatch:
                 out.append(col)
         return out
 
-    def _next_apc_checkpoint_column(self) -> Optional[int]:
+    def _next_apc_checkpoint_column(
+        self, start: Optional[int] = None, end: Optional[int] = None
+    ) -> Optional[int]:
         """Column the next chunk must stop on, over APC's checkpoint and the vault's ladder.
 
         With ``self._vault is None`` this reduces term for term to what it was:
         ``apc_on`` reproduces the old two-clause guard, the vault list is empty,
         and the min is taken over the same single column per row.
+
+        A11b.  ``start``/``end`` default to the window the loop is in right now,
+        which is every historical caller.  The pipelined SCHEDULE asks about a
+        window it has not reached yet -- the last chunk it may hand the peer --
+        because the width of that chunk is the width this clamp will give it,
+        and the schedule has to predict it exactly rather than approximately.
         """
         if not self._apc_meta or self._inputs_embeds is None:
             return None
         apc_on = self._apc_manager is not None and self._apc_mode == "exact"
         if not apc_on and self._vault is None:
             return None
-        start = self._processed_prompt_columns
-        end = start + self._inputs_embeds.shape[1]
+        if start is None:
+            start = self._processed_prompt_columns
+        if end is None:
+            end = self._processed_prompt_columns + self._inputs_embeds.shape[1]
         next_col: Optional[int] = None
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
@@ -2756,25 +2836,39 @@ class PromptProcessingBatch:
             if not rungs:
                 continue
             done = self._row_real_tokens_processed(batch_idx)
-            landed = [r for r in rungs if int(r) == done]
+            landed = [int(r) for r in rungs if int(r) == done]
             remaining = [r for r in rungs if int(r) > done]
             if landed:
-                row_cache = self._apc_prompt_cache_for_store(batch_idx)
-                if row_cache is not None:
-                    full_ids = meta.get("full_input_ids") or []
-                    provenance = self._harvest_provenance(batch_idx)
-                    for r in landed:
-                        try:
-                            _context_vault.insert_checkpoint(
-                                self._vault,
-                                full_ids,
-                                int(r),
-                                _context_vault.capture_fragments(row_cache, int(r)),
-                                harvest_provenance=provenance,
-                            )
-                        except Exception:  # noqa: BLE001 - storing is best-effort
-                            pass
+                self._insert_vault_rungs(batch_idx, meta, landed)
             meta["vault_rungs"] = remaining
+
+    def _insert_vault_rungs(self, batch_idx: int, meta: dict, rungs: List[int]) -> None:
+        """Capture and store this row's cache at each of ``rungs``.
+
+        The ONE place a vault rung is written from the batch path, so the
+        pipelined full-depth checkpoint (A5) and the chunk loop's ladder store
+        cannot drift apart in what they capture or how they name it: same
+        ``capture_fragments`` over the same row snapshot, same
+        ``insert_checkpoint``, same provenance.  Best-effort per rung -- a vault
+        fault must never fail a request, and ``capture_fragments`` returns None
+        rather than a partial ladder, which ``insert`` refuses.
+        """
+        row_cache = self._apc_prompt_cache_for_store(batch_idx)
+        if row_cache is None:
+            return
+        full_ids = meta.get("full_input_ids") or []
+        provenance = self._harvest_provenance(batch_idx)
+        for r in rungs:
+            try:
+                _context_vault.insert_checkpoint(
+                    self._vault,
+                    full_ids,
+                    int(r),
+                    _context_vault.capture_fragments(row_cache, int(r)),
+                    harvest_provenance=provenance,
+                )
+            except Exception:  # noqa: BLE001 - storing is best-effort
+                pass
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
         if n is None or not self._prompt_length_aware_keys:
@@ -2826,25 +2920,913 @@ class PromptProcessingBatch:
             captured.append(row_logits)
         return captured
 
+    # ------------------------------------------------- two-box pipelined prefill
+    #
+    # The server does NOT prefill through ``generate_step``: its GPU thread runs
+    # ``BatchGenerator``, whose prefill is the chunk loop below.  The pipeline
+    # was wired only into ``generate_step``, so every served request bypassed it
+    # by construction.  This is the second call site, and it is gated on THIS
+    # batch's own facts rather than on ``generate_step``'s arguments.
+    #
+    # WHAT THE PEER GETS.  ``prompt_step`` stops once the remainder fits in one
+    # step and ``generate()`` runs that remainder as the final forward, so the
+    # pipelined part is AT MOST the chunk loop's part: the first
+    # ``k = ceil(T/C) - 1`` chunks of the plan the loop itself would run (A11b
+    # -- the last of them may be L35's merged chunk or one clamped to a
+    # checkpoint column), and ``k - 1`` of them when A5c shortens the schedule
+    # to move a checkpoint column out of the peer's way
+    # (``_pipeline_schedule_plan``).  Everything past the pipelined depth is
+    # prefilled here AFTER ``finalize`` has installed all 45 layers -- one
+    # remainder forward, or a chunk loop plus one, and in both cases the same
+    # chunks a single box would have run -- so no token is ever forwarded by
+    # half a stack, and decode is untouched single-box code.
+
+    def _pipeline_warm_prefix_len(self) -> int:
+        """How many columns of this prompt are already in the cache.
+
+        Three ways they can be, and the handoff schema supports none of them: an
+        APC/vault prefix hit (``prefix_len``), a resumed cache
+        (``existing_left_padding``, which is why a non-zero left pad counts),
+        and a chunk loop that has already run (defensive; the gate is only ever
+        evaluated at column 0).  The DEEPEST of the three, because the question
+        the caller asks is "how much of the prompt would a two-box prefill have
+        to be handed that it cannot be", and one warm row is enough to refuse
+        the batch.
+
+        Note what the left-padding term also catches, unchanged from the
+        predicate this replaces: a COLD batch of unequal-length rows is
+        left-padded too, so ``max(...) > 0`` there as well.  That request is
+        refused as warm rather than as ``batch_not_one`` only because warm is
+        asked first, and it was before this split as well -- A10-0 moves no
+        decision, only the name it is recorded under.
+        """
+        lengths = [int(self._processed_prompt_columns or 0)]
+        lengths += [
+            int((m or {}).get("prefix_len") or 0) for m in (self._apc_meta or [])
+        ]
+        lengths += [int(p or 0) for p in self._left_padding_per_row]
+        return max(lengths)
+
+    def _pipeline_warm_prefix(self) -> bool:
+        """Is any part of this prompt already in the cache?"""
+        return self._pipeline_warm_prefix_len() > 0
+
+    def _pipeline_warm_facts(self):
+        """``(reason, per-request stats)`` for the warm arm of the gate.
+
+        ``(None, None)`` when nothing is cached.  Otherwise the reason is one of
+        the two A10-0 names, decided by the uncached SUFFIX against the chunk
+        size:
+
+        * ``S`` is ``self._inputs_embeds.shape[1]``.  For a warm row that array
+          is already the suffix -- ``input_ids`` here are the per-row prefill
+          inputs, "for warm-start rows this is the suffix" (``__init__``) -- so
+          the whole prompt is ``prefix_len + S`` and the number the chunk loop
+          will actually work on is ``S``.  It is also exactly what
+          ``_pipeline_chunk_schedule`` measures, which is the point: the split
+          has to agree with the thing it predicts.
+        * ``S <= C`` is ``warm_suffix_lt_chunk``.  ``ceil(S/C) - 1 == 0``, so
+          there is no chunk to hand a peer at this C and no version of A10
+          changes that -- this request stays single-box on arithmetic, not on
+          policy.
+        * ``S > C`` is ``warm_suffix_ge_chunk``: at least one chunk exists, so
+          this is the shape A10-1..7 would pay for, and its frequency is the
+          gate on building them at all.
+        """
+        prefix_len = self._pipeline_warm_prefix_len()
+        if prefix_len <= 0:
+            return None, None
+        suffix_len = (
+            int(self._inputs_embeds.shape[1])
+            if self._inputs_embeds is not None
+            else 0
+        )
+        chunk_size = int(self.prefill_step_size or 0)
+        reason = (
+            "warm_suffix_ge_chunk"
+            if chunk_size > 0 and suffix_len > chunk_size
+            else "warm_suffix_lt_chunk"
+        )
+        return reason, {
+            "prefix_len": prefix_len,
+            "suffix_len": suffix_len,
+            "chunk_size": chunk_size,
+        }
+
+    def _pipeline_full_depth(self) -> int:
+        """Tokens the pipelined part of this prefill will have written.
+
+        The one depth at which a two-box prefill holds a COMPLETE cache before
+        the request is over: ``finalize`` has just pulled stage B's caches back
+        and installed them, the head owns all ``n_layers``, and the remainder
+        has not been forwarded yet.  It is the ADMITTED depth and not ``k*C``:
+        A5c may have given one chunk back to the head, in which case the
+        remainder is ``C + r`` tokens rather than ``r``
+        (``_pipeline_schedule_plan``).
+        """
+        return sum(self._pipeline_chunk_schedule())
+
+    def _pipeline_plan_chunks(self, count: int) -> List[int]:
+        """The FIRST ``count`` chunks of the plan a single box would run.
+
+        A11b.  Two schedules used to meet in ``prompt_step`` and disagree: the
+        loop's, which is L35's plan (a merged tail, a chunk clamped to a
+        checkpoint column), and the peer's, which ``PrefillEnvelope.create``
+        fixed at ``C`` per chunk.  A11 reconciled them by giving a chunk BACK to
+        the head whenever they would differ -- which at the served ``C = 8192,
+        tail_min = 1024`` is one prompt length in eight, and costs that request a
+        whole extra ``C``-wide head chunk (+9-18 s of TTFT, measured 58.9 s vs
+        48 s at 33k on 2026-09-07) to preserve a merge worth ~0.5 s.
+
+        The envelope carries an explicit width list now, so the peer can run the
+        loop's OWN chunks and the reconciliation is free.  What this returns is
+        therefore a PREFIX of the single-box chunk sequence, which is the whole
+        of the identity argument: chunk for chunk, the two-box prefill forwards
+        the shapes the one-box prefill forwards, and everything past ``count``
+        is the head's ordinary remainder.
+
+        Only the LAST chunk may leave ``C``, and only in the two ways
+        ``prompt_step`` leaves it:
+
+        * L35's tail merge grows it to ``C + r - 1`` when what is left is one
+          full chunk plus a short tail (``next_prefill_chunk``);
+        * the APC/vault ladder clamps it to a checkpoint column that lands
+          inside it (``_next_apc_checkpoint_column``), which is what the served
+          config actually does -- the vault's deepest rung is
+          ``((T-1)//stride)*stride``, i.e. exactly the ``kC`` the merge would
+          have swallowed, so the served single-box loop never merges that chunk
+          at all and A11's give-back was paid for a merge that does not happen.
+
+        Every EARLIER chunk is exactly ``C``: the merge cannot fire before the
+        last cell (``remaining >= 2C + r - 1 >= C + tail_min``), and a
+        checkpoint column strictly inside one is refused by
+        ``_pipeline_schedule_unserved`` rather than clamped, because a chunk
+        boundary inside the pipelined part is a boundary at which half the KV
+        is still on the peer.
+        """
+        step = int(self.prefill_step_size or 0)
+        if count <= 0 or step <= 0:
+            return []
+        chunks = [step] * (count - 1)
+        processed = step * (count - 1)
+        total = int(
+            self._inputs_embeds.shape[1] if self._inputs_embeds is not None else 0
+        )
+        width = next_prefill_chunk(
+            total - 1 - processed,
+            step,
+            batch=int(self._inputs_embeds.shape[0]),
+        )
+        column = self._next_apc_checkpoint_column(start=processed, end=total)
+        if column is not None:
+            width = min(width, column - processed)
+        if width <= 0:
+            return []
+        return chunks + [width]
+
+    def _pipeline_schedule_unserved(self, chunks: List[int]) -> Optional[str]:
+        """Which checkpoint a pipelined part ``depth`` tokens deep cannot pay.
+
+        ``None`` when every rung and column this request owes is serveable at
+        that depth.  Otherwise the NAME of the first one that is not, which is
+        also A5c's shortening reason: ``exact_column`` or ``vault_rung``.
+
+        PP cannot checkpoint MID-prefill: at a chunk boundary half the KV lives
+        on the peer and the snapshot would be of a half-populated cache.  What
+        it can do is take exactly one snapshot at ``depth``, immediately after
+        ``finalize`` (A5), and then run everything past ``depth`` itself, over
+        the full stack, as ordinary single-box ``prompt_step`` chunks (A5b).  So
+        a requirement at column ``X`` is SERVEABLE at ``depth`` when:
+
+        * ``X == depth`` -- the post-finalize snapshot IS it.  For the vault
+          that is the collapse target; for APC exact, ``_pipeline_step`` calls
+          ``_store_apc_exact_checkpoints`` after ``finalize`` and after the
+          column advance, so the store sees all ``n_layers`` over a cache
+          exactly ``depth`` deep.
+        * ``depth < X < T`` -- it lands in the head's own remainder, where the
+          chunk loop clamps to it exactly as it does on one box (``T=40, C=8``,
+          column 36: the pipelined chunks, then a chunk clamped to 4 here, then
+          ``generate()``'s final 4) and the same store fires from the same call
+          site over the same complete cache.  This is A5b's argument, and A5c is
+          nothing but the observation that ``depth`` is a CHOICE: one chunk
+          fewer moves a column out of the pipelined part and into this case.
+        * ``X < depth`` and ``X`` is a vault rung ON ONE OF THE PLAN'S OWN
+          BOUNDARIES -- the collapse drops it and keeps the deepest serveable
+          one instead (``_pipeline_collapse_ladder``).  That is A5's trade:
+          early-divergence coverage for the peer, counted as
+          ``pp_ladder_rungs_skipped``.  A11b asks the PLAN rather than
+          ``rung % C``: the two agree on every uniform schedule, but the last
+          chunk may be merged or clamped now, and a rung on a multiple of ``C``
+          can then land strictly inside it -- where it is neither a boundary
+          the collapse may drop nor a column a later chunk may stop on.
+
+        and UNSERVEABLE otherwise:
+
+        * an APC exact column strictly inside the pipelined part.  The entry is
+          keyed on ``full_input_ids[:checkpoint_len]`` and stored at exactly
+          that many tokens, so it can be neither moved nor dropped; a boundary
+          there would snapshot a cache whose stage-B layers were never written.
+          (A column the LAST chunk would run past is not this case: the plan
+          ends that chunk on it, and ``X == depth`` above is the answer.)
+        * a rung inside the pipelined part that is not one of the plan's
+          boundaries, for the same reason.
+        * a rung at or past the prompt length ``T``.  Left refused exactly as
+          A5 refused it -- and unreachable in the served config, because
+          ``align_boundaries`` admits only multiples of ``C`` strictly below the
+          prompt length.
+
+        The narrowing A5c makes to A5's vault clause is the middle case: a rung
+        DEEPER than the pipelined part used to be refused with the unaligned
+        ones, and it is the same request the APC exact column is (a column in
+        the head's own remainder), so it is admitted on the same argument and
+        stays PENDING through the collapse.
+        """
+        if not self._apc_meta:
+            return None
+        apc_on = self._apc_manager is not None and self._apc_mode == "exact"
+        step = int(self.prefill_step_size or 0)
+        total = (
+            int(self._inputs_embeds.shape[1])
+            if self._inputs_embeds is not None
+            else 0
+        )
+        # A11b.  The BOUNDARIES, not ``% step``.  The two coincide while every
+        # pipelined chunk is exactly ``C`` -- which is every schedule A5c could
+        # produce -- but the last chunk may now be merged or clamped, and then
+        # a rung on a multiple of ``C`` can land strictly INSIDE it, where it
+        # is neither collapsible nor clampable.  Asking the plan directly is
+        # the same question the old arithmetic asked, of a plan that can
+        # answer it.
+        depth = sum(chunks)
+        boundaries = set()
+        running = 0
+        for n in chunks:
+            running += n
+            boundaries.add(running)
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None:
+                continue
+            if apc_on:
+                # The COLUMN, not the length: it is the column the chunk loop
+                # would stop on, and it is what ``depth`` is measured in.  They
+                # coincide on every request the rest of this gate admits (B=1,
+                # no left pad, no right pad) and this keeps them from drifting
+                # if one of those ever loosens.
+                column = self._apc_checkpoint_column_for_meta(batch_idx, meta)
+                if column is not None and column < depth:
+                    return "exact_column"
+            if self._vault is None:
+                continue
+            rungs = [int(r) for r in (meta.get("vault_rungs") or ())]
+            if not rungs:
+                continue
+            if step <= 0:
+                return "vault_rung"
+            for rung in rungs:
+                if rung < depth and rung not in boundaries:
+                    return "vault_rung"
+                if rung > depth and rung >= total:
+                    return "vault_rung"
+        return None
+
+    def _pipeline_schedule_plan(self) -> dict:
+        """The chunks this loop may hand the peer, and why they are that many.
+
+        ONE derivation, read by everything that has to agree with it: the gate's
+        refusal (``_pipeline_has_checkpoint_ladder``), the envelope
+        (``_pipeline_open`` -> ``begin``), the loop's own schedule check
+        (``_pipeline_step``), the collapse depth and the post-finalize
+        checkpoint.  There used to be two -- the ladder predicate measured
+        ``k*C`` while the schedule handed out ``k`` chunks -- and two is exactly
+        the drift A5c would introduce by shortening one of them.
+
+        ``needs_processing`` stops the loop while ``remaining > step``, so the
+        FULL schedule is fixed the moment the batch is built: ``k = ceil(T/C) -
+        1`` chunks, the first ``k-1`` of them exactly ``C`` and the last one
+        whatever the single-box loop would run there -- ``C``, or L35's merged
+        ``C + r - 1``, or a chunk clamped to a checkpoint column
+        (``_pipeline_plan_chunks``).  A5c may spend one of them:
+
+        * ``k`` chunks serve every checkpoint -> the schedule is ``k``, which is
+          every request A5b already admitted, list for list.
+        * they do not and ``k-1`` do -> the schedule is ``k-1`` (``shortened``,
+          with the reason ``k`` failed on).  The head's post-finalize remainder
+          is now ``C + r`` tokens and it splits them at the column exactly as
+          one box splits them.  This is the case the first served smoke found:
+          at ``C=8192`` the 32,780- and 131,084-token prompts have ``r = 12``,
+          under ``APC_EXACT_PREFIX_GUARD_TOKENS``, so the exact column ``T-16``
+          fell inside the last pipelined chunk and A5b refused BOTH.
+        * ``k-1 <= 0`` -> no schedule at all, and the caller names it
+          ``no_pipelined_chunks`` -- which is what it is, and is not a claim
+          about this request's checkpoints.
+        * ``k-1`` do not serve it either -> ``apc_checkpoint_ladder``, A5's
+          refusal, now genuinely the last resort.
+        * ``k-1`` serve it but are fewer than
+          ``MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS`` ->
+          ``below_min_pipelined_chunks``.  The shortened head pays a whole extra
+          chunk of ``C`` inside the TTFT (~``C/450`` s, +18 s at the served
+          ``C=8192``), so the trade only pays while the pipelined part still
+          dominates: two chunks, i.e. ``T >= ~3C``.  A POLICY refusal, named
+          like ``below_min_tokens`` and not like a shape one.
+
+        ``begin`` re-derives the chunk tuple from the ``depth + 1`` token ids it
+        is handed and ``finalize`` refuses an envelope mismatch, so a drift
+        between this arithmetic and the loop is a failure, never a silent
+        divergence -- and the envelope the tail sees is the SHORTENED list,
+        because ``_pipeline_open`` measures ``depth`` off ``chunks``.
+        """
+        step = int(self.prefill_step_size or 0)
+        total = (
+            int(self._inputs_embeds.shape[1])
+            if self._inputs_embeds is not None
+            else 0
+        )
+        plan = {
+            "chunks": [],
+            "full_chunks": 0,
+            "chunk_size": step,
+            "depth": 0,
+            "shortened": False,
+            "reason": None,
+            "refusal": None,
+        }
+        if step <= 0 or total <= step:
+            return plan
+        full = -(-total // step) - 1
+        plan["full_chunks"] = full
+        chunks = self._pipeline_plan_chunks(full)
+        if not chunks:
+            return plan
+        unserved = self._pipeline_schedule_unserved(chunks)
+        if unserved is None:
+            plan["chunks"] = chunks
+            plan["depth"] = sum(chunks)
+            return plan
+        short = full - 1
+        if short <= 0:
+            # Nothing to shorten TO.  Leaving ``refusal`` unset is the point:
+            # the request is refused for having no pipelined chunks, not for a
+            # checkpoint the peer could have served at some other depth.
+            return plan
+        # A5c's fallback, and it stays UNIFORM.  The short schedule's last
+        # chunk is not the loop's last cell, so the merge cannot fire in it
+        # (``remaining >= 2C + r - 1``); and a checkpoint column strictly inside
+        # it is a column the peer cannot serve at any width, because giving the
+        # chunk back is precisely what moves that column into the head's own
+        # remainder.  Clamping here would put it back on the boundary the
+        # shortening exists to take it off.
+        short_chunks = [step] * short
+        if self._pipeline_schedule_unserved(short_chunks) is not None:
+            plan["refusal"] = True
+            return plan
+        from ..pipeline_runtime import min_pipelined_chunks
+
+        if short < min_pipelined_chunks():
+            plan["refusal"] = "below_min_pipelined_chunks"
+            return plan
+        plan["chunks"] = short_chunks
+        plan["depth"] = sum(short_chunks)
+        plan["shortened"] = True
+        plan["reason"] = unserved
+        return plan
+
+    def _pipeline_has_checkpoint_ladder(self, plan: Optional[dict] = None):
+        """The refusal this request's checkpoints owe the gate, or ``False``.
+
+        A name and not a bool now: ``apc_checkpoint_ladder`` (``True``) when no
+        admissible depth serves them, ``below_min_pipelined_chunks`` when one
+        does but the TTFT floor refuses to buy it.  ``pipeline_bypass_reason``
+        takes either, the same way it takes ``capture`` and ``warm``.
+
+        Derived from the plan the caller already computed, so the depth the gate
+        judges is the depth the peer is actually sent.
+        """
+        return (plan or self._pipeline_schedule_plan())["refusal"] or False
+
+    def _pipeline_collapse_ladder(self, depth: int) -> None:
+        """Take the vault rungs out of the chunk loop's way for this request.
+
+        Two things have to happen before the first pipelined chunk runs, and
+        both are this method.  A rung the peer will run past must stop being
+        PENDING, or ``_store_vault_checkpoints`` fires at the chunk boundary it
+        lands on and captures a cache whose stage-B layers are empty -- a rung
+        that restores to a fluent wrong answer, which is the one failure a cache
+        change must not introduce.  And it must be REMEMBERED, because a peer
+        that dies mid-prefill sends this request back to column 0 single-box,
+        where the ladder is exactly as serveable as it was before the peer was
+        ever dialled.
+
+        A5c: only the rungs AT OR BELOW ``depth`` are the peer's business.  A
+        rung deeper than the admitted depth -- which A5 refused and A5c admits,
+        and which the default served ladder's ``k*C`` rung becomes the moment
+        the schedule is shortened -- lands in the head's own post-finalize
+        remainder, where the single-box loop clamps to it and stores it from a
+        complete cache.  So it stays pending, is stored at ITS OWN depth rather
+        than collapsed onto another, and is not counted as skipped.  It is still
+        remembered: a fallback re-prefills from column 0 and re-assigns the
+        whole original ladder, which must be the whole ladder whichever side of
+        the depth each rung was on.
+        """
+        self._pipeline_ladder = None
+        if self._vault is None or not self._apc_meta:
+            return
+        rows: dict = {}
+        skipped = 0
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None:
+                continue
+            rungs = [int(r) for r in (meta.get("vault_rungs") or ())]
+            if not rungs:
+                continue
+            collapsed = [r for r in rungs if r <= depth]
+            if not collapsed:
+                # Nothing the peer would run past: the ladder is entirely in the
+                # head's remainder and the chunk loop serves it unchanged.
+                continue
+            rows[batch_idx] = rungs
+            skipped += sum(1 for r in collapsed if r != depth)
+            meta["vault_rungs"] = [r for r in rungs if r > depth]
+        if not rows:
+            return
+        self._pipeline_ladder = {"depth": int(depth), "rows": rows}
+        from ..pipeline_runtime import note_pipeline_ladder_collapsed
+
+        note_pipeline_ladder_collapsed(skipped)
+
+    def _pipeline_restore_ladder(self) -> None:
+        """Give the rungs back.  Runs when the peer failed and the request is
+        about to be re-prefilled on one box, which can serve all of them."""
+        ladder, self._pipeline_ladder = self._pipeline_ladder, None
+        if not ladder:
+            return
+        for batch_idx, rungs in ladder["rows"].items():
+            meta = self._apc_meta[batch_idx] if batch_idx < len(self._apc_meta) else None
+            if meta is not None:
+                meta["vault_rungs"] = list(rungs)
+
+    def _pipeline_store_full_depth_checkpoint(self) -> None:
+        """The one checkpoint a two-box prefill CAN take, taken.
+
+        Called immediately after ``finalize`` and BEFORE the batch advances, so
+        the preconditions are the ones the gate reasoned about and not a
+        reconstruction of them: the head owns every layer, the cache holds
+        exactly ``depth`` tokens, ``_processed_prompt_columns`` has not moved,
+        and ``_apc_meta`` is intact.  The capture goes through
+        ``_insert_vault_rungs`` -- the same ``capture_fragments`` +
+        ``insert_checkpoint`` the single-box chunk loop stores a rung with -- so
+        the entry's bytes, keys and provenance are what the vault expects and a
+        loopback run is bit-identical to a single-box one at this depth.
+
+        Never raises.  A fault here would otherwise reach ``_pipeline_step``'s
+        handler, which would throw away a cache that is COMPLETE and correct and
+        re-prefill the whole prompt -- paying the entire request over again for
+        a best-effort store.
+        """
+        ladder, self._pipeline_ladder = self._pipeline_ladder, None
+        if not ladder or self._vault is None:
+            return
+        try:
+            depth = int(ladder["depth"])
+            for batch_idx in ladder["rows"]:
+                meta = (
+                    self._apc_meta[batch_idx]
+                    if batch_idx < len(self._apc_meta)
+                    else None
+                )
+                if meta is not None:
+                    self._insert_vault_rungs(batch_idx, meta, [depth])
+        except Exception as exc:  # noqa: BLE001 - a store must not fail a prefill
+            logger.warning(
+                "pipeline: the post-finalize vault checkpoint failed (%r); the "
+                "prefill itself is complete and the request continues", exc,
+            )
+
+    def _pipeline_capture_plan(self):
+        """``(capture spec, refusal)`` for this batch's hidden-reading drafter.
+
+        A6.  Until now ANY such drafter refused the pipeline outright
+        (``speculative_hidden_capture``), which in the default served config --
+        DFlash2 -- is every request, so the feature was unreachable twice over
+        (A5 removed the other block).  What the drafter actually needs from a
+        prefill is a bounded window of the target's own activations, and both
+        boxes can produce their share of it:
+
+        * ``layers``: a per-layer capture (``capture_layer_ids``; dflash and
+          eagle3).  DFlash2's ``[5, 14, 24, 33, 42]`` STRADDLES the shipped
+          split of 23, so the head keeps 5/14 and the tail returns 24/33/42.
+          ``sorted(set(...))`` is not a normalisation of the drafter's list but
+          a reproduction of the model's own order: ``Glm5NextModel.__call__``
+          tests membership of a SET inside an ascending layer loop, so the
+          single-box capture is ascending and deduplicated whatever order the
+          drafter declared.
+        * ``hidden``: MTP's ``return_hidden`` -- the pre-final-norm,
+          mHC-collapsed hidden after the LAST layer, so the tail owns it whole.
+
+        Two refusals survive, and they are different questions:
+
+        * ``speculative_hidden_capture`` (the historical name, kept for the
+          historical reason) when the drafter declares NO finite window.
+          ``self._prefill_hidden.keep`` is read rather than
+          ``prefill_context_keep`` recomputed, because the window that comes
+          back has to be the window the accumulator would have trimmed to --
+          including when ``_capture_refusal`` already forced it to ``None`` for
+          a right-padded batch.  An unbounded window is not merely large, it is
+          the whole prompt's activations on the wire: 3.2 GB at 131k for
+          DFlash2, against 50.3 MB for the trailing 2047 rows.
+        * ``capture_unsupported`` when the capture is a shape this rail has no
+          merge for.  Additive: nothing produces it today (``chunk_capture_
+          kwargs_for`` emits only the two forms above), which is exactly why it
+          exists -- a third form added later must fall out of the pipeline by
+          name rather than be handed a merge that was written for two.
+        """
+        kwargs = self._chunk_capture_kwargs
+        if not kwargs:
+            return None, None
+        layer_ids = kwargs.get("capture_layer_ids")
+        if layer_ids:
+            kind, ids = "layers", sorted({int(i) for i in layer_ids})
+        elif kwargs.get("return_hidden"):
+            kind, ids = "hidden", []
+        else:
+            return None, "capture_unsupported"
+        keep = getattr(self._prefill_hidden, "keep", None)
+        if not keep or int(keep) <= 0:
+            return None, "speculative_hidden_capture"
+        return {"schema": 1, "kind": kind, "layers": ids, "keep": int(keep)}, None
+
+    def _pipeline_adopt_capture(self, hidden, depth: int) -> None:
+        """Seed the accumulator with the merged window, as ``depth`` appends would.
+
+        The pipelined chunks never ran on this box, so the accumulator has
+        nothing in it; what it gets instead is the one thing those chunks would
+        have left behind -- the trailing ``keep`` rows of ``depth`` tokens,
+        merged across the split -- plus the row count they stand for.  After
+        this, ``generate()``'s post-finalize remainder forward appends its own
+        capture exactly as it does on one box, and ``finish()`` returns the same
+        arrays and the same ``target_hidden_offset``.
+
+        Raises on anything unexpected, and the caller turns that into the
+        single-box fallback: a drafter primed on a short or misordered context
+        is a quietly worse answer, which is the failure mode this whole rail is
+        built to avoid.
+        """
+        if not hidden:
+            raise RuntimeError(
+                "pipelined prefill: the peer returned no speculative capture"
+            )
+        self._prefill_hidden.adopt_window(hidden, rows_covered=depth)
+
+    def _next_chunk_width(self, step: int) -> int:
+        """Columns the next SINGLE-BOX prefill chunk takes -- L35's plan.
+
+        A11b.  This used to answer for the pipelined chunk too, by turning the
+        merge off while the peer held the request: the peer could not run a
+        chunk of any width but ``C``, so the loop had to promise it would not
+        ask for one.  The envelope carries an explicit width list now, so a
+        pipelined chunk's width is READ FROM THE SCHEDULE that was handed to
+        the peer (``prompt_step``) instead of re-derived here -- which is not
+        merely tidier, it is the only thing that works: the collapse
+        (``_pipeline_collapse_ladder``) drops the rungs the schedule may have
+        clamped a chunk to, so a re-derivation after the collapse can no longer
+        reproduce the width the peer was promised.
+
+        What is left is the plain single-box width, which is what every caller
+        of this method now is.
+        """
+        return next_prefill_chunk(
+            self._inputs_embeds.shape[1] - 1,
+            step,
+            batch=self._inputs_embeds.shape[0],
+        )
+
+    def _pipeline_chunk_schedule(self) -> List[int]:
+        """The chunks this loop will hand the peer, in order.
+
+        The admitted schedule: the first ``k = ceil(T/C) - 1`` chunks of the
+        plan a single box would run, unless A5c shortened it to ``k-1`` -- see
+        ``_pipeline_schedule_plan``, which is where the decision is made and the
+        only place it is made.
+        """
+        return list(self._pipeline_schedule_plan()["chunks"])
+
+    def _pipeline_should_open(self) -> bool:
+        return (
+            self._pipeline is None
+            and not self._pipeline_declined
+            and self._processed_prompt_columns == 0
+            and self.prefill_step_size is not None
+        )
+
+    def _pipeline_open(self) -> None:
+        """Evaluate the admission gate once and, if it passes, take the lease."""
+        from ..pipeline_runtime import (
+            PipelineSettings,
+            acquire_pipeline_slot,
+            maybe_open_pipeline,
+            note_pipeline_bypass,
+            note_pipeline_schedule_shortened,
+            note_pipeline_warm,
+            pipeline_bypass_reason,
+            pipeline_language_model,
+        )
+
+        self._pipeline_declined = True
+        if not os.environ.get("MLX_VLM_PIPELINE_HOSTS", "").strip():
+            # The feature is off.  Nothing above this line touched an mx array
+            # and nothing below runs, so the statement sequence of the prefill
+            # is the one it was before this call site existed.
+            return
+        total_tokens = int(self._inputs_embeds.shape[1])
+        # A5b.  THE ROUTING RULE IS ASKED FIRST.  It used to be asked inside
+        # ``maybe_open_pipeline``, i.e. after every request-shape reason below,
+        # so a request the >= 16k policy never intended to route reported
+        # whichever shape reason happened to fire -- and in the default served
+        # config that was ``apc_checkpoint_ladder`` on EVERY request, at 8192
+        # tokens as loudly as at 131072.  The histogram is the only thing an
+        # operator reads to learn why the peer is idle, so a length refusal has
+        # to be named as one: below the routing threshold this request was never
+        # a pipeline candidate and its shape is not the reason it stayed home.
+        settings = PipelineSettings.from_env()
+        if settings is not None and total_tokens < settings.min_tokens:
+            note_pipeline_bypass("below_min_tokens")
+            return
+        capture, capture_refusal = self._pipeline_capture_plan()
+        # A10-0.  The warm arm now names ITSELF -- ``warm_suffix_lt_chunk`` or
+        # ``warm_suffix_ge_chunk`` -- because only this call site knows the
+        # suffix and the chunk size.  The gate is unchanged: it still asks the
+        # ladder and the capture first, and a warm request either of those
+        # refuses is still recorded under THEIR name, exactly as it was under
+        # ``warm_prefix``.
+        warm_reason, warm_facts = self._pipeline_warm_facts()
+        # A5c.  Derived ONCE, here: the depth the gate judges below is the depth
+        # the envelope carries and the depth the collapse and the post-finalize
+        # checkpoint use.  Deriving it twice is how a shortened schedule and a
+        # full-depth ladder test would disagree.
+        schedule = self._pipeline_schedule_plan()
+        reason = pipeline_bypass_reason(
+            ladder=self._pipeline_has_checkpoint_ladder(schedule),
+            capture=capture_refusal,
+            warm=warm_reason,
+            right_pad=(
+                self._right_pad_per_row is not None
+                and any(self._right_pad_per_row)
+            ),
+            pixel_values=self._prompt_kwargs.get("pixel_values"),
+            mask=self._prompt_kwargs.get("mask"),
+            cache=self.prompt_cache,
+            input_ids=self._input_ids,
+            kv_quantized=self._kv_quantized,
+        )
+        if reason is not None:
+            if warm_reason is not None and reason == warm_reason:
+                # Counted here and nowhere else, so ``pp_warm_requests`` is
+                # reconcilable with the bypass histogram by construction: it is
+                # the sum of the two warm names and nothing more.
+                self._pipeline_warm_stats = note_pipeline_warm(
+                    prefix_len=warm_facts["prefix_len"],
+                    suffix_len=warm_facts["suffix_len"],
+                    chunk_size=warm_facts["chunk_size"],
+                )
+            return
+        lm = pipeline_language_model(self.model)
+        if lm is None:
+            note_pipeline_bypass("no_pipeline_hook")
+            return
+        if len(self.prompt_cache) != int(lm.pipeline_num_layers):
+            # ``install_state`` refuses a cache that is not exactly n_layers
+            # long, and it refuses it at FINALIZE -- after the whole prefill has
+            # been paid for.  Refuse it here, where a fallback is still free.
+            note_pipeline_bypass("cache_depth_mismatch")
+            return
+        chunks = list(schedule["chunks"])
+        if not chunks:
+            note_pipeline_bypass("no_pipelined_chunks")
+            return
+        if not acquire_pipeline_slot():
+            return
+        self._pipeline_slot = True
+        try:
+            pipeline = maybe_open_pipeline(self.model, total_tokens, verbose=False)
+            if pipeline is None:
+                self._pipeline_release()
+                return
+            self._pipeline = pipeline
+            depth = sum(chunks)
+            # ``begin`` hashes ``input_ids[:, :-1]``, so hand it the pipelined
+            # prefix PLUS one token -- and ``chunks`` as well (A11b), because
+            # the plan's last chunk may be merged or clamped and the envelope's
+            # own uniform arithmetic would not derive it.
+            pipeline.begin(
+                depth + 1,
+                int(self.prefill_step_size),
+                input_ids=self._input_ids[:, : depth + 1],
+                capture=capture,
+                chunks=list(chunks),
+            )
+        except Exception as exc:  # noqa: BLE001 - a peer must not fail a request
+            logger.warning(
+                "pipeline: opening the two-box prefill failed (%r); this request "
+                "prefills single-box", exc,
+            )
+            note_pipeline_bypass("pp_begin_failed")
+            self._pipeline_release()
+            return
+        self._pipeline_chunks = chunks
+        self._pipeline_chunks_done = 0
+        # Counted HERE and nowhere else: the peer has the envelope, so this is
+        # the first moment a shortening is a fact about a request that ran
+        # rather than about one the gate was still thinking about.
+        if schedule["shortened"]:
+            self._pipeline_schedule_stats = note_pipeline_schedule_shortened(
+                reason=schedule["reason"],
+                full_chunks=schedule["full_chunks"],
+                chunks=len(chunks),
+                chunk_size=int(self.prefill_step_size),
+            )
+        # The gate has admitted the ladder; collapse it now, BEFORE the first
+        # chunk, so no boundary the chunk loop is about to cross can fire a
+        # capture over a half-populated cache.
+        self._pipeline_collapse_ladder(depth)
+        # Everything the fallback needs to start over.  ``_inputs_embeds`` is
+        # the whole prompt's embedding and is held for the duration of the
+        # pipelined prefill (1.07 GB at 131k) -- the price of being able to
+        # re-prefill without re-embedding.
+        self._pipeline_restore = {
+            "input_ids": self._input_ids,
+            "inputs_embeds": self._inputs_embeds,
+            "columns": self._processed_prompt_columns,
+            "prompt_kwargs": dict(self._prompt_kwargs),
+        }
+
+    def _pipeline_release(self) -> None:
+        """End the lease.  Idempotent, and never raises: it runs in failure paths.
+
+        ``close`` returns the connection to the pool if the request finalized and
+        discards it (counting ``pp_failed``) if it did not, so the caller does
+        not have to know which happened.
+        """
+        pipeline, self._pipeline = self._pipeline, None
+        try:
+            if pipeline is not None:
+                pipeline.close()
+        finally:
+            if self._pipeline_slot:
+                self._pipeline_slot = False
+                from ..pipeline_runtime import release_pipeline_slot
+
+                release_pipeline_slot()
+            self._pipeline_chunks = []
+            self._pipeline_chunks_done = 0
+
+    def _pipeline_fallback(self, exc: BaseException) -> None:
+        """Throw the half-filled cache away and restart this request single-box.
+
+        ``PipelineHead.abort`` already refuses to reuse a partially filled cache
+        and it is right to: layers ``[0, split)`` hold this box's writes for the
+        chunks that got through and layers ``[split, n)`` hold nothing at all.
+        There is no state to salvage and no way to tell the client, so the
+        request pays the prefill again, from column 0, on a fresh cache -- which
+        is what makes the fallback bit-identical to a run that never tried.
+        """
+        logger.warning(
+            "pipeline: two-box prefill failed after %d/%d chunks (%r); discarding "
+            "the partial cache and re-prefilling single-box",
+            self._pipeline_chunks_done,
+            len(self._pipeline_chunks),
+            exc,
+        )
+        restore = self._pipeline_restore or {}
+        self._pipeline_release()
+        self._pipeline_restore = None
+        # The re-prefill runs every chunk on this box and captures each one, so
+        # the accumulator has to start where a request that never tried starts.
+        # It is empty already on every path that reaches here today (the chunk
+        # loop's ``append`` runs only in the single-box branch, and PP adopts
+        # its window after the last chunk) -- reset anyway, because "empty
+        # already" is a property of the caller and a stale window here would be
+        # rows of a prompt prefix stitched in front of the whole prompt.
+        self._prefill_hidden = PrefillHiddenAccumulator(keep=self._prefill_hidden.keep)
+        # The single-box re-prefill can serve every rung, including the ones the
+        # collapse dropped, so it gets the whole ladder back.
+        self._pipeline_restore_ladder()
+        self.prompt_cache = self._build_prompt_cache()
+        if restore:
+            self._input_ids = restore["input_ids"]
+            self._inputs_embeds = restore["inputs_embeds"]
+            self._processed_prompt_columns = restore["columns"]
+            self._prompt_kwargs = dict(restore["prompt_kwargs"])
+        mx.clear_cache()
+
+    def _pipeline_step(self, n: int) -> Optional[int]:
+        """One pipelined chunk, or ``None`` if the request fell back to one box.
+
+        Advances the batch by exactly what the single-box branch advances it by;
+        the two differ only in WHERE layers ``[split, n_layers)`` ran.
+        """
+        try:
+            idx = self._pipeline_chunks_done
+            if idx >= len(self._pipeline_chunks) or n != self._pipeline_chunks[idx]:
+                raise RuntimeError(
+                    f"pipeline chunk {idx} is {n} tokens, schedule says "
+                    f"{self._pipeline_chunks[idx:idx + 1] or '(end)'}"
+                )
+            self._pipeline.prefill_chunk(
+                self.model,
+                self._input_ids[:, :n],
+                self._inputs_embeds[:, :n],
+                self.prompt_cache,
+            )
+            # Only stage A's caches exist on this box until finalize, so
+            # scheduling the whole list would evaluate empty tail entries.
+            mx.eval([c.state for c in self._pipeline.local_caches(self.prompt_cache)])
+            self._pipeline_chunks_done += 1
+            if self._pipeline_chunks_done == len(self._pipeline_chunks):
+                # Pull stage B's KDA/DSA caches back and install them: from here
+                # the remainder forward, the last token and all of decode run
+                # locally over the full stack.
+                self._pipeline.finalize(self.prompt_cache)
+                # A6.  The drafter's context for the pipelined part, merged
+                # from both halves and adopted BEFORE the lease is released --
+                # inside this handler, so a window that did not arrive or does
+                # not fit costs the request a single-box re-prefill rather than
+                # a silently short drafter context.
+                if self._chunk_capture_kwargs:
+                    self._pipeline_adopt_capture(
+                        self._pipeline.take_hidden(), sum(self._pipeline_chunks)
+                    )
+                # A5.  Here and nowhere else: all 45 layers are on this box,
+                # the cache is exactly ``sum(chunks)`` tokens deep, and the
+                # batch has not advanced past it yet.
+                self._pipeline_store_full_depth_checkpoint()
+                self._pipeline_restore = None
+                self._pipeline_release()
+        except Exception as exc:  # noqa: BLE001 - never surface a peer fault
+            self._pipeline_fallback(exc)
+            return None
+        self._processed_prompt_columns += n
+        self._store_apc_exact_checkpoints()
+        self._store_vault_checkpoints()
+        self._inputs_embeds = self._inputs_embeds[:, n:]
+        self._input_ids = self._input_ids[:, n:]
+        for k in self._prompt_length_aware_keys:
+            self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
+                k, self._prompt_kwargs[k], start=n
+            )
+        mx.clear_cache()
+        return n
+
     def prompt_step(self) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
             return 0
 
         step = self.prefill_step_size or self._inputs_embeds.shape[1]
-        # L35(b), on by default (I1437); ``...TAIL_MERGE=0`` makes this exactly
-        # ``min(step, remaining)`` again.  This driver is the batched one, so the
-        # TP forward cap it must respect is ``batch * width``, not width.
-        n = next_prefill_chunk(
-            self._inputs_embeds.shape[1] - 1,
-            step,
-            batch=self._inputs_embeds.shape[0],
-        )
-        checkpoint_col = self._next_apc_checkpoint_column()
-        if checkpoint_col is not None:
-            n = min(n, checkpoint_col - self._processed_prompt_columns)
+        # A11.  THE GATE IS ASKED BEFORE THE WIDTH IS CHOSEN, because the width
+        # DEPENDS on the answer: a pipelined chunk's width is the schedule's
+        # (A11b), a single-box one's is ``_next_chunk_width``, and the two are
+        # the same number only while the plan is a prefix of the loop's own.
+        # Asking in the other order made the first chunk's width a prediction of
+        # the gate's verdict, and a wrong prediction is not a slower request --
+        # it is a ``pipeline chunk 0 is N tokens`` mismatch and a whole
+        # re-prefill.  Nothing between here and the old call site touched an mx
+        # array, and the lease this may take is released on every exit below
+        # (``_pipeline_step`` -> fallback/release), so the move costs a request
+        # that ends up single-box exactly what it cost before.
+        if self._pipeline_should_open():
+            self._pipeline_open()
+        if self._pipeline is not None and self._pipeline_chunks_done < len(
+            self._pipeline_chunks
+        ):
+            # A11b.  ONE derivation, and this is not it: the width of a
+            # pipelined chunk was decided when ``_pipeline_schedule_plan`` built
+            # the list the peer's envelope carries, and re-deriving it here
+            # would have to reproduce a clamp whose rung the collapse has since
+            # dropped.  The ENVELOPE is still the cross-check -- it was built
+            # from this same list, and both ``PipelineHead.prefill_chunk`` and
+            # the tail's receiver refuse a chunk whose width is not the one at
+            # this index.
+            n = int(self._pipeline_chunks[self._pipeline_chunks_done])
+        else:
+            n = self._next_chunk_width(step)
+            checkpoint_col = self._next_apc_checkpoint_column()
+            if checkpoint_col is not None:
+                n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
+        if self._pipeline is not None:
+            processed = self._pipeline_step(n)
+            if processed is not None:
+                return processed
+            # The peer failed mid-prefill: the batch is back at column 0 on a
+            # fresh cache, so re-derive this chunk and run it on one box -- and
+            # ``_pipeline`` is None now, so this is the L35 plan a request that
+            # never tried would have taken.
+            n = self._next_chunk_width(step)
+            checkpoint_col = self._next_apc_checkpoint_column()
+            if checkpoint_col is not None:
+                n = min(n, checkpoint_col - self._processed_prompt_columns)
+            if n <= 0:
+                return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
         # Which rows END in this chunk (right-padded batches only).  Reading it
         # off the recorded absolute column adds NOTHING to the forward's
@@ -3016,6 +3998,14 @@ class PromptProcessingBatch:
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        if self._pipeline is not None:
+            # Unreachable by the schedule (``_pipeline_step`` finalizes and
+            # releases the lease on the schedule's LAST chunk, whether that is
+            # the loop's last chunk or -- A5c -- one before it), so this is a
+            # guard and not a path: half the KV would be on the peer.  Falling
+            # back restores the whole prompt, which the forward below then runs
+            # unchunked on a fresh cache.
+            self._pipeline_fallback(RuntimeError("prefill ended with the peer open"))
         call_kwargs = dict(self._prompt_kwargs)
         # Prefill leg: hidden captures yes, KDA rollback stash no.  Computed once in
         # ``__init__`` so this forward and every chunk before it carry byte-identical
@@ -4148,7 +5138,26 @@ class BatchGenerator:
     def stream(self):
         return self._stream
 
+    @staticmethod
+    def _release_prompt_batch_pipeline(prompt_batch) -> None:
+        """Give back a pipelined prefill's lease, if it holds one.
+
+        ``getattr`` rather than an attribute access because several tests build a
+        ``PromptProcessingBatch`` with ``__new__`` and set only the fields the
+        method under test reads.
+        """
+        release = getattr(prompt_batch, "_pipeline_release", None)
+        if callable(release) and getattr(prompt_batch, "_pipeline", None) is not None:
+            try:
+                release()
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                logger.warning("pipeline: releasing a cancelled lease failed",
+                               exc_info=True)
+
     def close(self):
+        # ``__del__`` calls this, and it can run on a half-built generator.
+        if getattr(self, "_prompt_batch", None) is not None:
+            self._release_prompt_batch_pipeline(self._prompt_batch)
         if self._wire_stack is not None:
             self._wire_stack.close()
             self._wire_stack = None
@@ -4359,6 +5368,10 @@ class BatchGenerator:
             # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
                 if len(self._prompt_batch.uids) == 1:
+                    # A cancelled pipelined prefill still holds the peer's only
+                    # slot and a pooled socket the peer thinks is mid-request;
+                    # dropping the batch without saying so would strand both.
+                    self._release_prompt_batch_pipeline(self._prompt_batch)
                     self._prompt_batch.uids = []
                     self._prompt_batch.prompt_cache = []
                     self._prompt_batch = None
