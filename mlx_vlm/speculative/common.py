@@ -478,6 +478,26 @@ def _record_speculative_round(
     ) + int(draft_count)
 
 
+def _record_admitted_rows(draft_model: nn.Module, rows: int) -> None:
+    """Rows admitted into an ALREADY RUNNING speculative batch.
+
+    ``rows/round`` alone cannot say whether a wide batch was wide because the
+    first queue drain caught every peer or because the loop grew afterwards.
+    This counter is the difference, and it is the receipt for
+    ``MLX_VLM_SPEC_EXTEND_ACTIVE``: zero here with a high rows/round means the
+    coalescing window did the work, non-zero means the loop did.
+    """
+    rows = int(rows)
+    if rows <= 0:
+        return
+    draft_model.speculative_total_admitted_rows = (
+        getattr(draft_model, "speculative_total_admitted_rows", 0) + rows
+    )
+    draft_model.speculative_total_admissions = (
+        getattr(draft_model, "speculative_total_admissions", 0) + 1
+    )
+
+
 def _record_batch_round(draft_model: nn.Module, rows: int) -> None:
     """One BATCH round happened, over ``rows`` active rows.
 

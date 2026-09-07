@@ -80,6 +80,70 @@ def _get_batch_cache_eval_interval() -> int:
         return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
 
 
+def spec_extend_active_enabled() -> bool:
+    """``MLX_VLM_SPEC_EXTEND_ACTIVE=1`` -- let a LIVE speculative batch grow.
+
+    Default 0, and 0 is byte-identical to the tree before V1b: with the flag off
+    ``SpeculativeGenerationBatch.extend`` raises exactly as it did,
+    ``BatchGenerator._next`` returns before the prefill path exactly as it did,
+    and ``run_speculative_server_rounds`` is called with ``admission=None`` so a
+    B == 1 dflash request still takes the scalar ``_dflash_rounds`` loop.
+
+    WHY IT IS A FLAG AND NOT A FIX.  Admission changes the batch composition of
+    the verify forward, and batch composition is not numerically neutral: the
+    tree already pins that (``tests/test_dflash_perrow_rollback.py`` compares a
+    B > 1 row against a B == 1 reference at 1e-4, not bit for bit, "and the same
+    reason as the clamp tests").  A row that joins at round 40 therefore decodes
+    a different -- equally valid, equally in-distribution -- continuation than
+    the same row would have decoded alone.  That is the same class of difference
+    the width policies produce (``speculative/dflash.py::_adaptive_k_enabled``,
+    ON IDENTITY), and it is not something a default may change silently.
+
+    Read fresh on every call rather than cached: it is consulted once per decode
+    step, next to a target forward, and a cached copy is a knob that cannot be
+    toggled in a test without reaching into module state.
+    """
+    return os.environ.get("MLX_VLM_SPEC_EXTEND_ACTIVE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def spec_extend_prefill_every() -> int:
+    """``MLX_VLM_SPEC_EXTEND_PREFILL_EVERY`` -- the interleave policy. Default 1.
+
+    THE POLICY, STATED.  With admission on, ``_next`` no longer returns after
+    the speculative decode step; it falls through to the prefill path, which
+    advances the waiting batch by AT MOST ONE CHUNK (``prefill_step_size``
+    columns, ``PromptProcessingBatch.prompt_step``) per call.  So the unit of
+    decode stall is one prefill chunk, not one prompt: a 16k-token prompt
+    admitted behind a live batch costs the incumbents ceil(16384/step) short
+    stalls spread over as many decode steps, not one long one.
+
+    ``next()`` on a speculative batch returns ONE emitted position, and a round
+    emits ``accepted + 1`` of them, so at the default of 1 a round pays roughly
+    ``rows/round``-many prefill chunks.  Raising this to N pays one chunk every
+    N decode steps: strictly less decode stall for the incumbents, strictly
+    worse TTFT for the waiting row (its prefill takes N times as many steps).
+    The default is 1 because the defect being repaired is TTFT measured in whole
+    generations -- a waiting row used to wait for the batch to DRAIN -- and
+    because the chunk is already the bounded unit; N > 1 is the knob for a
+    deployment that would rather protect the incumbents' inter-token latency.
+
+    The other admissible policy -- "one whole waiting ROW per round boundary" --
+    is not implemented: it makes the stall proportional to that row's prompt
+    length, which is the very thing chunking exists to bound, and it cannot be
+    expressed with ``prompt_step`` without unchunking the prefill.
+    """
+    try:
+        value = int(os.environ.get("MLX_VLM_SPEC_EXTEND_PREFILL_EVERY", "1"))
+    except (TypeError, ValueError):
+        return 1
+    return max(1, value)
+
+
 def _position_seed(seed: int, row_id: int, position: int) -> int:
     x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
     x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
@@ -1882,6 +1946,20 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        # V1b mid-stream admission.  ``_loop_rows`` maps the ROUND LOOP's own
+        # row index (0..B-1 of the generator that is currently running) onto
+        # this batch's stable row index (``_all_uids``).  They are the same list
+        # until the first admission, and they diverge permanently after a
+        # restart (see ``_restart_rounds_for_pending``), which is why every
+        # callback the loop is handed goes through ``_global_row``.
+        self._loop_rows = list(range(len(uids)))
+        # Rows prefilled while this batch was decoding, waiting for the next
+        # round boundary.  Filled by ``extend``, drained by ``_admission_poll``.
+        self._admission_queue: List[dict] = []
+        # (rows, first tokens) for admitted rows whose bonus token has not been
+        # emitted yet.  The round loop counts an admitted row's bonus as already
+        # emitted (``emitted = 1``), so THIS class owes the caller that token.
+        self._first_pending: List[Tuple[List[int], List[int]]] = []
         # Refuse an unsupported STRUCTURED shape at construction rather than on
         # the first ``next()``, so the request fails where the batch was
         # admitted.  A request with no grammar processor, and any request at all
@@ -1934,11 +2012,196 @@ class SpeculativeGenerationBatch:
             uid for uid, done in zip(self._all_uids, self._finished) if not done
         ]
 
+    def _global_row(self, loop_row: int) -> int:
+        """Round-loop row index -> this batch's stable row index."""
+        rows = self._loop_rows
+        if 0 <= loop_row < len(rows):
+            return rows[loop_row]
+        return loop_row
+
+    def accepts_extension(self) -> bool:
+        """May a row be admitted into this batch while it is decoding?
+
+        Three refusals, each because the thing being extended is built once for
+        a fixed batch:
+
+        * the flag is off (default) -- shipped behaviour;
+        * the drafter is not dflash -- ``_mtp_rounds_batch``/``_eagle3_rounds_batch``
+          have no admission channel, and ``run_speculative_server_rounds``
+          refuses loudly rather than dropping the rows;
+        * a structured/grammar processor is live -- ``_resolve_structured_ledger``
+          builds ONE ``StructuredLedger`` sized to the batch at ``_start_rounds``,
+          and a row admitted later would not be in it.
+        """
+        if not spec_extend_active_enabled():
+            return False
+        if self.draft_kind != "dflash":
+            return False
+        if self.logits_processors and any(self.logits_processors):
+            return False
+        return True
+
     def extend(self, other: "SpeculativeGenerationBatch"):
         if len(self) == 0:
             self.__dict__.update(other.__dict__)
             return
-        raise RuntimeError("Cannot extend an active speculative generation batch.")
+        if not self.accepts_extension():
+            raise RuntimeError("Cannot extend an active speculative generation batch.")
+        self._admit(other)
+
+    def _admit(self, other: "SpeculativeGenerationBatch") -> None:
+        """Queue ``other``'s rows for the next ROUND BOUNDARY.
+
+        Bookkeeping this class owns (uids, per-row token counts, per-row
+        max_tokens, thinking budgets) is extended NOW, so ``len(self)`` counts
+        the new rows immediately and the server's capacity check sees them.  The
+        caches and the drafter state are extended LATER, by
+        ``_admission_poll``, because the round loop may be suspended mid-round
+        with a verify done and its rollback still pending.
+        """
+        if other.draft_kind != self.draft_kind:
+            raise RuntimeError(
+                f"cannot admit a {other.draft_kind!r} row into a "
+                f"{self.draft_kind!r} speculative batch"
+            )
+        if other.logits_processors and any(other.logits_processors):
+            raise RuntimeError(
+                "cannot admit a structured-output row into a live speculative "
+                "batch; the grammar ledger is built once per batch"
+            )
+        n = len(other._all_uids)
+        if n == 0:
+            return
+        mx.eval(other.first_tokens)
+        bonus = [int(t) for t in other.first_tokens.reshape(-1).tolist()]
+        base = len(self._all_uids)
+        rows = list(range(base, base + n))
+        self._all_uids.extend(other._all_uids)
+        self._num_tokens.extend([0] * n)
+        self._finished.extend([False] * n)
+        self.max_tokens.extend(list(other.max_tokens))
+        criteria = list(other.thinking_budget_criteria)
+        criteria.extend([None] * (n - len(criteria)))
+        self.thinking_budget_criteria.extend(criteria[:n])
+        self._admission_queue.append(
+            {
+                "rows": rows,
+                "prompt_cache": other.prompt_cache,
+                "hidden": other.hidden,
+                "bonus": bonus,
+                "target_hidden_offset": int(other.target_hidden_offset or 0),
+            }
+        )
+        self._first_pending.append((list(rows), list(bonus)))
+        # The donor is spent: its cache now belongs to this batch's queue, and
+        # leaving it addressable invites a second owner.
+        other.uids = []
+        other.prompt_cache = []
+        self._refresh_uids()
+
+    def _admission_poll(self) -> Optional[dict]:
+        """Round-boundary callback: merge the waiting rows' TARGET caches.
+
+        The merge is done HERE, not in the round loop, for one reason and it is
+        not style: ``_extend_cache`` (left padding, per-row offsets, per-row
+        recurrent state) is this module's, and the speculative package is
+        imported BY this module.  ``self.prompt_cache`` is sliced in place so the
+        list object the running generator closed over stays the same object.
+        """
+        if not self._admission_queue:
+            return None
+        records, self._admission_queue = self._admission_queue, []
+        rows_hidden: List[mx.array] = []
+        bonus: List[int] = []
+        offsets: List[int] = []
+        rows: List[int] = []
+        merged_cache: List[Any] = []
+        for record in records:
+            keep = [i for i, row in enumerate(record["rows"]) if not self._finished[row]]
+            if not keep:
+                continue
+            if len(keep) < len(record["rows"]):
+                # A row whose FIRST token already stopped it never enters the
+                # loop; its cache columns leave with it rather than riding along
+                # as a row nothing will ever read.
+                keep_arr = mx.array(keep, mx.int32)
+                for c in record["prompt_cache"]:
+                    c.filter(keep_arr)
+            rows.extend(record["rows"][i] for i in keep)
+            rows_hidden.extend(record["hidden"][i : i + 1] for i in keep)
+            bonus.extend(record["bonus"][i] for i in keep)
+            offsets.extend(record["target_hidden_offset"] for _ in keep)
+            merged_cache = _extend_cache(merged_cache, record["prompt_cache"])
+        if not rows:
+            return None
+        self.prompt_cache[:] = _extend_cache(self.prompt_cache, merged_cache)
+        self._loop_rows.extend(rows)
+        return {
+            "rows_hidden": rows_hidden,
+            "bonus": bonus,
+            "row_ids": [0] * len(rows),
+            "target_hidden_offset": offsets,
+            "max_tokens": max(self.max_tokens[row] for row in rows),
+        }
+
+    def _emit_pending_first_tokens(
+        self, responses: List[GenerationBatch.Response]
+    ) -> None:
+        """Emit an admitted row's bonus token, exactly as ``next()`` does for a
+        row that was present when the batch was built."""
+        pending, self._first_pending = self._first_pending, []
+        for rows, tokens in pending:
+            for row, token in zip(rows, tokens):
+                if self._finished[row]:
+                    continue
+                token = int(token)
+                self._num_tokens[row] += 1
+                criteria = self._criteria_for(row)
+                if criteria is not None:
+                    criteria(token)
+                finish_reason = self._finish_reason(row, token)
+                if finish_reason is not None:
+                    self._finished[row] = True
+                responses.append(
+                    self.Response(
+                        uid=self._all_uids[row],
+                        token=token,
+                        token_logprob=0.0,
+                        finish_reason=finish_reason,
+                    )
+                )
+
+    def _restart_rounds_for_pending(self) -> bool:
+        """The loop ended with rows still queued: start a NEW loop for them.
+
+        Reachable when every active row finishes in the same round an admission
+        was queued (the loop breaks on an empty active set BEFORE it polls
+        again).  Rather than strand those requests, the batch re-seeds itself
+        from the first waiting record -- the same state a fresh batch would have
+        -- and keeps the rest queued for the new loop's first round boundary.
+        ``_loop_rows`` is what makes that safe: the new generator's row 0 is not
+        this batch's row 0.
+        """
+        while self._admission_queue:
+            record = self._admission_queue.pop(0)
+            keep = [i for i, row in enumerate(record["rows"]) if not self._finished[row]]
+            if not keep:
+                continue
+            if len(keep) < len(record["rows"]):
+                keep_arr = mx.array(keep, mx.int32)
+                for c in record["prompt_cache"]:
+                    c.filter(keep_arr)
+            keep_arr = mx.array(keep, mx.int32)
+            self.prompt_cache = record["prompt_cache"]
+            self.hidden = record["hidden"][keep_arr]
+            self.first_tokens = mx.array(
+                [record["bonus"][i] for i in keep], dtype=self.token_dtype
+            )
+            self.target_hidden_offset = int(record["target_hidden_offset"])
+            self._loop_rows = [record["rows"][i] for i in keep]
+            self._rounds_iter = None
+            return True
+        return False
 
     def filter(self, keep: List[int]):
         keep_uids = {self.uids[idx] for idx in keep}
@@ -1962,7 +2225,8 @@ class SpeculativeGenerationBatch:
         responses: List[GenerationBatch.Response],
         tok_list: List[Optional[int]],
     ) -> None:
-        for row, token in enumerate(tok_list):
+        for loop_row, token in enumerate(tok_list):
+            row = self._global_row(loop_row)
             if token is None or self._finished[row]:
                 continue
             token = int(token)
@@ -1987,14 +2251,17 @@ class SpeculativeGenerationBatch:
             # The rounds call this once per EMITTED token, in order, per row --
             # the same contract the autoregressive loop gives the criteria, so
             # the criteria's own ``_forced_index`` ledger advances exactly once
-            # per forced id as that id is emitted.
-            criteria = self._criteria_for(seq_idx)
+            # per forced id as that id is emitted.  ``seq_idx`` is the ROUND
+            # LOOP's row, which is this batch's row only until the first
+            # admission.
+            row = self._global_row(seq_idx)
+            criteria = self._criteria_for(row)
             if criteria is not None:
                 criteria(int(token_id))
             return (
-                self._finished[seq_idx]
+                self._finished[row]
                 or self.stop_criteria(token_id)
-                or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
+                or self._num_tokens[row] >= self.max_tokens[row]
             )
 
         has_budget = any(c is not None for c in self.thinking_budget_criteria)
@@ -2014,11 +2281,22 @@ class SpeculativeGenerationBatch:
             shared_kv_states=self.shared_kv_states,
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
-            row_ids=[0] * len(self._all_uids),
+            # Sized to the LOOP, not to this batch: an admission queued before
+            # the first round has already lengthened ``_all_uids``.
+            row_ids=[0] * len(self._loop_rows),
             target_hidden_offset=self.target_hidden_offset,
             logits_processors=self.logits_processors,
-            emit_limit=self._emit_limit if has_budget else None,
-            forced_draft_ids=self._forced_draft_ids if has_budget else None,
+            emit_limit=(
+                (lambda r: self._emit_limit(self._global_row(r)))
+                if has_budget
+                else None
+            ),
+            forced_draft_ids=(
+                (lambda r: self._forced_draft_ids(self._global_row(r)))
+                if has_budget
+                else None
+            ),
+            admission=self._admission_poll if self.accepts_extension() else None,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -2048,10 +2326,22 @@ class SpeculativeGenerationBatch:
             self._refresh_uids()
             return responses
 
+        if self._first_pending:
+            # An admitted row owes its bonus token before the loop can emit for
+            # it (the loop starts that row at ``emitted = 1``).  Returned on its
+            # own step so a row that stops ON its first token never enters the
+            # round loop at all.
+            self._emit_pending_first_tokens(responses)
+            self._refresh_uids()
+            return responses
+
         self._start_rounds()
         try:
             tok_list, round_meta = next(self._rounds_iter)
         except StopIteration:
+            if self._restart_rounds_for_pending():
+                self._refresh_uids()
+                return responses
             for row, done in enumerate(self._finished):
                 if not done:
                     self._finished[row] = True
@@ -4473,6 +4763,9 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
         self._cache_eval_interval = _get_batch_cache_eval_interval()
+        # Decode steps taken since the last prefill slice was interleaved into a
+        # LIVE speculative batch (V1b; see ``spec_extend_prefill_every``).
+        self._spec_prefill_phase = 0
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
@@ -5485,7 +5778,24 @@ class BatchGenerator:
             getattr(self._generation_batch, "is_speculative", False)
             and len(self._generation_batch) > 0
         ):
-            return prompt_responses, generation_responses
+            # THE ROW THAT ARRIVES SECOND USED TO WAIT FOR THE BATCH TO DRAIN.
+            # This early return is the whole of "CB prefill interleaving" being
+            # absent on the speculative path: prefill is not merely deprioritised
+            # while a speculative batch is alive, it is unreachable, so the batch
+            # is whatever the first queue drain saw (V1: rows/round 3.29, 3.91
+            # with the 40 ms coalescing window, out of 8-16 waiting).
+            #
+            # With admission on, fall through to the prefill path instead.  The
+            # capacity check below (``completion_batch_size`` =
+            # MLX_VLM_MAX_NUM_SEQS) is the bound on how wide the batch may grow,
+            # and ``spec_extend_prefill_every`` is the bound on how much decode
+            # stall one waiting row may cost the incumbents.
+            accepts = getattr(self._generation_batch, "accepts_extension", None)
+            if not (callable(accepts) and accepts()):
+                return prompt_responses, generation_responses
+            self._spec_prefill_phase += 1
+            if self._spec_prefill_phase % spec_extend_prefill_every() != 0:
+                return prompt_responses, generation_responses
 
         if len(self._generation_batch) >= self.completion_batch_size:
             return prompt_responses, generation_responses

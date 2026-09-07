@@ -14,6 +14,7 @@ from .common import (
     _batch_acceptance_must_be_uniform,
     _dflash_block_total,
     _forced_prefix_len,
+    _record_admitted_rows,
     _record_batch_round,
     _record_budget_clamp,
     _record_draft_seconds,
@@ -1315,6 +1316,7 @@ def _dflash_rounds_batch(
     target_hidden_offset: int = 0,
     emit_limit: Optional[Callable[[int], Optional[int]]] = None,
     forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
+    admission: Optional[Callable[[], Optional[dict]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -1328,6 +1330,36 @@ def _dflash_rounds_batch(
     Yields ``(tokens_list, None)`` where ``tokens_list[i]`` is the
     token for sequence ``i`` (or ``None`` if that sequence has nothing
     to emit this step).
+
+    ``admission`` is the other half of continuous batching: rows LEAVING this
+    loop were always supported, rows ARRIVING were not, so a served batch was
+    whatever the first queue drain happened to see and never grew again (V1,
+    rows/round 3.3-3.9 out of 8-16 waiting).  It is polled once per round, at
+    the ROUND BOUNDARY -- after the previous round's walk, rollback and
+    finished-row filter, before the next round's width is chosen -- because that
+    is the only point at which every cache in the batch is settled: mid-round the
+    verify has run but ``rollback_speculative_cache`` has not, so a batch-dimension
+    edit there would trim rows against the wrong length.
+
+    The callback returns ``None`` (nothing waiting) or a dict:
+
+        rows_hidden            n arrays of shape [1, L_i, D] -- the target hidden
+                               each row would have started a batch of its own
+                               with.  A LIST, not one array: rows admitted in the
+                               same poll can come from different prefills and
+                               have different prompt lengths.
+        bonus                  n first tokens (already emitted by the caller)
+        row_ids                n sampler row ids
+        target_hidden_offset   n per-row prefill context trims
+        max_tokens             the new rows' largest max_tokens, or 0
+
+    THE CALLER MERGES THE TARGET CACHES ITSELF, in the callback, before it
+    returns -- ``prompt_cache`` is the same list object the caller holds, and
+    the batch-dimension merge (``generate/ar.py::_extend_cache``, left padding,
+    per-row offsets) lives there.  Passing it in here would import ar.py from
+    the speculative package, which imports this module.  What this loop owns is
+    everything the caller cannot reach: the drafter caches, the per-row
+    committed hidden, the bonus tokens and the active-slot map.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -1391,6 +1423,58 @@ def _dflash_rounds_batch(
     total_emitted = sum(emitted)
 
     while len(active_idx) > 0:
+        if admission is not None:
+            pending = admission()
+            if pending:
+                # The caller has already merged the new rows' TARGET caches into
+                # ``prompt_cache`` (same list object).  Everything below is the
+                # per-row state a fresh batch would have seeded for them.
+                new_hidden = list(pending["rows_hidden"])
+                new_bonus = [int(t) for t in pending["bonus"]]
+                n_new = len(new_bonus)
+                new_offsets = list(
+                    pending.get("target_hidden_offset") or [0] * n_new
+                )
+                base = B
+                B += n_new
+                b.extend(new_bonus)
+                # A round the row was not in cannot have emitted for it: the
+                # bonus IS its first emitted token, which is what ``emitted=1``
+                # means for a row present at construction.
+                emitted.extend([1] * n_new)
+                finished.extend([False] * n_new)
+                hidden_by_orig.extend(new_hidden)
+                row_ids.extend(list(pending.get("row_ids") or [0] * n_new))
+                active_idx.extend(range(base, B))
+                # A row admitted later may want more tokens than any incumbent.
+                # Raising the loop's own ceiling only relaxes ITS cap; the exact
+                # per-row limit is the caller's ``stop_check``, which has been
+                # authoritative for per-row max_tokens since this loop was
+                # written (the scalar here is max() over the batch either way).
+                max_tokens = max(max_tokens, int(pending.get("max_tokens") or 0))
+                if batched_draft:
+                    for cache_entry in batched_caches:
+                        grow = getattr(cache_entry, "grow", None)
+                        if not callable(grow):
+                            raise RuntimeError(
+                                f"{type(cache_entry).__name__} cannot admit rows "
+                                "into a live batched draft cache; run with "
+                                "MLX_VLM_DFLASH_BATCHED_DRAFT=0 or "
+                                "MLX_VLM_SPEC_EXTEND_ACTIVE=0."
+                            )
+                    # Per-row offsets: one grow call per row keeps the rows
+                    # in admission order and lets each carry its own prefill
+                    # context trim.
+                    for off in new_offsets:
+                        for cache_entry in batched_caches:
+                            cache_entry.grow(1, int(off))
+                else:
+                    for off in new_offsets:
+                        fresh = draft_model.make_cache()
+                        _adopt_pretruncated_context(draft_model, [fresh], int(off))
+                        draft_caches.append(fresh)
+                _record_admitted_rows(draft_model, n_new)
+
         remaining = []
         for j in range(len(active_idx)):
             room = max_tokens - emitted[active_idx[j]] + 1

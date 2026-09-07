@@ -592,6 +592,7 @@ def run_speculative_server_rounds(
     structured_ledger: Optional[Any] = None,
     emit_limit: Optional[Callable[[int], Optional[int]]] = None,
     forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
+    admission: Optional[Callable[[], Optional[dict]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Server-side speculative rounds for one batch.
 
@@ -603,6 +604,16 @@ def run_speculative_server_rounds(
     ``draft[:k]`` is the target's own continuation for every ``j < accepted``.
     Only the continuous-batching kinds (dflash, mtp) honour them; eagle3 and
     lookup ignore them, which is why the server still refuses a budget there.
+
+    ``admission`` (V1b, ``MLX_VLM_SPEC_EXTEND_ACTIVE``) lets a LIVE batch grow:
+    the round loop polls it at each round boundary for rows the server prefilled
+    while this batch was decoding.  Only ``dflash`` implements it; every other
+    kind refuses rather than silently dropping the rows, because a dropped
+    admission is a request that never answers.  A B == 1 dflash batch that may
+    grow is routed to the BATCH loop instead of the scalar one -- the scalar
+    loop has no active-slot map to append to -- so under this flag a single-row
+    request takes a different (equivalent, not bit-identical: see
+    ``_adaptive_k_enabled``'s ON IDENTITY note) code path than it does today.
     """
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
     _validate_speculative_sampling(draft_model, greedy_sampling)
@@ -613,6 +624,12 @@ def run_speculative_server_rounds(
         draft_kind=draft_kind,
         call_site="run_speculative_server_rounds",
     )
+
+    if admission is not None and draft_kind != "dflash":
+        raise NotImplementedError(
+            f"mid-stream row admission is implemented for dflash only, not "
+            f"{draft_kind!r}; set MLX_VLM_SPEC_EXTEND_ACTIVE=0."
+        )
 
     if draft_kind == "lookup":
         if batch_size != 1:
@@ -694,7 +711,7 @@ def run_speculative_server_rounds(
         return
 
     if draft_kind == "dflash":
-        if batch_size == 1:
+        if batch_size == 1 and admission is None:
             for tok, state in _dflash_rounds(
                 model,
                 draft_model,
@@ -732,6 +749,7 @@ def run_speculative_server_rounds(
             target_hidden_offset=target_hidden_offset,
             emit_limit=emit_limit,
             forced_draft_ids=forced_draft_ids,
+            admission=admission,
         )
         return
 
