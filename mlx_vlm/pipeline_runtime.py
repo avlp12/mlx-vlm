@@ -744,6 +744,40 @@ class PipelineHead:
 # ------------------------------------------------------------------ receipts
 
 
+# A10-0.  Bucket EDGES for the warm-suffix histogram, in the order they are
+# tested; the first one a suffix fits is the bucket it lands in.  Two of them
+# are absolute (512, 2048) because they are the band the A10 analysis says
+# cannot be pipelined at any sane chunk size, and four are relative to the
+# chunk size C because C is what actually decides it (``ceil(S/C) - 1`` chunks)
+# and C is configurable (``PREFILL_STEP_SIZE``; 8192 served, 2048 on the PP05
+# driver).  When C <= 2048 the ``le_c`` bucket is unreachable -- an absolute
+# edge catches those suffixes first -- and that is a property of the ordering,
+# not a lost count: every request lands in exactly one bucket and the buckets
+# sum to ``pp_warm_requests``.
+WARM_SUFFIX_BUCKETS = ("le_512", "le_2048", "le_c", "le_2c", "le_4c", "gt_4c")
+
+
+def warm_suffix_bucket(suffix_len, chunk_size) -> str:
+    """Which :data:`WARM_SUFFIX_BUCKETS` name this suffix belongs to.
+
+    ``chunk_size <= 0`` (no chunked prefill configured) leaves the C-relative
+    edges undefined, so only the absolute ones are tested and everything above
+    them reads ``gt_4c``.  Named rather than raising: this is instrumentation
+    on a refusal path and it must never be the thing that fails a request.
+    """
+    s = int(suffix_len or 0)
+    c = int(chunk_size or 0)
+    if s <= 512:
+        return "le_512"
+    if s <= 2048:
+        return "le_2048"
+    if c > 0:
+        for mult, name in ((1, "le_c"), (2, "le_2c"), (4, "le_4c")):
+            if s <= mult * c:
+                return name
+    return "gt_4c"
+
+
 class PipelineMetrics:
     """Counters a running server can be asked for.
 
@@ -769,6 +803,8 @@ class PipelineMetrics:
             self.breaker_state = "closed"
             self.ladder_collapsed = 0
             self.ladder_rungs_skipped = 0
+            self.warm_requests = 0
+            self.warm_suffix_hist = {}
 
     def note_bypass(self, reason: Optional[str]):
         if not reason:
@@ -819,6 +855,20 @@ class PipelineMetrics:
             self.ladder_collapsed += 1
             self.ladder_rungs_skipped += max(0, int(skipped))
 
+    def note_warm(self, suffix_len: int, chunk_size: int):
+        """One warm-prefix refusal, bucketed by the suffix it did not pipeline.
+
+        A10-0's gate is a FREQUENCY question -- "does this fleet ever send a
+        warm request with a suffix big enough to pipeline?" -- and the bypass
+        histogram can only answer it two ways round (below C / above C).  The
+        buckets carry the distribution, so a decision to build A10-1..7 can be
+        read off one ``/metrics`` diff instead of a log scrape.
+        """
+        bucket = warm_suffix_bucket(suffix_len, chunk_size)
+        with self._lock:
+            self.warm_requests += 1
+            self.warm_suffix_hist[bucket] = self.warm_suffix_hist.get(bucket, 0) + 1
+
     def set_breaker_state(self, state: str):
         with self._lock:
             self.breaker_state = state
@@ -836,6 +886,8 @@ class PipelineMetrics:
                 "pp_breaker_trips": self.breaker_trips,
                 "pp_ladder_collapsed": self.ladder_collapsed,
                 "pp_ladder_rungs_skipped": self.ladder_rungs_skipped,
+                "pp_warm_requests": self.warm_requests,
+                "pp_warm_suffix_tokens_hist": dict(self.warm_suffix_hist),
             }
 
 
@@ -1163,6 +1215,35 @@ def note_pipeline_ladder_collapsed(skipped: int = 0) -> None:
     METRICS.note_ladder_collapsed(skipped)
 
 
+def note_pipeline_warm(*, prefix_len: int, suffix_len: int, chunk_size: int) -> dict:
+    """Record ONE warm request's prefix/suffix/chunk split; return its stats.
+
+    A10-0 is instrumentation, so this is deliberately two things at once.  The
+    return value is the PER-REQUEST record -- ``warm_prefix_len``,
+    ``warm_suffix_len``, ``chunk_size`` -- which the batch keeps on itself so a
+    test (and, later, A10-1's protocol) can read the exact numbers the gate
+    decided on.  The side effect is the AGGREGATE the smoke driver diffs out of
+    ``/metrics``: ``pp_warm_requests`` and the ``pp_warm_suffix_tokens_hist``
+    bucket, which is the only receipt that answers the question the whole plan
+    is gated on (unknown 6.1: how often does a warm request carry a suffix
+    worth pipelining?).
+
+    Called ONLY when the gate actually returned one of the two warm names, so
+    ``pp_warm_requests`` equals their sum equals what ``warm_prefix`` counted
+    before this split.  A warm request that a shape reason ABOVE warm in the
+    gate refused (``apc_checkpoint_ladder``, a capture) is not counted here for
+    the same reason it was never counted as ``warm_prefix``: the gate names one
+    refusal, and this histogram has to stay reconcilable with it.
+    """
+    stats = {
+        "warm_prefix_len": int(prefix_len or 0),
+        "warm_suffix_len": int(suffix_len or 0),
+        "chunk_size": int(chunk_size or 0),
+    }
+    METRICS.note_warm(stats["warm_suffix_len"], stats["chunk_size"])
+    return stats
+
+
 def note_pipeline_bypass(reason: Optional[str]) -> Optional[str]:
     """Count a refusal that is a RESOURCE fact rather than a request fact.
 
@@ -1202,7 +1283,19 @@ def _pipeline_bypass_reason(
         # historical name.
         return capture if isinstance(capture, str) else "speculative_hidden_capture"
     if warm:
-        return "warm_prefix"
+        # A10-0, and the same string-or-bool idiom ``capture`` above uses.  The
+        # BATCH call site knows the two numbers that decide whether a warm
+        # request could EVER be pipelined -- the uncached suffix ``S`` it is
+        # about to prefill and the chunk size ``C`` -- so it names the refusal
+        # itself: ``warm_suffix_lt_chunk`` (S <= C, which yields
+        # ``ceil(S/C) - 1 == 0`` chunks and is therefore unpipelinable at this
+        # C no matter what A10 ships) or ``warm_suffix_ge_chunk`` (S > C, the
+        # shape A10 would pay for).  The two names REPLACE ``warm_prefix`` in
+        # that path and sum to exactly what it counted.
+        # ``generate_step``'s call site passes a bool -- it has no suffix
+        # length to hand over, its ``warm_prefix`` argument is the caller's
+        # flag -- so it keeps the historical ``warm_prefix`` string unchanged.
+        return warm if isinstance(warm, str) else "warm_prefix"
     # New in the batch call site (A4) and additive: ``generate_step`` never sees
     # a right-padded batch, so it leaves this at its default and its reason
     # strings are unchanged.  ``prompt_step``'s batch can be right-padded (mixed

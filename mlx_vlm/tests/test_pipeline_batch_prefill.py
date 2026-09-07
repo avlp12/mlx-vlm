@@ -313,7 +313,21 @@ def test_the_schedule_is_the_chunk_loop_and_nothing_else():
             {"right_pad_per_row": [0, 3], "suffix_lens": [40, 37]},
             {},
         ),
-        ("warm_prefix", [PROMPT], {}, {"_apc_meta": [{"prefix_len": 4}]}),
+        # A10-0 split the blanket ``warm_prefix`` refusal in the BATCH path in
+        # two, by the uncached suffix against the chunk size.  Same prompt, same
+        # 4-token cached prefix, same refusal -- only C moves.
+        (
+            "warm_suffix_ge_chunk",  # S = 40 > C = 8: A10 would have chunks to send
+            [PROMPT],
+            {},
+            {"_apc_meta": [{"prefix_len": 4}]},
+        ),
+        (
+            "warm_suffix_lt_chunk",  # S = 40 <= C = 64: ceil(S/C) - 1 == 0, ever
+            [PROMPT],
+            {"step": 64},
+            {"_apc_meta": [{"prefix_len": 4}]},
+        ),
         (
             # A5 admits a rung the post-finalize checkpoint can stand in for.
             # This one it cannot: 12 is not a multiple of the chunk size, so
@@ -1318,3 +1332,254 @@ def test_a_pp_turn_1_with_apc_exact_on_leaves_the_session_tier_alone(monkeypatch
         warm[arm] = _cache_digest(pick["warm_cache"])
     assert picks["pipelined"] == picks["single_box"] == (len(PROMPT), "vault-session")
     assert warm["pipelined"] == warm["single_box"]
+
+
+# ------------------------------- 8. A10-0: which warm requests A10 could serve
+#
+# ``warm_prefix`` was one name for two facts, and the difference between them
+# decides whether the rest of A10 gets built at all.  PP's unit of work is a
+# CHUNK: ``_pipeline_chunk_schedule`` hands the peer ``ceil(S/C) - 1`` chunks of
+# ``C``, so a warm request whose uncached suffix ``S`` is at most ``C`` has zero
+# chunks to give and would stay single-box under every version of A10 -- while
+# one with ``S > C`` is exactly the shape the prefix push would pay for.  One
+# name could not tell an operator which of those the fleet actually sends.
+#
+# This stage is INSTRUMENTATION ONLY.  Every request that stayed on one box
+# still stays on one box; the two new names replace ``warm_prefix`` in the batch
+# path and sum to what it counted, ``generate_step``'s bool call site keeps the
+# old string, and the numbers the gate decided on are recorded per request and
+# bucketed into ``/metrics``.
+
+
+def _session_warm(monkeypatch, new_tokens):
+    """A genuinely RESTORED cache plus the suffix that follows it.
+
+    Turn 1 is prefilled for real and its end-of-turn rung is written to the
+    session tier; ``_vault_pick_for`` hands back the same ``warm_cache`` /
+    ``prefix_len`` the server would hand ``PromptProcessingBatch``.  So the warm
+    facts under test come from the shipped restore path, not from a patched
+    ``_apc_meta`` -- which is the one thing the parametrised table above cannot
+    show.
+    """
+    from mlx_vlm import apc as _apc
+    from mlx_vlm import context_vault as cv
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    monkeypatch.setenv("MLX_VLM_APC_SAVE_SESSION", "1")
+    lm = _lm()
+    with _pipeline_off():
+        batch = _batch(lm)
+        while batch.needs_processing():
+            batch.prompt_step()
+        first = {}
+
+        def sampler(logprobs):
+            first["tok"] = mx.argmax(logprobs, axis=-1)
+            return first["tok"]
+
+        gen = batch.generate(sampler=sampler, stop_criteria=lambda t: False)
+        mx.eval(first["tok"])
+    key = PROMPT + [int(first["tok"][0].item())]
+    vault = cv.ContextVault("identity-for-the-test", budget_bytes=1 << 30)
+    assert cv.record_session_turn(
+        vault,
+        key,
+        _apc.snapshot_prompt_cache_row(gen.prompt_cache, 0),
+        completed=True,
+        session_id="conv-1",
+        adopt=False,
+    ), cv.session_skip_counts()
+    turn2 = key + list(range(45, 45 + int(new_tokens)))
+    pick = BatchGenerator._vault_pick_for(_PickGen(vault, lm), turn2, {}, None)
+    assert pick is not None and pick["prefix_len"] > 0, "turn 2 missed the session tier"
+    return lm, pick, turn2
+
+
+def _warm_batch(lm, pick, turn2, *, step=STEP):
+    prefix_len = int(pick["prefix_len"])
+    suffix = turn2[prefix_len:]
+    batch = _batch(
+        lm,
+        [suffix],
+        step=step,
+        warm_cache=pick["warm_cache"],
+        apc_meta=[{"prefix_len": prefix_len, "full_input_ids": list(turn2)}],
+    )
+    return batch, prefix_len, len(suffix)
+
+
+@pytest.mark.parametrize(
+    "new_tokens,step,expected",
+    [
+        (5, STEP, "warm_suffix_lt_chunk"),  # S = 6 <= C = 8
+        (39, STEP, "warm_suffix_ge_chunk"),  # S = 40 > C = 8
+        (39, 64, "warm_suffix_lt_chunk"),  # the SAME suffix, at a bigger C
+    ],
+)
+def test_a_restored_cache_is_named_by_its_suffix(
+    monkeypatch, new_tokens, step, expected
+):
+    """The name follows S vs C, on a cache the session tier actually restored."""
+    lm, pick, turn2 = _session_warm(monkeypatch, new_tokens)
+    _arm(monkeypatch, min_tokens=1)
+    pr.METRICS.reset()
+    batch, prefix_len, suffix_len = _warm_batch(lm, pick, turn2, step=step)
+    batch._pipeline_open()
+    assert batch._pipeline is None, "A10-0 changes no behaviour: still single-box"
+    assert _hist() == {expected: 1}, _hist()
+    # and the name agrees with the arithmetic it claims to predict
+    assert (suffix_len > step) == (expected == "warm_suffix_ge_chunk")
+    assert bool(batch._pipeline_chunk_schedule()) == (suffix_len > step)
+
+
+def test_the_warm_split_is_recorded_per_request(monkeypatch):
+    """``warm_prefix_len`` / ``warm_suffix_len`` / ``chunk_size``, on the batch.
+
+    The per-request record is what makes the aggregate auditable: a histogram
+    bucket with no way to see the numbers behind it cannot be checked against
+    the restore that produced it.
+    """
+    lm, pick, turn2 = _session_warm(monkeypatch, 39)
+    _arm(monkeypatch, min_tokens=1)
+    pr.METRICS.reset()
+    batch, prefix_len, suffix_len = _warm_batch(lm, pick, turn2)
+    assert batch._pipeline_warm_stats is None, "nothing recorded before the gate"
+    batch._pipeline_open()
+    assert batch._pipeline_warm_stats == {
+        "warm_prefix_len": prefix_len,
+        "warm_suffix_len": suffix_len,
+        "chunk_size": STEP,
+    }
+    # the prefix is the RESTORED depth and the suffix is the new user message,
+    # so the two of them are the whole turn-2 prompt and neither is the prompt
+    assert prefix_len + suffix_len == len(turn2)
+    assert prefix_len == len(PROMPT)
+
+
+def test_a_cold_request_records_no_warm_split(monkeypatch):
+    """The recorder fires on the warm arm and nowhere else."""
+    _arm(monkeypatch)
+    batch = _batch(_lm())
+    batch._pipeline_open()
+    assert batch._pipeline is not None, "the cold request is the admitted one"
+    assert batch._pipeline_warm_stats is None
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_warm_requests"] == 0
+    assert snap["pp_warm_suffix_tokens_hist"] == {}
+
+
+def test_a_warm_request_a_shape_reason_refuses_first_is_not_counted_warm(monkeypatch):
+    """``pp_warm_requests`` stays reconcilable with the bypass histogram.
+
+    The gate names ONE refusal and asks the ladder before warm, so a warm
+    request carrying an unserveable rung is recorded as ``apc_checkpoint_ladder``
+    -- exactly as it was under ``warm_prefix``.  Counting it warm as well would
+    make ``pp_warm_requests`` bigger than the two warm names put together, which
+    is the one property that lets an operator trust either number.
+    """
+    _arm(monkeypatch)
+    batch = _batch(_lm())
+    batch._vault = object()
+    batch._apc_meta = [{"prefix_len": 4, "vault_rungs": [12]}]
+    batch._pipeline_open()
+    assert _hist() == {"apc_checkpoint_ladder": 1}
+    assert batch._pipeline_warm_stats is None
+    assert pr.METRICS.snapshot()["pp_warm_requests"] == 0
+
+
+def test_the_two_names_sum_to_what_warm_prefix_counted(monkeypatch):
+    """Additive, not lossy: every request that WAS ``warm_prefix`` is still one.
+
+    Six warm requests over the two shapes; the histogram must carry no
+    ``warm_prefix`` key, the two new keys must sum to six, and
+    ``pp_warm_requests`` must equal that sum.
+    """
+    _arm(monkeypatch, min_tokens=1)
+    lm = _lm()
+    for step, count in ((STEP, 4), (64, 2)):
+        for _ in range(count):
+            batch = _batch(lm, step=step)
+            batch._apc_meta = [{"prefix_len": 4}]
+            batch._pipeline_open()
+            assert batch._pipeline is None
+    hist = _hist()
+    assert "warm_prefix" not in hist
+    assert hist == {"warm_suffix_ge_chunk": 4, "warm_suffix_lt_chunk": 2}, hist
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_warm_requests"] == sum(hist.values()) == 6
+    assert sum(snap["pp_warm_suffix_tokens_hist"].values()) == 6
+
+
+def test_generate_step_keeps_the_historical_warm_prefix_name():
+    """Only the BATCH path is split.
+
+    ``generate_step`` passes a bool -- it has no suffix length to hand over --
+    and its reason strings are a receipt other rails already read, so the split
+    must not reach it.  Pinned as a call, not as a comment.
+    """
+    kw = dict(
+        ladder=False,
+        capture=False,
+        pixel_values=None,
+        mask=None,
+        cache=[],
+        input_ids=mx.zeros((1, 4), dtype=mx.int32),
+        kv_quantized=False,
+    )
+    assert pr.pipeline_bypass_reason(**kw, warm=True) == "warm_prefix"
+    assert pr.pipeline_bypass_reason(**kw, warm=False) is None
+    # and the batch path's own strings pass through untouched
+    for name in ("warm_suffix_lt_chunk", "warm_suffix_ge_chunk"):
+        assert pr.pipeline_bypass_reason(**kw, warm=name) == name
+
+
+@pytest.mark.parametrize(
+    "suffix_len,chunk,bucket",
+    [
+        (0, 8192, "le_512"),
+        (512, 8192, "le_512"),
+        (513, 8192, "le_2048"),
+        (2048, 8192, "le_2048"),
+        (2049, 8192, "le_c"),
+        (8192, 8192, "le_c"),
+        (8193, 8192, "le_2c"),
+        (16384, 8192, "le_2c"),
+        (16385, 8192, "le_4c"),
+        (32768, 8192, "le_4c"),
+        (32769, 8192, "gt_4c"),
+        # C = 2048: the absolute edges catch first, so ``le_c`` is unreachable
+        (2048, 2048, "le_2048"),
+        (4096, 2048, "le_2c"),
+        (8192, 2048, "le_4c"),
+        (8193, 2048, "gt_4c"),
+        # no chunked prefill configured: only the absolute edges are defined
+        (2049, 0, "gt_4c"),
+    ],
+)
+def test_the_warm_suffix_buckets_are_first_match_in_order(suffix_len, chunk, bucket):
+    assert pr.warm_suffix_bucket(suffix_len, chunk) == bucket
+    assert bucket in pr.WARM_SUFFIX_BUCKETS
+
+
+def test_the_metrics_snapshot_carries_the_warm_keys(monkeypatch):
+    """``/metrics`` -> ``server.pipeline_prefill`` is where the gate is read.
+
+    The A10-0 decision -- build A10-1..7 only if ``warm_suffix_ge_chunk`` is a
+    real share of served prefills -- is taken off a diff of this block, so the
+    two keys have to be in the snapshot the server actually exports, and the
+    counter has to be diffable (monotone over the process, reset only by
+    ``reset()``).
+    """
+    snap = pr.pipeline_metrics_snapshot()
+    assert snap["pp_warm_requests"] == 0
+    assert snap["pp_warm_suffix_tokens_hist"] == {}
+    pr.note_pipeline_warm(prefix_len=131072, suffix_len=32768, chunk_size=8192)
+    pr.note_pipeline_warm(prefix_len=32768, suffix_len=500, chunk_size=8192)
+    snap = pr.pipeline_metrics_snapshot()
+    assert snap["pp_warm_requests"] == 2
+    assert snap["pp_warm_suffix_tokens_hist"] == {"le_4c": 1, "le_512": 1}
+    # and the per-request record is the return value, so a caller never has to
+    # read the aggregate back to learn what it just recorded
+    assert pr.note_pipeline_warm(
+        prefix_len=1, suffix_len=2, chunk_size=3
+    ) == {"warm_prefix_len": 1, "warm_suffix_len": 2, "chunk_size": 3}

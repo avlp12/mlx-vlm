@@ -2263,13 +2263,19 @@ class PromptProcessingBatch:
         # of the first chunk; ``_pipeline_declined`` latches that decision so no
         # later chunk pays the gate again.  A batch that never meets the gate --
         # every batch, with ``MLX_VLM_PIPELINE_HOSTS`` unset -- carries these
-        # six attributes and executes one ``os.environ.get``.
+        # seven attributes and executes one ``os.environ.get``.
         self._pipeline = None
         self._pipeline_declined = False
         self._pipeline_slot = False
         self._pipeline_chunks: List[int] = []
         self._pipeline_chunks_done = 0
         self._pipeline_restore: Optional[dict] = None
+        # A10-0: the per-request warm split (``warm_prefix_len``,
+        # ``warm_suffix_len``, ``chunk_size``) for a request the warm arm of the
+        # gate refused, or ``None``.  Instrumentation only -- nothing reads it
+        # to make a decision -- and it is the per-request twin of the aggregate
+        # ``pp_warm_suffix_tokens_hist`` an operator diffs out of ``/metrics``.
+        self._pipeline_warm_stats: Optional[dict] = None
         # A5: the vault ladder this request took out of the chunk loop's way,
         # kept so the post-finalize checkpoint knows which rows to store and so
         # a fallback can put the original rungs BACK (a peer that dies must not
@@ -2879,20 +2885,77 @@ class PromptProcessingBatch:
     # all 45 layers, so no token is ever forwarded by half a stack, and decode is
     # untouched single-box code.
 
-    def _pipeline_warm_prefix(self) -> bool:
-        """Is any part of this prompt already in the cache?
+    def _pipeline_warm_prefix_len(self) -> int:
+        """How many columns of this prompt are already in the cache.
 
-        Three ways it can be, and the handoff schema supports none of them: an
+        Three ways they can be, and the handoff schema supports none of them: an
         APC/vault prefix hit (``prefix_len``), a resumed cache
         (``existing_left_padding``, which is why a non-zero left pad counts),
         and a chunk loop that has already run (defensive; the gate is only ever
-        evaluated at column 0).
+        evaluated at column 0).  The DEEPEST of the three, because the question
+        the caller asks is "how much of the prompt would a two-box prefill have
+        to be handed that it cannot be", and one warm row is enough to refuse
+        the batch.
+
+        Note what the left-padding term also catches, unchanged from the
+        predicate this replaces: a COLD batch of unequal-length rows is
+        left-padded too, so ``max(...) > 0`` there as well.  That request is
+        refused as warm rather than as ``batch_not_one`` only because warm is
+        asked first, and it was before this split as well -- A10-0 moves no
+        decision, only the name it is recorded under.
         """
-        if self._processed_prompt_columns:
-            return True
-        if any(int((m or {}).get("prefix_len") or 0) > 0 for m in (self._apc_meta or [])):
-            return True
-        return any(int(p or 0) > 0 for p in self._left_padding_per_row)
+        lengths = [int(self._processed_prompt_columns or 0)]
+        lengths += [
+            int((m or {}).get("prefix_len") or 0) for m in (self._apc_meta or [])
+        ]
+        lengths += [int(p or 0) for p in self._left_padding_per_row]
+        return max(lengths)
+
+    def _pipeline_warm_prefix(self) -> bool:
+        """Is any part of this prompt already in the cache?"""
+        return self._pipeline_warm_prefix_len() > 0
+
+    def _pipeline_warm_facts(self):
+        """``(reason, per-request stats)`` for the warm arm of the gate.
+
+        ``(None, None)`` when nothing is cached.  Otherwise the reason is one of
+        the two A10-0 names, decided by the uncached SUFFIX against the chunk
+        size:
+
+        * ``S`` is ``self._inputs_embeds.shape[1]``.  For a warm row that array
+          is already the suffix -- ``input_ids`` here are the per-row prefill
+          inputs, "for warm-start rows this is the suffix" (``__init__``) -- so
+          the whole prompt is ``prefix_len + S`` and the number the chunk loop
+          will actually work on is ``S``.  It is also exactly what
+          ``_pipeline_chunk_schedule`` measures, which is the point: the split
+          has to agree with the thing it predicts.
+        * ``S <= C`` is ``warm_suffix_lt_chunk``.  ``ceil(S/C) - 1 == 0``, so
+          there is no chunk to hand a peer at this C and no version of A10
+          changes that -- this request stays single-box on arithmetic, not on
+          policy.
+        * ``S > C`` is ``warm_suffix_ge_chunk``: at least one chunk exists, so
+          this is the shape A10-1..7 would pay for, and its frequency is the
+          gate on building them at all.
+        """
+        prefix_len = self._pipeline_warm_prefix_len()
+        if prefix_len <= 0:
+            return None, None
+        suffix_len = (
+            int(self._inputs_embeds.shape[1])
+            if self._inputs_embeds is not None
+            else 0
+        )
+        chunk_size = int(self.prefill_step_size or 0)
+        reason = (
+            "warm_suffix_ge_chunk"
+            if chunk_size > 0 and suffix_len > chunk_size
+            else "warm_suffix_lt_chunk"
+        )
+        return reason, {
+            "prefix_len": prefix_len,
+            "suffix_len": suffix_len,
+            "chunk_size": chunk_size,
+        }
 
     def _pipeline_full_depth(self) -> int:
         """Tokens the pipelined part of this prefill will have written: ``k*C``.
@@ -3183,6 +3246,7 @@ class PromptProcessingBatch:
             acquire_pipeline_slot,
             maybe_open_pipeline,
             note_pipeline_bypass,
+            note_pipeline_warm,
             pipeline_bypass_reason,
             pipeline_language_model,
         )
@@ -3208,23 +3272,37 @@ class PromptProcessingBatch:
             note_pipeline_bypass("below_min_tokens")
             return
         capture, capture_refusal = self._pipeline_capture_plan()
-        if (
-            pipeline_bypass_reason(
-                ladder=self._pipeline_has_checkpoint_ladder(),
-                capture=capture_refusal,
-                warm=self._pipeline_warm_prefix(),
-                right_pad=(
-                    self._right_pad_per_row is not None
-                    and any(self._right_pad_per_row)
-                ),
-                pixel_values=self._prompt_kwargs.get("pixel_values"),
-                mask=self._prompt_kwargs.get("mask"),
-                cache=self.prompt_cache,
-                input_ids=self._input_ids,
-                kv_quantized=self._kv_quantized,
-            )
-            is not None
-        ):
+        # A10-0.  The warm arm now names ITSELF -- ``warm_suffix_lt_chunk`` or
+        # ``warm_suffix_ge_chunk`` -- because only this call site knows the
+        # suffix and the chunk size.  The gate is unchanged: it still asks the
+        # ladder and the capture first, and a warm request either of those
+        # refuses is still recorded under THEIR name, exactly as it was under
+        # ``warm_prefix``.
+        warm_reason, warm_facts = self._pipeline_warm_facts()
+        reason = pipeline_bypass_reason(
+            ladder=self._pipeline_has_checkpoint_ladder(),
+            capture=capture_refusal,
+            warm=warm_reason,
+            right_pad=(
+                self._right_pad_per_row is not None
+                and any(self._right_pad_per_row)
+            ),
+            pixel_values=self._prompt_kwargs.get("pixel_values"),
+            mask=self._prompt_kwargs.get("mask"),
+            cache=self.prompt_cache,
+            input_ids=self._input_ids,
+            kv_quantized=self._kv_quantized,
+        )
+        if reason is not None:
+            if warm_reason is not None and reason == warm_reason:
+                # Counted here and nowhere else, so ``pp_warm_requests`` is
+                # reconcilable with the bypass histogram by construction: it is
+                # the sum of the two warm names and nothing more.
+                self._pipeline_warm_stats = note_pipeline_warm(
+                    prefix_len=warm_facts["prefix_len"],
+                    suffix_len=warm_facts["suffix_len"],
+                    chunk_size=warm_facts["chunk_size"],
+                )
             return
         lm = pipeline_language_model(self.model)
         if lm is None:
