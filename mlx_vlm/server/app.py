@@ -23,6 +23,7 @@ from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..prompt_utils import template_references_kw
 from ..reranker import RerankerKind, reranker_kind
+from ..speculative.common import ROUND_TIMER_SYNC_POINTS
 from ..speculative.utils import batched_draft_enabled
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
@@ -285,6 +286,33 @@ def _speculative_stats_snapshot() -> dict:
         snapshot["verify_seconds"] = float(
             getattr(drafter, "speculative_verify_seconds", 0.0) or 0.0
         )
+        # The SCALAR round loops (the ones a B == 1 request takes) split the
+        # round in four, not two, and publish a per-round row.  The two fields
+        # above keep their exact meaning either way, so a reader that only knows
+        # the batch schema is unaffected; these are additive.  ``timed_rounds``
+        # is the denominator -- ms/round is only meaningful against the number of
+        # rounds that were actually timed, which is not ``rounds`` when a request
+        # ran before the timers were on or on a loop that only times two halves.
+        snapshot["emit_seconds"] = float(
+            getattr(drafter, "speculative_emit_seconds", 0.0) or 0.0
+        )
+        snapshot["rollback_seconds"] = float(
+            getattr(drafter, "speculative_rollback_seconds", 0.0) or 0.0
+        )
+        snapshot["round_seconds"] = float(
+            getattr(drafter, "speculative_round_seconds", 0.0) or 0.0
+        )
+        snapshot["timed_rounds"] = int(
+            getattr(drafter, "speculative_timed_rounds", 0) or 0
+        )
+        rows = getattr(drafter, "speculative_round_timings", None)
+        if rows:
+            # Bounded by ``common.ROUND_TIMING_RING``; the per-round rows are the
+            # only thing a round-cost fit (round = fixed + slope * accepted) can
+            # be made from, and they die with the process, so they ride the same
+            # snapshot the harness already polls before/after a run.
+            snapshot["round_timer_sync_points"] = list(ROUND_TIMER_SYNC_POINTS)
+            snapshot["round_timings"] = list(rows)
     return snapshot
 
 
