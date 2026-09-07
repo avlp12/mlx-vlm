@@ -65,6 +65,7 @@ __all__ = [
     "ContextVault",
     "VaultTier",
     "record_session_turn",
+    "trim_cache_to_prefix",
     "lookup_session",
     "VaultCheckpoint",
     "VaultStats",
@@ -1381,6 +1382,49 @@ def prefix_len_from_cache(caches: Sequence[Any]) -> Optional[int]:
     return n if n > 0 else None
 
 
+def trim_cache_to_prefix(caches: Sequence[Any], prefix_len: int) -> bool:
+    """Cut a SNAPSHOT of a cache back to ``prefix_len`` tokens, in place.
+
+    For the end-of-turn session capture on a SPECULATIVE batch, where the round
+    loop's cache can legitimately be AHEAD of the tokens the row emitted (a
+    block is verified whole and only the accepted prefix is kept, and a row that
+    stopped on a stop token mid-block keeps the committed tokens after it).  A
+    rung whose cache is longer than its key is not merely useless, it is
+    unsafe: at +1 the length still matches and the rung is stored with its last
+    column labelled as a token that column is not.
+
+    Only ever called on a detached row snapshot, never on a live decode cache.
+
+    Returns False -- meaning "refuse the rung" -- unless EVERY component can
+    give the extra tokens back exactly.  ``is_trimmable()`` is the existing
+    predicate for that and it is False for the recurrent components (the KDA
+    ``ArraysCache``), which is right: a gated-delta state has absorbed the extra
+    tokens and cannot be rewound by slicing, only replayed.  Trimming the
+    attention half of a hybrid cache and leaving the recurrent half where it is
+    would produce a rung whose halves describe different prefixes -- silently
+    wrong, which is the one outcome this campaign does not accept.
+    """
+    have = prefix_len_from_cache(caches)
+    if have is None or prefix_len <= 0 or prefix_len > have:
+        return False
+    if have == prefix_len:
+        return True
+    drop = have - prefix_len
+    for entry in caches:
+        is_trimmable = getattr(entry, "is_trimmable", None)
+        if not callable(is_trimmable) or not is_trimmable():
+            return False
+        if not callable(getattr(entry, "trim", None)):
+            return False
+    for entry in caches:
+        try:
+            if int(entry.trim(drop)) != drop:
+                return False
+        except Exception:  # noqa: BLE001 - a half-trimmed snapshot is discarded
+            return False
+    return prefix_len_from_cache(caches) == prefix_len
+
+
 def record_session_turn(
     vault: Optional[ContextVault],
     tokens: Sequence[int],
@@ -1436,6 +1480,20 @@ def record_session_turn(
         if n is None or n <= 0:
             record_session_skip("no_cache_offset")
             return False
+        if prefix_len is not None:
+            # A caller that names the length must name the one the cache
+            # actually has.  ``n > len(toks)`` is caught below, but a caller
+            # that under-states the length walks straight past that check and
+            # stores a rung whose key stops short of the KV it holds -- the
+            # same mislabelled-column failure, arrived at from the other side.
+            # The cache's own offset is the independent witness (V1d).
+            own = prefix_len_from_cache(caches)
+            if own is not None and own != n:
+                record_session_skip("prefix_len_disagrees_with_cache")
+                logger.warning(
+                    "vault: session capture skipped, caller claims %d tokens "
+                    "but the cache holds %d", n, own)
+                return False
         if n > len(toks):
             record_session_skip("cache_longer_than_key")
             # The cache holds more than the key describes; the key would not

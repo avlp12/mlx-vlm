@@ -118,6 +118,8 @@ class _StubDrafter:
         self.accept_lens = []
         self.draft_lens = []
         self.calls = 0
+        self.boundary = None
+        self.pending_boundary = False
 
     def reset(self, model=None):
         self.accept_lens = []
@@ -127,6 +129,14 @@ class _StubDrafter:
         return []
 
     def draft_block(self, bonus, hidden, cache, bs, sampler, token_dtype):
+        # V1d: the round loop now rolls the cache back BEFORE it emits, so the
+        # window in which a round's cache state is observable opens once that
+        # round's tokens have been yielded and closes when the next round
+        # drafts.  The rollback spy arms ``pending_boundary``; the first draft
+        # call of the next round runs the hook there.
+        if self.pending_boundary and self.boundary is not None:
+            self.pending_boundary = False
+            self.boundary()
         # The batch loop drafts row by row, in active-slot order.
         row = self.calls % 2
         self.calls += 1
@@ -134,10 +144,15 @@ class _StubDrafter:
 
 
 class _RollbackDone(Exception):
-    """Stops the round loop the instant the rollback has been applied.
+    """Stops the round loop at the boundary after the Nth rollback.
 
-    The round's cache state is only observable between the rollback and the
-    next round's drafting, and the generator does not yield there.
+    The round's cache state is observable between the rollback and the next
+    round's drafting.  Since V1d the rollback comes BEFORE the round's emit
+    loop (so the end-of-turn session capture, which lands inside one of those
+    yields, does not snapshot the KV of rejected drafts), and that window
+    therefore contains the round's yields -- the loop is stopped at the next
+    round's first draft call, not inside the rollback itself, or the round's
+    emitted tokens would never reach the caller.
     """
 
 
@@ -182,11 +197,15 @@ def _run_one_ragged_round(model, accepted=RAGGED, rounds_to_run=1):
             )
         )
         original_rollback(caches, gdn_states, accepted_arg, block_size)
+        drafter.pending_boundary = True
+
+    def _round_boundary():
         if len(seen) >= rounds_to_run:
             raise _RollbackDone
 
     model.rollback_speculative_cache = spy
     drafter = _StubDrafter()
+    drafter.boundary = _round_boundary
     emitted = [[], []]
     try:
         rounds = dflash_utils._dflash_rounds_batch(

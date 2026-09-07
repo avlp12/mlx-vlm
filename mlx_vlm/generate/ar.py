@@ -5676,6 +5676,41 @@ class BatchGenerator:
             key = list(tokens) if tokens is not None else self._session_tokens.get(uid)
             if not key:
                 return _refuse("empty_token_key")
+            # V1d.  On a speculative batch the round loop's cache may be AHEAD
+            # of the emitted stream at this instant, and the rung's length is
+            # then a lie about which tokens the KV belongs to.  Two sources,
+            # both real: a verify block is written whole and only its accepted
+            # prefix survives the round's rollback, and a row that stopped on a
+            # stop token mid-block keeps the KV of the committed tokens after
+            # it that the stream never carried.  The key is the ground truth --
+            # ``prompt + everything emitted``, and the last emitted token was
+            # never fed back through the model -- so the cache is entitled to
+            # exactly ``len(key) - 1`` columns.  Longer: give the extra columns
+            # back if the cache can (attention-only), refuse if it cannot (a
+            # hybrid's recurrent half cannot be rewound by slicing).  Shorter is
+            # left alone: a shorter prefix is still a TRUE prefix of this key.
+            #
+            # Speculative batches only, deliberately.  The plain decode path
+            # writes one column per emitted token and its ``n == len(key)``
+            # fixtures are a pinned contract (test_session_store T1,
+            # test_session_capture_wiring's four-token round); there is no
+            # phantom column there to distinguish, and widening this guard
+            # would refuse rungs that are correct.
+            if callable(cache_row_for_uid):
+                entitled = len(key) - 1
+                held = _context_vault.prefix_len_from_cache(row_cache)
+                if held is None:
+                    return _refuse("row_cache_offset_unreadable")
+                if held > entitled and not _context_vault.trim_cache_to_prefix(
+                    row_cache, entitled
+                ):
+                    logger.info(
+                        "vault-session: uid=%s cache holds %d tokens but the "
+                        "key accounts for %d; the round's unemitted columns "
+                        "cannot be given back on this cache",
+                        uid, held, entitled,
+                    )
+                    return _refuse("cache_ahead_of_emitted")
             stored = _context_vault.record_session_turn(
                 self.vault,
                 key,
