@@ -92,6 +92,39 @@ logger = logging.getLogger("mlx_vlm.server")
 ENV_HOIST_WIRED_LIMIT = "MLX_VLM_HOIST_WIRED_LIMIT"
 
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
+
+# V1 (2026-09-07): the burst-admission quiet window.  DEFAULT OFF (0 disables).
+#
+# A speculative generation batch CANNOT GROW: ``BatchGenerator._next`` returns
+# before it ever reaches the prefill path while a speculative batch is alive
+# (generate/ar.py, the ``is_speculative`` early return), because
+# ``SpeculativeGenerationBatch.extend`` raises on a non-empty batch.  Whatever
+# rows are in the FIRST prompt batch are the rows that decode, alone, until the
+# last of them finishes.
+#
+# That turns a millisecond of arrival jitter into a permanent width loss.  On
+# the B0 #6 panel eight peers were enqueued inside 24 ms, the 5 ms coalescing
+# window drained 4 of them, and the other 4 waited 20.4 s -- one full generation
+# -- before their prefill ran.  Receipts:
+# logs/sweep11/V3_SPEC_TIMERS_20260907/dflash2_timers/server.log (N=8 decodes as
+# 4 then 4; ``rows_per_round`` 2.33 against a requested 8) and B0 #6 dflash2
+# ``rows_per_round`` 2.94 over an n_list topping out at 16.
+#
+# The window closes on QUIET, not on time: after each slice the queue is drained
+# again and the wait stops as soon as a slice adds nothing.  The slice is
+# therefore a SILENCE THRESHOLD, not a poll interval -- it must be longer than
+# the gap between peers of one burst (24 ms measured), or the first gap ends the
+# wait and the window buys nothing.  It is only armed when the first drain
+# already found a burst (>= 2 peers), so a lone request pays nothing: N=1
+# latency is untouched by construction, not by tuning.
+#
+# This does NOT fix the underlying defect, and is not meant to: a caller whose
+# peers arrive seconds apart still gets a batch that cannot grow.  Making
+# ``SpeculativeGenerationBatch`` extendable (merge the target caches with
+# ``_extend_cache``, re-seed the round loop's per-row hidden and bonus) is the
+# real repair; this is the part of it that is one function long.
+DEFAULT_SPEC_ADMISSION_QUIET_MS = 0.0
+DEFAULT_SPEC_ADMISSION_WINDOW_MS = 250.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
 # The vendor recommendation for GLM-5.3-Flash, and harmless elsewhere because
@@ -191,6 +224,38 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def get_spec_admission_quiet_s() -> float:
+    """``MLX_VLM_SPEC_ADMISSION_QUIET_MS`` -- burst-admission quiet slice, ms.
+
+    0 (the default) is the shipped behaviour exactly: no extra sleep, no extra
+    drain, one less branch.  See ``DEFAULT_SPEC_ADMISSION_QUIET_MS`` for why a
+    non-zero value is worth a whole generation at N=8.
+    """
+    raw = os.environ.get(
+        "MLX_VLM_SPEC_ADMISSION_QUIET_MS", str(DEFAULT_SPEC_ADMISSION_QUIET_MS)
+    )
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_SPEC_ADMISSION_QUIET_MS / 1000.0
+
+
+def get_spec_admission_window_s() -> float:
+    """``MLX_VLM_SPEC_ADMISSION_WINDOW_MS`` -- hard cap on the quiet window.
+
+    The quiet loop normally stops on its own (a slice that adds nothing); this
+    is the backstop for a caller that dribbles requests in forever, so the cost
+    of the feature is bounded by one number a reader can find.
+    """
+    raw = os.environ.get(
+        "MLX_VLM_SPEC_ADMISSION_WINDOW_MS", str(DEFAULT_SPEC_ADMISSION_WINDOW_MS)
+    )
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_SPEC_ADMISSION_WINDOW_MS / 1000.0
 
 
 def dflash_continuous_batching_enabled() -> bool:
@@ -2280,12 +2345,23 @@ class ResponseGenerator:
         capacity: Optional[int] = None,
         idle_timeout: float = 0.1,
         coalesce_s: float = 0.0,
+        quiet_s: float = 0.0,
+        window_s: float = 0.0,
     ):
         """Collect the first queued request, then drain immediately available peers.
 
         When ``capacity`` is set, admit at most ``capacity`` new requests and leave
         the rest queued (backpressure), so the running batch never exceeds
         ``--max-num-seqs`` concurrent sequences.
+
+        ``quiet_s`` (0 = off) adds the V1 burst-admission window on top of the
+        one-shot drain: keep re-draining in ``quiet_s`` slices until a slice adds
+        nothing, capacity fills, or ``window_s`` elapses.  A single drain is a
+        SNAPSHOT of a queue a burst is still arriving on -- eight peers enqueued
+        inside 24 ms leave four behind -- and for a speculative batch, which
+        cannot be extended once it starts, the four left behind wait a whole
+        generation.  Armed only when the first drain already saw >= 2 peers, so
+        a lone request never pays the slice.
         """
         pending = []
         should_stop = False
@@ -2321,11 +2397,26 @@ class ResponseGenerator:
         if pending and coalesce_s > 0:
             time.sleep(coalesce_s)
 
-        while not should_stop and _has_room():
-            try:
-                append_item(self.requests.get_nowait())
-            except QueueEmpty:
-                break
+        def _drain():
+            while not should_stop and _has_room():
+                try:
+                    append_item(self.requests.get_nowait())
+                except QueueEmpty:
+                    break
+
+        _drain()
+
+        if quiet_s > 0 and len(pending) >= 2 and not should_stop and _has_room():
+            deadline = time.monotonic() + max(quiet_s, window_s)
+            while not should_stop and _has_room():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                before = len(pending)
+                time.sleep(min(quiet_s, left))
+                _drain()
+                if len(pending) == before:
+                    break
 
         return pending, should_stop
 
@@ -2430,10 +2521,22 @@ class ResponseGenerator:
                 capacity = (
                     None if max_num_seqs is None else max(0, max_num_seqs - len(active))
                 )
+                # The quiet window is armed on exactly the condition the
+                # coalescing window already is -- an IDLE speculative batch --
+                # because that is the only batch that cannot be extended later.
+                quiet_s = (
+                    get_spec_admission_quiet_s() if coalesce_s or (
+                        not active_batch
+                        and self.draft_model is not None
+                        and self.draft_kind in ("mtp", "dflash")
+                    ) else 0.0
+                )
                 new_items, should_stop = self._collect_pending_requests(
                     active=active_batch,
                     capacity=capacity,
                     coalesce_s=coalesce_s,
+                    quiet_s=quiet_s,
+                    window_s=get_spec_admission_window_s() if quiet_s else 0.0,
                 )
                 if should_stop and not active:
                     break
