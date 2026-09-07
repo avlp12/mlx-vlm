@@ -179,6 +179,22 @@ def _prefill(lm, prompt, *, step, capture, keep=None):
 # ------------------------------------------- 1. the target does not move at all
 
 
+@pytest.fixture(autouse=True)
+def _pin_the_tail_merge_off(monkeypatch):
+    """This module pins CHUNK DECOMPOSITION at an 8-token step.
+
+    L35(b) (``MLX_VLM_GLM5_PREFILL_TAIL_MERGE``, generate/common.py) is ON by
+    default since ledger I1437, and its ``..._TAIL_MIN`` threshold of 1024 is an
+    ABSOLUTE token count sized for the shipped 8192 step.  At ``CHUNK = 8`` every
+    prompt here is one full chunk plus a tail far shorter than 1024, so the merge
+    would fold the whole prompt into a single chunk and the capture-per-chunk
+    assertions below would be testing an unchunked prefill.  The merge has its
+    own coverage in test_prefill_chunk_plan.py; here it is pinned off so the plan
+    under test is the one ``CHUNK``/``BATCH_STEP`` name.
+    """
+    monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
+
+
 CHUNK = 8
 PROMPT = 40
 WINDOW = 16  # the stub drafter's sliding_window; it keeps WINDOW - 1 = 15 rows

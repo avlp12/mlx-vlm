@@ -2952,6 +2952,23 @@ class LanguageModel(nn.Module):
     # this line changes no behaviour.  It is here because the reason lives here.
     supports_right_padded_prefill = False
 
+    # L35(a).  ``__call__`` below honours ``num_logits_to_keep``: it slices the
+    # hidden BEFORE the vocab projection, so a prefill forward that only needs
+    # its last row does not build a [B, S, 154880] array.  Advertised under its
+    # OWN name rather than by setting ``supports_logits_to_keep``, because that
+    # generic flag is read in two other places (generate/ar.py) that would then
+    # pass the kwarg under a name this model does not read -- a silent no-op --
+    # and would change the chunk loop's argument list as a side effect.
+    # The caller-side gate is ``generate/common.py::prefill_logits_keep_kwargs``.
+    #
+    # NOT bit-identical: narrowing the projection changes the GEMM's M, which
+    # moves the last ulp of the row that IS kept (I1098 kept it out of a
+    # correctness fix for that reason).  The caller-side gate is therefore
+    # licensed by the rule-13 rail of 2026-09-07 (I1437: 4/4 identical text
+    # sha, identical acceptance) rather than by bit-identity, and it ships ON
+    # by default with ``MLX_VLM_GLM5_PREFILL_LOGITS_KEEP=0`` as the revert.
+    supports_num_logits_to_keep = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -3015,7 +3032,7 @@ class LanguageModel(nn.Module):
         )
         # Only the last few positions' logits are ever needed for generation; slicing
         # before the (vocab-wide) projection skips it on discarded prefill positions.
-        nlk = kwargs.get("num_logits_to_keep", 0)
+        nlk = kwargs.get("num_logits_to_keep", kwargs.get("logits_to_keep", 0) or 0)
         logits = None
         if not skip_logits:
             logits = self._logits(out[:, -nlk:, :] if nlk else out)

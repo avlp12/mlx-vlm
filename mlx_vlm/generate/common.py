@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -84,6 +85,255 @@ def _chunked_prefill_enabled(
     # Hidden-state speculative prefill is model-contract dependent. Keep unknown
     # target models conservative unless they expose a chunked_prefill_policy.
     return draft_model is None
+
+
+# --------------------------------------------------------------------------
+# L35 -- two prefill wins (2026-09-07).  BOTH ARE ON BY DEFAULT since the
+# rule-13 rail of 2026-09-07 (ledger I1437): on the DFlash2 natural gen1024
+# panel plus a greedy arm, all 4/4 completion text sha256 were IDENTICAL to the
+# off arm, speculative acceptance and rounds were identical (2.02/3.68/6.42/
+# 4.57), and TTFT moved -1.5..-3 % (receipts L35_RAIL_20260907/).  Neither lever
+# is bit-identical (see below), so the rail -- not an identity claim -- is what
+# licences the default.
+#
+# SETTING EITHER ENV TO "0" RESTORES THE a6634a75 PATH EXACTLY, and
+# ``MLX_VLM_GLM5_PREFILL_LOGITS_KEEP=0 MLX_VLM_GLM5_PREFILL_TAIL_MERGE=0``
+# together restore it on every path (asserted in tests/test_prefill_chunk_plan.py
+# ::TestBaseParityWhenBothAreOff).  That is the revert knob if the L40 KL gate,
+# which is kept running as a check, ever fails.
+#
+# (a) PREFILL LM-HEAD SKIP (``MLX_VLM_GLM5_PREFILL_LOGITS_KEEP``, default 1).
+#     The chunk LOOP already skips the vocab projection: every loop drops
+#     ``chunk_out`` before the eval (ar.py, server/generation.py), and MLX never
+#     computes an unreferenced graph -- measured here on CPU, a [1,2048,8192]
+#     projection built-and-dropped costs 1.9 ms vs 32.9 ms when a slice of it is
+#     evaluated.  What is NOT skipped is the FINAL forward of an *unchunked*
+#     prefill: ``should_chunk`` is false whenever the prompt is <= the step, so
+#     the whole prompt goes through one forward whose ``logits[:, -1, :]`` pulls
+#     the full [B, S, vocab] matmul.  On GLM-5.3-Flash that is 309,760 B/token
+#     (I1077) and, on the PFINAL receipt, the 8,192-token exact prefill's
+#     out-of-forward time is 0.69-0.72 s against 0.12-0.22 s for the runs whose
+#     final forward is one token wide.  Slicing the hidden BEFORE the projection
+#     removes it.
+#
+#     Not bit-identical: narrowing the projection changes the GEMM's M
+#     dimension, which moves the last ulp of the kept row (I1098 declined to mix
+#     this into a correctness fix for exactly that reason).  On a near-tie it can
+#     flip a token -- the rail's 4/4 text-sha match is the evidence that it does
+#     not, on the natural panel.
+#
+# (b) TAIL-CHUNK MERGE (``MLX_VLM_GLM5_PREFILL_TAIL_MERGE``, default 1, with
+#     ``..._TAIL_MIN`` 1024 and ``..._TAIL_MODE`` grow).
+#     The last chunk of an N-token prompt is (N-1) mod step wide, and a short
+#     chunk runs at a worse per-token rate: the as-fed 32k run's 537-token tail
+#     cost 1.788 s = 3.33 ms/token against 2.38 ms/token for its 8,192-token
+#     chunks (PFINAL_PREFILL_PATH_20260906).  Folding a short tail into the
+#     previous chunk removes that penalty.
+#
+#     Also not bit-identical, and the numerical evidence against identity is
+#     stronger than for (a): L7B measured "identity across chunk sizes: FALSE"
+#     at both 8k and 32k (L7B_PREFILL_CHUNK_20260905), and L7B3 put a chunked
+#     prefill's first divergence from an unchunked reference at token 35/45 with
+#     mean KL 0.025.  Chunk decomposition is chaos-limited on this model, which
+#     is why the promotion rests on the rule-13 rail (text sha + acceptance
+#     parity) rather than on an identity assertion.
+#     (The L23e receipts' "identity across chunk sizes: True" is vacuous -- those
+#     arms ran a single chunk size.)
+
+
+# An explicit "0"/"false"/"no"/"off" (any case) turns a default-ON lever off.
+# Everything else -- including the empty string -- is ON, so a launcher that
+# emits ``NAME=`` for a variable it did not set (the shape of the TP passthrough
+# bug fixed in server/tp_mode.py::launch_worker) lands on the DEFAULT rather
+# than silently disabling the lever on one rank only.
+_ENV_OFF = ("0", "false", "no", "off")
+
+
+def _env_default_on(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _ENV_OFF
+
+
+def prefill_logits_keep_enabled() -> bool:
+    """(a), default ON since I1437.  ``...LOGITS_KEEP=0`` restores a6634a75."""
+    return _env_default_on("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP")
+
+
+def prefill_logits_keep_kwargs(language_model, width: int) -> dict:
+    """``{"num_logits_to_keep": 1}`` when this forward may skip the projection.
+
+    ``width`` is the number of columns the forward will process.  At width 1 the
+    slice is the identity and the kwarg is withheld, so decode steps keep the
+    arguments -- and therefore the kernels -- they always had.
+
+    TP=2 is safe: ``num_logits_to_keep`` is in ``server/tp_mode.py``'s
+    ``_RANK0_ONLY_KWARGS`` ("slices replicated lm_head output"), so the announce
+    guard does not refuse it and the collective sequence is unchanged.
+    """
+    if int(width) <= 1 or not prefill_logits_keep_enabled():
+        return {}
+    if not getattr(language_model, "supports_num_logits_to_keep", False):
+        return {}
+    return {"num_logits_to_keep": 1}
+
+
+def prefill_tail_merge_enabled() -> bool:
+    """(b), default ON since I1437.  ``...TAIL_MERGE=0`` restores a6634a75."""
+    return _env_default_on("MLX_VLM_GLM5_PREFILL_TAIL_MERGE")
+
+
+def prefill_tail_min() -> int:
+    """Tails strictly shorter than this are merged.  0 disables the merge."""
+    try:
+        return max(0, int(os.environ.get("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "1024")))
+    except ValueError:
+        return 1024
+
+
+def prefill_tail_mode() -> str:
+    mode = os.environ.get("MLX_VLM_GLM5_PREFILL_TAIL_MODE", "grow").strip().lower()
+    return mode if mode in ("grow", "balance") else "grow"
+
+
+def tp_forward_token_room() -> Optional[int]:
+    """How many ``b * s`` columns one announced TP forward may carry, or None.
+
+    None means "not serving TP", which is every single-box process: the check
+    below then costs one ``os.environ.get`` and no import.
+
+    In TP=2 the control plane rides the data collective as a fixed-width int32
+    vector, so a forward's token ids must fit the payload:
+    ``tp/worker.py::encode`` RAISES ``TPUnavailable`` when ``len(flat)`` exceeds
+    ``MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD`` minus the ``ECHO_WORDS`` reserved
+    for the shape agreement (worker.py:224).  A grown tail chunk is the one
+    thing in this file that can make a forward WIDER than ``step``, so it is the
+    one thing that could turn a working TP deployment into a raise.  It does not
+    -- ``next_prefill_chunk`` falls back instead.
+    """
+    raw = os.environ.get("MLX_VLM_GLM5_TP_HOSTS", "")
+    hosts = [h for h in raw.split(",") if h.strip()]
+    if len(hosts) < 2:
+        return None
+    try:
+        from ..tp.worker import ECHO_WORDS, _max_tok
+    except Exception:  # pragma: no cover - TP extras absent; treat as single-box
+        return None
+    return max(0, _max_tok() - ECHO_WORDS)
+
+
+def next_prefill_chunk(
+    remaining: int,
+    step: int,
+    *,
+    tail_min: Optional[int] = None,
+    mode: Optional[str] = None,
+    enabled: Optional[bool] = None,
+    batch: int = 1,
+    tp_room: Optional[int] = None,
+) -> int:
+    """Width of the next prefill chunk.  ``min(step, remaining)`` when disabled.
+
+    ``remaining`` is the number of columns the chunk loop still has to consume
+    (the loops already hold back the final token, so this is prompt_len - 1).
+
+    The merge only ever touches the LAST GRID CELL: it fires when what is left
+    is one full chunk plus a short tail (``step < remaining < step + tail_min``),
+    which means every chunk before it stays exactly ``step`` wide.  That is the
+    property the APC/vault ladder needs -- ``align_boundaries`` (context_vault.py
+    :469) admits only multiples of ``step``, and the deepest admissible boundary
+    is at most the start of this cell, so no boundary can fall inside a merged
+    chunk except the one at ``processed + step``.  That one is still honoured:
+    ``CheckpointLadder.clamp`` / ``_next_apc_checkpoint_column`` run AFTER this
+    and can only shorten, so a checkpointing request silently gets the old plan
+    rather than a missed rung.
+
+    ``grow``    -- one chunk of ``remaining`` (<= step + tail_min - 1, and
+                   ``tail_min`` is clamped to ``step``, so <= 2*step - 1).  Costs
+                   up to (tail_min-1)/step more activation peak on one chunk.
+    ``balance`` -- two chunks of ceil/floor ``remaining/2``, memory-neutral, but
+                   L7B's per-chunk rate falls with chunk size (209 tok/s at 8192
+                   vs 200 at 4096), so it is expected to be the slower arm; it
+                   exists for the memory-capped case.
+
+    TP=2 CAVEAT.  ``batch`` (default 1) is the forward's batch dimension, and in
+    TP mode ``batch * width`` must fit the control vector's payload
+    (:func:`tp_forward_token_room`; ``tp_room`` overrides it for tests).  A grown
+    chunk is the only width here that can exceed ``step``, so when it would
+    overflow the cap this returns the ``balance`` split instead -- and, if even
+    that does not fit, ``min(step, balanced)``, which is never wider than the
+    plan the unmerged loop would have produced.  The lever therefore cannot turn
+    a TP deployment that worked into ``TPUnavailable``; a cap that is already too
+    small for ``step`` itself stays exactly as (mis)configured as it was.
+    """
+    remaining = int(remaining)
+    step = int(step)
+    if step <= 0 or remaining <= 0:
+        return max(0, remaining)
+    if remaining <= step:
+        return remaining
+    if enabled is None:
+        enabled = prefill_tail_merge_enabled()
+    if not enabled:
+        return step
+    tail_min = prefill_tail_min() if tail_min is None else max(0, int(tail_min))
+    # ``tail_min`` is an ABSOLUTE token count sized for the shipped 8192 step, so
+    # it is clamped to ``step``: without this, any deployment whose step is below
+    # the threshold stops chunking altogether (at step 64 a 1024 threshold merges
+    # every prompt up to 1088 columns into ONE chunk), and the activation peak of
+    # the merged cell is unbounded relative to the step it was sized against.
+    # With it, a merged chunk is never wider than ``2 * step - 1``.  No-op at
+    # every step >= tail_min, which includes the serving default (8192) and the
+    # pipeline-parallel prefill step (2048), so the plans the I1437 rail measured
+    # are bit-for-bit the plans this produces.
+    tail_min = min(tail_min, step)
+    if tail_min <= 0 or remaining >= step + tail_min:
+        return step
+    # step < remaining < step + tail_min: one full chunk plus a short tail.
+    mode = prefill_tail_mode() if mode is None else mode
+    balanced = (remaining + 1) // 2
+    width = balanced if mode == "balance" else remaining
+    batch = max(1, int(batch))
+    room = tp_forward_token_room() if tp_room is None else int(tp_room)
+    if room is not None and width * batch > room:
+        width = balanced if balanced * batch <= room else min(step, balanced)
+    return width
+
+
+def plan_prefill_chunks(
+    remaining: int,
+    step: int,
+    *,
+    tail_min: Optional[int] = None,
+    mode: Optional[str] = None,
+    enabled: Optional[bool] = None,
+    batch: int = 1,
+    tp_room: Optional[int] = None,
+) -> List[int]:
+    """The whole chunk plan for ``remaining`` columns -- the loop, unrolled.
+
+    Exists so the plan is testable without a model; the loops call
+    :func:`next_prefill_chunk` one chunk at a time (they must, because the
+    checkpoint ladder can shorten any chunk out from under a precomputed plan).
+    """
+    plan: List[int] = []
+    left = int(remaining)
+    while left > 0:
+        n = next_prefill_chunk(
+            left,
+            step,
+            tail_min=tail_min,
+            mode=mode,
+            enabled=enabled,
+            batch=batch,
+            tp_room=tp_room,
+        )
+        if n <= 0:
+            raise ValueError(f"non-advancing chunk plan: remaining={left} step={step}")
+        plan.append(n)
+        left -= n
+    return plan
 
 
 def maybe_quantize_kv_cache(
