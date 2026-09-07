@@ -1706,6 +1706,27 @@ def _dflash_rounds_batch(
             if hidden_segments[j].shape[1] > 0:
                 hidden_by_orig[orig] = hidden_segments[j]
 
+        # ROLLBACK BEFORE EMIT (V1d).  The emit loop below YIELDS, and the
+        # server captures an end-of-turn session rung inside that yield -- in
+        # the window between ``finish_reason`` and ``remove()``
+        # (server/generation.py::_step -> BatchGenerator.capture_session).  With
+        # the rollback still pending, the snapshot that capture takes carries
+        # the KV of every DRAFTED token in this block, including the ones the
+        # walk rejected and the row never emitted, so the rung's cache is
+        # ``bs - 1 - accepted`` columns longer than its key: at 2+ the vault
+        # refuses it (``cache_longer_than_key``) and the turn silently loses its
+        # rung; at exactly 1 the cache length EQUALS the key length and the rung
+        # is stored with its last column labelled as a token that column is not.
+        # Nothing between here and the old position reads or writes the caches,
+        # so this is a pure reorder: same call, same arguments (``accepted_arr``
+        # and ``verify_out.gdn_states`` are both final above), no extra work,
+        # and the emitted token stream is byte-identical.
+        if min_accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
+                )
+
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
         for pos in range(max_new):
@@ -1727,12 +1748,6 @@ def _dflash_rounds_batch(
             orig = active_idx[j]
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
-
-        if min_accepted < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
-                )
 
         # --- Continuous batching: filter out finished sequences ---
         keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]

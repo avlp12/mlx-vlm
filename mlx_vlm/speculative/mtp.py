@@ -1412,6 +1412,26 @@ def _mtp_rounds_batch(
             hidden = hidden_full[:, -1:, :]
         hidden = _mtp_draft_hidden(lm, hidden)
 
+        # ROLLBACK BEFORE EMIT (V1d).  The emit loop below YIELDS, and the
+        # server captures an end-of-turn session rung inside that yield
+        # (server/generation.py::_step -> BatchGenerator.capture_session, in the
+        # window between ``finish_reason`` and ``remove()``).  With the rollback
+        # still pending, that snapshot carries the KV of every DRAFTED token in
+        # the block -- including the rejected ones the row never emitted -- so
+        # the rung's cache is longer than its key: the vault refuses it
+        # (``cache_longer_than_key``) or, when it is longer by exactly one,
+        # stores it with the last column labelled as a token that column is not.
+        # Pure reorder: nothing between here and the old position touches the
+        # caches, the arguments are final above, and the emitted stream is
+        # unchanged.
+        # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
+        # per-row tail-zero on rows that accepted less).
+        if any(a < bs - 1 for a in accepted_list):
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify.gdn_states, accepted_list, bs
+                )
+
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
         for pos in range(max_new):
@@ -1441,14 +1461,6 @@ def _mtp_rounds_batch(
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
             positions[orig] = positions[orig] + len(new_tokens_list[j])
-
-        # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
-        # per-row tail-zero on rows that accepted less).
-        if any(a < bs - 1 for a in accepted_list):
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify.gdn_states, accepted_list, bs
-                )
 
         # Slice + tail-zero ``verify.shared_kv_states`` to match the
         # post-rollback target cache. ``set_shared_kv()`` will normalize the

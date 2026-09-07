@@ -134,16 +134,27 @@ def _prompt_mismatch(snapshot, reference, n):
     return worst
 
 
-def _drive(model, *, stop_tokens, rounds, capture_uid):
+def _drive(model, *, stops, rounds, capture_uid):
     """Run the real round loop until ``capture_uid`` finishes; capture there.
+
+    ``stops`` is a set of ``(round_number, token)`` pairs.  Round-aware on
+    purpose: every round ends every row on that row's SENTINEL, so a plain
+    token set cannot say "stop on the last token of round 2" without also
+    stopping on the last token of round 1.  And the last token of a round is
+    where a row has to stop for its capture to be legal at all -- a row that
+    stops MID-block leaves the cache holding the committed tokens after it,
+    which is the V1d refusal (``cache_ahead_of_emitted``), not this file's
+    subject.
 
     Returns (captured_row_cache, cache, rows_in_cache_at_capture, batch).
     """
     active_now = {"rows": [0, 1, 2]}
     remaining = list(rounds)
+    round_no = {"n": 0}
 
     def walk(draft_tokens, target_tokens, budgets):
         accepted = remaining.pop(0)
+        round_no["n"] += 1
         rows = draft_tokens.tolist()
         out = []
         for i, a in enumerate(accepted):
@@ -162,7 +173,7 @@ def _drive(model, *, stop_tokens, rounds, capture_uid):
         first_tokens=mx.array(BONUS, dtype=mx.int32),
         prompt_cache=cache,
         sampler=lambda logits: mx.argmax(logits, axis=-1),
-        stop_criteria=lambda token: int(token) in stop_tokens,
+        stop_criteria=lambda token: (round_no["n"], int(token)) in stops,
         max_tokens=[64] * 3,
         hidden=mx.zeros((3, 1, model.args.hidden_size), dtype=mx.float32),
         shared_kv_states=None,
@@ -170,9 +181,14 @@ def _drive(model, *, stop_tokens, rounds, capture_uid):
         greedy_sampling=True,
     )
 
+    # The key a real conversation carries: the row's own prompt plus every
+    # token the row has emitted.  It has to be the real one -- the end-of-turn
+    # rung's length is checked against it (V1d), so a placeholder key would be
+    # refused before the row lookup this file is about ever ran.
+    session_tokens = {uid: list(PROMPTS[i]) for i, uid in enumerate(UIDS)}
     generator = SimpleNamespace(
         vault=object(),
-        _session_tokens={uid: [1, 2, 3] for uid in UIDS},
+        _session_tokens=session_tokens,
         _generation_batch=batch,
     )
     captured = {}
@@ -190,6 +206,8 @@ def _drive(model, *, stop_tokens, rounds, capture_uid):
             if len(batch) == 0:
                 break
             for response in batch.next():
+                if response.token is not None:
+                    session_tokens[response.uid].append(int(response.token))
                 if response.finish_reason is None:
                     continue
                 # Exactly where the server captures: inside the window between
@@ -226,7 +244,7 @@ def test_a_later_rows_capture_is_not_taken_from_past_the_end(model):
     """
     row_cache, cache, rows_at_capture, batch = _drive(
         model,
-        stop_tokens={12, 19},
+        stops={(1, SENTINEL + 0), (2, SENTINEL + 2)},
         rounds=[[3, 3, 2], [3, 3]],
         capture_uid=103,
     )
@@ -251,7 +269,7 @@ def test_a_later_rows_capture_is_not_a_live_neighbours_kv(model):
     """
     row_cache, cache, rows_at_capture, batch = _drive(
         model,
-        stop_tokens={12, 23},
+        stops={(1, SENTINEL + 0), (2, SENTINEL + 1)},
         rounds=[[3, 2, 2], [3, 3]],
         capture_uid=102,
     )
@@ -275,7 +293,7 @@ def test_the_uid_to_cache_row_map_follows_the_loops_filter(model):
     """The mapping itself, named: uid -> the row the CACHE holds it in."""
     _, cache, rows_at_capture, batch = _drive(
         model,
-        stop_tokens={12, 19},
+        stops={(1, SENTINEL + 0), (2, SENTINEL + 2)},
         rounds=[[3, 3, 2], [3, 3]],
         capture_uid=103,
     )

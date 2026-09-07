@@ -658,6 +658,27 @@ def _eagle3_rounds_batch(
         col_idx = mx.array(accepted_list)
         hidden = verify_hidden[row_idx, col_idx, :][:, None, :]
 
+        # ROLLBACK BEFORE EMIT (V1d).  The emit loop below YIELDS, and the
+        # server captures an end-of-turn session rung inside that yield
+        # (server/generation.py::_step -> BatchGenerator.capture_session, in the
+        # window between ``finish_reason`` and ``remove()``).  With the rollback
+        # still pending, that snapshot carries the KV of every DRAFTED token in
+        # the block -- including the rejected ones the row never emitted -- so
+        # the rung's cache is longer than its key: the vault refuses it
+        # (``cache_longer_than_key``) or, when it is longer by exactly one,
+        # stores it with the last column labelled as a token that column is not.
+        # Pure reorder: nothing between here and the old position touches the
+        # caches, the arguments are final above, and the emitted stream is
+        # unchanged.
+        if any(accepted < bs - 1 for accepted in accepted_list):
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache,
+                    gdn_states,
+                    mx.array(accepted_list),
+                    bs,
+                )
+
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
         for pos in range(max_new):
             tokens_out: List[Optional[int]] = [None] * B
@@ -679,15 +700,6 @@ def _eagle3_rounds_batch(
             orig = active_idx[j]
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
-
-        if any(accepted < bs - 1 for accepted in accepted_list):
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache,
-                    gdn_states,
-                    mx.array(accepted_list),
-                    bs,
-                )
 
         if all(finished[active_idx[j]] for j in range(n_active)):
             break

@@ -86,6 +86,8 @@ class _StubDrafter:
         self.draft_lens = []
         self.rows: List[int] = []
         self.caches_made = 0
+        self.boundary = None
+        self.pending_boundary = False
 
     def reset(self, model=None):
         self.accept_lens = []
@@ -96,6 +98,14 @@ class _StubDrafter:
         return []
 
     def draft_block(self, bonus, hidden, cache, bs, sampler, token_dtype):
+        # V1d: the round loop now rolls the cache back BEFORE it emits, so the
+        # window in which a round's cache state is observable opens once that
+        # round's tokens have been yielded and closes when the next round
+        # drafts.  The rollback spy arms ``pending_boundary``; the first draft
+        # call of the next round runs the hook there.
+        if self.pending_boundary and self.boundary is not None:
+            self.pending_boundary = False
+            self.boundary()
         # The row is read off the BONUS rather than off a queue: the bonus is
         # distinct per row in every round (the first bonuses, then SENTINEL+row),
         # and an admission changes the drafting ORDER, which a queue would have
@@ -180,11 +190,15 @@ def _drive(
     def spy(caches, gdn_states, accepted_arg, block_size):
         seen.append([int(v) for v in accepted_arg.reshape(-1).tolist()])
         original_rollback(caches, gdn_states, accepted_arg, block_size)
+        drafter.pending_boundary = True
+
+    def _round_boundary():
         if len(seen) >= len(accepts_per_round):
             raise _RoundsDone
         active[0] = [i for i in active[0] if not finished[i]]
 
     model.rollback_speculative_cache = spy
+    drafter.boundary = _round_boundary
 
     def _stop(row, token):
         return finished[row]
