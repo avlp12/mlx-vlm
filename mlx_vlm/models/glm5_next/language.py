@@ -2409,7 +2409,7 @@ class Glm5NextSparseAttention(nn.Module):
         clamped = mx.clip(sel, 0, Kv - 1)
         q_e = self.embed_q(q)  # [B, H, L, dim]
 
-        # V5a.  MLX_VLM_GLM5_DSA_GATHER_KERNEL, default off -- see sparse_mla_attn.py for
+        # V5a.  MLX_VLM_GLM5_DSA_GATHER_KERNEL, default take (I1507) -- see sparse_mla_attn.py for
         # the mechanism (take_along_axis lowers to gather_axis, one thread per 2-byte
         # element with two elem_to_loc address chains apiece because both operands are
         # broadcast views; measured 6.96x its bandwidth floor at depth 0, I1493).

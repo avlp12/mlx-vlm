@@ -55,10 +55,10 @@ slice_sizes=[1,dim]), mlx/ops.cpp:3690-3720), and produces the SAME [G, topk, di
 element for element, as the take_along_axis form.  That is mode ``take`` below: a bit-exact
 drop-in that deletes the ALU wall and leaves a pure 1 KB-row copy.
 
-MODES  (env ``MLX_VLM_GLM5_DSA_GATHER_KERNEL``, default off/eager)
+MODES  (env ``MLX_VLM_GLM5_DSA_GATHER_KERNEL``, default take since I1507)
 ------------------------------------------------------------------
-  eager  (default, or "0"/"off")  language.py's take_along_axis, untouched.
-  take                            gather_front via mx.take.  BIT-EXACT with eager.
+  eager  ("0"/"off"/"eager")      language.py's take_along_axis, untouched.
+  take   (default, or unset)      gather_front via mx.take.  BIT-EXACT with eager.
   fused                           this file's ``mla_sparse_flash_attention``: one metal
                                   kernel that consumes the INDEX LIST and never
                                   materialises [G, topk, dim] at all.  NOT bit-exact
@@ -97,11 +97,13 @@ _VALID_MODES = ("eager", "take", "fused")
 
 
 def dsa_gather_mode() -> str:
-    """``MLX_VLM_GLM5_DSA_GATHER_KERNEL`` in {eager|take|fused}.  Default eager."""
+    """``MLX_VLM_GLM5_DSA_GATHER_KERNEL`` in {eager|take|fused}.  Default take (I1507: bit-exact, +5.4 % prefill)."""
     global _MODE
     if _MODE is None:
         v = os.environ.get("MLX_VLM_GLM5_DSA_GATHER_KERNEL", "").strip().lower()
-        if v in ("", "0", "off", "false", "no", "eager"):
+        if v == "":
+            _MODE = "take"
+        elif v in ("0", "off", "false", "no", "eager"):
             _MODE = "eager"
         elif v in _VALID_MODES:
             _MODE = v
