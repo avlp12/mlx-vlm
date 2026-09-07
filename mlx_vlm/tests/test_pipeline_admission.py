@@ -331,6 +331,50 @@ def test_non_finite_and_missing_samples_are_ignored():
     assert s.snapshot()["samples"] == 0
 
 
+def test_the_sampler_reads_flags_then_environment_then_defaults(monkeypatch):
+    """A7b.  ``min_samples`` used to be reachable only as a Python default, so
+    the only way to see a live tail report ``degraded`` was to send it eight
+    full prefills -- and the B3b drill's ninth request (the one that would have
+    read the flag back) never happened.  All three knobs are flags now, and the
+    ``or`` chain that would have swallowed ``--rail-p95-s 0`` is gone."""
+    monkeypatch.delenv("MLX_VLM_PIPELINE_RAIL_WINDOW", raising=False)
+    monkeypatch.delenv("MLX_VLM_PIPELINE_RAIL_P95_S", raising=False)
+    monkeypatch.delenv("MLX_VLM_PIPELINE_RAIL_MIN_SAMPLES", raising=False)
+    bare = SimpleNamespace()
+    s = adm.rail_sampler_from_args(bare)
+    assert s.window == adm.DEFAULT_RAIL_WINDOW
+    assert s.min_samples == adm.DEFAULT_RAIL_MIN_SAMPLES
+    assert s.p95_bound_s == adm.DEFAULT_RAIL_P95_BOUND_S
+
+    monkeypatch.setenv("MLX_VLM_PIPELINE_RAIL_MIN_SAMPLES", "3")
+    assert adm.rail_sampler_from_args(bare).min_samples == 3
+    flagged = SimpleNamespace(rail_window=4, rail_p95_s=0.001, rail_min_samples=2)
+    got = adm.rail_sampler_from_args(flagged)
+    assert (got.window, got.p95_bound_s, got.min_samples) == (4, 0.001, 2)
+    assert adm.rail_sampler_from_args(
+        SimpleNamespace(rail_p95_s=0.0)
+    ).p95_bound_s == 0.0, "a bound of zero is an ASKED-for bound, not an unset one"
+
+
+def test_the_tail_cli_exposes_every_rail_knob(monkeypatch):
+    """The flag has to EXIST for a drill to be able to say it: the sampler
+    reading ``args.rail_min_samples`` was never reachable from the command
+    line, so the launcher's ``--rail-p95-s 0.001`` could only ever be proved by
+    eight full prefills."""
+    seen = {}
+    monkeypatch.setattr(pp, "run_tail", lambda args: seen.setdefault("args", args))
+    pp.main([
+        "--role", "tail", "--model", "m", "--transport", "socket",
+        "--rail-window", "4", "--rail-p95-s", "0.001", "--rail-min-samples", "2",
+    ])
+    parsed = seen["args"]
+    assert (parsed.rail_window, parsed.rail_p95_s, parsed.rail_min_samples) == (
+        4, 0.001, 2,
+    )
+    sampler = adm.rail_sampler_from_args(parsed)
+    assert (sampler.window, sampler.p95_bound_s, sampler.min_samples) == (4, 0.001, 2)
+
+
 def test_prefill_seconds_ride_along_for_the_operator():
     s = adm.RailSampler(window=4, p95_bound_s=99.0, min_samples=1)
     s.observe(0.4, 12.0)

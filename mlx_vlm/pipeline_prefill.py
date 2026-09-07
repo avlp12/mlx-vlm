@@ -1564,10 +1564,23 @@ class TailDaemon:
         ``shutdown_reason`` is never in state ``listening``.  A tail that has
         been told to stop is either draining a request (``serving``), on its
         way out (``stopping``), or gone (``stopped``) -- never back at accept.
+
+        The invariant is enforced HERE and not only by where ``self.state`` is
+        assigned, because a signal arrives between assignments: an idle daemon
+        parked in ``accept`` keeps the name ``listening`` for up to ``POLL_S``
+        (0.25 s) after the flag flips, and a health probe in that window --
+        which is precisely when a drill probes, right after the STOP -- would
+        read back the exact shape (``shutdown_reason`` set, ``listening``) that
+        means "the SIGTERM did nothing".  The handler cannot fix it: it may
+        only set flags.  So the LINE reports the stop the gate already knows
+        about, and the field an operator reads never lies about it.
         """
+        state = self.state
+        if state == "listening" and self.gate.stopping:
+            state = "stopping"
         return {
             "role": "tail",
-            "state": self.state,
+            "state": state,
             "peer": self.peer,
             "uptime_s": round(self.clock() - self.started, 3),
             "idle_s": round(self.clock() - self.last_active, 3),
@@ -2459,6 +2472,12 @@ def main(argv=None):
         "--rail-p95-s", type=float, default=None,
         help="p95 wire seconds above which the tail reports degraded "
         f"[default {admission.DEFAULT_RAIL_P95_BOUND_S}]",
+    )
+    p.add_argument(
+        "--rail-min-samples", type=int, default=None,
+        help="requests the rail window must hold before the tail will report "
+        f"degraded at all [default {admission.DEFAULT_RAIL_MIN_SAMPLES}, env "
+        "MLX_VLM_PIPELINE_RAIL_MIN_SAMPLES]",
     )
     p.add_argument("--io-timeout", type=float, default=120.0)
     p.add_argument(

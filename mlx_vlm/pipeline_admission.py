@@ -834,20 +834,50 @@ def _configured_shard_bytes(args):
     return int(value)
 
 
+def _first_set(*values):
+    """The first value that was actually SET.  ``or`` chains cannot be used
+    here: ``--rail-p95-s 0`` and ``--rail-min-samples 0`` are falsy, and a
+    launcher that asks for a bound of zero must not be silently given 2.0 s."""
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def rail_sampler_from_args(args) -> RailSampler:
+    """The tail's rail sampler, from flags then environment then defaults.
+
+    ``min_samples`` is plumbed like the other two (A7b).  It used to be
+    reachable only as a Python default, which made the degraded verdict
+    untestable on live hardware for anything cheaper than
+    ``DEFAULT_RAIL_MIN_SAMPLES`` full prefills: the B3b drill sent nine 32k
+    requests to a tail pinned at ``--rail-p95-s 0.001`` and the eighth is the
+    first that can flip the flag, so one lost request (D5a's, which went to the
+    outgoing tail) was enough to make ``peer_degraded`` unobservable in a
+    28-minute window.  A drill that can say ``--rail-min-samples 2`` proves the
+    same path in two.
+    """
     return RailSampler(
         window=int(
-            getattr(args, "rail_window", None)
-            or os.environ.get("MLX_VLM_PIPELINE_RAIL_WINDOW")
-            or DEFAULT_RAIL_WINDOW
+            _first_set(
+                getattr(args, "rail_window", None),
+                os.environ.get("MLX_VLM_PIPELINE_RAIL_WINDOW"),
+                DEFAULT_RAIL_WINDOW,
+            )
         ),
         p95_bound_s=float(
-            getattr(args, "rail_p95_s", None)
-            or os.environ.get("MLX_VLM_PIPELINE_RAIL_P95_S")
-            or DEFAULT_RAIL_P95_BOUND_S
+            _first_set(
+                getattr(args, "rail_p95_s", None),
+                os.environ.get("MLX_VLM_PIPELINE_RAIL_P95_S"),
+                DEFAULT_RAIL_P95_BOUND_S,
+            )
         ),
         min_samples=int(
-            getattr(args, "rail_min_samples", None) or DEFAULT_RAIL_MIN_SAMPLES
+            _first_set(
+                getattr(args, "rail_min_samples", None),
+                os.environ.get("MLX_VLM_PIPELINE_RAIL_MIN_SAMPLES"),
+                DEFAULT_RAIL_MIN_SAMPLES,
+            )
         ),
     )
 

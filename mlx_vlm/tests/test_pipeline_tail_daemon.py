@@ -444,6 +444,79 @@ def test_two_requests_ride_one_connection_and_the_cache_is_reset_between(monkeyp
     assert not th.is_alive() and not errors
 
 
+def test_served_requests_flip_the_rail_flag_and_the_next_ping_carries_it(monkeypatch):
+    """A7b, end to end over the SHIPPED session loop: the tail samples the
+    request it just served, and the head reads the verdict back on the ping it
+    already sends before every lease.
+
+    This is the chain the B3b D5 drill could not demonstrate on live hardware.
+    Nothing in it was broken -- but nothing pinned it either, and the drill's
+    ``min_samples`` (8) was only reachable through eight full 32k prefills, so
+    a single mis-sequenced request (D5a's, which went to the OUTGOING tail) was
+    enough to leave the whole path unobserved for 28 minutes.  With
+    ``--rail-min-samples`` it takes two four-token requests."""
+    tail_model = _FakeModel()
+    monkeypatch.setattr(
+        pp,
+        "load_stage",
+        lambda *a: (tail_model, tail_model.make_cache(), [1, 2], 3, 0.0),
+    )
+    port = _free_port()
+    args = _tail_args(port)
+    args.rail_window = 4
+    args.rail_p95_s = 1e-9  # any real wire time is "slow" against this
+    args.rail_min_samples = 2
+    box = {}
+    errors = []
+
+    def tail():
+        try:
+            pp.run_tail(args, on_ready=lambda d: box.__setitem__("daemon", d))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    th = threading.Thread(target=tail, daemon=True)
+    th.start()
+    deadline = time.monotonic() + 5
+    while "daemon" not in box and time.monotonic() < deadline:
+        time.sleep(0.01)
+    head = _head(port)
+    model = _FakeModel()
+
+    def one_request(tokens=4):
+        ids = mx.arange(tokens, dtype=mx.int32)[None, :]
+        cache = model.make_cache()
+        head.begin(tokens, 2, input_ids=ids)
+        for start in range(0, tokens - 1, 2):
+            head.prefill_chunk(
+                model, ids[:, start : min(start + 2, tokens - 1)], None, cache
+            )
+        head.finalize(cache)
+
+    try:
+        head.connect(timeout=5)
+        head.ping()
+        assert head.peer_degraded is False and head.peer_rail["samples"] == 0
+
+        one_request()
+        head.ping()
+        assert head.peer_rail["samples"] == 1, "the served request was sampled"
+        assert head.peer_degraded is False, "one sample is below min_samples"
+
+        one_request()
+        head.ping()
+        assert head.peer_rail["samples"] == 2
+        assert head.peer_rail["p95_wire_s"] > 0
+        assert head.peer_degraded is True, "min_samples over the bound is degraded"
+        assert box["daemon"].status()["degraded"] is True
+        head.close()
+    finally:
+        head.abort()
+        box["daemon"].request_shutdown("test")
+        th.join(5)
+    assert not errors
+
+
 def test_shutdown_makes_the_stage_weights_unreachable(monkeypatch):
     """The rule that costs a reboot when it is broken: a tail must release the
     stage BEFORE the process exits.  The session closure holds the Stage and
@@ -808,6 +881,71 @@ def test_the_health_thread_retires_with_the_daemon():
     assert health.join(3.0), "the health thread outlived the daemon"
     with pytest.raises(OSError):
         socket.create_connection(("127.0.0.1", port), timeout=2).close()
+
+
+def test_an_idle_daemon_never_reports_listening_after_the_flag_flips():
+    """The invariant, at the one instant it used to be breakable: the signal
+    has landed but the accept poll (0.25 s) has not come round yet."""
+    srv, _ = _listener()
+    daemon = pp.TailDaemon(srv, lambda s, a: 0)
+    th, out = _run(daemon)
+    try:
+        assert _wait(lambda: daemon.state == "listening")
+        daemon.request_shutdown("signal_15")
+        line = daemon.status()
+        assert daemon.state == "listening", "the loop has not woken up yet"
+        assert line["state"] == "stopping" and line["stopping"] is True
+        assert line["shutdown_reason"] == "signal_15"
+    finally:
+        daemon.request_shutdown("test")
+        th.join(5)
+    assert out["status"]["state"] == "stopped"
+
+
+def test_a_poller_across_the_stop_reads_stopping_then_nothing():
+    """D6's observation, exactly as the drill should make it.
+
+    The B3b D6 step probed the health socket ONCE, immediately after the STOP
+    sentinel, and read ``state: serving`` -- the tail was still finishing the
+    request in flight, and it did go on to exit cleanly (wired back to
+    baseline).  A single probe cannot tell "stopping" from "ignored the
+    signal", which is the failure I1457 actually caught; a POLL can, and this
+    pins what it will see: never ``listening`` after the stop, at least one
+    line that says ``stopping: true``, and then a socket that is simply gone."""
+    srv, _ = _listener()
+    daemon = pp.TailDaemon(srv, lambda s, a: 0, unload=lambda: time.sleep(0.5))
+    lines = _capture(daemon)
+    th, out = _run(daemon)
+    port = _free_port()
+    health = pp.serve_health(daemon, port)
+    seen = []
+    try:
+        assert _wait(lambda: daemon.state == "listening")
+        daemon.request_shutdown("signal_15")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                c = socket.create_connection(("127.0.0.1", port), timeout=1)
+            except OSError:
+                break  # unreachable: the daemon reached "stopped" and retired
+            try:
+                seen.append(json.loads(c.recv(4096).decode()))
+            finally:
+                c.close()
+            time.sleep(0.02)
+        else:  # pragma: no cover - a stop that never ends is the bug itself
+            raise AssertionError("the health socket never went away")
+    finally:
+        if health is not None:
+            health.close()
+        th.join(5)
+    assert not out.get("error") and out["status"]["state"] == "stopped"
+    assert seen, "the probe must be able to read at least one line after a stop"
+    assert all(st["stopping"] is True for st in seen)
+    assert all(st["state"] in ("stopping", "stopped", "serving") for st in seen)
+    assert all("drain_remaining_s" in st for st in seen), "A2b's field, per line"
+    assert any(st["state"] == "stopping" for st in seen)
+    _assert_never_listening_after_a_stop(lines)
 
 
 class _Report:
