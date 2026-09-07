@@ -2742,6 +2742,8 @@ class Glm5NextModel(nn.Module):
         hi: int,
         inputs: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
+        hidden_sink: Optional[list] = None,
+        capture_layer_ids: Optional[list] = None,
     ) -> mx.array:
         """Run decoder layers [lo, hi) over one prefill chunk.
 
@@ -2753,6 +2755,18 @@ class Glm5NextModel(nn.Module):
         Masks depend only on (chunk length, cache offset) and offsets are equal
         for every layer of a kind, so any local layer of that kind supplies the
         mask -- a stage does not need the other half's caches to build one.
+
+        ``hidden_sink``/``capture_layer_ids`` are the SAME capture :meth:`__call__`
+        performs, restricted to the layers this stage owns, and they follow its
+        rules exactly rather than approximately: a captured layer contributes
+        ``h.mean(axis=2)`` (the mHC-collapsed residual stream) immediately after
+        it runs, and an OPEN sink with an EMPTY capture set contributes the
+        pre-final-norm hidden the nextn/MTP drafter reads -- which only exists
+        once the last layer has run, so only the stage that owns it appends one.
+        A drafter's target layers can fall on either side of the split (DFlash2's
+        ``[5, 14, 24, 33, 42]`` straddles split 23), so both halves capture and
+        the caller merges by layer id; the sink order here is ascending layer id
+        because the loop is, which is the order ``__call__`` produces too.
         """
         if lo == 0:
             h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
@@ -2776,11 +2790,16 @@ class Glm5NextModel(nn.Module):
             )
             h = mx.contiguous(h)
 
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for i in local:
             layer = self.layers[i]
             h = layer(
                 h, mask=ssm_mask if layer.is_linear else fa_mask, cache=cache[i]
             )
+            if i in capture_set and hidden_sink is not None:
+                hidden_sink.append(h.mean(axis=2))
+        if hidden_sink is not None and not capture_set and hi == len(self.layers):
+            hidden_sink.append(h.mean(axis=2))  # pre-final-norm, for the nextn drafter
         return h
 
     def pipeline_finish(self, h: mx.array) -> mx.array:
@@ -3045,11 +3064,30 @@ class LanguageModel(nn.Module):
         )
 
     def pipeline_prefill_head(
-        self, inputs=None, inputs_embeds=None, cache=None, split: int = 0
+        self,
+        inputs=None,
+        inputs_embeds=None,
+        cache=None,
+        split: int = 0,
+        hidden_sink=None,
+        capture_layer_ids=None,
     ) -> mx.array:
-        """Stage-A half of a pipelined prefill chunk -> the boundary tensor."""
+        """Stage-A half of a pipelined prefill chunk -> the boundary tensor.
+
+        ``hidden_sink`` collects this half's share of a speculative drafter's
+        per-layer capture (see :meth:`Glm5NextModel.pipeline_forward`); it is
+        ``None`` on every request that has no hidden-reading drafter, and then
+        this is the call it has always been.
+        """
         return self.model.pipeline_forward(
-            None, cache, 0, split, inputs=inputs, inputs_embeds=inputs_embeds
+            None,
+            cache,
+            0,
+            split,
+            inputs=inputs,
+            inputs_embeds=inputs_embeds,
+            hidden_sink=hidden_sink,
+            capture_layer_ids=capture_layer_ids,
         )
 
     @property
