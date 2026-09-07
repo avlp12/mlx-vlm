@@ -75,7 +75,7 @@ class _FakeHead:
         return None
 
 
-def _settings(port=1):
+def _settings(port=1, ping_timeout=None):
     return pr.PipelineSettings(
         ("127.0.0.1", port),
         None,
@@ -86,6 +86,7 @@ def _settings(port=1):
         model_sha256="a" * 64,
         source_revision="b" * 40,
         io_timeout=2.0,
+        ping_timeout=ping_timeout,
     )
 
 
@@ -597,3 +598,114 @@ def _connected_head(port):
     head.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
     head.sock.settimeout(5)
     return head
+
+
+# --------------------------------------------------------------- A3b: the ping is bounded
+
+
+def test_a_pooled_socket_whose_peer_closed_reconnects_and_the_request_succeeds(
+    monkeypatch,
+):
+    """The B3b D5a shape, over a REAL socket: the tail this connection was
+    opened to is gone, and the next request must not know it.
+
+    The distinction the drill is reading is the whole contract: a peer that
+    died BETWEEN requests costs a reconnect (``pp_reconnects``), and only a
+    peer that dies with a prefill already committed to it costs the request
+    (``pp_failed``).  Here the pooled socket's peer closed while the pool was
+    idle, so the request that follows is a clean ``pp_used``."""
+    srv, port = _listener_pair()
+    dead = pr.PipelineHead(_settings(port), 1, 3)
+    dead.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    dead.sock.settimeout(2.0)
+    peer, _ = srv.accept()
+    peer.close()  # the tail process is gone; this end sees EOF on the ping
+
+    class Factory(_FakeHead):
+        def __init__(self, settings, split, n_layers):
+            super().__init__(settings, split, n_layers)
+
+        def connect(self):
+            return self
+
+    pool = _pool(monkeypatch, Factory)
+    s = _settings(port)
+    key = pr._pool_key(s, 1, 3)
+    pool._idle[key] = [dead]
+    try:
+        head = pool.acquire(s, 1, 3)
+        assert head is not dead, "the dead socket must never be handed out"
+        assert dead.sock is None, "and it must be discarded, not leaked"
+        lease = pr.PooledPipelineHead(pool, head, key)
+        lease.finalize(cache=None)
+        lease.close()
+    finally:
+        srv.close()
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_reconnects"] == 1
+    assert snap["pp_failed"] == 0, "a peer that died BETWEEN requests failed nothing"
+    assert snap["pp_used"] == 1
+    assert snap["pp_bypass_reason"] == {}
+
+
+def test_the_ping_gives_up_on_a_silent_peer_inside_the_ping_timeout():
+    """Half-open is the case a closed socket does not cover: the peer's box is
+    up, the connection is established, and nothing ever comes back.  Only a
+    deadline distinguishes that from a quiet peer -- and it must be the PING's
+    deadline (2 s), not the 120 s one that bounds a 64 MiB boundary chunk."""
+    srv, port = _listener_pair()
+    head = pr.PipelineHead(_settings(port, ping_timeout=0.25), 1, 3)
+    head.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    head.sock.settimeout(2.0)
+    peer, _ = srv.accept()  # accepted, never answered
+    try:
+        t0 = time.monotonic()
+        with pytest.raises((TimeoutError, OSError)):
+            head.ping()
+        waited = time.monotonic() - t0
+        assert waited < 1.5, f"the ping waited {waited:.2f}s past its 0.25s bound"
+        assert head.sock.gettimeout() == 2.0, "the request's timeout was restored"
+    finally:
+        head.abort()
+        peer.close()
+        srv.close()
+
+
+def test_a_silent_peer_is_a_reconnect_not_a_stalled_request(monkeypatch):
+    """And the pool's reading of that timeout is the same as its reading of a
+    closed socket: discard, redial, count a reconnect -- never a failure."""
+    srv, port = _listener_pair()
+    hung = pr.PipelineHead(_settings(port, ping_timeout=0.25), 1, 3)
+    hung.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    hung.sock.settimeout(2.0)
+    peer, _ = srv.accept()
+
+    class Factory(_FakeHead):
+        def connect(self):
+            return self
+
+    pool = _pool(monkeypatch, Factory)
+    s = _settings(port, ping_timeout=0.25)
+    key = pr._pool_key(s, 1, 3)
+    pool._idle[key] = [hung]
+    try:
+        t0 = time.monotonic()
+        head = pool.acquire(s, 1, 3)
+        waited = time.monotonic() - t0
+        assert head is not hung and waited < 1.5
+    finally:
+        peer.close()
+        srv.close()
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_reconnects"] == 1 and snap["pp_failed"] == 0
+
+
+def test_the_ping_timeout_can_never_outlast_the_io_timeout():
+    """A launcher that lowers ``MLX_VLM_PIPELINE_IO_TIMEOUT`` below the ping
+    bound gets the smaller of the two, not a ping that outlives the I/O it is
+    supposed to be the cheap version of."""
+    s = _settings(1, ping_timeout=30.0)
+    assert s.ping_timeout == 2.0 == s.io_timeout
+    assert _settings(1).ping_timeout == pytest.approx(pr.DEFAULT_PING_TIMEOUT_S)
+    with pytest.raises(ValueError):
+        _settings(1, ping_timeout=0)

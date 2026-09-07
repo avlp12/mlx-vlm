@@ -15,6 +15,7 @@ everything else has a default::
     MLX_VLM_PIPELINE_MODEL_SHA256=<verified manifest SHA256>  # required
     MLX_VLM_PIPELINE_SOURCE_REVISION=<source commit SHA1>     # required
     MLX_VLM_PIPELINE_IO_TIMEOUT=120               # socket/queue timeout seconds
+    MLX_VLM_PIPELINE_PING_TIMEOUT=2               # A3b: liveness ping deadline
 
 The model/source identities are caller attestations: the launcher must verify
 the actual local files on each host before supplying these pins. Schema 1 only
@@ -146,6 +147,17 @@ DEFAULT_MIN_TOKENS = 16384
 # shape is unserveable.
 DEFAULT_MIN_PIPELINED_CHUNKS = 2
 
+# A3b.  The liveness ping is not an I/O timeout: ``io_timeout`` (120 s) bounds a
+# 64 MiB boundary transfer, and a request that spends it waiting to find out
+# whether it HAS a peer has already lost more than the fallback would have cost.
+# A tail that is up answers this round trip in microseconds on the TB rail, so a
+# ping that is still unanswered after a couple of seconds is a peer to reconnect
+# to, not a peer to wait for.  The field case is the half-open one the B3b
+# drills left open: a peer whose kernel is gone but whose socket sends nothing
+# back (a hung box, a dropped rail) never resets the connection, so only a
+# deadline distinguishes it from a peer that is merely quiet.
+DEFAULT_PING_TIMEOUT_S = 2.0
+
 
 def min_pipelined_chunks() -> int:
     """``MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS``, read fresh, never below 1.
@@ -178,6 +190,7 @@ class PipelineSettings:
         model_sha256=None,
         source_revision=None,
         io_timeout=120.0,
+        ping_timeout=None,
     ):
         self.peer = peer
         self.ring = ring
@@ -190,6 +203,14 @@ class PipelineSettings:
         self.io_timeout = float(io_timeout)
         if not math.isfinite(self.io_timeout) or self.io_timeout <= 0:
             raise ValueError("pipeline io_timeout must be positive and finite")
+        # Never longer than the I/O timeout it is a cheaper version of, and
+        # never zero: a non-blocking ping would report every live peer stale.
+        self.ping_timeout = min(
+            self.io_timeout,
+            float(DEFAULT_PING_TIMEOUT_S if ping_timeout is None else ping_timeout),
+        )
+        if not math.isfinite(self.ping_timeout) or self.ping_timeout <= 0:
+            raise ValueError("pipeline ping_timeout must be positive and finite")
 
     @classmethod
     def from_env(cls):
@@ -215,6 +236,11 @@ class PipelineSettings:
             model_sha256=os.environ.get("MLX_VLM_PIPELINE_MODEL_SHA256"),
             source_revision=os.environ.get("MLX_VLM_PIPELINE_SOURCE_REVISION"),
             io_timeout=float(os.environ.get("MLX_VLM_PIPELINE_IO_TIMEOUT", "120")),
+            ping_timeout=float(
+                os.environ.get(
+                    "MLX_VLM_PIPELINE_PING_TIMEOUT", str(DEFAULT_PING_TIMEOUT_S)
+                )
+            ),
         )
 
 
@@ -457,8 +483,21 @@ class PipelineHead:
             raise OSError("pipeline connection is closed")
         if self._active:
             raise RuntimeError("pipeline ping requires an idle peer")
-        _send_json(self.sock, {"cmd": "ping", "rail": True})
-        ack = _recv_json(self.sock)
+        # A3b: bounded by ``ping_timeout`` (2 s), not by ``io_timeout`` (120 s).
+        # A peer that has stopped answering must cost this request a couple of
+        # seconds and a reconnect, not two minutes and a stall -- and the
+        # timeout has to be RESTORED, because the same socket is about to carry
+        # a 64 MiB chunk that legitimately takes longer than a ping.
+        previous = self.sock.gettimeout()
+        try:
+            self.sock.settimeout(self.settings.ping_timeout)
+            _send_json(self.sock, {"cmd": "ping", "rail": True})
+            ack = _recv_json(self.sock)
+        finally:
+            try:
+                self.sock.settimeout(previous)
+            except OSError:
+                pass
         if (
             not isinstance(ack, dict)
             or ack.get("cmd") != "ping"
@@ -1090,9 +1129,16 @@ class PipelinePool:
         if head is not None:
             # A pooled socket can have died since the last request; find out
             # here, where falling back is still free, not inside ``begin``.
+            #
+            # A3b: any failure of that check -- a closed peer, a ping that did
+            # not answer inside ``ping_timeout``, a reply this head does not
+            # understand -- is a RECONNECT and not a request failure.  The
+            # request is only counted failed (``release(ok=False)``) when the
+            # peer dies with the prefill already committed to it, because only
+            # then has the request actually lost work.
             try:
                 head.ping()
-            except (OSError, ValueError, TimeoutError) as exc:
+            except Exception as exc:  # noqa: BLE001
                 if verbose:
                     print(f"[pipeline] pooled peer stale: {exc!r}", flush=True)
                 _discard(head)
