@@ -157,16 +157,58 @@ class PrefillEnvelope:
             or sum(self.chunks) != self.depth
         ):
             raise ValueError("pipeline depth/chunks mismatch")
+        # A11b.  THE WIDTHS ARE THE HEAD'S PLAN, NOT A CONSTANT -- but they are
+        # not arbitrary either, and this is the bound the TAIL gets to check
+        # before it sizes a buffer for them.  Every chunk but the last is the
+        # request's chunk size ``C``; the last one may be SHORTER (the head's
+        # plan clamped it to a checkpoint column) or WIDER (L35's tail merge
+        # folded the final short tail into it), and the merge is bounded by
+        # ``2C - 1`` because ``next_prefill_chunk`` clamps ``tail_min`` to the
+        # step.  So a peer is never handed an activation peak it could not have
+        # been handed by the uniform schedule, and a head that drifts sends an
+        # envelope the tail refuses rather than a chunk it silently mis-sizes.
+        width = self.chunks[0]
+        if any(n != width for n in self.chunks[:-1]) or self.chunks[-1] >= 2 * width:
+            raise ValueError("invalid pipeline chunk widths")
 
     @classmethod
     def create(
-        cls, *, model_sha256, source_revision, split, n_layers, input_ids, chunk
+        cls,
+        *,
+        model_sha256,
+        source_revision,
+        split,
+        n_layers,
+        input_ids,
+        chunk,
+        chunks=None,
     ):
+        """``chunks`` is the caller's OWN plan; without it the uniform one.
+
+        A11b.  The uniform derivation (``min(C, depth - p)``) is the plan a
+        chunk loop with no tail merge and no checkpoint ladder would run, and
+        for the bench roles that is exactly the plan.  The SERVED loop's plan is
+        neither: ``next_prefill_chunk`` may grow its last chunk and the APC /
+        vault ladder may clamp it, and a two-box prefill whose chunk
+        decomposition differs from the single-box one does not merely round
+        differently -- L7B measured "identity across chunk sizes: FALSE".  So
+        the served head hands its plan in rather than hoping this arithmetic
+        reproduces it, and the last chunk is the only one that may differ from
+        ``chunk`` (checked here, and again in ``__post_init__`` on the tail,
+        which does not know ``chunk``).
+        """
         if type(chunk) is not int or chunk <= 0:
             raise ValueError("invalid pipeline chunk size")
         raw = token_bytes(input_ids)
         depth = len(raw) // 4
-        chunks = tuple(min(chunk, depth - p) for p in range(0, depth, chunk))
+        if chunks is None:
+            chunks = tuple(min(chunk, depth - p) for p in range(0, depth, chunk))
+        else:
+            chunks = tuple(int(n) for n in chunks)
+            if not chunks or sum(chunks) != depth:
+                raise ValueError("pipeline chunk plan does not cover the prefix")
+            if any(n != chunk for n in chunks[:-1]):
+                raise ValueError("only the last pipelined chunk may leave C")
         return cls(
             1,
             uuid.uuid4().hex,

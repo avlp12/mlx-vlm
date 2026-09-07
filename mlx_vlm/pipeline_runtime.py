@@ -500,8 +500,15 @@ class PipelineHead:
         self._captured_hidden = None
 
     # -- one prefill --------------------------------------------------------
-    def begin(self, tokens: int, chunk: int, *, input_ids, capture=None):
+    def begin(self, tokens: int, chunk: int, *, input_ids, capture=None, chunks=None):
         """Open one request.  ``capture`` is A6's speculative hidden capture.
+
+        ``chunks`` (A11b) is the caller's own chunk plan for the ``tokens - 1``
+        pipelined columns.  ``None`` keeps the uniform ``min(C, depth - p)``
+        derivation, which is what the bench roles and ``generate_step`` send;
+        the served loop passes the plan it will actually run, because its last
+        chunk may be merged or clamped and the peer has to run the SAME
+        decomposition or the two-box cache is not the one-box cache.
 
         A hidden-reading drafter (the DEFAULT served config's DFlash2, and MTP)
         is primed on the target's activations over the prompt, and a pipelined
@@ -538,6 +545,7 @@ class PipelineHead:
             n_layers=self.n_layers,
             input_ids=input_ids[:, :-1],
             chunk=chunk,
+            chunks=chunks,
         )
         self.stats = {
             "chunks": [],
@@ -1210,10 +1218,10 @@ class PooledPipelineHead:
     def split(self):
         return self._head.split
 
-    def begin(self, tokens, chunk, *, input_ids, capture=None):
+    def begin(self, tokens, chunk, *, input_ids, capture=None, chunks=None):
         self._ok = False
         return self._head.begin(
-            tokens, chunk, input_ids=input_ids, capture=capture
+            tokens, chunk, input_ids=input_ids, capture=capture, chunks=chunks
         )
 
     def take_hidden(self):

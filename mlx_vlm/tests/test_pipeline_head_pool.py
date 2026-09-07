@@ -65,7 +65,7 @@ class _FakeHead:
             "handoff": {"handoff_bytes": 4096, "handoff_wire_recv_s": 0.25},
         }
 
-    def begin(self, tokens, chunk, *, input_ids):
+    def begin(self, tokens, chunk, *, input_ids, capture=None, chunks=None):
         return None
 
     def local_caches(self, cache):

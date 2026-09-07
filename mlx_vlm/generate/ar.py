@@ -2585,20 +2585,30 @@ class PromptProcessingBatch:
                 out.append(col)
         return out
 
-    def _next_apc_checkpoint_column(self) -> Optional[int]:
+    def _next_apc_checkpoint_column(
+        self, start: Optional[int] = None, end: Optional[int] = None
+    ) -> Optional[int]:
         """Column the next chunk must stop on, over APC's checkpoint and the vault's ladder.
 
         With ``self._vault is None`` this reduces term for term to what it was:
         ``apc_on`` reproduces the old two-clause guard, the vault list is empty,
         and the min is taken over the same single column per row.
+
+        A11b.  ``start``/``end`` default to the window the loop is in right now,
+        which is every historical caller.  The pipelined SCHEDULE asks about a
+        window it has not reached yet -- the last chunk it may hand the peer --
+        because the width of that chunk is the width this clamp will give it,
+        and the schedule has to predict it exactly rather than approximately.
         """
         if not self._apc_meta or self._inputs_embeds is None:
             return None
         apc_on = self._apc_manager is not None and self._apc_mode == "exact"
         if not apc_on and self._vault is None:
             return None
-        start = self._processed_prompt_columns
-        end = start + self._inputs_embeds.shape[1]
+        if start is None:
+            start = self._processed_prompt_columns
+        if end is None:
+            end = self._processed_prompt_columns + self._inputs_embeds.shape[1]
         next_col: Optional[int] = None
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
@@ -2920,9 +2930,11 @@ class PromptProcessingBatch:
     #
     # WHAT THE PEER GETS.  ``prompt_step`` stops once the remainder fits in one
     # step and ``generate()`` runs that remainder as the final forward, so the
-    # pipelined part is AT MOST the chunk loop's part: ``k = ceil(T/C) - 1``
-    # chunks of ``C``, and ``k - 1`` of them when A5c shortens the schedule to
-    # move a checkpoint column out of the peer's way
+    # pipelined part is AT MOST the chunk loop's part: the first
+    # ``k = ceil(T/C) - 1`` chunks of the plan the loop itself would run (A11b
+    # -- the last of them may be L35's merged chunk or one clamped to a
+    # checkpoint column), and ``k - 1`` of them when A5c shortens the schedule
+    # to move a checkpoint column out of the peer's way
     # (``_pipeline_schedule_plan``).  Everything past the pipelined depth is
     # prefilled here AFTER ``finalize`` has installed all 45 layers -- one
     # remainder forward, or a chunk loop plus one, and in both cases the same
@@ -3014,48 +3026,65 @@ class PromptProcessingBatch:
         """
         return sum(self._pipeline_chunk_schedule())
 
-    def _pipeline_schedule_merges_tail(self, chunks: int) -> bool:
-        """Would L35's tail merge grow the LAST of ``chunks`` pipelined chunks?
+    def _pipeline_plan_chunks(self, count: int) -> List[int]:
+        """The FIRST ``count`` chunks of the plan a single box would run.
 
-        A11.  ``next_prefill_chunk`` merges when what the loop has left is one
-        full chunk plus a short tail (``C < remaining < C + tail_min``), and at
-        the last pipelined chunk of a ``T = qC + r`` prompt ``remaining`` is
-        ``C + r - 1`` -- so it fires for every ``2 <= r <= tail_min``, which at
-        the served ``C = 8192`` is one prompt length in eight.  The peer cannot
-        run a chunk of any width but ``C`` (``PrefillEnvelope.create`` ->
-        ``prefill_chunk``), so on such a request the loop and the envelope only
-        agree because ``_next_chunk_width`` turns the merge off -- and that
-        makes the two-box decomposition ``[C]*k + remainder`` where the
-        single-box one is ``[C]*(k-1) + (C+r-1) + 1``.  Different chunkings are
-        not different roundings: L7B measured "identity across chunk sizes:
-        FALSE".  So the request would come out of a free peer with different
-        bytes than out of a busy one, which is the one thing a serving path may
-        not do.
+        A11b.  Two schedules used to meet in ``prompt_step`` and disagree: the
+        loop's, which is L35's plan (a merged tail, a chunk clamped to a
+        checkpoint column), and the peer's, which ``PrefillEnvelope.create``
+        fixed at ``C`` per chunk.  A11 reconciled them by giving a chunk BACK to
+        the head whenever they would differ -- which at the served ``C = 8192,
+        tail_min = 1024`` is one prompt length in eight, and costs that request a
+        whole extra ``C``-wide head chunk (+9-18 s of TTFT, measured 58.9 s vs
+        48 s at 33k on 2026-09-07) to preserve a merge worth ~0.5 s.
 
-        Asked THROUGH ``next_prefill_chunk`` rather than by re-deriving its
-        window, so the two cannot drift when ``TAIL_MIN``/``TAIL_MODE`` move or
-        when the lever is turned off (then this is False and the schedule is
-        A5c's, untouched).
+        The envelope carries an explicit width list now, so the peer can run the
+        loop's OWN chunks and the reconciliation is free.  What this returns is
+        therefore a PREFIX of the single-box chunk sequence, which is the whole
+        of the identity argument: chunk for chunk, the two-box prefill forwards
+        the shapes the one-box prefill forwards, and everything past ``count``
+        is the head's ordinary remainder.
+
+        Only the LAST chunk may leave ``C``, and only in the two ways
+        ``prompt_step`` leaves it:
+
+        * L35's tail merge grows it to ``C + r - 1`` when what is left is one
+          full chunk plus a short tail (``next_prefill_chunk``);
+        * the APC/vault ladder clamps it to a checkpoint column that lands
+          inside it (``_next_apc_checkpoint_column``), which is what the served
+          config actually does -- the vault's deepest rung is
+          ``((T-1)//stride)*stride``, i.e. exactly the ``kC`` the merge would
+          have swallowed, so the served single-box loop never merges that chunk
+          at all and A11's give-back was paid for a merge that does not happen.
+
+        Every EARLIER chunk is exactly ``C``: the merge cannot fire before the
+        last cell (``remaining >= 2C + r - 1 >= C + tail_min``), and a
+        checkpoint column strictly inside one is refused by
+        ``_pipeline_schedule_unserved`` rather than clamped, because a chunk
+        boundary inside the pipelined part is a boundary at which half the KV
+        is still on the peer.
         """
         step = int(self.prefill_step_size or 0)
-        total = (
-            int(self._inputs_embeds.shape[1])
-            if self._inputs_embeds is not None
-            else 0
+        if count <= 0 or step <= 0:
+            return []
+        chunks = [step] * (count - 1)
+        processed = step * (count - 1)
+        total = int(
+            self._inputs_embeds.shape[1] if self._inputs_embeds is not None else 0
         )
-        if chunks <= 0 or step <= 0:
-            return False
-        remaining = total - 1 - (chunks - 1) * step
-        if remaining <= step:
-            return False
-        return (
-            next_prefill_chunk(
-                remaining, step, batch=int(self._inputs_embeds.shape[0])
-            )
-            != step
+        width = next_prefill_chunk(
+            total - 1 - processed,
+            step,
+            batch=int(self._inputs_embeds.shape[0]),
         )
+        column = self._next_apc_checkpoint_column(start=processed, end=total)
+        if column is not None:
+            width = min(width, column - processed)
+        if width <= 0:
+            return []
+        return chunks + [width]
 
-    def _pipeline_schedule_unserved(self, depth: int) -> Optional[str]:
+    def _pipeline_schedule_unserved(self, chunks: List[int]) -> Optional[str]:
         """Which checkpoint a pipelined part ``depth`` tokens deep cannot pay.
 
         ``None`` when every rung and column this request owes is serveable at
@@ -3081,21 +3110,26 @@ class PromptProcessingBatch:
           site over the same complete cache.  This is A5b's argument, and A5c is
           nothing but the observation that ``depth`` is a CHOICE: one chunk
           fewer moves a column out of the pipelined part and into this case.
-        * ``X < depth`` and ``X`` is a vault rung on a multiple of ``C`` -- the
-          collapse drops it and keeps the deepest serveable one instead
-          (``_pipeline_collapse_ladder``).  That is A5's trade: early-divergence
-          coverage for the peer, counted as ``pp_ladder_rungs_skipped``.
+        * ``X < depth`` and ``X`` is a vault rung ON ONE OF THE PLAN'S OWN
+          BOUNDARIES -- the collapse drops it and keeps the deepest serveable
+          one instead (``_pipeline_collapse_ladder``).  That is A5's trade:
+          early-divergence coverage for the peer, counted as
+          ``pp_ladder_rungs_skipped``.  A11b asks the PLAN rather than
+          ``rung % C``: the two agree on every uniform schedule, but the last
+          chunk may be merged or clamped now, and a rung on a multiple of ``C``
+          can then land strictly inside it -- where it is neither a boundary
+          the collapse may drop nor a column a later chunk may stop on.
 
         and UNSERVEABLE otherwise:
 
         * an APC exact column strictly inside the pipelined part.  The entry is
           keyed on ``full_input_ids[:checkpoint_len]`` and stored at exactly
-          that many tokens, so it can be neither moved nor dropped; stopping a
-          chunk there would clamp a chunk the peer's schedule does not have AND
-          snapshot a cache whose stage-B layers were never written.
-        * an unaligned rung inside the pipelined part, for the same clamp
-          reason: ``_next_apc_checkpoint_column`` would shorten a chunk the
-          peer's schedule does not have.
+          that many tokens, so it can be neither moved nor dropped; a boundary
+          there would snapshot a cache whose stage-B layers were never written.
+          (A column the LAST chunk would run past is not this case: the plan
+          ends that chunk on it, and ``X == depth`` above is the answer.)
+        * a rung inside the pipelined part that is not one of the plan's
+          boundaries, for the same reason.
         * a rung at or past the prompt length ``T``.  Left refused exactly as
           A5 refused it -- and unreachable in the served config, because
           ``align_boundaries`` admits only multiples of ``C`` strictly below the
@@ -3116,6 +3150,19 @@ class PromptProcessingBatch:
             if self._inputs_embeds is not None
             else 0
         )
+        # A11b.  The BOUNDARIES, not ``% step``.  The two coincide while every
+        # pipelined chunk is exactly ``C`` -- which is every schedule A5c could
+        # produce -- but the last chunk may now be merged or clamped, and then
+        # a rung on a multiple of ``C`` can land strictly INSIDE it, where it
+        # is neither collapsible nor clampable.  Asking the plan directly is
+        # the same question the old arithmetic asked, of a plan that can
+        # answer it.
+        depth = sum(chunks)
+        boundaries = set()
+        running = 0
+        for n in chunks:
+            running += n
+            boundaries.add(running)
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
                 continue
@@ -3136,7 +3183,7 @@ class PromptProcessingBatch:
             if step <= 0:
                 return "vault_rung"
             for rung in rungs:
-                if rung < depth and rung % step:
+                if rung < depth and rung not in boundaries:
                     return "vault_rung"
                 if rung > depth and rung >= total:
                     return "vault_rung"
@@ -3153,10 +3200,12 @@ class PromptProcessingBatch:
         ``k*C`` while the schedule handed out ``k`` chunks -- and two is exactly
         the drift A5c would introduce by shortening one of them.
 
-        ``needs_processing`` stops the loop while ``remaining > step`` and
-        ``n = min(step, remaining - 1)`` equals ``step`` on every one of those
-        iterations, so the FULL schedule is fixed the moment the batch is built:
-        ``k = ceil(T/C) - 1`` chunks of ``C``.  A5c may spend one of them:
+        ``needs_processing`` stops the loop while ``remaining > step``, so the
+        FULL schedule is fixed the moment the batch is built: ``k = ceil(T/C) -
+        1`` chunks, the first ``k-1`` of them exactly ``C`` and the last one
+        whatever the single-box loop would run there -- ``C``, or L35's merged
+        ``C + r - 1``, or a chunk clamped to a checkpoint column
+        (``_pipeline_plan_chunks``).  A5c may spend one of them:
 
         * ``k`` chunks serve every checkpoint -> the schedule is ``k``, which is
           every request A5b already admitted, list for list.
@@ -3205,19 +3254,13 @@ class PromptProcessingBatch:
             return plan
         full = -(-total // step) - 1
         plan["full_chunks"] = full
-        unserved = self._pipeline_schedule_unserved(full * step)
-        if unserved is None and self._pipeline_schedule_merges_tail(full):
-            # A11.  L35(b) would grow the LAST of ``full`` pipelined chunks, and
-            # a pipelined chunk cannot grow (the envelope fixes it at ``C``).
-            # Spending a chunk is the SAME move A5c already makes for a
-            # checkpoint, and it buys the same thing: the head's remainder is
-            # ``C + r`` columns, the loop merges them exactly as one box merges
-            # them, and the request's chunk decomposition is the single-box one
-            # again -- which is the whole basis of the loopback identity.
-            unserved = "tail_merge"
+        chunks = self._pipeline_plan_chunks(full)
+        if not chunks:
+            return plan
+        unserved = self._pipeline_schedule_unserved(chunks)
         if unserved is None:
-            plan["chunks"] = [step] * full
-            plan["depth"] = full * step
+            plan["chunks"] = chunks
+            plan["depth"] = sum(chunks)
             return plan
         short = full - 1
         if short <= 0:
@@ -3225,7 +3268,15 @@ class PromptProcessingBatch:
             # the request is refused for having no pipelined chunks, not for a
             # checkpoint the peer could have served at some other depth.
             return plan
-        if self._pipeline_schedule_unserved(short * step) is not None:
+        # A5c's fallback, and it stays UNIFORM.  The short schedule's last
+        # chunk is not the loop's last cell, so the merge cannot fire in it
+        # (``remaining >= 2C + r - 1``); and a checkpoint column strictly inside
+        # it is a column the peer cannot serve at any width, because giving the
+        # chunk back is precisely what moves that column into the head's own
+        # remainder.  Clamping here would put it back on the boundary the
+        # shortening exists to take it off.
+        short_chunks = [step] * short
+        if self._pipeline_schedule_unserved(short_chunks) is not None:
             plan["refusal"] = True
             return plan
         from ..pipeline_runtime import min_pipelined_chunks
@@ -3233,8 +3284,8 @@ class PromptProcessingBatch:
         if short < min_pipelined_chunks():
             plan["refusal"] = "below_min_pipelined_chunks"
             return plan
-        plan["chunks"] = [step] * short
-        plan["depth"] = short * step
+        plan["chunks"] = short_chunks
+        plan["depth"] = sum(short_chunks)
         plan["shortened"] = True
         plan["reason"] = unserved
         return plan
@@ -3426,46 +3477,35 @@ class PromptProcessingBatch:
         self._prefill_hidden.adopt_window(hidden, rows_covered=depth)
 
     def _next_chunk_width(self, step: int) -> int:
-        """Columns the next prefill chunk takes -- L35's plan, or the peer's.
+        """Columns the next SINGLE-BOX prefill chunk takes -- L35's plan.
 
-        A11.  Two schedules meet in ``prompt_step`` and only one of them is a
-        choice.
+        A11b.  This used to answer for the pipelined chunk too, by turning the
+        merge off while the peer held the request: the peer could not run a
+        chunk of any width but ``C``, so the loop had to promise it would not
+        ask for one.  The envelope carries an explicit width list now, so a
+        pipelined chunk's width is READ FROM THE SCHEDULE that was handed to
+        the peer (``prompt_step``) instead of re-derived here -- which is not
+        merely tidier, it is the only thing that works: the collapse
+        (``_pipeline_collapse_ladder``) drops the rungs the schedule may have
+        clamped a chunk to, so a re-derivation after the collapse can no longer
+        reproduce the width the peer was promised.
 
-        * The PEER's is not.  ``PrefillEnvelope.create`` derives the tail's
-          chunk tuple as ``min(C, depth - p)`` over the ``depth + 1`` token ids
-          ``begin`` was handed (pipeline_prefill.py: ``chunks = tuple(...)``),
-          ``PipelineClient.prefill_chunk`` refuses any other width
-          ("pipeline input chunk schedule mismatch") and ``_pipeline_step``
-          checks the same thing one layer up.  So while the peer holds this
-          request the width is ``min(step, remaining)`` -- exactly, and the
-          merge is OFF for it.
-        * The HEAD's remainder is.  Everything after ``finalize`` is ordinary
-          single-box prefill over the full stack, so it takes L35's plan: the
-          A5c geometry (a schedule shortened by one chunk) leaves ``C + r``
-          columns here, and merging that tail is precisely the win L35 measured.
-
-        Why this MATTERS rather than merely differing: the merge fires when
-        ``C < remaining < C + tail_min``, and with ``tail_min`` clamped to
-        ``step`` the LAST pipelined chunk of a ``T = kC + r`` prompt has
-        ``remaining = C + r - 1``, i.e. it grows for every ``2 <= r <= tail_min``
-        -- which at the served ``C = 8192`` is the 32,780- and 131,084-token
-        prompts A5c already had to reason about (``r = 12``).  Left merged,
-        those requests do not run two-box slightly wrong; they raise, fall back,
-        and prefill the whole prompt twice.
+        What is left is the plain single-box width, which is what every caller
+        of this method now is.
         """
         return next_prefill_chunk(
             self._inputs_embeds.shape[1] - 1,
             step,
             batch=self._inputs_embeds.shape[0],
-            enabled=False if self._pipeline is not None else None,
         )
 
     def _pipeline_chunk_schedule(self) -> List[int]:
         """The chunks this loop will hand the peer, in order.
 
-        The admitted schedule, which is ``k = ceil(T/C) - 1`` chunks of ``C``
-        unless A5c shortened it to ``k-1`` -- see ``_pipeline_schedule_plan``,
-        which is where the decision is made and the only place it is made.
+        The admitted schedule: the first ``k = ceil(T/C) - 1`` chunks of the
+        plan a single box would run, unless A5c shortened it to ``k-1`` -- see
+        ``_pipeline_schedule_plan``, which is where the decision is made and the
+        only place it is made.
         """
         return list(self._pipeline_schedule_plan()["chunks"])
 
@@ -3573,12 +3613,15 @@ class PromptProcessingBatch:
             self._pipeline = pipeline
             depth = sum(chunks)
             # ``begin`` hashes ``input_ids[:, :-1]``, so hand it the pipelined
-            # prefix PLUS one token and it derives exactly ``chunks``.
+            # prefix PLUS one token -- and ``chunks`` as well (A11b), because
+            # the plan's last chunk may be merged or clamped and the envelope's
+            # own uniform arithmetic would not derive it.
             pipeline.begin(
                 depth + 1,
                 int(self.prefill_step_size),
                 input_ids=self._input_ids[:, : depth + 1],
                 capture=capture,
+                chunks=list(chunks),
             )
         except Exception as exc:  # noqa: BLE001 - a peer must not fail a request
             logger.warning(
@@ -3738,22 +3781,36 @@ class PromptProcessingBatch:
             return 0
 
         step = self.prefill_step_size or self._inputs_embeds.shape[1]
-        # A11.  THE GATE IS ASKED BEFORE THE WIDTH IS CHOSEN, because under the
-        # L35 defaults the width DEPENDS on the answer (``_next_chunk_width``):
-        # a pipelined chunk is exactly ``C`` and a single-box one may merge its
-        # tail.  Asking in the other order made the first chunk's width a
-        # prediction of the gate's verdict, and a wrong prediction is not a
-        # slower request -- it is a ``pipeline chunk 0 is N tokens`` mismatch
-        # and a whole re-prefill.  Nothing between here and the old call site
-        # touched an mx array, and the lease this may take is released on every
-        # exit below (``_pipeline_step`` -> fallback/release), so the move costs
-        # a request that ends up single-box exactly what it cost before.
+        # A11.  THE GATE IS ASKED BEFORE THE WIDTH IS CHOSEN, because the width
+        # DEPENDS on the answer: a pipelined chunk's width is the schedule's
+        # (A11b), a single-box one's is ``_next_chunk_width``, and the two are
+        # the same number only while the plan is a prefix of the loop's own.
+        # Asking in the other order made the first chunk's width a prediction of
+        # the gate's verdict, and a wrong prediction is not a slower request --
+        # it is a ``pipeline chunk 0 is N tokens`` mismatch and a whole
+        # re-prefill.  Nothing between here and the old call site touched an mx
+        # array, and the lease this may take is released on every exit below
+        # (``_pipeline_step`` -> fallback/release), so the move costs a request
+        # that ends up single-box exactly what it cost before.
         if self._pipeline_should_open():
             self._pipeline_open()
-        n = self._next_chunk_width(step)
-        checkpoint_col = self._next_apc_checkpoint_column()
-        if checkpoint_col is not None:
-            n = min(n, checkpoint_col - self._processed_prompt_columns)
+        if self._pipeline is not None and self._pipeline_chunks_done < len(
+            self._pipeline_chunks
+        ):
+            # A11b.  ONE derivation, and this is not it: the width of a
+            # pipelined chunk was decided when ``_pipeline_schedule_plan`` built
+            # the list the peer's envelope carries, and re-deriving it here
+            # would have to reproduce a clamp whose rung the collapse has since
+            # dropped.  The ENVELOPE is still the cross-check -- it was built
+            # from this same list, and both ``PipelineHead.prefill_chunk`` and
+            # the tail's receiver refuse a chunk whose width is not the one at
+            # this index.
+            n = int(self._pipeline_chunks[self._pipeline_chunks_done])
+        else:
+            n = self._next_chunk_width(step)
+            checkpoint_col = self._next_apc_checkpoint_column()
+            if checkpoint_col is not None:
+                n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
         if self._pipeline is not None:

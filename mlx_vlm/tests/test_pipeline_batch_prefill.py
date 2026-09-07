@@ -237,8 +237,12 @@ class _LoopbackHead:
         self.sock = None
 
     # -- request surface
-    def begin(self, tokens, chunk, *, input_ids, capture=None):
+    def begin(self, tokens, chunk, *, input_ids, capture=None, chunks=None):
         self.capture = capture
+        # A11b: the plan the head promised the peer.  ``prefill_chunk`` below
+        # records the widths it is actually handed, so a test can compare the
+        # promise with the delivery.
+        self.plan = None if chunks is None else [int(n) for n in chunks]
         self.calls.append(("begin", int(tokens), int(chunk), tuple(input_ids.shape)))
 
     def take_hidden(self):
@@ -1726,19 +1730,33 @@ def _a5c_arm(monkeypatch, ids, step, *, pipelined, **kwargs):
     }
 
 
-def _a5c_expectation(total, step, *, guard=GUARD, floor=2):
+def _a5c_expectation(total, step, *, guard=GUARD, floor=2, tail_min=TAIL_MIN):
     """What the schedule rule says about ``(T, C)``, written out independently.
 
     Deliberately NOT a call into the code under test: this is the rule as the
     plan states it, so a rewrite of the derivation that changes the rule has to
     disagree with this arithmetic before it can pass.
+
+    A11b.  The full schedule is ``k`` chunks whose LAST one is whatever the
+    single-box loop would run there -- grown by L35's tail merge, or clamped to
+    a checkpoint column that lands inside it, or plain ``C``.  A column clamped
+    to is a column AT the depth, which the post-finalize snapshot serves, so
+    the shortening is now only for a column the peer would run PAST: one
+    strictly inside an earlier chunk, or exactly on an interior boundary.
     """
     if total <= step:
         return "not_a_candidate", []
     full = -(-total // step) - 1
     column = total - guard
-    if column >= full * step:
-        return "full", [step] * full
+    processed = (full - 1) * step
+    left = total - 1 - processed
+    window = min(tail_min, step)
+    width = left if left <= step else (left if left < step + window else step)
+    if processed < column < processed + width:
+        width = column - processed
+    chunks = [step] * (full - 1) + [width]
+    if column >= processed + width:
+        return "full", chunks
     short = full - 1
     if short <= 0:
         return "no_pipelined_chunks", []
@@ -1847,34 +1865,38 @@ def test_the_shortening_is_counted_and_recorded_per_request(monkeypatch):
     full._pipeline_release()
 
 
-def test_a_rung_inside_the_last_pipelined_chunk_shortens_the_schedule_too(monkeypatch):
+def test_a_rung_inside_the_last_pipelined_chunk_clamps_it(monkeypatch):
     """The other reason, on the vault side, and its own identity.
 
-    A rung the peer would run PAST is not the peer's business: after the
-    shortening it lands in the head's remainder, where the chunk loop clamps to
-    it and ``_store_vault_checkpoints`` captures a complete cache.  So it stays
-    PENDING through the collapse and is stored at its own depth -- not collapsed
-    onto another one -- and the entry is the single-box entry.
+    A11b.  A rung the LAST pipelined chunk would run past is served by ending
+    that chunk on it: the peer keeps every chunk it had, the rung is the
+    admitted depth, and the post-finalize snapshot -- taken with all 45 layers
+    home -- is the store.  (Before A11b the only lever was giving the whole
+    chunk back to the head, which bought the same rung for a whole ``C`` of
+    serial head work.)  The chunk the head then runs is still L35's merged one,
+    because after ``finalize`` the head is running single-box code -- which is
+    the property A5b's remainder argument rests on.
     """
     made = _arm(monkeypatch)
     vault = _FakeVault()
     batch = _vault_batch(_lm(), vault, [DEPTH - 4])  # 28: unaligned, in (24, 32)
     steps = _drain(batch)[2]
     assert _hist() == {}
-    assert made[0].chunks == PIPELINED_CHUNKS[:-1]
+    assert made[0].chunks == PIPELINED_CHUNKS[:-1] + [4], "clamped, not given back"
+    assert made[0].plan == made[0].chunks, "the envelope carried the plan"
     snap = pr.METRICS.snapshot()
-    assert snap["pp_schedule_shortened_reason"] == {"vault_rung": 1}
-    assert snap["pp_ladder_collapsed"] == 0, "nothing to collapse: the rung is ours"
+    assert snap["pp_schedule_shortened"] == 0
+    assert snap["pp_ladder_rungs_skipped"] == 0, "the rung IS the depth"
     assert vault.depths() == [DEPTH - 4], "stored at the rung, not at the depth"
 
     ref_vault = _FakeVault()
     with _pipeline_off():
         ref_steps = _drain(_vault_batch(_lm(), ref_vault, [DEPTH - 4]))[2]
-    # ``[8, 8, 8, 4, 11]``: three pipelined chunks, the head's own chunk clamped
-    # to the rung at 28, and then L35(b) merging what is left (11 columns, inside
-    # the (C, C+tail_min) window) into ONE chunk instead of 8 + 4.  Both arms,
-    # because after ``finalize`` the head is running single-box code -- which is
-    # the property A5b's remainder argument rests on.
+    # ``[8, 8, 8, 4, 11]``: three full pipelined chunks, a fourth clamped to the
+    # rung at 28, and then L35(b) merging what is left (11 columns, inside the
+    # (C, C+tail_min) window) into ONE chunk instead of 8 + 4.  The peer runs
+    # the first FOUR of those and the head the last, and the sequence is the
+    # single-box sequence either way -- which is the whole of A11b.
     assert steps == ref_steps == [STEP, STEP, STEP, 4, STEP + 3]
     assert ref_vault.depths() == vault.depths()
     got, n_got = _fragments_digest(vault.inserts[0]["fragments"])
@@ -1970,10 +1992,22 @@ def test_nothing_left_to_shorten_to_is_named_no_pipelined_chunks(monkeypatch):
     """
     _arm(monkeypatch, min_tokens=1)
     ids = _ids(32)
-    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=15)
+    # A11b: a column INSIDE the only cell is served by clamping that cell to it,
+    # so the shape that has nothing to shorten to is the one A5 refused outright
+    # -- a rung at the prompt length, which no depth below ``T`` can take.
+    batch = _a5c_batch(
+        _lm(), _apc_manager(), ids, 16, checkpoint_len=15,
+        vault=_FakeVault(), rungs=[len(ids)],
+    )
     batch._pipeline_open()
     assert batch._pipeline is None and _hist() == {"no_pipelined_chunks": 1}
     assert batch._pipeline_chunk_schedule() == []
+    # ... and without it, the single cell is CLAMPED to the column and served.
+    pr.METRICS.reset()
+    served = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=15)
+    served._pipeline_open()
+    assert served._pipeline is not None and served._pipeline_chunks == [15]
+    served._pipeline_release()
 
 
 def test_a_shortening_that_costs_more_than_it_saves_is_refused_by_policy(monkeypatch):
@@ -1990,7 +2024,10 @@ def test_a_shortening_that_costs_more_than_it_saves_is_refused_by_policy(monkeyp
     assert pr.DEFAULT_MIN_PIPELINED_CHUNKS == 2
     ids = _ids(48)  # T = 3C at C = 16: k = 2, so shortening leaves ONE chunk
     _arm(monkeypatch, min_tokens=1)
-    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=31)
+    # The column is exactly the INTERIOR boundary (A11b): a chunk cannot stop
+    # there and stay on the peer -- half the KV would be on the other box -- and
+    # the clamp cannot help, so this is still the shape that needs the chunk back.
+    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=16)
     batch._pipeline_open()
     assert batch._pipeline is None
     assert _hist() == {"below_min_pipelined_chunks": 1}
@@ -2000,7 +2037,7 @@ def test_a_shortening_that_costs_more_than_it_saves_is_refused_by_policy(monkeyp
     pr.METRICS.reset()
     monkeypatch.setenv("MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS", "1")
     assert pr.min_pipelined_chunks() == 1
-    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=31)
+    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=16)
     batch._pipeline_open()
     assert batch._pipeline is not None and batch._pipeline_chunks == [16]
     assert pr.METRICS.snapshot()["pp_schedule_shortened"] == 1
@@ -2042,7 +2079,7 @@ def test_the_gate_asks_one_depth_and_the_peer_is_sent_that_depth(monkeypatch):
     batch._pipeline_release()
 
 
-# ---------------------------------------------- 8. A11: the L35 levers x the peer
+# --------------------------------------------- 8. A11b: the L35 levers x the peer
 #
 # The unified head ships two prefill levers ON by default (I1437):
 #
@@ -2051,35 +2088,35 @@ def test_the_gate_asks_one_depth_and_the_peer_is_sent_that_depth(monkeypatch):
 #   (b) MLX_VLM_GLM5_PREFILL_TAIL_MERGE  -- a short final chunk is folded into
 #       the chunk before it (``next_prefill_chunk``).
 #
-# (b) is the one the peer cares about.  A pipelined chunk's width is not a
-# choice: ``PrefillEnvelope.create`` derives the tail's schedule as
-# ``min(C, depth - p)`` and both ``PipelineClient.prefill_chunk`` and
-# ``_pipeline_step`` refuse any other width.  The merge fires when the loop has
+# (b) is the one the peer cares about.  The merge fires when the loop has
 # ``C < remaining < C + tail_min`` left, which at the LAST pipelined chunk of a
 # ``T = qC + r`` prompt is ``C + r - 1`` -- i.e. for every ``2 <= r <= tail_min``,
 # one prompt length in eight at the served ``C = 8192, tail_min = 1024``.
 #
-# Two things answer it, and both are here:
+# A11 answered it by giving that chunk BACK to the head (``tail_merge``, a
+# shortening): the peer could not run a chunk of any width but ``C``, so the
+# only way to keep the two-box decomposition equal to the one-box one was to
+# stop one chunk earlier and let the head merge.  Measured on the rail
+# (2026-09-07 16:26-16:32, C=8192, tail_min=1024, r=524): TTFT 58.9 s at 33k
+# against 48 s when the peer keeps all ``k`` chunks, and 177.0 s against 170 s
+# at 131k.  A whole ``C``-wide head chunk to preserve a merge worth ~0.5 s.
 #
-#   * the MECHANISM -- ``_next_chunk_width`` turns the merge off while the peer
-#     holds the chunk, so the loop can never hand the envelope a width it
-#     refuses (without it the request raises and re-prefills the whole prompt);
-#   * the POLICY -- ``_pipeline_schedule_merges_tail`` gives that chunk BACK to
-#     the head (A5c's shortening, reason ``tail_merge``), so the request's chunk
-#     decomposition is the single-box one and the two-box cache is the one-box
-#     cache.  Without it the mechanism alone would make the bytes depend on
-#     whether the peer happened to be free, and chunk decomposition is not a
-#     rounding detail: L7B measured "identity across chunk sizes: FALSE".
-
+# A11b removes the trade instead of paying it: the envelope carries an explicit
+# width LIST (``PrefillEnvelope.create(chunks=...)``), so the peer runs the
+# chunks the single-box loop would run -- the merged one included -- and the
+# loop reads a pipelined chunk's width off that schedule instead of re-deriving
+# it.  What is left of the shortening is the case a width cannot fix: a
+# checkpoint column the peer would run PAST rather than STOP on.
 
 MERGE_PROMPT = list(range(3, 45))  # 42 = 5*8 + 2: r = 2, inside the merge window
 MERGE_FULL_CHUNKS = 5  # ceil(42/8) - 1
-MERGE_CHUNKS = [STEP] * (MERGE_FULL_CHUNKS - 1)  # what the peer is actually sent
-MERGE_STEPS = MERGE_CHUNKS + [STEP + 1]  # ... and the head's merged remainder
+MERGE_HEAD = [STEP] * (MERGE_FULL_CHUNKS - 1)  # the chunks the merge cannot touch
+MERGE_CHUNKS = MERGE_HEAD + [STEP + 1]  # ... and the merged one, C + r - 1 = 9
+MERGE_STEPS = MERGE_CHUNKS  # the loop's whole sequence: the head keeps 1 token
 
 
 def _merge_batch(lm, *, rows=None, vault=None, rungs=None, apc=None, checkpoint=None):
-    """A batch over a prompt whose LAST pipelined chunk L35(b) would grow."""
+    """A batch over a prompt whose LAST pipelined chunk L35(b) grows."""
     rows = rows or [MERGE_PROMPT]
     batch = _batch(lm, rows)
     meta = {"prefix_len": 0, "full_input_ids": list(rows[0])}
@@ -2106,65 +2143,169 @@ def _both_arms(monkeypatch, make):
     return pp, ref, made
 
 
-def test_the_merge_would_grow_the_last_pipelined_chunk_and_that_is_refused():
+def test_the_merged_chunk_is_in_the_plan_the_peer_is_handed():
     """The arithmetic, before any of it runs: ``r = 2`` puts it in the window.
 
-    ``_pipeline_schedule_merges_tail`` asks ``next_prefill_chunk`` itself rather
-    than re-deriving its window, so this also pins that the two agree.
+    The plan asks ``next_prefill_chunk`` itself rather than re-deriving its
+    window, so this also pins that the two agree -- and that only the LAST
+    chunk ever leaves ``C``.
     """
     batch = _merge_batch(_lm())
-    assert batch._pipeline_schedule_merges_tail(MERGE_FULL_CHUNKS) is True
-    assert batch._pipeline_schedule_merges_tail(MERGE_FULL_CHUNKS - 1) is False, (
-        "one shortening is always enough: giving a chunk back adds a whole C to "
-        "what is left, which is past the window"
+    assert batch._pipeline_plan_chunks(MERGE_FULL_CHUNKS) == MERGE_CHUNKS
+    assert sum(MERGE_CHUNKS) == len(MERGE_PROMPT) - 1, "all but the last token"
+    assert batch._pipeline_plan_chunks(MERGE_FULL_CHUNKS - 1) == MERGE_HEAD, (
+        "the merge cannot fire before the last cell: what is left there is "
+        "2C + r - 1, which is past the window"
     )
-    assert _batch(_lm())._pipeline_schedule_merges_tail(len(PIPELINED_CHUNKS)) is False
+    # the fixture the rest of the file uses has r = C and does not merge at all
+    assert _batch(_lm())._pipeline_plan_chunks(len(PIPELINED_CHUNKS)) == (
+        PIPELINED_CHUNKS
+    )
 
 
-def test_a_chunk_the_merge_would_grow_is_given_back_to_the_head(monkeypatch):
-    """A11's policy: shorten by one, and the decomposition is single-box again.
+@pytest.mark.parametrize(
+    "total,chunks",
+    [
+        # The SERVED arithmetic, pinned as arithmetic: C = 8192, tail_min = 1024,
+        # both B1 r6 prompts have r = 524, so the last cell has C + r - 1 = 8715
+        # columns left -- inside the window.  The head keeps exactly one token.
+        (33292, [8192, 8192, 8192, 8715]),
+        (131596, [8192] * 15 + [8715]),
+    ],
+)
+def test_the_served_prompt_lengths_that_merge(monkeypatch, total, chunks):
+    monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "1024")  # the served value
+    b = _batch(_lm(), [list(range(3, 43))], step=8192)
+    b._inputs_embeds = mx.zeros((1, total, 1))  # only the SHAPE is read here
+    assert b._pipeline_plan_chunks(-(-total // 8192) - 1) == chunks
+    assert sum(chunks) == total - 1, "the head keeps exactly the last token"
 
-    The peer gets ``k-1`` chunks of exactly ``C``; the head's remainder is
-    ``C + r`` columns and the loop merges them the way one box merges them.  So
-    the step sequence, the cache and the prompt logprobs are the single-box ones
+
+@pytest.mark.parametrize("total", [33292, 131596])
+def test_the_served_config_gets_all_k_chunks_back(monkeypatch, total):
+    """B1 r6's two prompts, with the vault and APC exact the server runs.
+
+    This is the measurement A11b exists for, stated as arithmetic.  Both
+    prompts have ``r = 524``, so A11 gave a chunk back on both
+    (``pp_schedule_shortened=1``, reason ``tail_merge``) and the head prefilled
+    ``C + r`` columns single-box: TTFT 58.9 s at 33k against 48 s, 177.0 s at
+    131k against 170 s.
+
+    And the give-back bought nothing, which is the part that makes it a bug
+    rather than a trade: ``boundary_ladder``'s deepest rung is
+    ``((T-1)//stride)*stride = k*C``, which lands strictly INSIDE the cell the
+    merge would have grown -- so the single-box loop clamps that chunk to
+    exactly ``C`` and never merges it at all.  The plan says so directly now:
+    ``k`` chunks of ``C``, the schedule A5c would have handed over if the merge
+    had not been asked about without the clamp.
+    """
+    from mlx_vlm.context_vault import boundary_ladder
+
+    monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "1024")
+    step, k = 8192, -(-total // 8192) - 1
+    rungs = boundary_ladder(total, step=step)
+    assert rungs[-1] == k * step, "the deepest rung is the one the merge swallows"
+    b = _batch(_lm(), [list(range(3, 43))], step=step)
+    b._inputs_embeds = mx.zeros((1, total, 1))
+    b._vault = _FakeVault()
+    b._apc_manager, b._apc_mode = _apc_manager(), "exact"
+    b._apc_meta = [
+        {
+            "prefix_len": 0,
+            "checkpoint_len": total - GUARD,
+            "full_input_ids": [0] * total,
+            "extra_hash": 0,
+            "vault_rungs": list(rungs),
+        }
+    ]
+    plan = b._pipeline_schedule_plan()
+    assert plan["chunks"] == [step] * k, "all k chunks, and every one of them C"
+    assert plan["depth"] == k * step == rungs[-1]
+    assert plan["shortened"] is False and plan["refusal"] is None
+    # the APC exact column is past the depth: the head's own remainder, where
+    # the chunk loop clamps to it exactly as one box does
+    assert total - GUARD > plan["depth"]
+
+
+def test_the_peer_runs_the_merged_chunk_and_the_bytes_do_not_move(monkeypatch):
+    """A11b's point: the schedule IS the single-box plan, so nothing is given back.
+
+    The peer gets all ``k`` chunks, the last one ``C + r - 1`` columns wide, and
+    the head's remainder is the single final token that ``generate()`` forwards.
+    The step sequence, the cache and the prompt logprobs are the single-box ones
     -- which is what makes routing a scheduling decision instead of a numerical
     one.
     """
     pp, ref, made = _both_arms(monkeypatch, lambda: _merge_batch(_lm()))
-    assert made[0].chunks == MERGE_CHUNKS, "every pipelined chunk is exactly C"
-    assert all(n == STEP for n in made[0].chunks)
+    assert made[0].chunks == MERGE_CHUNKS, "the merged chunk went to the peer"
+    assert made[0].plan == MERGE_CHUNKS, "and the envelope said it would"
+    assert made[0].chunks[-1] == STEP + 1 > STEP
     assert pp[2] == ref[2] == MERGE_STEPS
     assert pp[0] == ref[0], "the two-box cache is the one-box cache"
     assert mx.array_equal(pp[1], ref[1])
-    assert _hist() == {}, "shortened, not refused"
+    assert _hist() == {}
     snap = pr.METRICS.snapshot()
     assert snap["pp_used"] == 1
-    assert snap["pp_schedule_shortened"] == 1
-    assert snap["pp_schedule_shortened_reason"] == {"tail_merge": 1}
+    assert snap["pp_schedule_shortened"] == 0, "nothing was given back"
+    assert snap["pp_schedule_shortened_reason"] == {}
 
 
-def test_the_shortening_is_recorded_on_the_request_too(monkeypatch):
+# The whole merge window and both its edges, at ``C = 8, tail_min = 4``.  The
+# peer's plan is written out here rather than derived, so a change to the
+# derivation has to disagree with the arithmetic before it can pass.
+MERGE_SWEEP = {
+    1: [STEP] * 4,          # remaining is exactly C: no merge, 1 token left
+    2: [STEP] * 3 + [9],    # C + r - 1, inside (C, C + tail_min)
+    3: [STEP] * 3 + [10],
+    4: [STEP] * 3 + [11],   # the widest the merge can make a chunk here
+    5: [STEP] * 4,          # remaining is C + tail_min: past the window
+    8: [STEP] * 4,          # r = C, the fixture the rest of the file uses
+}
+
+
+@pytest.mark.parametrize("r", sorted(MERGE_SWEEP))
+def test_the_two_box_prefill_is_the_single_box_prefill_across_the_merge_window(
+    monkeypatch, r
+):
+    """The identity rail over ``r``, with no checkpoint to move the decision.
+
+    ``T = 4C + r``.  Inside the window the peer's last chunk is the merged one
+    and the head keeps a single token; outside it the schedule is the uniform
+    one it always was.  Either way the loop's step sequence, the prompt cache
+    and the prompt logprobs must be what one box produces -- the plan is a
+    PREFIX of the single-box plan, so there is no arm in which the two differ.
+    """
+    rows = [list(range(3, 3 + STEP * 4 + r))]
+    pp, ref, made = _both_arms(monkeypatch, lambda: _batch(_lm(), rows))
+    assert made[0].chunks == MERGE_SWEEP[r]
+    assert made[0].plan == MERGE_SWEEP[r], "the envelope carried the plan"
+    assert pp[2] == ref[2] == MERGE_SWEEP[r], "the loop ran the peer's chunks"
+    assert pp[0] == ref[0], "the two-box cache is the one-box cache"
+    assert mx.array_equal(pp[1], ref[1])
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_used"] == 1 and snap["pp_schedule_shortened"] == 0
+
+
+def test_the_merge_is_not_a_shortening_any_more(monkeypatch):
+    """The per-request record, on the request A11 used to shorten."""
     _arm(monkeypatch)
     batch = _merge_batch(_lm())
     plan = batch._pipeline_schedule_plan()
-    assert plan["shortened"] and plan["reason"] == "tail_merge"
+    assert plan["shortened"] is False and plan["reason"] is None
     assert plan["chunks"] == MERGE_CHUNKS and plan["full_chunks"] == MERGE_FULL_CHUNKS
+    assert plan["depth"] == len(MERGE_PROMPT) - 1
     batch._pipeline_open()
     assert batch._pipeline_warm_stats is None
-    assert batch._pipeline_schedule_stats == {
-        "reason": "tail_merge",
-        "full_chunks": MERGE_FULL_CHUNKS,
-        "chunks": len(MERGE_CHUNKS),
-        "chunk_size": STEP,
-    }
+    assert batch._pipeline_schedule_stats is None
+    assert batch._pipeline_chunks == MERGE_CHUNKS
     batch._pipeline_release()
 
 
 def test_with_the_merge_off_the_schedule_is_the_full_k(monkeypatch):
-    """The lever is the lever: ``TAIL_MERGE=0`` gives A5c's schedule back.
+    """The lever is the lever: ``TAIL_MERGE=0`` gives the uniform schedule back.
 
-    Same prompt, same peer -- five chunks instead of four, no shortening
-    counted, and the two arms still agree with each other.
+    Same prompt, same peer -- five chunks of exactly C, and the two arms still
+    agree with each other.
     """
     monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
     pp, ref, made = _both_arms(monkeypatch, lambda: _merge_batch(_lm()))
@@ -2174,27 +2315,35 @@ def test_with_the_merge_off_the_schedule_is_the_full_k(monkeypatch):
     assert pr.METRICS.snapshot()["pp_schedule_shortened"] == 0
 
 
-def test_the_mechanism_holds_even_if_the_policy_is_bypassed(monkeypatch):
-    """``_next_chunk_width`` is the belt: with the peer open, the width is ``C``.
+def test_a_pipelined_chunks_width_comes_from_the_schedule(monkeypatch):
+    """One derivation, and it is not ``_next_chunk_width``.
 
-    The policy above means the loop should never MEET a merge inside the
-    pipelined part -- so this pins the guard that makes meeting one harmless,
-    by putting the batch in the state the loop would be in (peer open, one
-    chunk to go, ``remaining`` inside the window) and asking for the width.
+    A11b.  The loop used to re-derive every pipelined chunk's width with the
+    merge switched off, which worked only because every such chunk was ``C``.
+    It cannot work now: the collapse (``_pipeline_collapse_ladder``) drops the
+    very rungs the plan may have clamped a chunk to, so a re-derivation after
+    the collapse would ask for a width the peer was never promised -- and
+    ``_pipeline_step`` would fail the request into a whole re-prefill.  So the
+    width is READ from the schedule, and ``_next_chunk_width`` is the plain
+    single-box one.
     """
     _arm(monkeypatch)
-    batch = _merge_batch(_lm())
+    # 40 = k*C, the rung ``boundary_ladder`` puts deepest -- and, at ``r >= 2``,
+    # strictly inside the cell the merge would have grown.  This is the SERVED
+    # shape in miniature: the clamp cancels the merge, so the plan is ``k``
+    # chunks of exactly C and A11's give-back bought nothing at all.
+    batch = _merge_batch(_lm(), vault=_FakeVault(), rungs=[STEP * MERGE_FULL_CHUNKS])
+    plan = batch._pipeline_schedule_plan()
+    assert plan["chunks"] == [STEP] * MERGE_FULL_CHUNKS, "clamped to the rung"
+    batch._pipeline_open()
     while batch._processed_prompt_columns < (MERGE_FULL_CHUNKS - 1) * STEP:
         batch.prompt_step()
-    assert batch._pipeline is None, "the lease ended with the schedule"
-    remaining = batch._inputs_embeds.shape[1] - 1
-    assert STEP < remaining < STEP + TAIL_MIN, "the loop is inside the window"
-    assert batch._next_chunk_width(STEP) == remaining, "single-box: merged"
-    batch._pipeline = object()  # pretend the peer still holds this chunk
-    try:
-        assert batch._next_chunk_width(STEP) == STEP, "pipelined: exactly C"
-    finally:
-        batch._pipeline = None
+    assert batch._pipeline is not None, "one chunk still to go"
+    assert batch._apc_meta[0]["vault_rungs"] == [], "the collapse took the rung"
+    assert batch._next_chunk_width(STEP) == STEP + 1, "re-derived: the merge"
+    assert batch._pipeline_chunks[batch._pipeline_chunks_done] == STEP, "promised: C"
+    assert batch.prompt_step() == STEP, "and the loop keeps the promise"
+    batch._pipeline_release()
 
 
 @pytest.mark.parametrize("column", [36, 34])
@@ -2221,9 +2370,9 @@ def test_the_merged_remainder_still_yields_to_a_vault_rung(monkeypatch, column):
     with _pipeline_off():
         ref = _drain(make("ref")())
 
-    assert made[0].chunks == MERGE_CHUNKS
-    tail = column - sum(MERGE_CHUNKS)
-    assert pp[2] == ref[2] == MERGE_CHUNKS + [tail]
+    tail = column - sum(MERGE_HEAD)
+    assert made[0].chunks == MERGE_HEAD + [tail], "the peer's chunk stops on it"
+    assert pp[2] == ref[2] == MERGE_HEAD + [tail]
     assert pp[0] == ref[0] and mx.array_equal(pp[1], ref[1])
     assert vaults["pp"].depths() == vaults["ref"].depths() == [column]
     got, n_got = _fragments_digest(vaults["pp"].inserts[0]["fragments"])
@@ -2256,8 +2405,8 @@ def test_the_merged_remainder_still_yields_to_the_apc_exact_column(monkeypatch):
     with _pipeline_off():
         ref = _drain(make("ref")())
 
-    assert made[0].chunks == MERGE_CHUNKS
-    assert pp[2] == ref[2] == MERGE_CHUNKS + [column - sum(MERGE_CHUNKS)]
+    assert made[0].chunks == MERGE_HEAD + [column - sum(MERGE_HEAD)]
+    assert pp[2] == ref[2] == MERGE_HEAD + [column - sum(MERGE_HEAD)]
     assert pp[0] == ref[0] and mx.array_equal(pp[1], ref[1])
     got, want = _apc_entries(managers["pp"]), _apc_entries(managers["ref"])
     assert sorted(got) == sorted(want) == [column, len(MERGE_PROMPT)]
@@ -2266,25 +2415,34 @@ def test_the_merged_remainder_still_yields_to_the_apc_exact_column(monkeypatch):
         assert got[length].token_ids == tuple(MERGE_PROMPT[:length])
 
 
-def test_a_column_inside_the_pipelined_part_still_names_its_own_reason(monkeypatch):
-    """A5c's reason wins over A11's when both would shorten the same schedule.
+def test_the_column_a_width_cannot_serve_is_still_a_shortening(monkeypatch):
+    """What survives of A5c: a column the peer would run PAST, not STOP on.
 
-    The checkpoint is asked first because it is the one that can REFUSE; the
-    merge only ever asks for a chunk back.
+    A11b buys back every column that lands strictly inside the last pipelined
+    chunk -- the chunk simply ends there.  Two shapes it cannot buy, and both
+    still cost the chunk:
+
+    * a column exactly on an INTERIOR boundary.  A chunk can stop there, but
+      stopping there is not a checkpoint: half the KV is on the peer until
+      ``finalize``, so only the LAST boundary is a snapshot.
+    * a column strictly inside an EARLIER chunk, which one chunk back does not
+      reach either -- still a refusal, as it was.
     """
     _arm(monkeypatch)
     lm = _lm()
-    # Column 36 is inside the LAST pipelined chunk of the full schedule and in
-    # the head's remainder once one chunk is given back, so A5b and A11 ask for
-    # the same shortening.  It is reported as the checkpoint's, because that is
-    # the one that would have REFUSED the request outright.
-    plan = _merge_batch(lm, apc=_apc_manager(), checkpoint=36)._pipeline_schedule_plan()
+    interior = STEP * (MERGE_FULL_CHUNKS - 1)  # 32: the last chunk's own start
+    plan = _merge_batch(
+        lm, apc=_apc_manager(), checkpoint=interior
+    )._pipeline_schedule_plan()
     assert plan["shortened"] and plan["reason"] == "exact_column"
-    assert plan["chunks"] == MERGE_CHUNKS
-    # ... and with no checkpoint at all, the same schedule under A11's name.
+    assert plan["chunks"] == MERGE_HEAD and plan["depth"] == interior
+    # ... and a column INSIDE that last chunk is served by ending it there.
+    plan = _merge_batch(lm, apc=_apc_manager(), checkpoint=36)._pipeline_schedule_plan()
+    assert plan["shortened"] is False
+    assert plan["chunks"] == MERGE_HEAD + [36 - sum(MERGE_HEAD)]
+    # ... and with no checkpoint at all, the merged plan itself.
     plan = _merge_batch(lm)._pipeline_schedule_plan()
-    assert plan["shortened"] and plan["reason"] == "tail_merge"
-    assert plan["chunks"] == MERGE_CHUNKS
+    assert plan["shortened"] is False and plan["chunks"] == MERGE_CHUNKS
     # A column the shortened schedule cannot serve either is still a refusal.
     refused = _merge_batch(lm, apc=_apc_manager(), checkpoint=STEP * 3 + 4)
     assert refused._pipeline_schedule_plan()["refusal"] is True

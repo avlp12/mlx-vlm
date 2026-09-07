@@ -192,6 +192,13 @@ def _random_chunks(n_layers, widths, dim=7, seed=0):
         (40, [8, 8, 8, 8]),   # a window wider than everything captured
         (9, [4, 4, 4, 4, 4]), # a window that spans three chunk pieces
         (15, [8]),            # one chunk only
+        # A11b: the LAST chunk may be wider than the ones before it (L35's tail
+        # merge, up to C + tail_min - 1).  The window is width-agnostic by
+        # construction -- it keeps per-piece widths -- and this measures it
+        # rather than trusting the construction, at the fixture ratio and at the
+        # served one.
+        (15, [8, 8, 11]),
+        (2047, [8192, 9215]),
     ],
 )
 def test_the_tails_window_is_the_accumulators_window(keep, widths):
@@ -234,6 +241,11 @@ def test_the_tails_window_is_the_accumulators_window(keep, widths):
         (2048, [2048] * 3, 512),
         (40, [8, 8, 8, 8], 8),
         (9, [4, 4, 4, 4], 4),
+        # A11b: the peer runs the merged chunk and the head's remainder is the
+        # single last token, which is the shape every ``2 <= r <= tail_min``
+        # prompt now has.
+        (15, [8, 8, 11], 1),
+        (2047, [8192, 8192, 8192, 8715], 1),
     ],
 )
 def test_adopting_a_merged_window_reproduces_finish(keep, widths, remainder):
@@ -424,7 +436,16 @@ def _run_two_box(monkeypatch, lm, ids, *, capture, chunks, drop_capture=False):
     cache = lm.make_cache()
     try:
         head.connect(timeout=5)
-        head.begin(int(ids.shape[1]), chunks[0], input_ids=ids, capture=capture)
+        head.begin(
+            int(ids.shape[1]),
+            chunks[0],
+            input_ids=ids,
+            capture=capture,
+            # A11b: the plan, explicitly.  Equal to the envelope's own uniform
+            # derivation on every schedule of C-wide chunks, and the only way to
+            # say "the last one is the MERGED one" on the schedules that have one.
+            chunks=list(chunks),
+        )
         start = 0
         for n in chunks:
             head.prefill_chunk(lm, ids[:, start : start + n], None, cache)
@@ -481,6 +502,42 @@ def test_the_merged_window_is_the_single_box_capture(
     assert stats["capture"]["capture_bytes"] == tail_side * KEEP * 128 * 2
     assert stats["capture"]["capture_rows_covered"] == sum(chunks)
     # and the prefill it rode on is still the prefill
+    assert _digest(_cache_arrays(cache)) == _digest(_cache_arrays(ref_cache))
+
+
+def test_a_chunk_wider_than_c_crosses_the_wire_and_captures(monkeypatch):
+    """A11b, on two real boxes: the LAST chunk is ``C + tail_min - 1`` wide.
+
+    Everything that sizes itself off a chunk has to take it: the head's
+    envelope (``chunks=``), the boundary header the sender writes, the tail's
+    receiver -- which validates ``S`` against ``envelope.chunks[idx]`` and
+    allocates ``B*S*HC*D*2`` bytes for it -- the tail's own forward over layers
+    ``[split, n)``, and both halves' capture windows.  The reference is one box
+    running the SAME two chunks, because that is what the plan promises: the
+    peer runs the loop's chunks, merged one included.
+    """
+    lm = _bf16_lm()
+    chunks = [STEP, STEP + TAIL_MIN - 1]  # 8, 11: the widest the merge can make
+    ids = mx.array([PROMPT[: sum(chunks) + 1]], dtype=mx.int32)
+    spec = {"schema": 1, "kind": "layers", "layers": [0, 1], "keep": KEEP}
+    hidden, stats, cache = _run_two_box(
+        monkeypatch, lm, ids, capture=spec, chunks=chunks
+    )
+    assert list(stats["envelope"]["chunks"]) == chunks
+    assert stats["envelope"]["depth"] == sum(chunks) == int(ids.shape[1]) - 1
+
+    ref, ref_cache = _single_box_capture(
+        _bf16_lm(),
+        ids[:, :-1],
+        capture_kwargs={"capture_layer_ids": [0, 1]},
+        keep=KEEP,
+        chunks=chunks,
+    )
+    want, _ = ref.finish()
+    assert len(hidden) == len(want) == 2
+    for got, expect in zip(hidden, want):
+        assert got.shape == expect.shape == (1, KEEP, 128)
+        assert mx.array_equal(got, expect)
     assert _digest(_cache_arrays(cache)) == _digest(_cache_arrays(ref_cache))
 
 
@@ -585,7 +642,7 @@ class _SplitLoopbackHead:
         self.calls.append("abort")
         self.sock = None
 
-    def begin(self, tokens, chunk, *, input_ids, capture=None):
+    def begin(self, tokens, chunk, *, input_ids, capture=None, chunks=None):
         self.calls.append(("begin", int(tokens), int(chunk)))
         self.spec = (
             CaptureSpec.parse(capture, n_layers=self.n_layers)
@@ -748,6 +805,33 @@ def test_the_default_served_config_now_reaches_the_peer(monkeypatch, layer_ids):
     assert mx.array_equal(got["hidden"], want["hidden"]), (
         "the drafter's context is not the single-box context"
     )
+
+
+def test_the_drafter_context_survives_a_merged_pipelined_chunk(monkeypatch):
+    """A11b x A6: the peer runs the MERGED chunk, and the stitch still holds.
+
+    ``T = 42 = 5*8 + 2`` puts the last cell inside L35's merge window, so the
+    plan is ``[8, 8, 8, 8, 9]`` and the head keeps exactly one token.  That is
+    the geometry A11 refused to send (it gave the fifth chunk back), and it is
+    the one where the adopted window has to stand for a chunk WIDER than C:
+    ``adopt_window(rows_covered=41)`` then one remainder forward, against a
+    single box that appended all five chunks itself.  The drafter's array and
+    its RoPE origin are the same either way, or the two-box answer is a fluent
+    wrong one.
+    """
+    rows = [list(range(3, 45))]
+    made = _arm(monkeypatch)
+    got = _drain_spec(
+        _spec_batch(_lm(), drafter=_StubDFlash(), kind="dflash", rows=rows)
+    )
+    assert made[0].chunks == [STEP] * 4 + [STEP + 1], "the merged chunk is the peer's"
+    assert got["steps"] == [STEP] * 4 + [STEP + 1]
+    assert pr.METRICS.snapshot()["pp_schedule_shortened"] == 0
+
+    want = _single_box_spec(monkeypatch, drafter=_StubDFlash(), kind="dflash", rows=rows)
+    assert got["cache"] == want["cache"]
+    assert got["offset"] == want["offset"] == len(rows[0]) - KEEP
+    assert mx.array_equal(got["hidden"], want["hidden"])
 
 
 def test_the_mtp_served_request_reaches_the_peer_too(monkeypatch):
