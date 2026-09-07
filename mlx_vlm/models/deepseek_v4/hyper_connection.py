@@ -25,6 +25,320 @@ def _hc_compile_enabled() -> bool:
     return _HC_COMPILE_ENV
 
 
+# ---------------------------------------------------------------- L34 (fused)
+# MLX_VLM_GLM5_HC_FUSED: hand-written Metal kernels for the two ends of the
+# hyper-connection cycle that are still many small element-wise dispatches --
+# the pre-norm (fp32 cast + rms_norm) in FRONT of the mixing matmul, and the
+# residual inject (`hc_expand`) BEHIND the block.  The middle (the fn
+# projection, and the sinkhorn+collapse) is deliberately untouched: the
+# projection is real parallel work (I906 fused it and measured 22x SLOWER at
+# B=1) and the sinkhorn+collapse already IS one kernel above.
+#
+# This is a PREFILL lever, not a decode lever.  At B*L=1 row the three
+# dispatches this replaces cost ~6 us each and the bytes are noise; at
+# B*L=8192 rows each dispatch is a full round trip of a [B,S,hc_mult,D] fp32
+# tensor and the bytes ARE the cost (same argument, and the same regime, as
+# Glm5NextLinearAttention._fused_kda_prefill_step).  Hence the row floor:
+# below it we stay on the compiled/eager path that decode was tuned on.
+#
+# DEFAULT ON since I1450 (2026-09-07).  Both flags were opt-in when the kernels
+# landed at 5cd9d8b5; the registered KL gate has since passed, so serving takes
+# them by default and the flags became opt-OUT:
+# ``MLX_VLM_GLM5_HC_FUSED=0`` (or ``_HC_PRENORM_FUSED=0`` for just the pre-norm)
+# restores the 5cd9d8b5 behaviour, i.e. the compiled/eager path.
+#
+# The expand kernel reassociates nothing but does let the Metal compiler
+# contract mul+add into fma, so it is NOT bit-identical to `mx.matmul` +
+# `mx.compile` -- see ``test_expand_kernel_arithmetic_matches_eager_fp32``,
+# which pins the drift at a few fp32 ulp.  Promotion therefore rests on the
+# rule-13 rail (natural-panel text sha + speculative acceptance parity) and the
+# registered KL gate, not on a bit-identical logit fingerprint.
+_HC_FUSED_ENV = None
+_HC_PRENORM_ENV = None
+
+# An explicit "0"/"false"/"no"/"off" (any case) turns a default-ON lever off.
+# Everything else -- INCLUDING the empty string -- is ON, so a launcher that
+# emits ``NAME=`` for a variable it did not set (the shape of the TP passthrough
+# bug fixed in server/tp_mode.py::launch_worker) lands on the DEFAULT rather
+# than silently disabling the lever on one rank only.
+#
+# Semantics copied verbatim from ``mlx_vlm/generate/common.py::_env_default_on``
+# (glm5-serve-unified @ 6e92b5bf) rather than imported: that module does
+# ``from ..models import cache`` at import time, so a models -> generate import
+# here would cycle.  Same reason ``_hc_compile_enabled`` above duplicates
+# language.py's ``_env_flag``.
+_ENV_OFF = ("0", "false", "no", "off")
+
+
+def _env_default_on(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _ENV_OFF
+
+# Rows (B*L) below which the fused path is not taken.  512 is chosen as
+# "clearly prefill": one threadgroup per row * D/4 threads keeps every core
+# busy, which is exactly the property B=1 decode lacks.  UNCHANGED by the I1450
+# default-ON promotion: decode (B*L = 1, and every speculative width up to 511)
+# still takes the eager/compiled path it was tuned on, so the promotion moves
+# prefill only.  Pinned by ``test_expand_row_floor_rejects_decode_shapes`` and
+# ``test_row_floor_holds_with_flags_defaulted_on``.
+_HC_FUSED_MIN_ROWS = int(os.environ.get("MLX_VLM_GLM5_HC_FUSED_MIN_ROWS", "512"))
+
+
+def _hc_fused_enabled() -> bool:
+    """Master gate, DEFAULT ON.  ``MLX_VLM_GLM5_HC_FUSED=0`` restores 5cd9d8b5."""
+    global _HC_FUSED_ENV
+    if _HC_FUSED_ENV is None:
+        _HC_FUSED_ENV = _env_default_on("MLX_VLM_GLM5_HC_FUSED")
+    return _HC_FUSED_ENV
+
+
+def _hc_prenorm_fused_enabled() -> bool:
+    """Second gate for the pre-norm kernel, DEFAULT ON.
+
+    The expand kernel only has to match a 4x4-by-4xD matmul; this one has to
+    match ``mx.fast.rms_norm``'s own reduction tree over a 16384-long row, and
+    that tree is an implementation detail of the installed MLX.  It keeps its
+    own flag so a fingerprint failure can be attributed to one kernel rather
+    than two: ``MLX_VLM_GLM5_HC_PRENORM_FUSED=0`` drops just the pre-norm and
+    leaves the expand kernel on.  Still ANDed with MLX_VLM_GLM5_HC_FUSED, so
+    turning the master flag off turns this off too.
+    """
+    global _HC_PRENORM_ENV
+    if _HC_PRENORM_ENV is None:
+        _HC_PRENORM_ENV = _env_default_on("MLX_VLM_GLM5_HC_PRENORM_FUSED")
+    return _HC_PRENORM_ENV and _hc_fused_enabled()
+
+
+def _reset_flag_cache() -> None:
+    """Test hook: drop the read-once env caches so a monkeypatched environment
+    is re-read.  Not used by serving -- the caches exist precisely so serving
+    reads ``os.environ`` once per process."""
+    global _HC_FUSED_ENV, _HC_PRENORM_ENV
+    _HC_FUSED_ENV = None
+    _HC_PRENORM_ENV = None
+
+
+def _metal_ok() -> bool:
+    return mx.default_device() == mx.gpu and mx.metal.is_available()
+
+
+# ------------------------------------------------------------------ expand
+_HC_EXPAND_SOURCE = """
+    uint d4  = thread_position_in_grid.x;
+    uint row = thread_position_in_grid.y;
+
+    constexpr uint D4 = (uint)D / 4;
+    if (d4 >= D4) {
+        return;
+    }
+
+    using T4 = vec<T, 4>;
+
+    const device float* p = (const device float*)post + row * HC;
+    const device float* c = (const device float*)comb + row * HC * HC;
+
+    const device T* xrow = (const device T*)x_in     + row * (uint)D;
+    const device T* rrow = (const device T*)residual + row * (uint)(HC * D);
+    device T*       orow = (device T*)out            + row * (uint)(HC * D);
+
+    // x is [B, L, D] and broadcasts over the hyper axis: one load, HC uses.
+    float4 xv = float4(*(const device T4*)(xrow + d4 * 4));
+
+    // residual is [B, L, HC, D]: HC loads, HC uses each.  Held in registers so
+    // the HC*HC MACs below touch device memory exactly once per element --
+    // that is the whole point of the kernel.
+    float4 rv[HC];
+    for (int j = 0; j < HC; ++j) {
+        rv[j] = float4(*(const device T4*)(rrow + j * (uint)D + d4 * 4));
+    }
+
+    // out[h] = post[h] * x + sum_j comb[j][h] * residual[j]
+    //
+    // Association is the eager one: the j-sum accumulates in ASCENDING j (the
+    // K axis of `mx.matmul(comb.swapaxes(-1,-2), residual)`), and the post*x
+    // term is added LAST, because the eager code is `y = post*x` then
+    // `y = y + matmul(...)`.  Written with separate `*` and `+` rather than
+    // fma() for that reason -- though Metal's default fp-contract may still
+    // fuse them, which is why this is fingerprint-gated and not asserted
+    // bit-identical.
+    for (int h = 0; h < HC; ++h) {
+        float4 acc = c[h] * rv[0];
+        for (int j = 1; j < HC; ++j) {
+            acc = acc + c[j * HC + h] * rv[j];
+        }
+        float4 y = p[h] * xv + acc;
+        *(device T4*)(orow + h * (uint)D + d4 * 4) = T4(y);
+    }
+"""
+
+
+def _make_hc_expand_kernel():
+    if not _metal_ok():
+        return None
+    return mx.fast.metal_kernel(
+        name="hc_expand_fused",
+        input_names=["x_in", "residual", "post", "comb"],
+        output_names=["out"],
+        source=_HC_EXPAND_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_expand_kernel = _make_hc_expand_kernel()
+
+
+def hc_expand_fused_eligible(x, residual, post, comb) -> bool:
+    """Per-call preconditions.  Deliberately total: any surprise falls back."""
+    if _hc_expand_kernel is None:
+        return False
+    if x.ndim != 3 or residual.ndim != 4:
+        return False
+    B, L, D = x.shape
+    if residual.shape != (B, L, comb.shape[-1], D):
+        return False
+    HC = comb.shape[-1]
+    if D % 4 != 0 or HC < 1 or HC > 8:
+        return False
+    if B * L < _HC_FUSED_MIN_ROWS:
+        return False
+    if residual.dtype != x.dtype:
+        return False
+    if post.dtype != mx.float32 or comb.dtype != mx.float32:
+        return False
+    if post.shape != (B, L, HC) or comb.shape != (B, L, HC, HC):
+        return False
+    return True
+
+
+def _hc_expand_fused(x, residual, post, comb):
+    B, L, D = x.shape
+    HC = comb.shape[-1]
+    d4 = D // 4
+    tg = min(256, d4)
+    grid_x = ((d4 + tg - 1) // tg) * tg
+    (out,) = _hc_expand_kernel(
+        inputs=[x, residual, post, comb],
+        template=[("T", x.dtype), ("HC", HC), ("D", D)],
+        grid=(grid_x, B * L, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(B, L, HC, D)],
+        output_dtypes=[x.dtype],
+    )
+    return out
+
+
+# ------------------------------------------------------------------ pre-norm
+_HC_PRENORM_SOURCE = """
+    uint lid  = thread_position_in_threadgroup.x;
+    uint row  = threadgroup_position_in_grid.x;
+    uint lane = lid % 32;
+    uint sg   = lid / 32;
+
+    constexpr uint N = (uint)(HC * D);          // flattened hyper row
+    constexpr uint NT = (uint)NTHREADS;
+    constexpr uint SG = NT / 32;
+
+    const device T* xrow = (const device T*)x_in + row * N;
+    device float*   zrow = (device float*)z_out  + row * N;
+
+    threadgroup float part[SG];
+
+    // Sum of squares.  Per-thread order: N_READS=4 CONTIGUOUS elements per
+    // thread per stride step, stride NT*4 -- the same walk mx.fast.rms_norm's
+    // single-row kernel uses -- then simd_sum, then a scalar fold over the
+    // simdgroup partials.  fp32 accumulator, exactly like the eager path,
+    // whose input is already an exact bf16->fp32 widening.
+    float acc = 0.0f;
+    for (uint r = 0; r < N; r += NT * 4) {
+        uint o = r + lid * 4;
+        float x0 = (float)xrow[o + 0];
+        float x1 = (float)xrow[o + 1];
+        float x2 = (float)xrow[o + 2];
+        float x3 = (float)xrow[o + 3];
+        acc += x0 * x0;
+        acc += x1 * x1;
+        acc += x2 * x2;
+        acc += x3 * x3;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        part[sg] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float inv_shared;
+    if (lid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < SG; ++i) {
+            total += part[i];
+        }
+        inv_shared = metal::precise::rsqrt(total / (float)N + EPS_INT * 1e-9f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = inv_shared;
+
+    for (uint r = 0; r < N; r += NT * 4) {
+        uint o = r + lid * 4;
+        zrow[o + 0] = (float)xrow[o + 0] * inv;
+        zrow[o + 1] = (float)xrow[o + 1] * inv;
+        zrow[o + 2] = (float)xrow[o + 2] * inv;
+        zrow[o + 3] = (float)xrow[o + 3] * inv;
+    }
+"""
+
+
+def _make_hc_prenorm_kernel():
+    if not _metal_ok():
+        return None
+    return mx.fast.metal_kernel(
+        name="hc_prenorm_fused",
+        input_names=["x_in"],
+        output_names=["z_out"],
+        source=_HC_PRENORM_SOURCE,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_prenorm_kernel = _make_hc_prenorm_kernel()
+
+_HC_PRENORM_NTHREADS = 256
+
+
+def hc_prenorm_fused_eligible(x) -> bool:
+    if _hc_prenorm_kernel is None:
+        return False
+    if x.ndim != 4:
+        return False
+    B, L, H, D = x.shape
+    n = H * D
+    if n % (_HC_PRENORM_NTHREADS * 4) != 0:
+        return False
+    if B * L < _HC_FUSED_MIN_ROWS:
+        return False
+    return True
+
+
+def _hc_prenorm_fused(x, norm_eps):
+    B, L, H, D = x.shape
+    (z,) = _hc_prenorm_kernel(
+        inputs=[x],
+        template=[
+            ("T", x.dtype),
+            ("HC", H),
+            ("D", D),
+            ("NTHREADS", _HC_PRENORM_NTHREADS),
+            ("EPS_INT", round(norm_eps / 1e-9)),
+        ],
+        grid=(B * L * _HC_PRENORM_NTHREADS, 1, 1),
+        threadgroup=(_HC_PRENORM_NTHREADS, 1, 1),
+        output_shapes=[(B, L, H * D)],
+        output_dtypes=[mx.float32],
+    )
+    return z
+
+
 def _make_hc_sinkhorn_collapse_kernel():
     """Fused sinkhorn + collapse: eliminates one dispatch per HC cycle.
 
@@ -431,18 +745,29 @@ class HyperConnection(nn.Module):
         """
         B, L, H, D = x.shape
         hc_compile = _hc_compile_enabled()
-        if hc_compile:
-            y, mixes = _hc_preamble_compiled(x, self.fn.T, self.norm_eps)
-        else:
-            y = x.astype(mx.float32)
-            z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-            mixes = z @ self.fn.T
-
         use_ops = (
             self.training
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
         )
+        # L34: on the fused-kernel path ``y`` is DEAD -- the sinkhorn+collapse
+        # kernel reads ``x`` and widens it itself -- so the fp32 cast exists
+        # only to feed the rms_norm, and the two collapse into one kernel that
+        # reads bf16 and writes the fp32 normed row.  The ops path still needs
+        # ``y`` for its collapse, so it keeps the cast.
+        y = None
+        if (
+            not use_ops
+            and _hc_prenorm_fused_enabled()
+            and hc_prenorm_fused_eligible(x)
+        ):
+            mixes = _hc_prenorm_fused(x, self.norm_eps) @ self.fn.T
+        elif hc_compile:
+            y, mixes = _hc_preamble_compiled(x, self.fn.T, self.norm_eps)
+        else:
+            y = x.astype(mx.float32)
+            z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
+            mixes = z @ self.fn.T
         if use_ops:
             if hc_compile:
                 xc, post, comb = _hc_full_ops_compiled(
@@ -482,6 +807,21 @@ def _hc_expand_op(x, residual, post, comb):
 
 
 def hc_expand(x, residual, post, comb):
+    """Residual inject.
+
+    Eager/compiled form is ``(post * x) + comb^T @ residual``, which
+    ``mx.compile`` lowers to an fp32 cast of ``residual``, the batched matmul,
+    and one fused element-wise kernel -- three passes over a
+    ``[B, L, hc_mult, D]`` fp32 tensor.  At prefill width those passes ARE the
+    cost, so L34 replaces them with a single kernel that reads the bf16 inputs
+    once and writes the bf16 output once (see ``_HC_EXPAND_SOURCE``).
+
+    The fused kernel is the DEFAULT since I1450; ``MLX_VLM_GLM5_HC_FUSED=0``,
+    a sub-512-row call, and any box without Metal all land on
+    ``_hc_expand_op`` below, which is unchanged.
+    """
+    if _hc_fused_enabled() and hc_expand_fused_eligible(x, residual, post, comb):
+        return _hc_expand_fused(x, residual, post, comb)
     return _hc_expand_op(x, residual, post, comb)
 
 
