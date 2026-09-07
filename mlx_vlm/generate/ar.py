@@ -2024,8 +2024,15 @@ class SpeculativeGenerationBatch:
         ]
 
     def _note_active_rows(self, rows: Sequence[int]) -> None:
-        """Round-loop callback: the cache's batch dimension, column by column."""
-        self._cache_rows = [int(r) for r in rows]
+        """Round-loop callback: the cache's batch dimension, column by column.
+
+        The loop reports its OWN row indices, which are this batch's rows only
+        until the first admission -- so this goes through ``_global_row`` for
+        the same reason every other callback the loop is handed does.  After a
+        restart the running generator's row 0 is not this batch's row 0, and a
+        capture that believed it was would snapshot the wrong request.
+        """
+        self._cache_rows = [self._global_row(int(r)) for r in rows]
 
     def cache_row_for_uid(self, uid) -> Optional[int]:
         """Which column of ``prompt_cache`` holds ``uid``'s KV -- None if none.
@@ -2168,6 +2175,11 @@ class SpeculativeGenerationBatch:
             return None
         self.prompt_cache[:] = _extend_cache(self.prompt_cache, merged_cache)
         self._loop_rows.extend(rows)
+        # The merged rows are appended to the batch dimension, which is exactly
+        # where the loop is about to append them to its active-slot map.  Kept
+        # here as well so the mapping is never stale in the window between this
+        # merge and the loop's own ``active_rows`` report.
+        self._cache_rows.extend(rows)
         return {
             "rows_hidden": rows_hidden,
             "bonus": bonus,
@@ -2231,6 +2243,10 @@ class SpeculativeGenerationBatch:
             )
             self.target_hidden_offset = int(record["target_hidden_offset"])
             self._loop_rows = [record["rows"][i] for i in keep]
+            # A whole new cache: the queued record's, holding exactly the kept
+            # rows in order.  The new loop will report the same thing on its
+            # first round, but a capture can land before that.
+            self._cache_rows = list(self._loop_rows)
             self._rounds_iter = None
             return True
         return False

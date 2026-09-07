@@ -355,3 +355,114 @@ def test_an_out_of_range_row_is_refused_not_snapshotted_empty():
     assert _apc.snapshot_prompt_cache_row([cache], 1) is not None
     assert _apc.snapshot_prompt_cache_row([cache], 2) is None
     assert _apc.snapshot_prompt_cache_row([cache], -1) is None
+
+
+# ==========================================================================
+# V1b: the same map, on a batch that GROWS
+# ==========================================================================
+def _batch_cache(rows, length):
+    from mlx_vlm.models.cache import BatchKVCache
+
+    cache = BatchKVCache([0] * rows)
+    cache.update_and_fetch(
+        mx.zeros((rows, 1, length, 4)), mx.zeros((rows, 1, length, 4))
+    )
+    return [cache]
+
+
+def _spec_batch(uids, *, first=5, cache=None):
+    return SpeculativeGenerationBatch(
+        model=SimpleNamespace(),
+        draft_model=SimpleNamespace(),
+        draft_kind="dflash",
+        uids=list(uids),
+        first_tokens=mx.array(
+            [first + i for i in range(len(uids))], dtype=mx.int32
+        ),
+        prompt_cache=[] if cache is None else cache,
+        sampler=lambda logits: logits,
+        stop_criteria=lambda token: False,
+        max_tokens=[64] * len(uids),
+        hidden=mx.zeros((len(uids), 1, 8), dtype=mx.float32),
+        shared_kv_states=None,
+        prompt_tokens=None,
+    )
+
+
+def test_the_map_is_the_loops_rows_translated_not_the_loops_rows(monkeypatch):
+    """A row admitted mid-stream: the loop's slot is not this batch's row.
+
+    ``_loop_rows`` already carries that translation for every other callback
+    (tokens, budgets, stop checks); the cache map goes through the same one, or
+    a capture after a restart snapshots a different request.
+    """
+    monkeypatch.setenv("MLX_VLM_SPEC_EXTEND_ACTIVE", "1")
+
+    def fake_rounds(*args, **kwargs):
+        admission = kwargs["admission"]
+        active_rows = kwargs["active_rows"]
+        # Round 1: rows 0 and 1, both alive.
+        active_rows([0, 1])
+        yield [70, 71], None
+        # Row 0 finished and left the cache; then a row is admitted.
+        active_rows([1])
+        pending = admission()
+        if pending:
+            active_rows([1, 2])
+        yield [None, 80, 81], None
+
+    monkeypatch.setattr(ar_mod, "run_speculative_server_rounds", fake_rounds)
+    cache = _batch_cache(2, 4)
+    batch = _spec_batch((1, 2), cache=cache)
+    batch.next()  # first tokens
+    batch.next()  # round 1
+    assert batch.cache_row_for_uid(1) == 0 and batch.cache_row_for_uid(2) == 1
+
+    batch.extend(_spec_batch((3,), first=9, cache=_batch_cache(1, 4)))
+    batch.next()  # the admitted row's bonus token
+    batch.next()  # the round that polls and grows
+    assert batch._loop_rows == [0, 1, 2]
+    assert batch.cache_row_for_uid(1) is None, "row 0's columns left the cache"
+    assert batch.cache_row_for_uid(2) == 0
+    assert batch.cache_row_for_uid(3) == 1
+
+
+def test_a_restarted_loop_does_not_leave_the_map_pointing_at_the_old_cache(
+    monkeypatch,
+):
+    """``_restart_rounds_for_pending`` swaps the WHOLE cache for the queued
+    record's; the map has to move with it, not merely be overwritten later."""
+    monkeypatch.setenv("MLX_VLM_SPEC_EXTEND_ACTIVE", "1")
+
+    def fake_rounds(*args, **kwargs):
+        return iter(())  # every row finished: the loop ends at once
+
+    monkeypatch.setattr(ar_mod, "run_speculative_server_rounds", fake_rounds)
+    batch = _spec_batch((1, 2), cache=_batch_cache(2, 4))
+    batch.next()
+    batch.extend(_spec_batch((3,), first=9, cache=_batch_cache(1, 4)))
+    batch.next()  # the admitted row's bonus
+    batch.next()  # the first loop ends; the batch restarts on the queued row
+    assert batch._loop_rows == [2]
+    assert batch._cache_rows == [2], (
+        "the restart's cache is the queued record's, one row wide, and that row "
+        "is this batch's row 2"
+    )
+    assert batch.cache_row_for_uid(3) == 0
+    assert batch.cache_row_for_uid(1) is None
+
+
+def test_a_queued_row_has_no_cache_row_until_the_merge(monkeypatch):
+    """``_admit`` extends the bookkeeping now and the caches at the next round
+    boundary; between the two there is no row to snapshot."""
+    monkeypatch.setenv("MLX_VLM_SPEC_EXTEND_ACTIVE", "1")
+    cache = _batch_cache(2, 4)
+    batch = _spec_batch((1, 2), cache=cache)
+    batch.extend(_spec_batch((3,), first=9, cache=_batch_cache(1, 4)))
+    assert batch._all_uids == [1, 2, 3]
+    assert batch.cache_row_for_uid(3) is None, (
+        "the donor's cache has not been merged yet; refusing beats snapshotting "
+        "a row that is not there"
+    )
+    batch._admission_poll()
+    assert batch.cache_row_for_uid(3) == 2
