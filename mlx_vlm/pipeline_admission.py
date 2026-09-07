@@ -165,37 +165,80 @@ class BoxLock:
     its own restart.  The descriptor is kept open for the life of the service --
     closing it releases the lock -- and the file body is a human-readable
     receipt of who holds it, used only for the refusal message.
+
+    A2b adds one liveness step to the refusal path.  The kernel's guarantee is
+    about the lock, not about the RECORD: a body naming a pid that is gone
+    means either a race (the holder died between our flock attempt and our
+    read) or a descriptor some other process inherited.  Neither may cost the
+    box its own restart, so a stale record buys exactly one more attempt, with
+    a log line saying so -- and if the lock is still genuinely held, the
+    refusal says the record was stale rather than pretending a dead pid holds
+    it.  What this never does is steal a lock somebody is holding.
     """
 
     def __init__(self, path=None):
         self.path = Path(os.path.expanduser(str(path or default_lock_path())))
         self.fd = None
         self.holder = None
+        self.reclaimed = False
 
-    def acquire(self, *, pid=None, note=None):
+    def acquire(self, *, pid=None, note=None, is_alive=None, log=None):
         pid = os.getpid() if pid is None else int(pid)
+        log = log or (lambda line: print(line, flush=True))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError) as exc:
             self.holder = _read_holder(fd)
-            os.close(fd)
-            who = ""
-            if isinstance(self.holder, dict) and self.holder.get("pid"):
-                who = f" (held by pid {self.holder['pid']}"
-                if self.holder.get("since"):
-                    who += f", since {self.holder['since']}"
-                who += ")"
-            raise AdmissionRefused(
-                "flock",
-                f"another pipeline tail already owns this box{who}; "
-                f"lock {self.path} -- refusing to start a second resident tail "
-                f"(no weights were loaded). Set MLX_VLM_PIPELINE_LOCK to run a "
-                f"second, deliberately separate service.",
-                {"lock_path": str(self.path), "holder": self.holder,
-                 "errno": getattr(exc, "errno", None)},
-            ) from None
+            holder_pid = (
+                self.holder.get("pid") if isinstance(self.holder, dict) else None
+            )
+            stale = holder_pid is not None and not _pid_is_alive(
+                holder_pid, is_alive
+            )
+            stale_and_held = False
+            if stale:
+                log(
+                    f"[tail-admission] lock {self.path} names pid {holder_pid}, "
+                    "which is gone -- a stale record must not lock the box out "
+                    "of its own restart; retrying the flock once"
+                )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    stale_and_held = True
+                else:
+                    stale_and_held = False
+            if not stale or stale_and_held:
+                os.close(fd)
+                who = ""
+                if isinstance(self.holder, dict) and self.holder.get("pid"):
+                    who = f" (held by pid {self.holder['pid']}"
+                    if self.holder.get("since"):
+                        who += f", since {self.holder['since']}"
+                    who += ")"
+                    if stale:
+                        who = (
+                            f" (the recorded holder pid {holder_pid} is gone, "
+                            "but the lock is still held -- another process has "
+                            "the descriptor)"
+                        )
+                raise AdmissionRefused(
+                    "flock",
+                    f"another pipeline tail already owns this box{who}; "
+                    f"lock {self.path} -- refusing to start a second resident tail "
+                    f"(no weights were loaded). Set MLX_VLM_PIPELINE_LOCK to run a "
+                    f"second, deliberately separate service.",
+                    {"lock_path": str(self.path), "holder": self.holder,
+                     "stale_holder": bool(stale),
+                     "errno": getattr(exc, "errno", None)},
+                ) from None
+            self.reclaimed = True
+            log(
+                f"[tail-admission] reclaimed the stale lock {self.path} "
+                f"(previous holder pid {holder_pid} is gone)"
+            )
         self.fd = fd
         body = json.dumps(
             {
@@ -214,6 +257,8 @@ class BoxLock:
         return self
 
     def release(self):
+        """Idempotent, and safe to call from any exit path -- including one
+        that is already unwinding an exception."""
         if self.fd is None:
             return
         fd, self.fd = self.fd, None
@@ -233,6 +278,23 @@ class BoxLock:
     def __exit__(self, *exc):
         self.release()
         return False
+
+
+def _pid_is_alive(pid, is_alive=None) -> bool:
+    """Liveness by signal 0.  Only ``ProcessLookupError`` proves a pid is gone:
+    a pid we are not allowed to signal belongs to someone else and is alive,
+    and an unreadable record is treated as alive (refusing is the safe error)."""
+    if is_alive is not None:
+        return bool(is_alive(pid))
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (TypeError, ValueError, OverflowError):
+        return True
+    except OSError:
+        return True
+    return True
 
 
 def _read_holder(fd):
@@ -691,7 +753,10 @@ def admit(
                 raise
             report.lock = lock
             report.gates["flock"] = {"ok": True, "lock_path": str(lock.path),
-                                     "pid": os.getpid()}
+                                     "pid": os.getpid(),
+                                     "reclaimed": bool(
+                                         getattr(lock, "reclaimed", False)
+                                     )}
 
         # 2. one heavy model per box
         allow_shared = bool(

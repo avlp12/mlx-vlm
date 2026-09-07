@@ -90,6 +90,11 @@ HDR = struct.Struct("!4sIIIIIQ")  # magic, chunk_idx, B, S, HC, D, nbytes
 EOF_IDX = 0xFFFFFFFF
 MAX_JSON_BYTES = 4 * 1024 * 1024
 ADMISSION_REFUSED_EXIT = 3  # a refused start is not a crash and not a success
+# How long a request ALREADY IN FLIGHT may keep running after a stop has been
+# asked for.  30 s covers the remaining chunks of a 131k pipelined prefill at
+# the measured rates; past it the connection is aborted and the head prefills
+# single-box (``pp_failed``), which is the documented failure model.
+DEFAULT_DRAIN_TIMEOUT_S = 30.0
 
 
 def _hex(value, length, name):
@@ -229,17 +234,154 @@ def _queue_put(q, item, errors, timeout):
             pass
 
 
-def _check_stop(path):
+def _check_stop_file(path):
     if path and Path(path).exists():
         raise InterruptedError("pipeline cooperative STOP requested")
 
 
-class StopAwareSocket:
-    """Tail-owned stop-file checks during idle and transfer, without signals."""
+class ShutdownGate:
+    """Why the tail is stopping, and how long the request in flight still has.
 
-    def __init__(self, sock, stop_file, timeout):
-        self.sock, self.stop_file, self.timeout = sock, stop_file, timeout
+    A2b.  The tail had two unrelated ways of being told to stop and they never
+    met: the cooperative STOP *file*, which every socket wait polls, and the
+    signal *flag*, which only the accept loop between connections ever read.  A
+    pooled head keeps ONE connection open across requests
+    (``pipeline_runtime.PipelinePool``), so ``session`` -- not ``accept`` -- is
+    where a busy tail lives, and the flag was never looked at there.  That is
+    how a SIGTERMed tail went on serving for eight minutes with
+    ``shutdown_reason: "signal_15"`` already on its own health line (B3
+    fallback drills, 2026-09-07 15:25-16:02: D2/D3/D4/D5 all void, and the
+    flock it still held refused every replacement tail).
+
+    Both sources live here now, behind one object that is passed where the stop
+    file used to go -- so every place that already polled the file observes the
+    signal too -- and the answer depends on what the tail is doing:
+
+    ===================  ==================================================
+    idle (no request)    stop -> raise at the next poll (<= 0.25 s)
+    inside a request     stop -> keep going, until ``drain_timeout``
+    inside a request     drain expired, or a second signal -> raise now
+    ===================  ==================================================
+
+    Plain attribute stores only, never a lock: :meth:`request` runs inside a
+    signal handler, and taking a lock the interrupted thread may already hold
+    is a deadlock.  Single stores are atomic under the GIL, which is all the
+    handler needs.
+    """
+
+    def __init__(
+        self,
+        stop_file=None,
+        drain_timeout: float = DEFAULT_DRAIN_TIMEOUT_S,
+        clock=time.monotonic,
+    ):
+        self.stop_file = stop_file or None
+        self.drain_timeout = max(0.0, float(drain_timeout))
+        self.clock = clock
+        self.reason = None
+        self.stopping = False
+        self.hard = False
+        self.deadline = None
+        self.in_request = False
+        self.requests = 0
+
+    # -- control (signal-handler safe) --------------------------------------
+    def request(self, reason: str = "shutdown") -> str:
+        """First ask starts the drain; a second one is the hard stop.
+
+        Returns ``"soft"`` or ``"hard"``.  Idempotent in the sense that
+        matters: the reason and the deadline are only ever set once by the
+        first ask, so a supervisor that signals twice cannot extend the drain.
+        """
+        self.requests += 1
+        if not self.stopping:
+            self.reason = reason
+            self.deadline = self.clock() + self.drain_timeout
+            self.stopping = True
+            return "soft"
+        self.hard = True
+        self.deadline = self.clock()
+        return "hard"
+
+    def enter_request(self):
+        """A request owns the connection: the drain window applies from here."""
+        self.in_request = True
+
+    def leave_request(self):
+        self.in_request = False
+
+    # -- verdicts ------------------------------------------------------------
+    @property
+    def drained(self) -> bool:
+        if not self.stopping:
+            return False
+        if self.hard or self.deadline is None:
+            return True
+        return self.clock() >= self.deadline
+
+    def remaining(self):
+        """Seconds left of the drain window, or None when not stopping."""
+        if not self.stopping or self.deadline is None:
+            return None
+        return max(0.0, self.deadline - self.clock())
+
+    def check(self):
+        """Raise if this wait must not continue.  Called from every I/O poll."""
+        _check_stop_file(self.stop_file)
+        if not self.stopping:
+            return
+        if not self.in_request:
+            raise InterruptedError(
+                f"pipeline shutdown ({self.reason}): retiring an idle connection"
+            )
+        if self.hard:
+            raise InterruptedError(
+                f"pipeline shutdown ({self.reason}): second signal, aborting the "
+                "request in flight"
+            )
+        if self.drained:
+            raise InterruptedError(
+                f"pipeline shutdown ({self.reason}): drain timeout "
+                f"{self.drain_timeout:g}s expired, aborting the request in flight"
+            )
+
+    def snapshot(self) -> dict:
+        return {
+            "stopping": self.stopping,
+            "hard_stop": self.hard,
+            "drain_timeout_s": round(self.drain_timeout, 3),
+            "drain_remaining_s": (
+                None if self.remaining() is None else round(self.remaining(), 3)
+            ),
+        }
+
+
+def _check_stop(stop):
+    """``stop`` is a :class:`ShutdownGate` (the service) or a stop-file path
+    (the bench tail, and every caller that predates A2b)."""
+    if isinstance(stop, ShutdownGate):
+        stop.check()
+    else:
+        _check_stop_file(stop)
+
+
+class StopAwareSocket:
+    """Tail-owned stop checks during idle and transfer, without signal I/O.
+
+    The second argument is a :class:`ShutdownGate` for the service and a bare
+    stop-file path for the bench roles; both are polled at most 0.25 s apart,
+    inside every recv/send wait, so a stop is observed while the socket is idle
+    and not only between connections.
+    """
+
+    def __init__(self, sock, stop, timeout):
+        self.sock, self.stop, self.timeout = sock, stop, timeout
         sock.settimeout(min(0.25, timeout))
+
+    @property
+    def stop_file(self):
+        """Back-compat alias: this used to be the only kind of stop there was."""
+        return self.stop
 
     def gettimeout(self):
         return self.timeout
@@ -247,7 +389,7 @@ class StopAwareSocket:
     def recv_into(self, view, n):
         deadline = time.monotonic() + self.timeout
         while True:
-            _check_stop(self.stop_file)
+            _check_stop(self.stop)
             if time.monotonic() >= deadline:
                 raise TimeoutError("pipeline socket receive timeout")
             try:
@@ -260,7 +402,7 @@ class StopAwareSocket:
         sent = 0
         deadline = time.monotonic() + self.timeout
         while sent < len(view):
-            _check_stop(self.stop_file)
+            _check_stop(self.stop)
             if time.monotonic() >= deadline:
                 raise TimeoutError("pipeline socket send timeout")
             try:
@@ -1291,7 +1433,10 @@ class TailDaemon:
     Shutdown is explicit and unloads BEFORE the process exits: a bare SIGTERM
     to a process holding MLX buffers leaks wired memory that only a reboot
     reclaims, so the signal only sets the flag and the loop's own ``finally``
-    releases the stage.
+    releases the stage.  A2b: the flag lives in a :class:`ShutdownGate` that
+    the SESSION and every socket wait share, because the accept loop is
+    exactly where a tail with a pooled head never is -- see the gate's
+    docstring for the eight minutes of post-SIGTERM serving that proved it.
     """
 
     POLL_S = 0.25
@@ -1309,6 +1454,8 @@ class TailDaemon:
         clock=time.monotonic,
         admission_report=None,
         sampler=None,
+        gate=None,
+        drain_timeout: float = DEFAULT_DRAIN_TIMEOUT_S,
     ):
         self.srv = srv
         self.session = session
@@ -1323,6 +1470,14 @@ class TailDaemon:
         # never has to guess why a tail is up or whether it is worth using.
         self.admission_report = admission_report
         self.sampler = sampler
+        # A2b: one stop verdict for the whole tail.  The session and the
+        # per-request sockets hold the SAME gate, so a signal is observed
+        # wherever the daemon happens to be, not only between connections.
+        self.gate = (
+            gate
+            if gate is not None
+            else ShutdownGate(drain_timeout=drain_timeout, clock=clock)
+        )
         self.state = "starting"
         self.peer = None
         self.shutdown_reason = None
@@ -1334,18 +1489,22 @@ class TailDaemon:
             "connection_errors": 0,
             "last_error": None,
         }
-        self._stop = threading.Event()
 
     # -- control ------------------------------------------------------------
-    def request_shutdown(self, reason: str = "shutdown"):
-        """Idempotent; safe from a signal handler (only sets a flag)."""
+    def request_shutdown(self, reason: str = "shutdown") -> str:
+        """Ask the daemon to stop.  Safe from a signal handler (flags only).
+
+        Returns ``"soft"`` (drain the request in flight) or ``"hard"`` (a
+        second ask: abort it now).  Never does I/O -- a print here can deadlock
+        on the stdout lock the interrupted thread already holds.
+        """
         if self.shutdown_reason is None:
             self.shutdown_reason = reason
-        self._stop.set()
+        return self.gate.request(reason)
 
     @property
     def stopping(self) -> bool:
-        return self._stop.is_set()
+        return self.gate.stopping
 
     def status(self) -> dict:
         """The health line.  Schema (every key always present):
@@ -1355,7 +1514,14 @@ class TailDaemon:
         ``shutdown_reason`` str|null, ``connections`` int, ``requests`` int,
         ``connection_errors`` int, ``last_error`` str|null, ``degraded`` bool,
         ``rail`` object|null (:meth:`RailSampler.snapshot`), ``admission``
-        object|null (:meth:`AdmissionReport.to_dict`).
+        object|null (:meth:`AdmissionReport.to_dict`), and A2b's four stop
+        fields: ``stopping`` bool, ``hard_stop`` bool, ``drain_timeout_s``
+        float, ``drain_remaining_s`` float|null.
+
+        INVARIANT (A2b, and the shape the B3 drills caught): a line with a
+        ``shutdown_reason`` is never in state ``listening``.  A tail that has
+        been told to stop is either draining a request (``serving``), on its
+        way out (``stopping``), or gone (``stopped``) -- never back at accept.
         """
         return {
             "role": "tail",
@@ -1364,6 +1530,7 @@ class TailDaemon:
             "uptime_s": round(self.clock() - self.started, 3),
             "idle_s": round(self.clock() - self.last_active, 3),
             "shutdown_reason": self.shutdown_reason,
+            **self.gate.snapshot(),
             "degraded": self.degraded,
             "rail": self.sampler.snapshot() if self.sampler is not None else None,
             "admission": (
@@ -1387,7 +1554,7 @@ class TailDaemon:
         self.state = "listening"
         self._emit_status()
         try:
-            while not self._stop.is_set():
+            while not self.gate.stopping:
                 conn = self._accept()
                 if conn is None:
                     self._check_deadlines()
@@ -1404,16 +1571,30 @@ class TailDaemon:
                 except BaseException as exc:  # noqa: BLE001
                     # One head's bad day is not the daemon's: count it, name
                     # it, re-arm.  KeyboardInterrupt still stops the service.
-                    self.counters["connection_errors"] += 1
-                    self.counters["last_error"] = repr(exc)
-                    self.log(f"[tail] connection error: {exc!r}")
+                    if isinstance(exc, InterruptedError) and self.gate.stopping:
+                        # A2b: our own shutdown ending an IDLE connection is
+                        # not the peer failing.  It is still recorded -- an
+                        # operator reading the health line wants to know how
+                        # the connection ended -- but it does not inflate the
+                        # error counter a rail verdict is read from.  A request
+                        # actually cut by the drain deadline does not come
+                        # through here: it surfaces as the RuntimeError the
+                        # receiver thread's error is re-raised as, and counts.
+                        self.counters["last_error"] = repr(exc)
+                        self.log(f"[tail] connection retired by shutdown: {exc}")
+                    else:
+                        self.counters["connection_errors"] += 1
+                        self.counters["last_error"] = repr(exc)
+                        self.log(f"[tail] connection error: {exc!r}")
                     if isinstance(exc, KeyboardInterrupt):
                         self.request_shutdown("interrupt")
                 finally:
                     _close_quietly(sock)
                     self.peer = None
                     self.last_active = self.clock()
-                    self.state = "listening"
+                    # Never "listening" while a stop is pending: that line is
+                    # the one an operator read as "SIGTERM did nothing".
+                    self.state = "stopping" if self.gate.stopping else "listening"
                     self._emit_status()
                 if self.once:
                     self.request_shutdown("once")
@@ -1421,6 +1602,11 @@ class TailDaemon:
             self.state = "stopping"
             if self.shutdown_reason is None:
                 self.shutdown_reason = "loop_exit"
+            if self.gate.hard:
+                self.log(
+                    "[tail] hard stop: the request in flight was aborted "
+                    "(second signal)"
+                )
             self._emit_status()
             try:
                 self.srv.close()
@@ -1438,7 +1624,7 @@ class TailDaemon:
         except (socket.timeout, TimeoutError):
             return None
         except OSError as exc:
-            if self._stop.is_set():
+            if self.gate.stopping:
                 return None
             raise exc
         return sock, addr
@@ -1474,10 +1660,25 @@ def _close_quietly(sock):
 def install_tail_signal_handlers(daemon, signums=(signal.SIGTERM, signal.SIGINT)):
     """SIGTERM asks; the loop unloads.  Never let the runtime be killed while
     it owns MLX buffers -- a bare SIGTERM there leaks wired memory that only a
-    reboot reclaims.  Returns the previous handlers so a caller can restore."""
+    reboot reclaims.  Returns the previous handlers so a caller can restore.
+
+    A2b, what the signal now MEANS in each state (the CLI help says the same):
+
+    * idle, whether between connections or holding a pooled one -- the daemon
+      exits within ~1 s, having unloaded the stage;
+    * inside a request -- the request keeps running and is answered if it
+      finishes within ``--drain-timeout`` (default 30 s), then the connection
+      retires and the daemon exits; past the drain the connection is aborted
+      and the head falls back to single-box (``pp_failed``);
+    * a SECOND signal -- abort the request in flight immediately, then unload.
+      Still not a kill: the unload always runs, because the wired memory of a
+      SIGKILLed MLX process is only reclaimed by a reboot.
+    """
     previous = {}
     for num in signums:
         def _handler(signo, frame, _daemon=daemon):
+            # Flags only.  Logging here would take the stdout lock that the
+            # interrupted thread may already hold; the loop logs instead.
             _daemon.request_shutdown(f"signal_{signo}")
 
         try:
@@ -1486,6 +1687,43 @@ def install_tail_signal_handlers(daemon, signums=(signal.SIGTERM, signal.SIGINT)
             # not the main thread: the caller is embedding us, and owns signals
             pass
     return previous
+
+
+class HealthServer:
+    """The health socket and its thread, so a caller can actually join it.
+
+    A2b: the loop used to stop accepting the instant ``daemon.stopping``
+    flipped, which made "SIGTERM was received" and "the tail died" look the
+    same to a probe -- and left the thread's lifetime unobservable.  It now
+    answers until the daemon has reached ``stopped``, so the last thing a probe
+    can read is the shutdown itself, and the owner closes and joins it.
+    """
+
+    def __init__(self, sock):
+        self.socket = sock
+        self.thread = None
+        self.closed = False
+
+    def fileno(self):
+        return self.socket.fileno()
+
+    def getsockname(self):
+        return self.socket.getsockname()
+
+    def close(self):
+        """Idempotent; the loop wakes on the closed descriptor or its 0.25 s
+        poll, whichever is first."""
+        self.closed = True
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+
+    def join(self, timeout=None) -> bool:
+        if self.thread is None:
+            return True
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
 
 
 def serve_health(daemon, port: int, bind: str = "127.0.0.1"):
@@ -1498,9 +1736,10 @@ def serve_health(daemon, port: int, bind: str = "127.0.0.1"):
     hs.bind((bind, int(port)))
     hs.listen(8)
     hs.settimeout(0.25)
+    handle = HealthServer(hs)
 
     def loop():
-        while not daemon.stopping:
+        while not handle.closed and daemon.state != "stopped":
             try:
                 c, _ = hs.accept()
             except (socket.timeout, TimeoutError):
@@ -1513,25 +1752,37 @@ def serve_health(daemon, port: int, bind: str = "127.0.0.1"):
                 pass
             finally:
                 _close_quietly(c)
-        try:
-            hs.close()
-        except OSError:
-            pass
+        handle.close()
 
     th = threading.Thread(target=loop, daemon=True, name="tail-health")
+    handle.thread = th
     th.start()
-    return hs
+    return handle
 
 
-def tail_session_factory(args, stage, n_layers, load_s, stop_file, sampler=None):
+def tail_session_factory(args, stage, n_layers, load_s, stop, sampler=None):
     """Build the per-connection handler: hello, then run/bye until the peer
-    leaves.  Returns the number of requests the connection served."""
+    leaves.  Returns the number of requests the connection served.
+
+    ``stop`` is A2b's :class:`ShutdownGate` -- or, for callers that predate it,
+    the bare stop-file path.  The connection, not the request, is what a stop
+    retires: with a pooled head this loop is where the daemon spends its life
+    (``pipeline_runtime.PipelinePool`` keeps one socket across requests), so it
+    asks the gate before every command it waits for, and again as soon as the
+    request in flight has been answered.
+    """
+    gate = stop if isinstance(stop, ShutdownGate) else None
+
+    def _retiring(g):
+        """A stop that arrived while this connection was IDLE: nothing is in
+        flight, so there is nothing to drain and nothing to abort."""
+        return g is not None and g.stopping and not g.in_request
 
     def session(raw_sock, addr):
         served = 0
         raw_sock.settimeout(args.io_timeout)
         raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock = StopAwareSocket(raw_sock, stop_file, args.io_timeout)
+        sock = StopAwareSocket(raw_sock, stop, args.io_timeout)
         print(f"[tail] peer {addr}", flush=True)
         hello = _recv_json(sock)
         if hello.get("cmd") != "hello" or hello.get("transport") not in (
@@ -1548,7 +1799,32 @@ def tail_session_factory(args, stage, n_layers, load_s, stop_file, sampler=None)
             ring_group()
         try:
             while True:
-                req = _recv_json(sock)
+                # Idle between requests is a state a stop must be able to end:
+                # a pooled head can leave this connection open for hours, and
+                # before A2b that was the state a signal was never observed in.
+                # The gate answers here and inside the recv poll below (<=
+                # 0.25 s); a stop-file path keeps its old meaning exactly.
+                if _retiring(gate):
+                    print(
+                        "[tail] shutdown: retiring the idle connection",
+                        flush=True,
+                    )
+                    return served
+                _check_stop(stop)
+                try:
+                    req = _recv_json(sock)
+                except InterruptedError:
+                    # The stop landed while we were blocked on the head.  That
+                    # is a clean end of a connection, not a failed one: the
+                    # requests this connection did serve are still counted and
+                    # the daemon logs a retirement rather than an error.
+                    if not _retiring(gate):
+                        raise
+                    print(
+                        "[tail] shutdown: retiring the idle connection",
+                        flush=True,
+                    )
+                    return served
                 if req.get("cmd") == "bye":
                     _send_json(sock, {"cmd": "bye", "ok": True})
                     return served
@@ -1615,20 +1891,46 @@ def tail_session_factory(args, stage, n_layers, load_s, stop_file, sampler=None)
                             },
                         )
                         continue
-                _check_stop(stop_file)
+                _check_stop(stop)
                 # Reset BEFORE acknowledging ownership of every request,
                 # including the first/no-prune request. No stale head layers
                 # enter handoff.
                 _reset_caches(stage, args.model)
-                _send_json(sock, {"ok": True, "request_id": envelope.request_id})
-                rep = _tail_one(args, stage, sock, req, capture)
-                served += 1
-                if sampler is not None:
-                    # Sample AFTER the work and BEFORE the reply, so the next
-                    # ping already reflects the request that just ran.
-                    sampler.observe(rep.get("wire_recv_s"), rep.get("tail_total_s"))
-                _send_json(sock, rep)
+                if gate is not None:
+                    # From the ack to the reply this connection owns a request:
+                    # a stop DRAINS it (up to --drain-timeout) instead of
+                    # cutting it, and a shutdown that lands while the reply is
+                    # being written cannot throw the finished work away.
+                    gate.enter_request()
+                try:
+                    _send_json(
+                        sock, {"ok": True, "request_id": envelope.request_id}
+                    )
+                    rep = _tail_one(args, stage, sock, req, capture)
+                    served += 1
+                    if sampler is not None:
+                        # Sample AFTER the work and BEFORE the reply, so the
+                        # next ping already reflects the request that just ran.
+                        sampler.observe(
+                            rep.get("wire_recv_s"), rep.get("tail_total_s")
+                        )
+                    _send_json(sock, rep)
+                finally:
+                    if gate is not None:
+                        gate.leave_request()
                 print(json.dumps(rep), flush=True)
+                if gate is not None and gate.stopping:
+                    # Graceful: the request that was in flight when the signal
+                    # arrived is finished and answered.  The connection retires
+                    # here -- the head's next ping fails, so it reconnects or
+                    # bypasses with peer_unreachable -- and the accept loop
+                    # sees the flag on its very next turn.
+                    print(
+                        "[tail] drained the request in flight; retiring the "
+                        "connection and shutting down",
+                        flush=True,
+                    )
+                    return served
         finally:
             # Whatever ended this connection, the next head gets an empty
             # stage: a half-populated cache must never be reachable by a
@@ -1671,6 +1973,13 @@ def _admission_enabled(args) -> bool:
 
 
 def _run_tail_admitted(args, stop_file, report, on_ready):
+    # A2b.  One gate for the process: the signal handlers, the accept loop, the
+    # session and every socket poll read the same flags, and the drain window
+    # starts the moment the first signal lands.
+    drain = getattr(args, "drain_timeout", None)
+    gate = ShutdownGate(
+        stop_file, DEFAULT_DRAIN_TIMEOUT_S if drain is None else drain
+    )
     lo, hi = args.split, args.layers
     model, caches, local, n_layers, load_s = load_stage(args.model, lo, hi, args.prune)
     stage = Stage(model, caches, local, n_layers)
@@ -1703,24 +2012,31 @@ def _run_tail_admitted(args, stop_file, report, on_ready):
     def unload_and_unlock():
         # The lock is released only AFTER the weights are gone: a successor
         # that grabbed the lock the instant we set the flag would load its own
-        # shard against ours and blow the box's wired budget.
-        unload()
-        if report is not None:
-            report.release()
+        # shard against ours and blow the box's wired budget.  The release is a
+        # ``finally`` because a lock this process still holds after it has
+        # stopped serving locks the box out of its own restart -- which is what
+        # the B3 drills hit from the other side (a live-but-deaf tail refusing
+        # every replacement).
+        try:
+            unload()
+        finally:
+            if report is not None:
+                report.release()
 
     sampler = admission.rail_sampler_from_args(args)
     daemon = TailDaemon(
         srv,
-        tail_session_factory(args, stage, n_layers, load_s, stop_file, sampler),
+        tail_session_factory(args, stage, n_layers, load_s, gate, sampler),
         connect_timeout=getattr(args, "connect_timeout", 0.0) or 0.0,
         idle_timeout=getattr(args, "idle_timeout", 0.0) or 0.0,
         once=bool(getattr(args, "once", False)),
         unload=unload_and_unlock,
         admission_report=report,
         sampler=sampler,
+        gate=gate,
     )
     install_tail_signal_handlers(daemon)
-    serve_health(daemon, getattr(args, "health_port", 0) or 0, bind=args.bind)
+    health = serve_health(daemon, getattr(args, "health_port", 0) or 0, bind=args.bind)
     if on_ready is not None:
         # An embedding caller (or a test) needs a handle on the running
         # service to shut it down; the daemon is built here, so it is handed
@@ -1728,7 +2044,16 @@ def _run_tail_admitted(args, stop_file, report, on_ready):
         on_ready(daemon)
     stage = None
     del caches, model
-    return daemon.serve_forever()
+    try:
+        return daemon.serve_forever()
+    finally:
+        # The health thread deliberately outlives the loop (it is what answers
+        # the "stopping"/"stopped" line), but it must not outlive the process's
+        # exit path: close its listener and join it here.
+        if health is not None:
+            health.close()
+            if not health.join(2.0):
+                print("[tail] health thread did not retire", flush=True)
 
 
 def _tail_one(args, stage: Stage, sock, req, capture: Optional[CaptureSpec] = None):
@@ -1750,6 +2075,12 @@ def _tail_one(args, stage: Stage, sock, req, capture: Optional[CaptureSpec] = No
     recv_times = []
     err = []
     stop = threading.Event()
+    # A2b: the same stop the socket polls, so a chunk boundary is a stop point
+    # too -- ``sock`` carries the gate for the service, and the bench roles
+    # keep their stop-file path.
+    request_stop = getattr(sock, "stop", None)
+    if request_stop is None:
+        request_stop = getattr(args, "stop_file", None)
     timeout = args.io_timeout
     expected_hc = stage.hc_mult
     expected_d = stage.lm.layers[stage.local[0]].input_layernorm.weight.shape[0]
@@ -1808,7 +2139,7 @@ def _tail_one(args, stage: Stage, sock, req, capture: Optional[CaptureSpec] = No
     last_logits = None
     try:
         while True:
-            _check_stop(getattr(args, "stop_file", None))
+            _check_stop(request_stop)
             if err:
                 raise RuntimeError(err[0])
             t0 = time.perf_counter()
@@ -2008,6 +2339,18 @@ def main(argv=None):
         help="tail-role: shut down cleanly after this many idle seconds; 0 = never",
     )
     p.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=DEFAULT_DRAIN_TIMEOUT_S,
+        help="tail-role: on SIGTERM/SIGINT, how long a request ALREADY IN "
+        "FLIGHT may keep running before its connection is aborted (the head "
+        "then prefills single-box and counts pp_failed). An idle tail exits "
+        "within ~1s either way; a SECOND signal aborts the request "
+        "immediately. Both paths unload the stage before exiting -- the "
+        "process is never left to be killed while it owns MLX buffers "
+        f"[default {DEFAULT_DRAIN_TIMEOUT_S:g}s, 0 = abort at once]",
+    )
+    p.add_argument(
         "--once",
         action="store_true",
         help="tail-role: serve a single connection then exit (the bench behaviour)",
@@ -2099,6 +2442,8 @@ def main(argv=None):
         p.error("io-timeout and queue depth must be positive")
     if args.connect_timeout < 0 or args.idle_timeout < 0:
         p.error("connect-timeout and idle-timeout must be >= 0 (0 disables)")
+    if not math.isfinite(args.drain_timeout) or args.drain_timeout < 0:
+        p.error("drain-timeout must be a finite number of seconds >= 0")
 
     mx.random.seed(args.seed)
     if args.role != "single" and args.transport == "ring":

@@ -357,8 +357,15 @@ def test_health_line_schema(tmp_path):
             "role", "state", "peer", "uptime_s", "idle_s", "shutdown_reason",
             "degraded", "rail", "admission", "connections", "requests",
             "connection_errors", "last_error",
+            # A2b: what a stop is doing, so "SIGTERM was received" and "the
+            # tail is wedged" stop looking the same on the health line
+            "stopping", "hard_stop", "drain_timeout_s", "drain_remaining_s",
         }
         assert line["role"] == "tail" and line["degraded"] is False
+        assert line["stopping"] is False and line["hard_stop"] is False
+        assert line["drain_timeout_s"] == pp.DEFAULT_DRAIN_TIMEOUT_S
+        assert line["drain_remaining_s"] is None
+        assert line["admission"]["gates"]["flock"]["reclaimed"] is False
         assert line["rail"]["p95_bound_s"] == 1.0
         a = line["admission"]
         assert a["admitted"] is True and a["refused_gate"] is None
@@ -563,3 +570,100 @@ def test_a_queue_script_that_greps_for_the_patterns_is_not_a_heavy_model():
     # rsync is a box-busy pattern, and it is matched by its own argv0
     busy = adm.heavy_processes(patterns=adm.BOX_BUSY_PATTERNS, ps_reader=ps)
     assert sorted(p["pid"] for p in busy) == [77, 95718]
+
+
+# ------------------------------------------- A2b: a stale lock record
+
+def test_a_dead_holder_is_detected_by_signal_zero():
+    import subprocess
+    import sys
+
+    assert adm._pid_is_alive(os.getpid()) is True
+    done = subprocess.Popen([sys.executable, "-c", "pass"])
+    done.wait()  # reaped: the pid is gone, not a zombie
+    assert adm._pid_is_alive(done.pid) is False
+    # an unreadable or nonsensical record is treated as alive: refusing to
+    # start is the safe error, stealing a live box's lock is not
+    assert adm._pid_is_alive("not-a-pid") is True
+    assert adm._pid_is_alive(None) is True
+
+
+def _hold(path, pid):
+    """A lock held by a descriptor whose RECORD names ``pid``."""
+    import fcntl
+
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.write(fd, (json.dumps({"pid": pid, "since": "2026-09-07T15:34:29+0900"})
+                  + "\n").encode())
+    return fd
+
+
+def test_a_stale_record_left_by_a_dead_pid_does_not_block_a_new_tail(tmp_path):
+    """The B3 shape, from the successor's side: a tail is gone but its record
+    is still in the lock file.  The kernel drops the flock when the holder
+    dies, so the retry that the staleness buys is what actually gets the box
+    back -- here the descriptor is released at exactly the moment the refusal
+    path notices the pid is gone (the ``log`` callback), which is the race the
+    retry exists for."""
+    path = tmp_path / "pp_tail.lock"
+    held = _hold(path, 999999)
+    lines = []
+
+    def log(line):
+        lines.append(line)
+        if len(lines) == 1:  # the "pid is gone" line, before the retry
+            os.close(held)  # the dead holder's descriptor goes away
+
+    lock = adm.BoxLock(path)
+    lock.acquire(is_alive=lambda pid: False, log=log)
+    try:
+        assert lock.reclaimed is True
+        assert any("which is gone" in ln for ln in lines)
+        assert any("reclaimed the stale lock" in ln for ln in lines)
+        assert json.loads(path.read_text())["pid"] == os.getpid()
+    finally:
+        lock.release()
+
+
+def test_a_stale_record_whose_lock_is_still_held_is_refused_and_says_so(tmp_path):
+    """The other half of the honesty: a lock somebody still holds is never
+    stolen, however dead the record's pid is."""
+    path = tmp_path / "pp_tail.lock"
+    held = _hold(path, 999999)
+    try:
+        lock = adm.BoxLock(path)
+        with pytest.raises(adm.AdmissionRefused) as caught:
+            lock.acquire(is_alive=lambda pid: False, log=lambda line: None)
+        assert lock.reclaimed is False
+        assert caught.value.detail["stale_holder"] is True
+        assert "still held" in caught.value.message
+        assert "no weights were loaded" in caught.value.message
+    finally:
+        os.close(held)
+
+
+def test_a_live_holder_is_refused_without_a_retry(tmp_path):
+    path = tmp_path / "pp_tail.lock"
+    held = _hold(path, 4242)
+    lines = []
+    try:
+        with pytest.raises(adm.AdmissionRefused) as caught:
+            adm.BoxLock(path).acquire(
+                is_alive=lambda pid: True, log=lines.append
+            )
+        assert lines == [], "a live holder is not a stale record"
+        assert caught.value.detail["stale_holder"] is False
+        assert caught.value.detail["holder"]["pid"] == 4242
+        assert "held by pid 4242" in caught.value.message
+    finally:
+        os.close(held)
+
+
+def test_the_admission_report_records_a_reclaim(tmp_path):
+    report = adm.admit(_args(tmp_path), ps_reader=_quiet_ps(),
+                       vm_stat_reader=lambda: _vm_stat(100))
+    try:
+        assert report.gates["flock"]["reclaimed"] is False
+    finally:
+        report.release()
