@@ -41,46 +41,83 @@ def _hc_compile_enabled() -> bool:
 # Glm5NextLinearAttention._fused_kda_prefill_step).  Hence the row floor:
 # below it we stay on the compiled/eager path that decode was tuned on.
 #
-# Default OFF.  The expand kernel reassociates nothing but does let the Metal
-# compiler contract mul+add into fma, so it is NOT guaranteed bit-identical to
-# `mx.matmul` + `mx.compile`; adoption is gated on the L23 logit fingerprint,
-# not asserted here.
+# DEFAULT ON since I1450 (2026-09-07).  Both flags were opt-in when the kernels
+# landed at 5cd9d8b5; the registered KL gate has since passed, so serving takes
+# them by default and the flags became opt-OUT:
+# ``MLX_VLM_GLM5_HC_FUSED=0`` (or ``_HC_PRENORM_FUSED=0`` for just the pre-norm)
+# restores the 5cd9d8b5 behaviour, i.e. the compiled/eager path.
+#
+# The expand kernel reassociates nothing but does let the Metal compiler
+# contract mul+add into fma, so it is NOT bit-identical to `mx.matmul` +
+# `mx.compile` -- see ``test_expand_kernel_arithmetic_matches_eager_fp32``,
+# which pins the drift at a few fp32 ulp.  Promotion therefore rests on the
+# rule-13 rail (natural-panel text sha + speculative acceptance parity) and the
+# registered KL gate, not on a bit-identical logit fingerprint.
 _HC_FUSED_ENV = None
 _HC_PRENORM_ENV = None
 
+# An explicit "0"/"false"/"no"/"off" (any case) turns a default-ON lever off.
+# Everything else -- INCLUDING the empty string -- is ON, so a launcher that
+# emits ``NAME=`` for a variable it did not set (the shape of the TP passthrough
+# bug fixed in server/tp_mode.py::launch_worker) lands on the DEFAULT rather
+# than silently disabling the lever on one rank only.
+#
+# Semantics copied verbatim from ``mlx_vlm/generate/common.py::_env_default_on``
+# (glm5-serve-unified @ 6e92b5bf) rather than imported: that module does
+# ``from ..models import cache`` at import time, so a models -> generate import
+# here would cycle.  Same reason ``_hc_compile_enabled`` above duplicates
+# language.py's ``_env_flag``.
+_ENV_OFF = ("0", "false", "no", "off")
+
+
+def _env_default_on(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _ENV_OFF
+
 # Rows (B*L) below which the fused path is not taken.  512 is chosen as
 # "clearly prefill": one threadgroup per row * D/4 threads keeps every core
-# busy, which is exactly the property B=1 decode lacks.
+# busy, which is exactly the property B=1 decode lacks.  UNCHANGED by the I1450
+# default-ON promotion: decode (B*L = 1, and every speculative width up to 511)
+# still takes the eager/compiled path it was tuned on, so the promotion moves
+# prefill only.  Pinned by ``test_expand_row_floor_rejects_decode_shapes`` and
+# ``test_row_floor_holds_with_flags_defaulted_on``.
 _HC_FUSED_MIN_ROWS = int(os.environ.get("MLX_VLM_GLM5_HC_FUSED_MIN_ROWS", "512"))
 
 
 def _hc_fused_enabled() -> bool:
+    """Master gate, DEFAULT ON.  ``MLX_VLM_GLM5_HC_FUSED=0`` restores 5cd9d8b5."""
     global _HC_FUSED_ENV
     if _HC_FUSED_ENV is None:
-        _HC_FUSED_ENV = os.environ.get("MLX_VLM_GLM5_HC_FUSED", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        _HC_FUSED_ENV = _env_default_on("MLX_VLM_GLM5_HC_FUSED")
     return _HC_FUSED_ENV
 
 
 def _hc_prenorm_fused_enabled() -> bool:
-    """Second, STRICTER gate for the pre-norm kernel.
+    """Second gate for the pre-norm kernel, DEFAULT ON.
 
     The expand kernel only has to match a 4x4-by-4xD matmul; this one has to
     match ``mx.fast.rms_norm``'s own reduction tree over a 16384-long row, and
-    that tree is an implementation detail of the installed MLX.  It is kept
-    behind its own flag so a fingerprint failure can be attributed to one
-    kernel rather than two.  Requires MLX_VLM_GLM5_HC_FUSED as well.
+    that tree is an implementation detail of the installed MLX.  It keeps its
+    own flag so a fingerprint failure can be attributed to one kernel rather
+    than two: ``MLX_VLM_GLM5_HC_PRENORM_FUSED=0`` drops just the pre-norm and
+    leaves the expand kernel on.  Still ANDed with MLX_VLM_GLM5_HC_FUSED, so
+    turning the master flag off turns this off too.
     """
     global _HC_PRENORM_ENV
     if _HC_PRENORM_ENV is None:
-        _HC_PRENORM_ENV = os.environ.get(
-            "MLX_VLM_GLM5_HC_PRENORM_FUSED", "0"
-        ).lower() in ("1", "true", "yes", "on")
+        _HC_PRENORM_ENV = _env_default_on("MLX_VLM_GLM5_HC_PRENORM_FUSED")
     return _HC_PRENORM_ENV and _hc_fused_enabled()
+
+
+def _reset_flag_cache() -> None:
+    """Test hook: drop the read-once env caches so a monkeypatched environment
+    is re-read.  Not used by serving -- the caches exist precisely so serving
+    reads ``os.environ`` once per process."""
+    global _HC_FUSED_ENV, _HC_PRENORM_ENV
+    _HC_FUSED_ENV = None
+    _HC_PRENORM_ENV = None
 
 
 def _metal_ok() -> bool:
@@ -778,6 +815,10 @@ def hc_expand(x, residual, post, comb):
     ``[B, L, hc_mult, D]`` fp32 tensor.  At prefill width those passes ARE the
     cost, so L34 replaces them with a single kernel that reads the bf16 inputs
     once and writes the bf16 output once (see ``_HC_EXPAND_SOURCE``).
+
+    The fused kernel is the DEFAULT since I1450; ``MLX_VLM_GLM5_HC_FUSED=0``,
+    a sub-512-row call, and any box without Metal all land on
+    ``_hc_expand_op`` below, which is unchanged.
     """
     if _hc_fused_enabled() and hc_expand_fused_eligible(x, residual, post, comb):
         return _hc_expand_fused(x, residual, post, comb)
