@@ -1944,6 +1944,17 @@ class SpeculativeGenerationBatch:
         self.thinking_budget_criteria = criteria[: len(uids)]
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
+        # Stable row -> CACHE row.  ``prompt_cache`` belongs to the ROUND LOOP,
+        # and the loop filters its batch dimension down to the rows still
+        # decoding every time one finishes, while ``_all_uids`` deliberately
+        # never shrinks (a finished row must stay locatable for the capture
+        # window).  Entry k of this list is the ``_all_uids`` row whose KV the
+        # cache holds in column k, and it is the ONLY authority on where a uid's
+        # cache is: the loop maintains it through ``_note_active_rows``.  Until
+        # the loop speaks -- a stubbed round iterator, a B == 1 scalar loop that
+        # never filters -- the two indexings are the same list, which is what
+        # they were before this existed.
+        self._cache_rows = list(range(len(uids)))
         self._sent_first = False
         self._rounds_iter = None
         # V1b mid-stream admission.  ``_loop_rows`` maps the ROUND LOOP's own
@@ -2011,6 +2022,27 @@ class SpeculativeGenerationBatch:
         self.uids = [
             uid for uid, done in zip(self._all_uids, self._finished) if not done
         ]
+
+    def _note_active_rows(self, rows: Sequence[int]) -> None:
+        """Round-loop callback: the cache's batch dimension, column by column."""
+        self._cache_rows = [int(r) for r in rows]
+
+    def cache_row_for_uid(self, uid) -> Optional[int]:
+        """Which column of ``prompt_cache`` holds ``uid``'s KV -- None if none.
+
+        ``None`` is a real answer and not a failure: once the round loop has
+        filtered a finished row out of the batch dimension, that uid's KV is
+        gone from this cache and the only correct thing to do is refuse, rather
+        than snapshot whichever row inherited its index.
+        """
+        try:
+            row = self._all_uids.index(uid)
+        except ValueError:
+            return None
+        try:
+            return self._cache_rows.index(row)
+        except ValueError:
+            return None
 
     def _global_row(self, loop_row: int) -> int:
         """Round-loop row index -> this batch's stable row index."""
@@ -2297,6 +2329,7 @@ class SpeculativeGenerationBatch:
                 else None
             ),
             admission=self._admission_poll if self.accepts_extension() else None,
+            active_rows=self._note_active_rows,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -5596,15 +5629,31 @@ class BatchGenerator:
             # on 32046983 named this gate (uid_gone_from_batch, twice, both
             # turns) and it is why the feature stored nothing.
             #
-            # ``_all_uids`` is the stable list and is what the row indices are
-            # aligned to: _append_token_responses attributes tokens via
-            # _all_uids[row], and filter() -- the only thing that compacts the
-            # prompt cache -- rewrites both together. Plain GenerationBatch has
-            # no _all_uids and never prunes on finish, so uids is correct there.
+            # ``_all_uids`` is the stable list and is what the TOKEN indices
+            # are aligned to: _append_token_responses attributes tokens via
+            # _all_uids[row]. Plain GenerationBatch has no _all_uids and never
+            # prunes on finish, so uids is correct there.
             all_uids = getattr(gb, "_all_uids", None) or gb.uids
             if uid not in all_uids:
                 return _refuse("uid_gone_from_batch")
-            row = all_uids.index(uid)
+            # ...but a stable row index is NOT a cache row on the speculative
+            # path.  The claim this comment used to make -- "filter() rewrites
+            # both together" -- is true of the plain GenerationBatch and false
+            # of SpeculativeGenerationBatch, whose prompt_cache is the round
+            # loop's and is filtered down to the rows still decoding every time
+            # one finishes (speculative/dflash.py, mtp.py, eagle3.py).  So once
+            # ANY row of a speculative batch had finished, every later row's
+            # capture snapshotted a row that was not its own -- a still-live
+            # neighbour's KV under this conversation's session key, or, past the
+            # end, a width-0 cache carrying an offset and no data.  The batch
+            # that knows asks the loop; anything else keeps the old indexing.
+            cache_row_for_uid = getattr(gb, "cache_row_for_uid", None)
+            if callable(cache_row_for_uid):
+                row = cache_row_for_uid(uid)
+                if row is None:
+                    return _refuse("row_left_the_cache")
+            else:
+                row = all_uids.index(uid)
             row_cache = _apc.snapshot_prompt_cache_row(gb.prompt_cache, row)
             if not row_cache:
                 return _refuse("row_cache_unavailable")

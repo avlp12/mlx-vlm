@@ -1317,6 +1317,7 @@ def _dflash_rounds_batch(
     emit_limit: Optional[Callable[[int], Optional[int]]] = None,
     forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
     admission: Optional[Callable[[], Optional[dict]]] = None,
+    active_rows: Optional[Callable[[List[int]], None]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -1352,6 +1353,15 @@ def _dflash_rounds_batch(
         row_ids                n sampler row ids
         target_hidden_offset   n per-row prefill context trims
         max_tokens             the new rows' largest max_tokens, or 0
+
+    ``active_rows(rows)`` is the loop TELLING the caller what it just did to the
+    batch dimension of ``prompt_cache``: ``rows[k]`` is the original row index
+    whose KV the cache now holds in column k.  Called once before the first
+    round and again after every edit (a finished-row filter, an admission).
+    Without it the caller has no way to know where a row's cache went -- rows
+    leave the cache but not the caller's stable row list -- and anything that
+    indexes ``prompt_cache`` by the stable row (L31's end-of-turn session
+    capture) reads a different row's KV, or none.
 
     THE CALLER MERGES THE TARGET CACHES ITSELF, in the callback, before it
     returns -- ``prompt_cache`` is the same list object the caller holds, and
@@ -1419,6 +1429,11 @@ def _dflash_rounds_batch(
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
     hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
+    cache_is_filterable = bool(prompt_cache) and all(
+        hasattr(c, "filter") for c in prompt_cache
+    )
+    if active_rows is not None:
+        active_rows(list(active_idx))
 
     total_emitted = sum(emitted)
 
@@ -1474,6 +1489,8 @@ def _dflash_rounds_batch(
                         _adopt_pretruncated_context(draft_model, [fresh], int(off))
                         draft_caches.append(fresh)
                 _record_admitted_rows(draft_model, n_new)
+                if active_rows is not None:
+                    active_rows(list(active_idx))
 
         remaining = []
         for j in range(len(active_idx)):
@@ -1735,6 +1752,8 @@ def _dflash_rounds_batch(
                     cache_entry.filter(keep_slots)
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
+            if active_rows is not None and cache_is_filterable:
+                active_rows(list(active_idx))
 
         verify_out = None
         total_emitted = sum(emitted)

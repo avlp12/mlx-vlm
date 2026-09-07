@@ -1103,6 +1103,7 @@ def _mtp_rounds_batch(
     prompt_tokens: Optional[mx.array] = None,
     emit_limit: Optional[Callable[[int], Optional[int]]] = None,
     forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
+    active_rows: Optional[Callable[[List[int]], None]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1198,6 +1199,12 @@ def _mtp_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
+    # ``active_rows(rows)``: rows[k] is the original row whose KV ``prompt_cache``
+    # holds in column k.  See ``dflash._dflash_rounds_batch`` -- the caller's
+    # stable row list does not shrink when this loop filters the cache, so
+    # anything indexing the cache by that list needs to be told.
+    if active_rows is not None:
+        active_rows(list(active_idx))
 
     pause_ctl = (
         _AdaptivePauseController(configured_block_total)
@@ -1503,6 +1510,8 @@ def _mtp_rounds_batch(
                     K_next, V_next = next_shared_kv[k]
                     next_shared_kv[k] = (K_next[keep_mx], V_next[keep_mx])
                 active_idx = [active_idx[j] for j in keep_slots]
+                if active_rows is not None:
+                    active_rows(list(active_idx))
 
         # Re-bind drafter with new shared_kv and per-row positions.
         positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]

@@ -593,6 +593,7 @@ def run_speculative_server_rounds(
     emit_limit: Optional[Callable[[int], Optional[int]]] = None,
     forced_draft_ids: Optional[Callable[[int], List[int]]] = None,
     admission: Optional[Callable[[], Optional[dict]]] = None,
+    active_rows: Optional[Callable[[List[int]], None]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Server-side speculative rounds for one batch.
 
@@ -604,6 +605,16 @@ def run_speculative_server_rounds(
     ``draft[:k]`` is the target's own continuation for every ``j < accepted``.
     Only the continuous-batching kinds (dflash, mtp) honour them; eagle3 and
     lookup ignore them, which is why the server still refuses a budget there.
+
+    ``active_rows(rows)`` is the reverse channel: the batch loops report which
+    ORIGINAL row each column of ``prompt_cache`` holds, once at the start and
+    again after every edit of the batch dimension (a finished-row filter, an
+    admission).  The caller's stable row list does not shrink when the loop
+    filters -- ``SpeculativeGenerationBatch._all_uids`` deliberately does not --
+    so without this report anything that indexes the cache by that list (L31's
+    end-of-turn session capture) reads the wrong row once any row has finished.
+    The B == 1 scalar loops never filter, so they do not report and the identity
+    mapping the caller starts with stands.
 
     ``admission`` (V1b, ``MLX_VLM_SPEC_EXTEND_ACTIVE``) lets a LIVE batch grow:
     the round loop polls it at each round boundary for rows the server prefilled
@@ -685,6 +696,7 @@ def run_speculative_server_rounds(
             stop_check=stop_check,
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
+            active_rows=active_rows,
         )
         return
 
@@ -707,6 +719,7 @@ def run_speculative_server_rounds(
             prompt_tokens=prompt_tokens,
             emit_limit=emit_limit,
             forced_draft_ids=forced_draft_ids,
+            active_rows=active_rows,
         )
         return
 
@@ -750,6 +763,7 @@ def run_speculative_server_rounds(
             emit_limit=emit_limit,
             forced_draft_ids=forced_draft_ids,
             admission=admission,
+            active_rows=active_rows,
         )
         return
 

@@ -4198,17 +4198,47 @@ def make_warm_batch_exact_cache_multi(
     return out, max(prefix_lens) if prefix_lens else 0
 
 
+def _batch_cache_row_count(cache: Any) -> Optional[int]:
+    """How many rows this cache holds, or ``None`` when it cannot say.
+
+    ``batch_size`` is a property on every batch-shaped layer; container layouts
+    (``CacheList``) delegate to their first child that can answer.
+    """
+    try:
+        width = getattr(cache, "batch_size", None)
+    except Exception:  # noqa: BLE001 - a cache that cannot say is not an error
+        width = None
+    if isinstance(width, int) and width >= 0:
+        return width
+    for child in getattr(cache, "caches", None) or ():
+        child_width = _batch_cache_row_count(child)
+        if child_width is not None:
+            return child_width
+    return None
+
+
 def extract_prompt_cache_from_batch(
     batch_caches: Sequence[Any],
     batch_idx: int,
 ) -> Optional[List[Any]]:
-    """Extract one row from batch-aware caches as single-row cache objects."""
+    """Extract one row from batch-aware caches as single-row cache objects.
+
+    An out-of-range row is ``None``, not a width-0 cache.  mx slicing past the
+    end of an axis yields an EMPTY row rather than raising, so before this check
+    a caller that asked for a row the batch no longer has (the speculative round
+    loop filters finished rows out of the batch dimension while the caller's
+    stable row list does not shrink -- ``SpeculativeGenerationBatch``) got a
+    cache carrying an offset and no data, and stored it.
+    """
 
     out: List[Any] = []
     eval_targets: List[mx.array] = []
     for c in batch_caches:
         extract = getattr(c, "extract", None)
         if not callable(extract):
+            return None
+        width = _batch_cache_row_count(c)
+        if width is not None and not (0 <= batch_idx < width):
             return None
         extracted = extract(batch_idx)
         out.append(extracted)
