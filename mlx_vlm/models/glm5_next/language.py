@@ -19,6 +19,7 @@ from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
 from ..deepseek_v32.language import MoEGate, group_expert_select
 from ..gated_delta import gated_delta_update
+from .chunk_kda import chunk_kda_update, kda_prefill_mode
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
 from .config import ModelConfig, TextConfig
@@ -1436,6 +1437,11 @@ class Glm5NextLinearAttention(nn.Module):
         """
         if not _fused_kda_prefill_enabled():
             return False
+        # V7/L36: MLX_VLM_GLM5_KDA_PREFILL_MODE=chunk routes prefill to the
+        # stock-op chunk scan (chunk_kda.py), which needs the eager glue around
+        # it -- this kernel fuses glue AND scan, so the two are exclusive.
+        if kda_prefill_mode() == "chunk":
+            return False
         if S < _FUSED_KDA_PREFILL_MIN_S:
             return False
         if _FUSED_KDA_PREFILL_MAX_S and S > _FUSED_KDA_PREFILL_MAX_S:
@@ -1752,17 +1758,40 @@ class Glm5NextLinearAttention(nn.Module):
                     lower_bound,
                 )
             )
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b_o,
-            A_log,
-            dt_bias,
-            state=state,
-            lower_bound=lower_bound,
-        )
+        chunked = None
+        if kda_prefill_mode() == "chunk" and gdn_sink is None:
+            # Returns None (and we keep the shipped scan) for every case the
+            # chunk form does not cover -- see chunk_kda.chunk_kda_update.
+            chunked = chunk_kda_update(
+                q,
+                k,
+                v,
+                a,
+                b_o,
+                A_log,
+                dt_bias,
+                state=state,
+                # No mask: the shipped eager call below does not pass one
+                # either (line above) -- this path masks by zeroing the
+                # PRE-CONV input, so q/k/v already carry it and the recurrence
+                # itself is unmasked.  Handing the chunk form a mask here would
+                # make it decline for no reason and change nothing.
+                lower_bound=lower_bound,
+            )
+        if chunked is not None:
+            out, state = chunked
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b_o,
+                A_log,
+                dt_bias,
+                state=state,
+                lower_bound=lower_bound,
+            )
         if cache is not None:
             cache[1] = state
             cache.advance(S)
