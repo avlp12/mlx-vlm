@@ -495,6 +495,7 @@ def _eagle3_rounds_batch(
     stop_check: Optional[Callable[[int, int], bool]] = None,
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
+    active_rows: Optional[Callable[[List[int]], None]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -545,6 +546,15 @@ def _eagle3_rounds_batch(
     finished = [False] * B
     active_idx = list(range(B))
     cache_slots = list(range(B))
+    # ``active_rows(rows)``: rows[k] is the original row whose KV ``prompt_cache``
+    # holds in column k (see ``dflash._dflash_rounds_batch``).  Reported only
+    # while the caches are actually filterable, because when they are not this
+    # loop leaves the batch dimension alone and the identity mapping stands.
+    cache_is_filterable = bool(prompt_cache) and all(
+        hasattr(c, "filter") for c in prompt_cache
+    )
+    if active_rows is not None:
+        active_rows(list(active_idx))
 
     while len(active_idx) > 0:
         remaining = [
@@ -693,6 +703,8 @@ def _eagle3_rounds_batch(
             hidden = hidden[keep_mx]
             active_idx = [active_idx[j] for j in keep_slots]
             cache_slots = [cache_slots[j] for j in keep_slots]
+            if active_rows is not None and cache_is_filterable:
+                active_rows(list(active_idx))
 
         if sum(emitted) % 256 == 0:
             mx.clear_cache()

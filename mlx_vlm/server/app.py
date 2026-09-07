@@ -262,6 +262,15 @@ def _speculative_stats_snapshot() -> dict:
         "per_row_kept": int(
             getattr(drafter, "speculative_total_per_row_kept", 0) or 0
         ),
+        # V1b: rows admitted into an ALREADY RUNNING batch
+        # (MLX_VLM_SPEC_EXTEND_ACTIVE).  ``rows_per_round`` alone cannot say
+        # whether a wide batch was wide because the first queue drain caught
+        # every peer or because the loop grew afterwards; these two separate the
+        # coalescing window's contribution from the admission channel's.
+        "admitted_rows": int(
+            getattr(drafter, "speculative_total_admitted_rows", 0) or 0
+        ),
+        "admissions": int(getattr(drafter, "speculative_total_admissions", 0) or 0),
         "rows_per_round": (row_rounds / batch_rounds) if batch_rounds else None,
         "width": (drafted / rounds + 1.0) if rounds else None,
     }

@@ -242,6 +242,48 @@ class BatchDFlashKVCache(_BaseCache):
             self._length -= drop
             self._left = [pad - drop for pad in self._left]
 
+    def grow(self, count: int, offset: int = 0) -> None:
+        """Append ``count`` EMPTY rows at the end, keeping the layout invariant.
+
+        Mid-stream admission (``MLX_VLM_SPEC_EXTEND_ACTIVE``) adds rows to a
+        live speculative batch at a round boundary.  A newly admitted row has
+        no drafter context yet -- exactly the state ``make_batched_cache`` would
+        have handed it in a batch of its own -- so its columns are ALL pad:
+
+            left_padding[new] = physical_length,  real_rows[new] = 0
+
+        which is the same equation every existing row satisfies, so
+        ``context_mask``/``update_and_fetch`` need no special case.  ``min(left)
+        == 0`` still holds because at least one incumbent row is full width.
+
+        ``offset`` is the row's ``target_hidden_offset`` (the context prefix the
+        prefill trimmed off the front and the drafter is owed as RoPE position).
+        It is per ROW here, so admitting a row whose prefill trimmed a different
+        amount than the incumbents' is representable; the scalar-cache path has
+        the same freedom because each row owns a cache.
+        """
+        count = int(count)
+        if count <= 0:
+            return
+        if self.keys is not None:
+            self.keys = mx.concatenate(
+                [self.keys, mx.zeros((count,) + self.keys.shape[1:], dtype=self.keys.dtype)],
+                axis=0,
+            )
+            self.values = mx.concatenate(
+                [
+                    self.values,
+                    mx.zeros((count,) + self.values.shape[1:], dtype=self.values.dtype),
+                ],
+                axis=0,
+            )
+        self._offset.extend([int(offset)] * count)
+        self._left.extend([self._length] * count)
+        if self._pending is not None:
+            self._pending.extend([0] * count)
+        self._batch += count
+        self._dirty()
+
     # ------------------------------------------------------------- plumbing
     def size(self) -> int:
         return self._length

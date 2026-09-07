@@ -5805,6 +5805,114 @@ class TestResponseGenerator:
         assert pending == [first, second]
         assert should_stop is False
 
+    # ---------------------------------------------------------------- V1
+    # Burst admission.  A speculative generation batch cannot be extended once
+    # it starts (generate/ar.py ``SpeculativeGenerationBatch.extend`` raises,
+    # and ``BatchGenerator._next`` returns before prefill while one is alive),
+    # so whichever peers the FIRST drain happens to see are the whole batch.
+    # These pin the window's three contracts: it closes on silence, it is not
+    # armed for a lone request, and it never exceeds capacity.
+
+    @staticmethod
+    def _burst_generator(quiet_ms):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.requests = Queue()
+        gen._stop = False
+        return gen
+
+    def test_quiet_window_admits_a_burst_that_arrives_after_the_first_drain(
+        self, monkeypatch
+    ):
+        gen = self._burst_generator(100)
+        early = [object() for _ in range(4)]
+        late = [object() for _ in range(4)]
+        for item in early:
+            gen.requests.put(item)
+
+        def feed():
+            time.sleep(0.05)
+            for item in late:
+                gen.requests.put(item)
+
+        thread = Thread(target=feed)
+        thread.start()
+        try:
+            pending, should_stop = gen._collect_pending_requests(
+                active=False,
+                coalesce_s=0.005,
+                quiet_s=0.15,
+                window_s=1.0,
+            )
+        finally:
+            thread.join()
+
+        assert should_stop is False
+        assert len(pending) == 8
+        assert pending[:4] == early
+
+    def test_without_the_quiet_window_the_late_half_of_a_burst_is_left_behind(self):
+        gen = self._burst_generator(0)
+        early = [object() for _ in range(4)]
+        late = [object() for _ in range(4)]
+        for item in early:
+            gen.requests.put(item)
+
+        def feed():
+            time.sleep(0.05)
+            for item in late:
+                gen.requests.put(item)
+
+        thread = Thread(target=feed)
+        thread.start()
+        try:
+            pending, _ = gen._collect_pending_requests(
+                active=False, coalesce_s=0.005, quiet_s=0.0
+            )
+        finally:
+            thread.join()
+
+        # The shipped behaviour, stated as a test rather than as a surprise:
+        # four rows decode and four wait a whole generation.
+        assert pending == early
+
+    def test_the_quiet_window_is_not_armed_for_a_lone_request(self):
+        gen = self._burst_generator(0)
+        only = object()
+        gen.requests.put(only)
+
+        started = time.monotonic()
+        pending, _ = gen._collect_pending_requests(
+            active=False, coalesce_s=0.0, quiet_s=2.0, window_s=5.0
+        )
+        elapsed = time.monotonic() - started
+
+        assert pending == [only]
+        # A single request must not buy a batch it is not part of.
+        assert elapsed < 0.5
+
+    def test_the_quiet_window_stops_at_capacity(self):
+        gen = self._burst_generator(0)
+        items = [object() for _ in range(8)]
+        for item in items:
+            gen.requests.put(item)
+
+        started = time.monotonic()
+        pending, _ = gen._collect_pending_requests(
+            active=False, capacity=3, coalesce_s=0.0, quiet_s=2.0, window_s=5.0
+        )
+        elapsed = time.monotonic() - started
+
+        assert len(pending) == 3
+        assert elapsed < 0.5
+
+    def test_the_quiet_window_defaults_to_off(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_SPEC_ADMISSION_QUIET_MS", raising=False)
+        assert server_generation.get_spec_admission_quiet_s() == 0.0
+        monkeypatch.setenv("MLX_VLM_SPEC_ADMISSION_QUIET_MS", "40")
+        assert server_generation.get_spec_admission_quiet_s() == pytest.approx(0.04)
+        monkeypatch.setenv("MLX_VLM_SPEC_ADMISSION_QUIET_MS", "not-a-number")
+        assert server_generation.get_spec_admission_quiet_s() == 0.0
+
     def test_step_streams_spm_subword_tokens_immediately(self):
         class SentencePieceTokenizer:
             vocab = {
