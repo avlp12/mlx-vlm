@@ -34,6 +34,11 @@ from .fused_kda_prefill import (
     fused_kda_prefill_supported,
     prefill_geometry,
 )
+from .fused_router import (
+    fused_group_expert_select,
+    fused_router_supported,
+    router_fused_enabled,
+)
 from .qmv_custom import DEFAULT_GEOMETRY, maybe_qmv, qmv_applicable
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
@@ -2501,6 +2506,12 @@ class Glm5NextMLP(DeepseekMLP):
 class Glm5NextMoEGate(MoEGate):
     # Router logits in fp32 (reference uses moe_router_dtype=float32) so near-tie top-k
     # membership matches the reference rather than flipping under bf16 rounding.
+    def __init__(self, config):
+        super().__init__(config)
+        # Resolved once, like shared_qmv/pack_shared: the flag is a deployment
+        # decision, not a per-token one.  Tests flip the attribute directly.
+        self.use_fused_router = router_fused_enabled(config)
+
     def __call__(self, x: mx.array):
         # NOTE: mx.array.astype(dtype) does not short-circuit when the dtype
         # already matches (checked on mlx 0.32.1 -- it returns a distinct array),
@@ -2510,6 +2521,30 @@ class Glm5NextMoEGate(MoEGate):
         if w.dtype != mx.float32:
             w = w.astype(mx.float32)
         logits = x.astype(mx.float32) @ w.T
+        # v3 row #2: fold primitives 2..7 (sigmoid, +bias, top-k, gather, sum,
+        # normalise, scale) into one Metal launch at decode widths.  The GEMV
+        # above is kept -- it is 2.36 MB of real traffic, not launch overhead.
+        # DEFAULT OFF (MLX_VLM_GLM5_ROUTER_FUSED); refused on CPU and at
+        # B*S > 8, where the eager argsort is a real parallel sort.
+        if self.use_fused_router:
+            rows = 1
+            for d in logits.shape[:-1]:
+                rows *= d
+            if fused_router_supported(
+                rows,
+                logits.shape[-1],
+                self.top_k,
+                self.n_group,
+                self.norm_topk_prob,
+                logits.dtype,
+            ):
+                return fused_group_expert_select(
+                    logits,
+                    self.e_score_correction_bias,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                )
         return group_expert_select(
             logits,
             self.e_score_correction_bias,
