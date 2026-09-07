@@ -454,6 +454,21 @@ def _fused_kda_enabled() -> bool:
 # K/V transient to O(chunk * index_topk) latents at prefill while staying wide
 # enough to keep the GPU busy. The short speculative-verify block (L <= 8) is
 # always a single chunk.
+# V5a opt-in gather paths (sparse_mla_attn.py).  Imported lazily inside the functions
+# that use them so a tree without the module still loads; these two thin wrappers keep
+# the call sites readable.
+def _dsa_gather_mode() -> str:
+    from .sparse_mla_attn import dsa_gather_mode
+
+    return dsa_gather_mode()
+
+
+def _gather_latents_take(kv_latent, clamped):
+    from .sparse_mla_attn import gather_latents_take
+
+    return gather_latents_take(kv_latent, clamped)
+
+
 _GATHER_Q_CHUNK = int(os.environ.get("MLX_VLM_GLM5_GATHER_Q_CHUNK", "1024"))
 
 # Floor for the depth-derived query chunk below.  Only reached past ~260k of
@@ -2393,6 +2408,32 @@ class Glm5NextSparseAttention(nn.Module):
         sel_valid = sel_valid | ~row_has_keys
         clamped = mx.clip(sel, 0, Kv - 1)
         q_e = self.embed_q(q)  # [B, H, L, dim]
+
+        # V5a.  MLX_VLM_GLM5_DSA_GATHER_KERNEL, default off -- see sparse_mla_attn.py for
+        # the mechanism (take_along_axis lowers to gather_axis, one thread per 2-byte
+        # element with two elem_to_loc address chains apiece because both operands are
+        # broadcast views; measured 6.96x its bandwidth floor at depth 0, I1493).
+        #   take   same tensor, built through MLX's gather_front fast path.  BIT-EXACT.
+        #   fused  no gathered tensor at all: one kernel consumes the index list.
+        _mode = _dsa_gather_mode()
+        if _mode == "fused" and q_e.dtype == mx.bfloat16 \
+                and kv_latent.dtype == mx.bfloat16 and dim % 8 == 0:
+            from .sparse_mla_attn import mla_sparse_flash_attention
+
+            idx = sel
+            if B > 1:
+                idx = mx.where(sel >= 0, sel + (mx.arange(B, dtype=sel.dtype) * Kv)[:, None, None], sel)
+            o = mla_sparse_flash_attention(
+                q_e.transpose(0, 2, 1, 3).reshape(B * L, H, dim),
+                kv_latent.reshape(B * Kv, dim),
+                idx.reshape(B * L, topk).astype(mx.int32),
+                self.scale,
+            )                                        # [B*L, H, dim]
+            attn = o.reshape(B, L, H, dim).transpose(0, 2, 1, 3)
+            attn = attn * row_has_keys.astype(attn.dtype)[:, None, :, 0, None]
+            out = self.unembed_out(attn).transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(out)
+
         outs = []
         # Depth-derived, not constant: see _gather_q_chunk_for.  At L <= 8 (a
         # speculative verify block) every candidate chunk exceeds L, so this is
@@ -2401,11 +2442,20 @@ class Glm5NextSparseAttention(nn.Module):
         for a0 in range(0, L, q_chunk):
             a1 = min(a0 + q_chunk, L)
             lc = a1 - a0
-            kv_g = mx.take_along_axis(
-                mx.broadcast_to(kv_latent, (B, lc, Kv, dim)),
-                mx.broadcast_to(clamped[:, a0:a1, :, None], (B, lc, topk, dim)),
-                axis=2,
-            )  # [B, lc, topk, dim]
+            if _mode == "take":
+                # Same [B, lc, topk, dim] tensor, element for element, off MLX's
+                # gather_front kernel instead of gather_axis.  The query chunk is
+                # deliberately NOT widened here even though the 2**31 operand that
+                # _gather_q_chunk_for defends against no longer exists on this path
+                # (the source is [B*Kv, dim], not the broadcast [B, lc, Kv, dim]) --
+                # that is a second lever and belongs in its own cell.
+                kv_g = _gather_latents_take(kv_latent, clamped[:, a0:a1, :])
+            else:
+                kv_g = mx.take_along_axis(
+                    mx.broadcast_to(kv_latent, (B, lc, Kv, dim)),
+                    mx.broadcast_to(clamped[:, a0:a1, :, None], (B, lc, topk, dim)),
+                    axis=2,
+                )  # [B, lc, topk, dim]
             q_bl = q_e[:, :, a0:a1].transpose(0, 2, 1, 3).reshape(B * lc, H, 1, dim)
             kv_bl = kv_g.reshape(B * lc, 1, topk, dim)
             valid = sel_valid[:, a0:a1].reshape(B * lc, 1, 1, topk)
