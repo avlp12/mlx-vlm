@@ -2931,16 +2931,38 @@ class PromptProcessingBatch:
             refused: unaligned would make ``_next_apc_checkpoint_column`` clamp
             a chunk, and a clamped chunk is a chunk the peer's schedule does not
             have.
-        2.  APC EXACT is still refused whole, and this is a deliberate NON-
-            narrowing.  Its checkpoint sits at ``checkpoint_len`` -- a length
-            chosen by the APC block policy from the prompt, not by the chunk
-            size -- so it is at ``T'``, essentially never at ``k*C``, and a
-            checkpoint stored at the wrong length is not a slower cache but a
-            wrong one.  (Nor could it simply be MOVED to ``k*C``: the APC store
-            is ``store_exact_cache``, keyed on ``full_input_ids[:checkpoint_len]``
-            and carrying a drafter ``hidden_tail`` for that same length; there is
-            no sense in which a k*C snapshot answers it.)  A request that wants
-            an exact APC checkpoint keeps prefilling on the box that can give it.
+        2.  APC EXACT (A5b) is admitted whenever its checkpoint COLUMN is at or
+            past ``k*C``, and refused only when it lies strictly inside the
+            pipelined part.  A5 refused it whole; that was wrong about where the
+            column is.  ``checkpoint_len`` is
+            ``len(prompt) - APC_EXACT_PREFIX_GUARD_TOKENS`` (16 by default,
+            ``_apc_exact_checkpoint_len``), so with a remainder
+            ``r = T - k*C in [1, C]`` the column is ``T - 16``:
+
+            * ``r > 16``  -- the column is INSIDE the remainder, which is the
+              part ``prompt_step`` runs on this box after ``finalize`` over the
+              full stack.  Nothing has to move: the loop clamps its own chunk to
+              the column exactly as it does on one box (``T=40, C=8``,
+              column 36: ``8,8,8,8`` pipelined, then a chunk clamped to 4 on
+              this box, then ``generate()``'s final 4), and
+              ``_store_apc_exact_checkpoints`` fires from the same call site,
+              with the same ``store_exact_cache``, over the same full-depth row
+              snapshot.  This is the DEFAULT served shape: at ``C=2048`` every
+              length outside ``T mod 2048 in [1, 15]`` lands here.
+            * ``r == 16`` -- the column is exactly ``k*C``.  ``_pipeline_step``
+              already calls ``_store_apc_exact_checkpoints`` after ``finalize``
+              and after the column advance, so the store sees all ``n_layers``
+              and a cache exactly ``k*C`` deep.
+            * ``r < 16``  -- the column is strictly inside the pipelined part.
+              THIS is the case that stays refused, under the existing
+              ``apc_checkpoint_ladder`` name: stopping a chunk there would both
+              clamp a chunk the peer's schedule does not have and snapshot a
+              cache whose stage-B layers are empty.
+
+            Note that the column is never MOVED and the store is never
+            reconstructed: the entry is keyed on
+            ``full_input_ids[:checkpoint_len]`` and it is stored at exactly that
+            many tokens, by the single-box code, or it is not stored at all.
         3.  No pipelined chunks at all (``depth <= 0``) means there is no
             full-depth point to take, so any pending rung is unserveable.
         """
@@ -2949,13 +2971,17 @@ class PromptProcessingBatch:
         apc_on = self._apc_manager is not None and self._apc_mode == "exact"
         depth = self._pipeline_full_depth()
         step = int(self.prefill_step_size or 0)
-        for meta in self._apc_meta:
+        for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
                 continue
-            if apc_on and not meta.get("checkpoint_done"):
-                if int(meta.get("checkpoint_len") or 0) > int(
-                    meta.get("prefix_len") or 0
-                ):
+            if apc_on:
+                # The COLUMN, not the length: it is the column the chunk loop
+                # would stop on, and it is what ``depth`` is measured in.  They
+                # coincide on every request the rest of this gate admits (B=1,
+                # no left pad, no right pad) and this keeps them from drifting
+                # if one of those ever loosens.
+                column = self._apc_checkpoint_column_for_meta(batch_idx, meta)
+                if column is not None and (depth <= 0 or column < depth):
                     return True
             if self._vault is None:
                 continue
@@ -3153,6 +3179,7 @@ class PromptProcessingBatch:
     def _pipeline_open(self) -> None:
         """Evaluate the admission gate once and, if it passes, take the lease."""
         from ..pipeline_runtime import (
+            PipelineSettings,
             acquire_pipeline_slot,
             maybe_open_pipeline,
             note_pipeline_bypass,
@@ -3167,6 +3194,19 @@ class PromptProcessingBatch:
             # is the one it was before this call site existed.
             return
         total_tokens = int(self._inputs_embeds.shape[1])
+        # A5b.  THE ROUTING RULE IS ASKED FIRST.  It used to be asked inside
+        # ``maybe_open_pipeline``, i.e. after every request-shape reason below,
+        # so a request the >= 16k policy never intended to route reported
+        # whichever shape reason happened to fire -- and in the default served
+        # config that was ``apc_checkpoint_ladder`` on EVERY request, at 8192
+        # tokens as loudly as at 131072.  The histogram is the only thing an
+        # operator reads to learn why the peer is idle, so a length refusal has
+        # to be named as one: below the routing threshold this request was never
+        # a pipeline candidate and its shape is not the reason it stayed home.
+        settings = PipelineSettings.from_env()
+        if settings is not None and total_tokens < settings.min_tokens:
+            note_pipeline_bypass("below_min_tokens")
+            return
         capture, capture_refusal = self._pipeline_capture_plan()
         if (
             pipeline_bypass_reason(

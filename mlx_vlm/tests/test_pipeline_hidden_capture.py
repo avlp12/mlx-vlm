@@ -894,3 +894,115 @@ def test_generate_step_keeps_the_historical_refusal():
     assert _pipeline_bypass_reason(capture="capture_unsupported", **args) == (
         "capture_unsupported"
     )
+
+
+# ------------- 8. A5b: the default served config is DFlash2 AND APC exact ON
+#
+# A6 removed the capture refusal and A5b removes the APC-exact one, so this is
+# the first configuration in which BOTH of the default server's reasons for
+# staying single-box are gone at once.  What the combination adds over either
+# alone is the drafter's ``hidden_tail``: the APC checkpoint carries one, it is
+# built by ``_hidden_tail_for_store`` from the SAME accumulator the pipeline
+# seeds with the merged two-box window, and a tail that is short or misordered
+# is a quietly worse turn 2 rather than a failure.
+
+CKPT_SPLIT = DEPTH + 4  # 36: the column lands inside the post-finalize remainder
+
+
+def _apc_manager():
+    from mlx_vlm.apc import APCManager
+
+    return APCManager(num_blocks=8, block_size=16)
+
+
+def _spec_apc_batch(lm, manager, checkpoint_len, **kw):
+    batch = _spec_batch(lm, **kw)
+    batch._apc_manager = manager
+    batch._apc_mode = "exact"
+    batch._apc_meta = [
+        {
+            "prefix_len": 0,
+            "checkpoint_len": int(checkpoint_len),
+            "full_input_ids": list(PROMPT),
+            "extra_hash": 0,
+            "vault_rungs": [],
+        }
+    ]
+    return batch
+
+
+def _spec_apc_arm(monkeypatch, *, pipelined, checkpoint_len=CKPT_SPLIT, **kw):
+    pr.METRICS.reset()
+    manager = _apc_manager()
+    if pipelined:
+        _arm(monkeypatch)
+    else:
+        monkeypatch.delenv("MLX_VLM_PIPELINE_HOSTS", raising=False)
+    out = _drain_spec(_spec_apc_batch(_lm(), manager, checkpoint_len, **kw))
+    out["entries"] = {len(e.token_ids): e for e in manager._exact_cache.values()}
+    out["hist"] = pr.METRICS.snapshot()["pp_bypass_reason"]
+    out["used"] = pr.METRICS.snapshot()["pp_used"]
+    return out
+
+
+def test_dflash_plus_apc_exact_is_the_first_admitted_default_config(monkeypatch):
+    """Both default-ON refusals gone: no bypass, and the peer really ran."""
+    arm = _spec_apc_arm(
+        monkeypatch, pipelined=True, drafter=_StubDFlash(), kind="dflash"
+    )
+    assert arm["hist"] == {}, arm["hist"]
+    assert arm["used"] == 1
+    assert sorted(arm["entries"]) == [CKPT_SPLIT, len(PROMPT)]
+    assert arm["steps"] == PIPELINED_CHUNKS + [4]
+
+
+def test_the_checkpoint_hidden_tail_survives_the_two_box_merge(monkeypatch):
+    """The tail is the drafter's turn-2 context, and it comes off the merge.
+
+    On one box the accumulator holds every chunk this box ran.  On two it holds
+    the window the peer returned, merged and adopted at ``finalize``, plus the
+    remainder's own capture.  ``_hidden_tail_for_store`` reads that accumulator
+    at the checkpoint column, so if the merge lost a row or reordered the layers
+    the stored tail would differ HERE -- and nowhere else, because the prompt
+    cache is unaffected by it.
+    """
+    pp = _spec_apc_arm(
+        monkeypatch, pipelined=True, drafter=_StubDFlash(), kind="dflash"
+    )
+    ref = _spec_apc_arm(
+        monkeypatch, pipelined=False, drafter=_StubDFlash(), kind="dflash"
+    )
+    assert pp["cache"] == ref["cache"], "the prefill itself moved"
+    assert pp["steps"] == ref["steps"]
+    assert _digest([pp["hidden"]]) == _digest([ref["hidden"]])
+    assert pp["offset"] == ref["offset"]
+    assert sorted(pp["entries"]) == sorted(ref["entries"]) == [CKPT_SPLIT, len(PROMPT)]
+    for length in sorted(ref["entries"]):
+        got, want = pp["entries"][length], ref["entries"][length]
+        assert got.token_ids == want.token_ids
+        assert _digest(_cache_arrays(got.prompt_cache)) == _digest(
+            _cache_arrays(want.prompt_cache)
+        ), f"the {length} snapshot moved"
+        if want.hidden_tail is None:
+            assert got.hidden_tail is None
+        else:
+            assert got.hidden_tail is not None
+            assert _digest(got.hidden_tail) == _digest(want.hidden_tail)
+            assert [t.shape for t in got.hidden_tail] == [
+                t.shape for t in want.hidden_tail
+            ]
+
+
+def test_the_checkpoint_tail_is_the_window_over_the_checkpoint_not_the_prompt(
+    monkeypatch,
+):
+    """A shape pin under the tail identity above, so a merge that produced the
+    RIGHT bytes for the wrong span cannot pass as equal-to-equal."""
+    pp = _spec_apc_arm(
+        monkeypatch, pipelined=True, drafter=_StubDFlash(), kind="dflash"
+    )
+    tail = pp["entries"][CKPT_SPLIT].hidden_tail
+    assert tail, "a dflash drafter's checkpoint carries a tail"
+    assert all(int(t.shape[1]) == min(KEEP, CKPT_SPLIT) for t in tail), [
+        t.shape for t in tail
+    ]

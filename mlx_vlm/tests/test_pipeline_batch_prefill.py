@@ -993,3 +993,328 @@ def test_the_session_rung_is_not_the_collapsed_prefill_rung(monkeypatch):
     assert pick is not None
     assert pick["prefix_len"] == len(PROMPT) > DEPTH, "the session rung, not k*C"
     assert pr.METRICS.snapshot()["pp_ladder_collapsed"] == 1
+
+
+# ------------------------- 7. A5b: the APC exact checkpoint a PP prefill CAN take
+#
+# A5 refused APC exact WHOLE, and the server turns APC exact on by default
+# (``APC_ENABLED`` defaults to "1", ``runtime_config``).  So the first real
+# two-box served smoke bypassed every request with ``apc_checkpoint_ladder`` --
+# at 8192, at 32768 and at 131072 tokens alike -- and the feature was
+# unreachable in the configuration it ships in.
+#
+# The refusal was wrong about WHERE the checkpoint column is.  It is
+# ``len(prompt) - APC_EXACT_PREFIX_GUARD_TOKENS`` (16 by default), so with a
+# remainder ``r = T - k*C`` the column sits in the REMAINDER whenever ``r > 16``
+# -- and the remainder is the part this box runs itself, after ``finalize``, over
+# all ``n_layers``.  Nothing has to be moved or reconstructed: the same
+# ``prompt_step`` clamps the same chunk to the same column and the same
+# ``_store_apc_exact_checkpoints`` writes the same ``store_exact_cache``.
+#
+# These pin that, the ordering fix that stops a length refusal from being
+# reported as a shape refusal, and the one case that is still unserveable.
+
+CKPT_SPLIT = DEPTH + 4  # 36: inside the remainder -- the DEFAULT served shape
+CKPT_AT_DEPTH = DEPTH  # 32: exactly k*C, taken at finalize
+CKPT_SWALLOWED = DEPTH - 8  # 24: inside the pipelined part -- unserveable
+
+
+def _apc_manager():
+    from mlx_vlm.apc import APCManager
+
+    return APCManager(num_blocks=8, block_size=16)
+
+
+def _apc_batch(lm, manager, checkpoint_len, *, vault=None, rungs=None, **kwargs):
+    """A batch shaped the way the server shapes one with APC exact ON."""
+    batch = _batch(lm, **kwargs)
+    batch._apc_manager = manager
+    batch._apc_mode = "exact"
+    if vault is not None:
+        batch._vault = vault
+    batch._apc_meta = [
+        {
+            "prefix_len": 0,
+            "checkpoint_len": int(checkpoint_len),
+            "full_input_ids": list(PROMPT),
+            "extra_hash": 0,
+            "vault_rungs": list(rungs or []),
+        }
+    ]
+    return batch
+
+
+def _apc_entries(manager):
+    """Every exact entry the prefill left behind, keyed by its token length.
+
+    There are TWO on a cold APC-exact prefill and both are part of the contract:
+    the CHECKPOINT at ``checkpoint_len``, written by
+    ``_store_apc_exact_checkpoints`` from inside the chunk loop, and the
+    post-prefill HARVEST at the whole prompt, written by ``generate()``.  A5b
+    moves neither; comparing the whole set is what proves it.
+    """
+    return {len(e.token_ids): e for e in manager._exact_cache.values()}
+
+
+def _entry_digest(entry):
+    return _cache_digest(entry.prompt_cache)
+
+
+def _prov(entry):  # everything but the wall clock the capture happened at
+    return {k: v for k, v in (entry.provenance or {}).items() if k != "harvest_at"}
+
+
+def _apc_arm(monkeypatch, *, pipelined, checkpoint_len, **kwargs):
+    """Run one prefill to completion and hand back its APC store."""
+    pr.METRICS.reset()
+    manager = _apc_manager()
+    ctx = contextlib.nullcontext()
+    if pipelined:
+        _arm(monkeypatch)
+    else:
+        ctx = _pipeline_off()
+    with ctx:
+        digest, logprobs, steps = _drain(
+            _apc_batch(_lm(), manager, checkpoint_len, **kwargs)
+        )
+    return {
+        "manager": manager,
+        "cache": digest,
+        "logprobs": logprobs,
+        "steps": steps,
+        "hist": _hist(),
+        "used": pr.METRICS.snapshot()["pp_used"],
+    }
+
+
+@pytest.mark.parametrize("total", [8192, 16384, 32768, 40960, 131072])
+def test_the_served_checkpoint_column_is_in_the_remainder(total):
+    """The arithmetic the smoke run contradicted, taken from the served code.
+
+    ``_apc_exact_checkpoint_len`` is what the server puts in ``checkpoint_len``;
+    ``k*C`` is what ``_pipeline_chunk_schedule`` hands the peer.  At the shipped
+    chunk size the column is deeper than the pipelined part at EVERY length the
+    routing policy admits, which is why A5's blanket refusal cost the whole
+    feature rather than an edge of it.
+    """
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    class _Gen:
+        apc_mode = "exact"
+
+        def __init__(self, manager):
+            self.apc_manager = manager
+
+        def _apc_media_token_ids(self):
+            return ()
+
+    chunk = 2048
+    column = BatchGenerator._apc_exact_checkpoint_len(
+        _Gen(_apc_manager()), list(range(total))
+    )
+    depth = (-(-total // chunk) - 1) * chunk
+    assert column == total - 16, "the guard is APC_EXACT_PREFIX_GUARD_TOKENS"
+    assert column >= depth, (total, column, depth)
+    assert 0 < total - depth <= chunk
+
+
+def test_the_apc_exact_request_the_server_sends_is_admitted(monkeypatch):
+    """No ``apc_checkpoint_ladder``, and the peer is actually used."""
+    arm = _apc_arm(monkeypatch, pipelined=True, checkpoint_len=CKPT_SPLIT)
+    assert arm["hist"] == {}, arm["hist"]
+    assert arm["used"] == 1
+    assert sorted(_apc_entries(arm["manager"])) == [CKPT_SPLIT, len(PROMPT)], (
+        "the checkpoint was taken, and so was the post-prefill harvest"
+    )
+
+
+def test_the_remainder_is_split_at_the_column_exactly_as_one_box_splits_it(monkeypatch):
+    """Item 3: the column inside the remainder needs no new code.
+
+    ``finalize`` leaves the head holding ``k*C`` and the remainder is single-box
+    ``prompt_step``, so the loop clamps its own chunk to the column the way it
+    always has.  Pinned as the STEP SEQUENCE because that is the thing that
+    would silently differ: a remainder run as one forward instead of
+    ``4 + 4`` is mathematically equal and not bit-identical.
+    """
+    pp = _apc_arm(monkeypatch, pipelined=True, checkpoint_len=CKPT_SPLIT)
+    ref = _apc_arm(monkeypatch, pipelined=False, checkpoint_len=CKPT_SPLIT)
+    assert ref["steps"] == pp["steps"] == PIPELINED_CHUNKS + [4], pp["steps"]
+    assert pp["steps"][: len(PIPELINED_CHUNKS)] == PIPELINED_CHUNKS
+    assert pp["cache"] == ref["cache"]
+    assert mx.array_equal(pp["logprobs"], ref["logprobs"])
+
+
+@pytest.mark.parametrize(
+    "checkpoint_len,steps",
+    [
+        (CKPT_SPLIT, PIPELINED_CHUNKS + [4]),
+        (CKPT_AT_DEPTH, PIPELINED_CHUNKS),
+    ],
+    ids=["inside-the-remainder", "exactly-k*C"],
+)
+def test_the_pipelined_snapshot_is_the_single_box_snapshot(
+    monkeypatch, checkpoint_len, steps
+):
+    """The identity that makes the admission safe, on both admitted geometries.
+
+    A checkpoint stored at the right length but from the wrong cache is not a
+    slower entry, it is a wrong one -- so this compares the ENTRY: its key, its
+    payload byte for byte, its provenance, and the tail slot.  ``exactly-k*C``
+    is the geometry where the store fires inside ``_pipeline_step`` itself,
+    right after ``finalize``; ``inside-the-remainder`` is the one where it fires
+    from a later, wholly single-box ``prompt_step``.
+    """
+    pp = _apc_arm(monkeypatch, pipelined=True, checkpoint_len=checkpoint_len)
+    ref = _apc_arm(monkeypatch, pipelined=False, checkpoint_len=checkpoint_len)
+    assert pp["steps"] == ref["steps"] == steps
+    assert pp["hist"] == {} and pp["used"] == 1
+
+    got, want = _apc_entries(pp["manager"]), _apc_entries(ref["manager"])
+    assert sorted(got) == sorted(want) == [checkpoint_len, len(PROMPT)]
+    for length in sorted(want):
+        g, w = got[length], want[length]
+        assert g.token_ids == w.token_ids == tuple(PROMPT[:length])
+        assert g.extra_hash == w.extra_hash
+        assert _entry_digest(g) == _entry_digest(w), f"the {length} snapshot moved"
+        assert _prov(g) == _prov(w)
+        assert _prov(g), "provenance is recorded, not merely equal"
+        assert g.hidden_tail == w.hidden_tail is None
+
+
+def test_the_second_request_hits_the_pipelined_entry_identically(monkeypatch):
+    """Turn 2's read side: same prefix length, same restored bytes, both arms.
+
+    ``lookup_exact_cache`` is what decides ``cached_tokens`` and therefore the
+    TTFT path, so an entry that stores but does not SERVE would look like a
+    working pipeline and a cache that quietly went cold.
+    """
+    pp = _apc_arm(monkeypatch, pipelined=True, checkpoint_len=CKPT_SPLIT)
+    ref = _apc_arm(monkeypatch, pipelined=False, checkpoint_len=CKPT_SPLIT)
+    seen = {}
+    for name, arm in (("pipelined", pp), ("single_box", ref)):
+        cache, prefix_len = arm["manager"].lookup_exact_cache(
+            PROMPT, 0, max_prefix_tokens=len(PROMPT) - 1
+        )
+        assert cache is not None, f"{name}: turn 2 missed the exact entry"
+        seen[name] = (prefix_len, _cache_digest(cache))
+    assert seen["pipelined"] == seen["single_box"], seen
+    assert seen["pipelined"][0] == CKPT_SPLIT
+
+
+def test_a_column_the_pipelined_part_would_swallow_is_still_refused(monkeypatch):
+    """The one case A5b cannot serve, and it keeps the existing name.
+
+    A column strictly inside ``[0, k*C)`` would have to stop a chunk the peer's
+    schedule does not have, and would snapshot a cache whose stage-B layers were
+    never written.  Reachable only when the remainder is shorter than the guard
+    (``T mod C in [1, 15]`` at the shipped chunk size); there the request
+    prefills on the box that can give it, as it did before A5b.
+    """
+    _arm(monkeypatch)
+    batch = _apc_batch(_lm(), _apc_manager(), CKPT_SWALLOWED)
+    batch._pipeline_open()
+    assert batch._pipeline is None and _hist() == {"apc_checkpoint_ladder": 1}
+
+
+def test_below_min_tokens_is_named_before_any_shape_reason(monkeypatch):
+    """Item 2: a length refusal must not be reported as a shape refusal.
+
+    The 8192-token request in a >= 16k-routed config was reported as
+    ``apc_checkpoint_ladder``, which says "this request's SHAPE is unserveable"
+    about a request the routing policy never intended to route at all.  The
+    histogram is the only thing an operator reads to find out why the peer is
+    idle, so the order is part of its meaning: arm this batch with BOTH an
+    unserveable APC column and an unserveable vault rung and it still reports
+    the length.
+    """
+    _arm(monkeypatch, min_tokens=len(PROMPT) + 1)
+    batch = _apc_batch(
+        _lm(), _apc_manager(), CKPT_SWALLOWED, vault=object(), rungs=[STEP + 4]
+    )
+    batch._pipeline_open()
+    assert batch._pipeline is None and _hist() == {"below_min_tokens": 1}
+
+
+def test_the_vault_ladder_and_the_apc_column_are_served_together(monkeypatch):
+    """The default served config is BOTH: vault ON since d1a3c3a4, APC exact ON
+    since ``APC_ENABLED`` defaulted to "1".  The collapse keeps the deepest rung
+    at ``k*C`` and the APC column is taken in the remainder; neither store moves
+    a chunk boundary and both entries match the single-box run."""
+    pr.METRICS.reset()
+    manager, vault = _apc_manager(), _FakeVault()
+    _arm(monkeypatch)
+    pp_steps = _drain(
+        _apc_batch(_lm(), manager, CKPT_SPLIT, vault=vault, rungs=LADDER)
+    )[2]
+    assert _hist() == {}, _hist()
+    assert pp_steps == PIPELINED_CHUNKS + [4]
+    assert vault.depths() == [DEPTH]
+    assert pr.METRICS.snapshot()["pp_ladder_collapsed"] == 1
+
+    ref_manager, ref_vault = _apc_manager(), _FakeVault()
+    with _pipeline_off():
+        ref_steps = _drain(
+            _apc_batch(_lm(), ref_manager, CKPT_SPLIT, vault=ref_vault, rungs=[DEPTH])
+        )[2]
+    assert ref_steps == pp_steps
+    got, want = _apc_entries(manager), _apc_entries(ref_manager)
+    assert sorted(got) == sorted(want) == [CKPT_SPLIT, len(PROMPT)]
+    for length in sorted(want):
+        assert got[length].token_ids == want[length].token_ids
+        assert _entry_digest(got[length]) == _entry_digest(want[length])
+    assert _fragments_digest(vault.inserts[0]["fragments"]) == _fragments_digest(
+        ref_vault.inserts[0]["fragments"]
+    )
+
+
+def test_a_pp_turn_1_with_apc_exact_on_leaves_the_session_tier_alone(monkeypatch):
+    """Item 4 with the new admission: the session rung is still the single-box
+    one.  ``MLX_VLM_APC_SAVE_SESSION`` writes AFTER the response, from the
+    finished cache, and the APC exact store must not have moved that cache."""
+    from mlx_vlm import apc as _apc
+    from mlx_vlm import context_vault as cv
+    from mlx_vlm.generate.ar import BatchGenerator
+
+    monkeypatch.setenv("MLX_VLM_APC_SAVE_SESSION", "1")
+    assert cv.session_tier_active()
+    picks, warm = {}, {}
+    for arm in ("pipelined", "single_box"):
+        pr.METRICS.reset()
+        manager = _apc_manager()
+        ctx = contextlib.nullcontext()
+        if arm == "pipelined":
+            _arm(monkeypatch)
+        else:
+            ctx = _pipeline_off()
+        with ctx:
+            batch = _apc_batch(_lm(), manager, CKPT_SPLIT)
+            while batch.needs_processing():
+                batch.prompt_step()
+            first = {}
+
+            def sampler(logprobs):
+                first["tok"] = mx.argmax(logprobs, axis=-1)
+                return first["tok"]
+
+            gen = batch.generate(sampler=sampler, stop_criteria=lambda t: False)
+            mx.eval(first["tok"])
+        assert arm != "pipelined" or pr.METRICS.snapshot()["pp_used"] == 1
+        key = PROMPT + [int(first["tok"][0].item())]
+        vault = cv.ContextVault("identity-for-the-test", budget_bytes=1 << 30)
+        assert cv.record_session_turn(
+            vault,
+            key,
+            _apc.snapshot_prompt_cache_row(gen.prompt_cache, 0),
+            completed=True,
+            session_id="conv-1",
+            adopt=False,
+        ), cv.session_skip_counts()
+        pick = BatchGenerator._vault_pick_for(
+            _PickGen(vault), key + [97, 98, 99], {}, None
+        )
+        assert pick is not None, f"{arm}: turn 2 missed the session tier"
+        picks[arm] = (pick["prefix_len"], pick.get("source"))
+        warm[arm] = _cache_digest(pick["warm_cache"])
+    assert picks["pipelined"] == picks["single_box"] == (len(PROMPT), "vault-session")
+    assert warm["pipelined"] == warm["single_box"]
