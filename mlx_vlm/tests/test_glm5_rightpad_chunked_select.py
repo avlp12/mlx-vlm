@@ -117,6 +117,23 @@ from mlx_vlm.models.glm5_next.language import LanguageModel
 
 STEPS = [4, 8, 12, 16, 24, 32]
 
+
+@pytest.fixture(autouse=True)
+def _pin_the_tail_merge_off(monkeypatch):
+    """This module pins CHUNK DECOMPOSITION at step sizes of a few dozen tokens.
+
+    L35(b) (``MLX_VLM_GLM5_PREFILL_TAIL_MERGE``, generate/common.py) is ON by
+    default since ledger I1437, and its ``..._TAIL_MIN`` threshold of 1024 is an
+    ABSOLUTE token count sized for the shipped 8192 step.  At the step sizes used
+    here every prompt is one full chunk plus a tail far shorter than 1024, so the
+    merge would fold the whole prompt into a single chunk and these tests would
+    quietly stop chunking at all -- the caches they compare would be unchunked
+    ones.  The merge has its own coverage in test_prefill_chunk_plan.py; here it
+    is pinned off so the plan under test is the one the parametrisation names.
+    """
+    monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
+
+
 # ``mx.default_device()`` is pinned by conftest from MLX_DEFAULT_DEVICE.
 ON_GPU = mx.default_device() == mx.gpu
 DEV = "gpu" if ON_GPU else "cpu"

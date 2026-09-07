@@ -246,10 +246,17 @@ def test_a_rung_is_stored_once():
 
 
 # ------------------------------------------------------- the OFF guarantee
-def test_with_the_vault_off_the_checkpoint_column_is_unchanged():
+def test_with_the_vault_off_the_checkpoint_column_is_unchanged(monkeypatch):
     """The whole point of gating: a vault-less batch must compute exactly the
     column it computed before, including when rung metadata is somehow present.
     """
+    # L35(b) (``MLX_VLM_GLM5_PREFILL_TAIL_MERGE``) is ON by default since
+    # ledger I1437 and its ``..._TAIL_MIN`` of 1024 is an ABSOLUTE token count
+    # sized for the shipped 8192 step.  At this fixture's step the merge would
+    # fold the whole prompt into one chunk, and what is under test here is the
+    # chunk plan itself, so the lever is pinned off; it has its own coverage in
+    # test_prefill_chunk_plan.py.
+    monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
     model = _tiny_lm(nope=False)
     ids = list(range(1, 129))
     off = _batch(model, ids, None, prefill_step_size=64, rungs=[32, 96])

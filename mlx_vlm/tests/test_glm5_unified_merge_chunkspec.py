@@ -212,7 +212,9 @@ def _singleton(row, *, step):
     return _first_tokens(gen_batch)[0]
 
 
-def test_both_chunk_loop_fixes_survive_on_one_right_padded_capturing_batch():
+def test_both_chunk_loop_fixes_survive_on_one_right_padded_capturing_batch(
+    monkeypatch,
+):
     """A's selection, B's capture and the gdn refusal, all on the same forwards.
 
     (i)   every row emits what it emits when run ALONE, chunked -- which is A's
@@ -224,6 +226,12 @@ def test_both_chunk_loop_fixes_survive_on_one_right_padded_capturing_batch():
           offset is 0 and the whole capture is the drafter's context;
     (iii) no KDA rollback stash is built on any forward.
     """
+    # L35(b) (``MLX_VLM_GLM5_PREFILL_TAIL_MERGE``) is ON by default since ledger
+    # I1437 and its ``..._TAIL_MIN`` of 1024 is an ABSOLUTE token count sized for
+    # the shipped 8192 step.  At ``STEP`` the merge would fold the whole prompt
+    # into a single chunk and there would be no chunk loop left to test.  The
+    # lever has its own coverage in test_prefill_chunk_plan.py.
+    monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
     gen_batch, spy, batch, after_loop = _right_padded_pair(
         step=STEP, drafter=_HiddenReadingStubDrafter()
     )

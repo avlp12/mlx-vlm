@@ -350,9 +350,13 @@ def _run_chunked_speculative_prefill(
         and remaining_embeds.shape[1] > prefill_step_size
     ):
         while remaining_embeds.shape[1] > 1:
-            # L35(b): ``min(step, remaining)`` unless the tail merge is on.
+            # L35(b), on by default (I1437); ``...TAIL_MERGE=0`` restores
+            # ``min(step, remaining)``.  ``batch`` lets the plan stay inside the
+            # TP=2 per-forward token cap.
             n_to_process = next_prefill_chunk(
-                remaining_embeds.shape[1] - 1, prefill_step_size
+                remaining_embeds.shape[1] - 1,
+                prefill_step_size,
+                batch=remaining_embeds.shape[0],
             )
             chunk_kwargs = {
                 **_slice_prefill_kwargs(remaining_kwargs, sequence_keys, n_to_process),
@@ -381,9 +385,10 @@ def _run_chunked_speculative_prefill(
 
     final_kwargs = {**remaining_kwargs, **capture_kwargs}
     final_kwargs["inputs_embeds"] = remaining_embeds
-    # L35(a).  After the loop above this forward is one token wide and the kwarg
-    # is withheld; it is wide only when the prompt was never chunked (short
-    # prompt, or a drafter whose policy declines chunking), which is precisely
+    # L35(a), ON by default since I1437.  After the loop above this forward is
+    # one token wide and the kwarg is withheld; it is wide only when the prompt
+    # was never chunked (short prompt, or a drafter whose policy declines
+    # chunking), which is precisely
     # the case that used to project the WHOLE prompt into vocab space to sample
     # its last row (``_sample_last_token``).
     final_kwargs.update(

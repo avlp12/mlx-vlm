@@ -306,6 +306,14 @@ The knee was verified to move with the gate — 32768 → knee at kv_len 32768,
   the cap; if raising it, do so on **both** ranks
   (it is agreed in preflight, so a one-sided change is refused rather than
   hung).
+* `MLX_VLM_GLM5_PREFILL_TAIL_MERGE` (default **1** since 2026-09-07) can make
+  the LAST prefill chunk wider than `step` -- up to `step + TAIL_MIN - 1`. It is
+  cap-aware: `generate/common.py::next_prefill_chunk` reads
+  `tp_forward_token_room()` (the cap minus `ECHO_WORDS`) and, when `batch *
+  width` would not fit, re-plans that cell as a `balance` split instead of
+  letting `encode` raise `TPUnavailable`. So the lever cannot widen a forward
+  past what the cap already allowed; it never returns more than `step`.
+
 * `tp/glm5_next.py:103` sets `attn._fused_ready = False` after sharding, so the
   fused-KDA kernel re-selects and recompiles at half `H`. Keep it on — it was on
   for every measured run — but expect a one-off recompile at the first new shape.

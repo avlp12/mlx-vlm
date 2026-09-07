@@ -1,11 +1,15 @@
-"""L35 -- the two "free" prefill wins, tested without a GPU or a real model.
+"""L35 -- the two prefill wins, tested without a GPU or a real model.
 
 (a) ``num_logits_to_keep`` on the forward that an UNCHUNKED prefill runs (the
     chunk LOOP never needed it -- it drops ``chunk_out`` before the eval, and MLX
     does not compute an unreferenced graph).
 (b) the tail-chunk merge.
 
-Both are opt-in; the "env unset" cases below are the shipped path.
+BOTH ARE ON BY DEFAULT since the rule-13 rail of 2026-09-07 (ledger I1437), so
+"env unset" below is the SHIPPED path and every base-behaviour assertion sets
+the env to "0" explicitly.  ``TestBaseParityWhenBothAreOff`` is the contract
+that "0" on both really is a6634a75: same chunk plan, same keep-kwargs, same
+forward widths.
 """
 
 from types import SimpleNamespace
@@ -18,9 +22,12 @@ from mlx_vlm.generate.ar import PromptProcessingBatch
 from mlx_vlm.generate.common import (
     next_prefill_chunk,
     plan_prefill_chunks,
+    prefill_logits_keep_enabled,
     prefill_logits_keep_kwargs,
+    prefill_tail_merge_enabled,
     prefill_tail_min,
     prefill_tail_mode,
+    tp_forward_token_room,
 )
 
 STEP = 8192
@@ -51,11 +58,33 @@ class TestChunkPlanDisabled:
             left -= n
         assert plan_prefill_chunks(remaining, STEP, enabled=False) == expected
 
-    def test_env_unset_is_disabled(self, monkeypatch):
-        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
+    def test_explicit_zero_is_disabled(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
         monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "1024")
         # 33,305 = 4*8192 + 537: the PFINAL as-fed 32k prompt's tail.
         assert plan_prefill_chunks(33305, STEP) == [STEP, STEP, STEP, STEP, 537]
+
+    @pytest.mark.parametrize("off", ["0", "false", "FALSE", "no", "off", " 0 "])
+    def test_the_spellings_that_turn_it_off(self, monkeypatch, off):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", off)
+        assert prefill_tail_merge_enabled() is False
+        assert next_prefill_chunk(STEP + 537, STEP) == STEP
+
+    def test_env_unset_is_ENABLED_now(self, monkeypatch):
+        # The default flip (I1437).  Same prompt as above, merged tail.
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "1024")
+        assert prefill_tail_merge_enabled() is True
+        assert plan_prefill_chunks(33305, STEP) == [STEP, STEP, STEP, 8729]
+
+    def test_empty_string_is_the_default_not_off(self, monkeypatch):
+        # A launcher that emits ``NAME=`` for a variable it did not set must not
+        # silently disable a default-ON lever (the shape of the TP passthrough
+        # bug in server/tp_mode.py::launch_worker).
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "")
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "")
+        assert prefill_tail_merge_enabled() is True
+        assert prefill_logits_keep_enabled() is True
 
 
 class TestChunkPlanMerged:
@@ -135,10 +164,22 @@ class TestEnvReading:
         assert prefill_tail_min() == 1024
         assert prefill_tail_mode() == "grow"
 
+    def test_merge_defaults_on_keep_defaults_on(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
+        assert prefill_tail_merge_enabled() is True
+        assert prefill_logits_keep_enabled() is True
+
     def test_env_on(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "1")
         monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "600")
         assert next_prefill_chunk(STEP + 537, STEP) == STEP + 537
+        assert next_prefill_chunk(STEP + 700, STEP) == STEP
+
+    def test_env_off(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "600")
+        assert next_prefill_chunk(STEP + 537, STEP) == STEP
         assert next_prefill_chunk(STEP + 700, STEP) == STEP
 
 
@@ -149,8 +190,16 @@ class TestLogitsKeepGate:
     class _Plain:
         pass
 
-    def test_off_by_default(self, monkeypatch):
+    def test_on_by_default(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
+        assert prefill_logits_keep_kwargs(self._Keeper(), 8192) == {
+            "num_logits_to_keep": 1
+        }
+
+    @pytest.mark.parametrize("off", ["0", "false", "No", "OFF"])
+    def test_explicit_off_restores_the_old_argument_list(self, monkeypatch, off):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", off)
+        assert prefill_logits_keep_enabled() is False
         assert prefill_logits_keep_kwargs(self._Keeper(), 8192) == {}
 
     def test_on_for_a_wide_forward(self, monkeypatch):
@@ -187,7 +236,7 @@ class TestPromptStepUsesThePlan:
         # The batch loop stops chunking as soon as what is left fits in one step
         # (``needs_processing``), so the 3-token tail is handed to the FINAL
         # forward instead of becoming a third-of-a-chunk of its own.
-        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
         monkeypatch.setattr(mx, "async_eval", MagicMock())
         monkeypatch.setattr(mx, "clear_cache", MagicMock())
         batch = self._batch(12, 8)
@@ -203,6 +252,15 @@ class TestPromptStepUsesThePlan:
         batch = self._batch(12, 8)
         assert batch.prompt_step() == 11
         assert batch.needs_processing() is False
+
+    def test_merge_folds_the_tail_with_the_env_unset(self, monkeypatch):
+        # Same as above with nothing exported: the default is now ON.
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "4")
+        monkeypatch.setattr(mx, "async_eval", MagicMock())
+        monkeypatch.setattr(mx, "clear_cache", MagicMock())
+        batch = self._batch(12, 8)
+        assert batch.prompt_step() == 11
 
     def test_a_checkpoint_column_still_wins(self, monkeypatch):
         # The APC/vault rung is clamped AFTER the plan, and the clamp can only
@@ -257,8 +315,20 @@ class TestBatchGenerateKeepKwarg:
             batch.generate(lambda x: mx.array([0]), MagicMock())
 
     def test_absent_when_disabled(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "0")
+        batch, recorded = self._batch()
+        self._run(batch)
+        assert "num_logits_to_keep" not in recorded
+
+    def test_present_with_the_env_unset(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
         batch, recorded = self._batch()
+        self._run(batch)
+        assert recorded["num_logits_to_keep"] == 1
+
+    def test_still_withheld_when_right_padded_by_default(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
+        batch, recorded = self._batch(right_pad=[1])
         self._run(batch)
         assert "num_logits_to_keep" not in recorded
 
@@ -345,9 +415,9 @@ def _chunk_widths(prompt_len, step, monkeypatch):
 
 
 class TestGenerateStepLoop:
-    def test_default_leaves_the_short_tail_as_its_own_chunk(self, monkeypatch):
-        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
-        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
+    def test_disabled_leaves_the_short_tail_as_its_own_chunk(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "0")
         widths = _chunk_widths(20, 8, monkeypatch)
         # 19 columns chunked (the loop always holds the last token back), then
         # the 1-token _step, then one decode step (max_tokens=1).
@@ -357,10 +427,19 @@ class TestGenerateStepLoop:
     def test_merge_folds_the_tail_into_the_previous_chunk(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "1")
         monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "4")
-        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "0")
         widths = _chunk_widths(20, 8, monkeypatch)
         assert [w for w, _ in widths] == [8, 11, 1, 1]
         assert sum(w for w, _ in widths[:-2]) == 19
+
+    def test_the_shipped_default_merges_and_keeps(self, monkeypatch):
+        # Nothing exported: (b) folds the 3-token tail, and (a) is inert here
+        # because after the loop every forward this path makes is one column.
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", "4")
+        widths = _chunk_widths(20, 8, monkeypatch)
+        assert widths == [(8, None), (11, None), (1, None), (1, None)]
 
     def test_unchunked_prefill_asks_for_one_row_when_enabled(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "1")
@@ -371,15 +450,24 @@ class TestGenerateStepLoop:
         widths = _chunk_widths(6, 8, monkeypatch)
         assert widths == [(6, 1), (1, None)]
 
-    def test_unchunked_prefill_is_untouched_when_disabled(self, monkeypatch):
+    def test_unchunked_prefill_asks_for_one_row_by_default(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", raising=False)
+        widths = _chunk_widths(6, 8, monkeypatch)
+        assert widths == [(6, 1), (1, None)]
+
+    def test_unchunked_prefill_is_untouched_when_disabled(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "0")
         widths = _chunk_widths(6, 8, monkeypatch)
         assert widths == [(6, None), (1, None)]
 
     def test_decode_steps_never_carry_the_kwarg(self, monkeypatch):
+        # Chunked prefill: every forward after the loop is one column wide, so
+        # (a) is withheld on all of them whether or not (b) merged the tail.
         monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "1")
-        widths = _chunk_widths(20, 8, monkeypatch)
-        assert [keep for _, keep in widths] == [None] * 5
+        for merge in ("0", "1"):
+            monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", merge)
+            widths = _chunk_widths(20, 8, monkeypatch)
+            assert [keep for _, keep in widths] == [None] * len(widths)
 
 
 # ------------------------------------------------ the model side of L35(a)
@@ -480,7 +568,11 @@ class TestChunkPlanIsNotBitExact:
     contradict this: those arms swept a single chunk size, so the check had
     nothing to compare against.)
 
-    So the assertion is a TOLERANCE, not an equality, and the lever ships off.
+    So the assertion is a TOLERANCE, not an equality.  The lever nevertheless
+    ships ON (I1437) because the rule-13 rail -- natural gen1024 panel, 4/4
+    identical completion text sha, identical speculative acceptance -- is the
+    gate that a chaos-limited decomposition can actually be judged by; the
+    numbers below are why "bit-identical" is NOT claimed anywhere.
     """
 
     def _cache_state(self, lm, prompt, plan):
@@ -515,3 +607,178 @@ class TestChunkPlanIsNotBitExact:
             for u, v in zip(a, b)
         )
         assert worst < 1e-4, worst
+
+
+# ------------------------------------------------ the "0 0" revert contract
+
+
+class TestBaseParityWhenBothAreOff:
+    """``LOGITS_KEEP=0 TAIL_MERGE=0`` == a6634a75, on every path this file sees.
+
+    This is the revert knob named in the promotion decision (I1437) and in
+    generate/common.py's L35 header, so it is asserted rather than asserted-by-
+    comment: the chunk plan is ``min(step, remaining)`` again, the keep-kwarg is
+    absent again, and generate_step's forward widths and argument lists are the
+    ones the old expressions produced.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _both_off(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_LOGITS_KEEP", "0")
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
+        # Left at their defaults on purpose: with the merge off they must not be
+        # read at all.
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", raising=False)
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MODE", raising=False)
+
+    @pytest.mark.parametrize(
+        "remaining", [1, 2, 537, 8191, 8192, 8193, 8729, 16384, 33305, 131071]
+    )
+    @pytest.mark.parametrize("step", [8192, 2048])
+    def test_the_chunk_plan_is_the_old_expression(self, remaining, step):
+        expected = []
+        left = remaining
+        while left > 0:
+            n = min(step, left)
+            expected.append(n)
+            left -= n
+        assert plan_prefill_chunks(remaining, step) == expected
+
+    @pytest.mark.parametrize("width", [1, 2, 512, 8192])
+    def test_the_keep_kwarg_is_absent_at_every_width(self, width):
+        keeper = SimpleNamespace(supports_num_logits_to_keep=True)
+        assert prefill_logits_keep_kwargs(keeper, width) == {}
+
+    def test_generate_step_widths_and_kwargs_are_the_base_ones(self, monkeypatch):
+        # chunked: 19 columns at step 8, then the 1-token _step, then decode
+        assert _chunk_widths(20, 8, monkeypatch) == [
+            (8, None),
+            (8, None),
+            (3, None),
+            (1, None),
+            (1, None),
+        ]
+        # unchunked: the whole prompt through one wide forward, no keep kwarg
+        assert _chunk_widths(6, 8, monkeypatch) == [(6, None), (1, None)]
+
+
+# ------------------------------------------------------- the TP=2 forward cap
+#
+# tp/worker.py::encode RAISES TPUnavailable when a forward's b*s exceeds
+# MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD minus the ECHO_WORDS reserved for the
+# shape agreement.  A GROWN chunk is the only width this module can produce that
+# is wider than ``step``, so it is the only way (b) could turn a TP deployment
+# that worked into a raise.  It falls back instead.
+
+
+class TestTpForwardCap:
+    ROOM = 8192 - 3  # _max_tok() - ECHO_WORDS at the shipped defaults
+
+    def test_room_is_none_off_tp(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_GLM5_TP_HOSTS", raising=False)
+        assert tp_forward_token_room() is None
+
+    def test_room_is_none_for_a_single_host(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_GLM5_TP_HOSTS", "box0")
+        assert tp_forward_token_room() is None
+
+    def test_room_is_the_cap_minus_the_echo_words(self, monkeypatch):
+        from mlx_vlm.tp import worker
+
+        monkeypatch.setenv("MLX_VLM_GLM5_TP_HOSTS", "box0,box1")
+        monkeypatch.setenv("MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD", "16384")
+        assert tp_forward_token_room() == 16384 - worker.ECHO_WORDS
+
+    def test_the_room_matches_what_encode_actually_accepts(self, monkeypatch):
+        """The number this module uses is the number the codec enforces."""
+        from mlx_vlm.tp import worker
+
+        monkeypatch.setenv("MLX_VLM_GLM5_TP_HOSTS", "box0,box1")
+        monkeypatch.setenv("MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD", "128")
+        room = tp_forward_token_room()
+        worker.encode(worker.OP_FORWARD, 1, (1, room), list(range(room)))
+        with pytest.raises(worker.TPUnavailable):
+            worker.encode(worker.OP_FORWARD, 1, (1, room + 1), list(range(room + 1)))
+
+    def test_a_grown_chunk_that_fits_is_left_alone(self):
+        # 8189 room, step 4096: a grown 4096+537 chunk fits, so grow wins.
+        assert (
+            next_prefill_chunk(4096 + 537, 4096, tail_min=1024, enabled=True,
+                               tp_room=self.ROOM)
+            == 4096 + 537
+        )
+
+    def test_a_grown_chunk_over_the_cap_falls_back_to_balance(self):
+        # The shipped step is 8192 and the shipped cap leaves room for 8189, so
+        # ANY grown chunk overflows in TP=2.  It must re-plan, not raise.
+        n = next_prefill_chunk(
+            STEP + 537, STEP, tail_min=1024, enabled=True, tp_room=self.ROOM
+        )
+        assert n == (STEP + 537 + 1) // 2 == 4365
+        assert n <= self.ROOM
+
+    def test_the_fallback_is_a_complete_plan_that_sums(self):
+        plan = plan_prefill_chunks(
+            4 * STEP + 537, STEP, tail_min=1024, enabled=True, tp_room=self.ROOM
+        )
+        assert sum(plan) == 4 * STEP + 537
+        assert plan == [STEP, STEP, STEP, 4365, 4364]
+        # every chunk before the last cell is untouched, so the vault ladder's
+        # multiples-of-step rungs still exist
+        assert plan[:3] == [STEP] * 3
+
+    def test_the_batch_dimension_is_what_the_cap_counts(self):
+        # b*s, not s: a 2-row batch halves the room a chunk may occupy.
+        assert (
+            next_prefill_chunk(2048 + 100, 2048, tail_min=1024, enabled=True,
+                               batch=1, tp_room=4096)
+            == 2148
+        )
+        assert (
+            next_prefill_chunk(2048 + 100, 2048, tail_min=1024, enabled=True,
+                               batch=2, tp_room=4096)
+            == 1074
+        )
+
+    def test_it_never_returns_wider_than_the_unmerged_plan(self):
+        # A cap too small for ``step`` itself is a pre-existing misconfiguration;
+        # the merge must not make it worse, so the worst case is the base width.
+        for tail in (1, 100, 537, 1023):
+            n = next_prefill_chunk(
+                STEP + tail, STEP, tail_min=1024, enabled=True, tp_room=16
+            )
+            assert n <= STEP
+
+    def test_balance_mode_is_capped_too(self):
+        n = next_prefill_chunk(
+            STEP + 537, STEP, tail_min=1024, mode="balance", enabled=True, tp_room=16
+        )
+        assert n <= STEP
+
+    def test_the_default_on_plan_never_widens_a_tp_forward(self, monkeypatch):
+        """End to end, through the ENV: no plan is wider than ``step`` in TP.
+
+        ``step`` itself, not the merge, is what the cap has to be sized for --
+        and at the shipped defaults it is NOT: DEFAULT_PREFILL_STEP_SIZE is 8192
+        while the default cap leaves room for 8189, which is why
+        tp/README_TP_SERVING.md tells a TP operator to raise
+        MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD or lower PREFILL_STEP_SIZE.  That
+        is a pre-existing configuration fact.  What this asserts is that the
+        default-ON merge does not make it worse: with the env exactly as shipped
+        the widest chunk is still ``step``.
+        """
+        monkeypatch.setenv("MLX_VLM_GLM5_TP_HOSTS", "box0,box1")
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", raising=False)
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MIN", raising=False)
+        monkeypatch.delenv("MLX_VLM_GLM5_PREFILL_TAIL_MODE", raising=False)
+        monkeypatch.delenv("MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD", raising=False)
+        for tail in range(1, 1024, 37):
+            plan = plan_prefill_chunks(2 * STEP + tail, STEP, batch=1)
+            assert sum(plan) == 2 * STEP + tail
+            assert max(plan) <= STEP, (tail, plan)
+        # and with a cap that IS big enough for the step, nothing overflows
+        monkeypatch.setenv("MLX_VLM_GLM5_TP_MAX_TOKENS_PER_FORWARD", "16384")
+        room = tp_forward_token_room()
+        for tail in range(1, 1024, 37):
+            plan = plan_prefill_chunks(2 * STEP + tail, STEP, batch=1)
+            assert max(plan) <= room, (tail, plan)

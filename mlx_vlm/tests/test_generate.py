@@ -717,6 +717,12 @@ class TestBatchGenerator:
         assert [p.cached_tokens for p in progress] == [3, 0]
 
     def test_prompt_step_schedules_cache_evaluation_asynchronously(self, monkeypatch):
+        # L35(b) is ON by default (I1437) and its 1024-token TAIL_MIN is
+        # absolute, so at this fixture's tiny step the merge would fold the
+        # whole prompt into one chunk.  This test pins the CHUNK PLAN, so it
+        # pins the lever off; the merge is covered in
+        # test_prefill_chunk_plan.py.
+        monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
         cache_state = mx.array([1])
         batch = PromptProcessingBatch(
             model=MagicMock(),
@@ -1983,7 +1989,14 @@ def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     assert pbar.update.call_count > 0
 
 
-def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
+def test_generate_step_chunks_prefill_when_model_policy_allows_speculation(
+    monkeypatch,
+):
+    # L35(b) is ON by default (I1437) with an absolute 1024-token TAIL_MIN, so
+    # at the 2-token step below it would merge the whole prompt into one chunk
+    # and this test would stop observing a chunk loop at all.  It pins the
+    # chunk plan, so it pins the lever off.
+    monkeypatch.setenv("MLX_VLM_GLM5_PREFILL_TAIL_MERGE", "0")
     model = MagicMock()
     model.no_chunked_prefill = False
     model.chunked_prefill_policy.return_value = True

@@ -2963,7 +2963,10 @@ class LanguageModel(nn.Module):
     #
     # NOT bit-identical: narrowing the projection changes the GEMM's M, which
     # moves the last ulp of the row that IS kept (I1098 kept it out of a
-    # correctness fix for that reason).  Hence opt-in at the caller.
+    # correctness fix for that reason).  The caller-side gate is therefore
+    # licensed by the rule-13 rail of 2026-09-07 (I1437: 4/4 identical text
+    # sha, identical acceptance) rather than by bit-identity, and it ships ON
+    # by default with ``MLX_VLM_GLM5_PREFILL_LOGITS_KEEP=0`` as the revert.
     supports_num_logits_to_keep = True
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
