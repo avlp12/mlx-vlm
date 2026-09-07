@@ -940,8 +940,10 @@ def _spec_apc_arm(monkeypatch, *, pipelined, checkpoint_len=CKPT_SPLIT, **kw):
         monkeypatch.delenv("MLX_VLM_PIPELINE_HOSTS", raising=False)
     out = _drain_spec(_spec_apc_batch(_lm(), manager, checkpoint_len, **kw))
     out["entries"] = {len(e.token_ids): e for e in manager._exact_cache.values()}
-    out["hist"] = pr.METRICS.snapshot()["pp_bypass_reason"]
-    out["used"] = pr.METRICS.snapshot()["pp_used"]
+    snap = pr.METRICS.snapshot()
+    out["hist"] = snap["pp_bypass_reason"]
+    out["used"] = snap["pp_used"]
+    out["shortened"] = snap["pp_schedule_shortened_reason"]
     return out
 
 
@@ -1006,3 +1008,76 @@ def test_the_checkpoint_tail_is_the_window_over_the_checkpoint_not_the_prompt(
     assert all(int(t.shape[1]) == min(KEEP, CKPT_SPLIT) for t in tail), [
         t.shape for t in tail
     ]
+
+
+# ------------- 9. A5c: the drafter's context across a SHORTENED schedule
+#
+# A5b admitted the exact column only when it already lay outside the pipelined
+# part; A5c moves the boundary instead, which changes what the peer captures
+# (one chunk less) and what this box captures (one chunk more).  The merge has
+# to be indifferent to that -- ``adopt_window`` is told how many rows the window
+# stands for and the remainder appends the rest -- and this is where that is
+# checked, because the drafter's context is the one output that would be merely
+# WORSE rather than wrong if the split moved.
+
+CKPT_SWALLOWED = DEPTH - STEP  # 24: inside the last pipelined chunk
+
+
+def test_the_shortened_schedule_hands_the_drafter_the_single_box_context(monkeypatch):
+    """DFlash2 + APC exact + ``r < guard``: the config the smoke run bypassed.
+
+    The peer now runs three chunks instead of four, so the window it returns
+    covers 24 rows instead of 32 and this box captures the other 16 itself.
+    ``finish()`` must still produce the single-box arrays AND the single-box
+    ``target_hidden_offset`` -- the drafter's RoPE origin -- and the checkpoint
+    entry must still carry the tail cut from that same accumulator.
+    """
+    pp = _spec_apc_arm(
+        monkeypatch, pipelined=True, checkpoint_len=CKPT_SWALLOWED,
+        drafter=_StubDFlash(), kind="dflash",
+    )
+    assert pp["hist"] == {} and pp["used"] == 1
+    assert pp["shortened"] == {"exact_column": 1}
+
+    ref = _spec_apc_arm(
+        monkeypatch, pipelined=False, checkpoint_len=CKPT_SWALLOWED,
+        drafter=_StubDFlash(), kind="dflash",
+    )
+    assert pp["steps"] == ref["steps"] == PIPELINED_CHUNKS
+    assert pp["cache"] == ref["cache"], "the prefill itself moved"
+    assert pp["offset"] == ref["offset"]
+    assert pp["hidden"].shape == ref["hidden"].shape
+    assert _digest([pp["hidden"]]) == _digest([ref["hidden"]])
+    assert sorted(pp["entries"]) == sorted(ref["entries"]) == [
+        CKPT_SWALLOWED, len(PROMPT)
+    ]
+    for length in sorted(ref["entries"]):
+        got, want = pp["entries"][length], ref["entries"][length]
+        assert got.token_ids == want.token_ids
+        assert _digest(_cache_arrays(got.prompt_cache)) == _digest(
+            _cache_arrays(want.prompt_cache)
+        ), f"the {length} snapshot moved"
+        if want.hidden_tail is None:
+            assert got.hidden_tail is None
+        else:
+            assert got.hidden_tail is not None
+            assert _digest(got.hidden_tail) == _digest(want.hidden_tail)
+
+
+def test_the_shortened_window_is_the_depth_the_peer_actually_ran(monkeypatch):
+    """``adopt_window`` is told ``sum(chunks)``, and the schedule is the plan's.
+
+    If the adopt had kept measuring ``k*C`` while the peer ran ``k-1`` chunks,
+    the window would be accounted 8 rows too deep and every drafter offset after
+    it would be wrong by 8 -- silently, and only for prompts with ``r < guard``.
+    """
+    made = _arm(monkeypatch)
+    pr.METRICS.reset()
+    manager = _apc_manager()
+    batch = _spec_apc_batch(
+        _lm(), manager, CKPT_SWALLOWED, drafter=_StubDFlash(), kind="dflash"
+    )
+    _drain_spec(batch)
+    assert made[0].chunks == PIPELINED_CHUNKS[:-1]
+    assert made[0].head_window.window(), "the peer still captured its half"
+    assert pr.METRICS.snapshot()["pp_schedule_shortened"] == 1

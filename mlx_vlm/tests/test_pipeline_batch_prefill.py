@@ -56,11 +56,27 @@ A6634A75_COLD_CACHE = (
 ON_GPU = mx.default_device() == mx.gpu
 
 
+def _free_pipeline_slot():
+    """Put the process-global PP slot back, however this test left it.
+
+    ``_PP_INFLIGHT`` outlives a test the way it outlives a request, and several
+    tests here evaluate the gate WITHOUT running the request it admits (that is
+    the point of them).  Without this, whether one of those ran first decides
+    whether the next test's request is admitted or reported ``pp_busy`` -- an
+    order dependency, and under a randomised order an intermittent one.
+    """
+    while pr._PP_INFLIGHT.acquire(blocking=False):
+        pass
+    pr.release_pipeline_slot()
+
+
 @pytest.fixture(autouse=True)
 def _clean_metrics():
+    _free_pipeline_slot()
     pr.METRICS.reset()
     pr.POOL.breaker.reset()
     yield
+    _free_pipeline_slot()
     pr.METRICS.reset()
     pr.POOL.breaker.reset()
 
@@ -1030,7 +1046,8 @@ def test_the_session_rung_is_not_the_collapsed_prefill_rung(monkeypatch):
 
 CKPT_SPLIT = DEPTH + 4  # 36: inside the remainder -- the DEFAULT served shape
 CKPT_AT_DEPTH = DEPTH  # 32: exactly k*C, taken at finalize
-CKPT_SWALLOWED = DEPTH - 8  # 24: inside the pipelined part -- unserveable
+CKPT_SWALLOWED = DEPTH - 8  # 24: inside the pipelined part -- A5c shortens for it
+CKPT_STILL_SWALLOWED = DEPTH - 16  # 16: two chunks back -- refused even shortened
 
 
 def _apc_manager():
@@ -1216,17 +1233,39 @@ def test_the_second_request_hits_the_pipelined_entry_identically(monkeypatch):
     assert seen["pipelined"][0] == CKPT_SPLIT
 
 
-def test_a_column_the_pipelined_part_would_swallow_is_still_refused(monkeypatch):
-    """The one case A5b cannot serve, and it keeps the existing name.
+def test_a_column_the_pipelined_part_would_swallow_is_served_by_a_shorter_schedule(
+    monkeypatch,
+):
+    """A5b left this refused; A5c serves it, and section 9 is why.
 
     A column strictly inside ``[0, k*C)`` would have to stop a chunk the peer's
-    schedule does not have, and would snapshot a cache whose stage-B layers were
-    never written.  Reachable only when the remainder is shorter than the guard
-    (``T mod C in [1, 15]`` at the shipped chunk size); there the request
-    prefills on the box that can give it, as it did before A5b.
+    schedule does not have.  A5b concluded "unserveable"; the missing step is
+    that ``k`` is a CHOICE -- hand the peer ``k-1`` chunks and the same column
+    is in the head's own remainder, where it needs no new code at all.  The
+    refusal survives only for a column no admissible depth reaches
+    (``CKPT_STILL_SWALLOWED``, below).
     """
     _arm(monkeypatch)
     batch = _apc_batch(_lm(), _apc_manager(), CKPT_SWALLOWED)
+    batch._pipeline_open()
+    assert batch._pipeline is not None, "A5c admits the r < guard shape"
+    assert _hist() == {}
+    assert batch._pipeline_chunks == PIPELINED_CHUNKS[:-1]
+    batch._pipeline_release()
+
+
+def test_a_column_one_shorter_schedule_still_cannot_reach_is_refused(monkeypatch):
+    """The refusal A5c keeps, under the name it has always had.
+
+    A5c gives back ONE chunk, so a column deeper inside the pipelined part than
+    that is still a column the peer would have to stop on -- and stopping there
+    would both clamp a chunk the schedule does not have and snapshot a cache
+    whose stage-B layers were never written.  ``C < APC_EXACT_PREFIX_GUARD_
+    TOKENS`` is the only way to reach it (16 lies two chunks of 8 back); at the
+    served ``C = 2048/8192`` one chunk always covers the guard.
+    """
+    _arm(monkeypatch)
+    batch = _apc_batch(_lm(), _apc_manager(), CKPT_STILL_SWALLOWED)
     batch._pipeline_open()
     assert batch._pipeline is None and _hist() == {"apc_checkpoint_ladder": 1}
 
@@ -1583,3 +1622,398 @@ def test_the_metrics_snapshot_carries_the_warm_keys(monkeypatch):
     assert pr.note_pipeline_warm(
         prefix_len=1, suffix_len=2, chunk_size=3
     ) == {"warm_prefix_len": 1, "warm_suffix_len": 2, "chunk_size": 3}
+
+
+# ---------------- 9. A5c: the schedule is a choice, and one chunk buys the rung
+#
+# The first two-box served smoke with A5b in hand still bypassed EVERY request:
+# at ``C = 8192`` the served prompts are 32,780 and 131,084 tokens (the target
+# plus 12 chat-template tokens), so ``r = T mod C = 12`` -- under
+# ``APC_EXACT_PREFIX_GUARD_TOKENS`` -- and the exact column ``T - 16`` landed
+# inside the LAST pipelined chunk.  A5b called that shape unserveable.  It is
+# not: ``k`` is a choice.  Hand the peer ``k-1`` chunks and the column is in the
+# head's own post-finalize remainder (now ``C + r`` tokens), which the chunk
+# loop splits at the column exactly as one box splits it -- A5b's own argument,
+# applied to a depth A5b never considered moving.
+#
+# What these pin: the shortening happens, it is exactly ONE chunk, the peer's
+# envelope carries the shortened list, the request is bit-identical to the
+# single-box one at every ``(C, r)`` that matters, the two reasons are counted,
+# and the two refusals that remain (nothing left to shorten to, and a TTFT floor
+# that says the trade does not pay) have their own names.
+
+GUARD = 16  # APC_EXACT_PREFIX_GUARD_TOKENS, the default the server runs
+
+
+def _ids(total):
+    """``total`` distinct ids inside the tiny model's 128-token vocabulary."""
+    assert 0 < total <= 125
+    return list(range(3, 3 + total))
+
+
+def _a5c_batch(lm, manager, ids, step, *, checkpoint_len=None, vault=None, rungs=None):
+    """The served shape at an arbitrary ``(T, C)``: APC exact ON, cold, B=1."""
+    batch = _batch(lm, [list(ids)], step=step)
+    batch._apc_manager = manager
+    batch._apc_mode = "exact"
+    if vault is not None:
+        batch._vault = vault
+    batch._apc_meta = [
+        {
+            "prefix_len": 0,
+            "checkpoint_len": int(
+                len(ids) - GUARD if checkpoint_len is None else checkpoint_len
+            ),
+            "full_input_ids": list(ids),
+            "extra_hash": 0,
+            "vault_rungs": list(rungs or []),
+        }
+    ]
+    return batch
+
+
+def _a5c_arm(monkeypatch, ids, step, *, pipelined, **kwargs):
+    """Run one whole prefill and hand back everything both arms must agree on."""
+    pr.METRICS.reset()
+    manager = _apc_manager()
+    made = []
+    ctx = contextlib.nullcontext()
+    if pipelined:
+        made = _arm(monkeypatch, min_tokens=1)
+    else:
+        ctx = _pipeline_off()
+    with ctx:
+        digest, logprobs, steps = _drain(
+            _a5c_batch(_lm(), manager, ids, step, **kwargs)
+        )
+    cache, prefix_len = manager.lookup_exact_cache(
+        list(ids), 0, max_prefix_tokens=len(ids) - 1
+    )
+    snap = pr.METRICS.snapshot()
+    return {
+        "cache": digest,
+        "logprobs": logprobs,
+        "steps": steps,
+        "entries": _apc_entries(manager),
+        # turn 2's read side: what ``cached_tokens`` would be, and the bytes
+        # behind it
+        "cached_tokens": int(prefix_len) if cache is not None else 0,
+        "warm": _cache_digest(cache) if cache is not None else None,
+        "hist": snap["pp_bypass_reason"],
+        "used": snap["pp_used"],
+        "shortened": snap["pp_schedule_shortened"],
+        "shortened_reason": snap["pp_schedule_shortened_reason"],
+        "peer_chunks": made[0].chunks if made else [],
+        "peer_calls": made[0].calls if made else [],
+    }
+
+
+def _a5c_expectation(total, step, *, guard=GUARD, floor=2):
+    """What the schedule rule says about ``(T, C)``, written out independently.
+
+    Deliberately NOT a call into the code under test: this is the rule as the
+    plan states it, so a rewrite of the derivation that changes the rule has to
+    disagree with this arithmetic before it can pass.
+    """
+    if total <= step:
+        return "not_a_candidate", []
+    full = -(-total // step) - 1
+    column = total - guard
+    if column >= full * step:
+        return "full", [step] * full
+    short = full - 1
+    if short <= 0:
+        return "no_pipelined_chunks", []
+    if column < short * step:
+        return "apc_checkpoint_ladder", []
+    if short < floor:
+        return "below_min_pipelined_chunks", []
+    return "shortened", [step] * short
+
+
+@pytest.mark.parametrize("step", [8, 16])
+@pytest.mark.parametrize("r", [1, 8, 15, 16, 17, "C"])
+def test_the_two_box_prefill_is_the_single_box_prefill_at_every_remainder(
+    monkeypatch, step, r
+):
+    """The identity rail, over the remainders the guard makes interesting.
+
+    ``T = k*C + r`` for ``r`` on both sides of ``APC_EXACT_PREFIX_GUARD_TOKENS``
+    and at the chunk size itself.  Whatever the gate decides -- full schedule,
+    shortened schedule, or refusal -- the request must come out of the machine
+    identical to the one that never had a peer: the prompt cache, the prompt
+    logits, the chunk sequence, BOTH APC exact entries (the checkpoint at
+    ``T - 16`` and the post-prefill harvest at ``T``) byte for byte, and turn
+    2's ``cached_tokens`` with the bytes it restores.
+
+    ``C = 8`` is smaller than the guard, so it also pins the case one chunk
+    cannot buy: the column is then two chunks back and the request is refused,
+    exactly as it was before A5c (at the served C the guard is a fraction of one
+    chunk and this cannot happen).
+    """
+    total = step * 4 + (step if r == "C" else r)
+    kind, chunks = _a5c_expectation(total, step)
+    ids = _ids(total)
+    pp = _a5c_arm(monkeypatch, ids, step, pipelined=True)
+    ref = _a5c_arm(monkeypatch, ids, step, pipelined=False)
+
+    # 1. the decision is the rule, and the peer got exactly what the rule says
+    assert pp["shortened"] == int(kind == "shortened")
+    assert pp["used"] == int(kind in ("full", "shortened"))
+    assert pp["hist"] == ({} if kind in ("full", "shortened") else {kind: 1})
+    assert pp["peer_chunks"] == chunks
+    if kind == "shortened":
+        full = -(-total // step) - 1
+        assert len(chunks) == full - 1, "exactly one chunk shorter"
+        assert len(chunks) >= 2, "and still worth pipelining"
+        assert pp["shortened_reason"] == {"exact_column": 1}
+
+    # 2. and the request is the single-box request
+    assert pp["steps"] == ref["steps"], (pp["steps"], ref["steps"])
+    assert pp["cache"] == ref["cache"], "the prompt cache moved"
+    assert mx.array_equal(pp["logprobs"], ref["logprobs"])
+    got, want = pp["entries"], ref["entries"]
+    assert sorted(got) == sorted(want) == [total - GUARD, total]
+    for length in sorted(want):
+        assert got[length].token_ids == want[length].token_ids == tuple(ids[:length])
+        assert got[length].extra_hash == want[length].extra_hash
+        assert _entry_digest(got[length]) == _entry_digest(want[length]), length
+        assert _prov(got[length]) == _prov(want[length])
+    assert pp["cached_tokens"] == ref["cached_tokens"] == total - GUARD
+    assert pp["warm"] == ref["warm"], "turn 2 restores different bytes"
+
+
+def test_the_envelope_the_tail_gets_is_the_shortened_list(monkeypatch):
+    """``begin`` is handed ``depth + 1`` ids, so the tail derives ``k-1``.
+
+    The envelope is the contract ``finalize`` checks, so a shortened schedule
+    that told the peer the OLD depth would fail the request at finalize -- after
+    the whole prefill had been paid for.
+    """
+    made = _arm(monkeypatch)
+    batch = _apc_batch(_lm(), _apc_manager(), CKPT_SWALLOWED)
+    _drain(batch)
+    assert made, _hist()
+    head = made[0]
+    depth = sum(PIPELINED_CHUNKS[:-1])
+    assert ("begin", depth + 1, STEP, (1, depth + 1)) in head.calls
+    assert head.chunks == PIPELINED_CHUNKS[:-1]
+    assert head.calls[-1] == "finalize", "the shortened request still finalizes"
+
+
+def test_the_shortening_is_counted_and_recorded_per_request(monkeypatch):
+    """``pp_schedule_shortened`` + the per-request stat, and neither on a full
+    schedule -- the counter has to answer "how often, and for which reason", and
+    a counter that also fires on unshortened requests answers neither."""
+    _arm(monkeypatch)
+    batch = _apc_batch(_lm(), _apc_manager(), CKPT_SWALLOWED)
+    batch._pipeline_open()
+    assert batch._pipeline_schedule_stats == {
+        "reason": "exact_column",
+        "full_chunks": len(PIPELINED_CHUNKS),
+        "chunks": len(PIPELINED_CHUNKS) - 1,
+        "chunk_size": STEP,
+    }
+    snap = pr.pipeline_metrics_snapshot()
+    assert snap["pp_schedule_shortened"] == 1
+    assert snap["pp_schedule_shortened_reason"] == {"exact_column": 1}
+    batch._pipeline_release()
+
+    pr.METRICS.reset()
+    full = _apc_batch(_lm(), _apc_manager(), CKPT_SPLIT)
+    full._pipeline_open()
+    assert full._pipeline is not None, "the A5b shape, unshortened"
+    assert full._pipeline_schedule_stats is None
+    assert full._pipeline_chunks == PIPELINED_CHUNKS
+    assert pr.METRICS.snapshot()["pp_schedule_shortened"] == 0
+    full._pipeline_release()
+
+
+def test_a_rung_inside_the_last_pipelined_chunk_shortens_the_schedule_too(monkeypatch):
+    """The other reason, on the vault side, and its own identity.
+
+    A rung the peer would run PAST is not the peer's business: after the
+    shortening it lands in the head's remainder, where the chunk loop clamps to
+    it and ``_store_vault_checkpoints`` captures a complete cache.  So it stays
+    PENDING through the collapse and is stored at its own depth -- not collapsed
+    onto another one -- and the entry is the single-box entry.
+    """
+    made = _arm(monkeypatch)
+    vault = _FakeVault()
+    batch = _vault_batch(_lm(), vault, [DEPTH - 4])  # 28: unaligned, in (24, 32)
+    steps = _drain(batch)[2]
+    assert _hist() == {}
+    assert made[0].chunks == PIPELINED_CHUNKS[:-1]
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_schedule_shortened_reason"] == {"vault_rung": 1}
+    assert snap["pp_ladder_collapsed"] == 0, "nothing to collapse: the rung is ours"
+    assert vault.depths() == [DEPTH - 4], "stored at the rung, not at the depth"
+
+    ref_vault = _FakeVault()
+    with _pipeline_off():
+        ref_steps = _drain(_vault_batch(_lm(), ref_vault, [DEPTH - 4]))[2]
+    assert steps == ref_steps == [STEP, STEP, STEP, 4, STEP]
+    assert ref_vault.depths() == vault.depths()
+    got, n_got = _fragments_digest(vault.inserts[0]["fragments"])
+    want, n_want = _fragments_digest(ref_vault.inserts[0]["fragments"])
+    assert n_got == n_want > 0 and got == want
+
+
+def test_the_default_served_config_shortens_once_for_both_stores(monkeypatch):
+    """APC exact ON and the vault ON, on the SAME request, at ``r < guard``.
+
+    One schedule, one shortening, and the two stores land where the one depth
+    says they do: the exact column at ``(k-1)*C`` is taken by the post-finalize
+    snapshot, the ladder's deepest rung (``k*C``) is past the admitted depth so
+    it stays pending and is stored by the head's own loop at its own depth, and
+    the sub-depth rung is collapsed onto the admitted depth -- A5's trade, at the
+    depth A5c admitted.  That collapse target is what the two arms differ in,
+    and it is the ONLY thing they differ in.
+    """
+    _arm(monkeypatch)
+    manager, vault = _apc_manager(), _FakeVault()
+    batch = _a5c_batch(
+        _lm(), manager, PROMPT, STEP,
+        checkpoint_len=CKPT_SWALLOWED, vault=vault, rungs=LADDER,
+    )
+    digest, logprobs, steps = _drain(batch)
+    short_depth = sum(PIPELINED_CHUNKS[:-1])
+    assert _hist() == {}
+    snap = pr.METRICS.snapshot()
+    assert snap["pp_schedule_shortened_reason"] == {"exact_column": 1}
+    assert snap["pp_ladder_collapsed"] == 1 and snap["pp_ladder_rungs_skipped"] == 1
+    assert vault.depths() == [short_depth, DEPTH], (
+        "the 16 rung is collapsed onto the admitted depth; the 32 rung is served "
+        "where the ladder asked for it"
+    )
+
+    ref_manager, ref_vault = _apc_manager(), _FakeVault()
+    with _pipeline_off():
+        ref = _drain(
+            _a5c_batch(
+                _lm(), ref_manager, PROMPT, STEP,
+                checkpoint_len=CKPT_SWALLOWED, vault=ref_vault, rungs=LADDER,
+            )
+        )
+    assert steps == ref[2] and digest == ref[0]
+    assert mx.array_equal(logprobs, ref[1])
+    assert ref_vault.depths() == [STEP * 2, DEPTH], "one box serves the whole ladder"
+    # the rung both arms DO have is the same rung, byte for byte
+    assert _fragments_digest(vault.inserts[-1]["fragments"]) == _fragments_digest(
+        ref_vault.inserts[-1]["fragments"]
+    )
+    got, want = _apc_entries(manager), _apc_entries(ref_manager)
+    assert sorted(got) == sorted(want) == [CKPT_SWALLOWED, len(PROMPT)]
+    for length in sorted(want):
+        assert _entry_digest(got[length]) == _entry_digest(want[length]), length
+
+
+def test_a_dead_peer_gives_back_a_shortened_requests_whole_ladder(monkeypatch):
+    """The fallback is unchanged by the shortening.
+
+    A peer that dies re-prefills from column 0 on one box, which can serve every
+    rung -- including the ones the collapse dropped AND the ones A5c left
+    pending, which must not be handed back twice.
+    """
+    _arm(monkeypatch, fail_at=2)
+    manager, vault = _apc_manager(), _FakeVault()
+    batch = _a5c_batch(
+        _lm(), manager, PROMPT, STEP,
+        checkpoint_len=CKPT_SWALLOWED, vault=vault, rungs=LADDER,
+    )
+    digest, logprobs, _ = _drain(batch)
+    assert vault.depths() == LADDER, "the whole ladder, once each"
+
+    ref_manager, ref_vault = _apc_manager(), _FakeVault()
+    with _pipeline_off():
+        ref_digest, ref_lp, _ = _drain(
+            _a5c_batch(
+                _lm(), ref_manager, PROMPT, STEP,
+                checkpoint_len=CKPT_SWALLOWED, vault=ref_vault, rungs=LADDER,
+            )
+        )
+    assert digest == ref_digest and mx.array_equal(logprobs, ref_lp)
+    assert vault.depths() == ref_vault.depths()
+    assert sorted(_apc_entries(manager)) == sorted(_apc_entries(ref_manager))
+
+
+def test_nothing_left_to_shorten_to_is_named_no_pipelined_chunks(monkeypatch):
+    """``k - 1 <= 0``: the request has no pipelined part, and says so.
+
+    Not ``apc_checkpoint_ladder``: that name is a claim about this request's
+    SHAPE being unserveable at any depth, and here there is simply no depth to
+    serve it at.  The histogram is the only thing an operator reads to find out
+    why the peer is idle (A10-0, A5b), so the two must not share a name.
+    """
+    _arm(monkeypatch, min_tokens=1)
+    ids = _ids(32)
+    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=15)
+    batch._pipeline_open()
+    assert batch._pipeline is None and _hist() == {"no_pipelined_chunks": 1}
+    assert batch._pipeline_chunk_schedule() == []
+
+
+def test_a_shortening_that_costs_more_than_it_saves_is_refused_by_policy(monkeypatch):
+    """``MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS``, and why its default is 2.
+
+    Shortening moves one chunk of ``C`` off the peer and onto the head, where it
+    runs serially inside the TTFT: ~``C/450`` s at the served rate, +18 s at
+    ``C = 8192`` (the module receipts bracket it at +9..+24 s), against a
+    whole-request PP saving of ~35 s at 32k.  So the trade pays only while what
+    is left on the peer still dominates -- two chunks, i.e. ``T >= ~3C``.  Below
+    that the request stays single-box under a POLICY name, next to
+    ``below_min_tokens``, and not under a shape name.
+    """
+    assert pr.DEFAULT_MIN_PIPELINED_CHUNKS == 2
+    ids = _ids(48)  # T = 3C at C = 16: k = 2, so shortening leaves ONE chunk
+    _arm(monkeypatch, min_tokens=1)
+    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=31)
+    batch._pipeline_open()
+    assert batch._pipeline is None
+    assert _hist() == {"below_min_pipelined_chunks": 1}
+    assert pr.METRICS.snapshot()["pp_schedule_shortened"] == 0
+
+    # the same request, with the floor an operator moved
+    pr.METRICS.reset()
+    monkeypatch.setenv("MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS", "1")
+    assert pr.min_pipelined_chunks() == 1
+    batch = _a5c_batch(_lm(), _apc_manager(), ids, 16, checkpoint_len=31)
+    batch._pipeline_open()
+    assert batch._pipeline is not None and batch._pipeline_chunks == [16]
+    assert pr.METRICS.snapshot()["pp_schedule_shortened"] == 1
+    batch._pipeline_release()
+
+
+@pytest.mark.parametrize(
+    "value,want", [("", 2), ("garbage", 2), ("0", 1), ("-3", 1), ("4", 4)]
+)
+def test_the_floor_is_read_fresh_and_never_below_one(monkeypatch, value, want):
+    """A knob that parses to nothing must not disable the pipeline outright."""
+    if value:
+        monkeypatch.setenv("MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS", value)
+    else:
+        monkeypatch.delenv("MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS", raising=False)
+    assert pr.min_pipelined_chunks() == want
+
+
+def test_the_gate_asks_one_depth_and_the_peer_is_sent_that_depth(monkeypatch):
+    """A5c's one structural risk, pinned: two derivations that disagree.
+
+    The ladder test used to measure ``k*C`` while the schedule handed out ``k``
+    chunks; if the shortening had moved only one of them, the gate would admit a
+    request whose envelope the peer could not serve (or refuse one it could).
+    So the plan is derived ONCE and everything reads it.
+    """
+    _arm(monkeypatch)
+    batch = _apc_batch(_lm(), _apc_manager(), CKPT_SWALLOWED)
+    plan = batch._pipeline_schedule_plan()
+    assert plan["shortened"] and plan["reason"] == "exact_column"
+    assert plan["chunks"] == PIPELINED_CHUNKS[:-1]
+    assert plan["depth"] == sum(PIPELINED_CHUNKS[:-1])
+    assert plan["full_chunks"] == len(PIPELINED_CHUNKS)
+    assert batch._pipeline_has_checkpoint_ladder(plan) is False
+    assert batch._pipeline_chunk_schedule() == plan["chunks"]
+    assert batch._pipeline_full_depth() == plan["depth"]
+    batch._pipeline_open()
+    assert batch._pipeline_chunks == plan["chunks"]
+    batch._pipeline_release()

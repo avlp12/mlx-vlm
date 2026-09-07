@@ -2276,6 +2276,11 @@ class PromptProcessingBatch:
         # to make a decision -- and it is the per-request twin of the aggregate
         # ``pp_warm_suffix_tokens_hist`` an operator diffs out of ``/metrics``.
         self._pipeline_warm_stats: Optional[dict] = None
+        # A5c: the per-request record of a SHORTENED schedule -- ``reason``
+        # (``exact_column`` / ``vault_rung``), ``full_chunks``, ``chunks``,
+        # ``chunk_size`` -- or ``None`` on every request whose schedule is the
+        # full ``k``.  Per-request twin of ``pp_schedule_shortened``.
+        self._pipeline_schedule_stats: Optional[dict] = None
         # A5: the vault ladder this request took out of the chunk loop's way,
         # kept so the post-finalize checkpoint knows which rows to store and so
         # a fallback can put the original rungs BACK (a peer that dies must not
@@ -2880,10 +2885,14 @@ class PromptProcessingBatch:
     #
     # WHAT THE PEER GETS.  ``prompt_step`` stops once the remainder fits in one
     # step and ``generate()`` runs that remainder as the final forward, so the
-    # pipelined part is exactly the chunk loop's part: ``ceil(T/C) - 1`` chunks
-    # of ``C``.  The remainder is prefilled here AFTER ``finalize`` has installed
-    # all 45 layers, so no token is ever forwarded by half a stack, and decode is
-    # untouched single-box code.
+    # pipelined part is AT MOST the chunk loop's part: ``k = ceil(T/C) - 1``
+    # chunks of ``C``, and ``k - 1`` of them when A5c shortens the schedule to
+    # move a checkpoint column out of the peer's way
+    # (``_pipeline_schedule_plan``).  Everything past the pipelined depth is
+    # prefilled here AFTER ``finalize`` has installed all 45 layers -- one
+    # remainder forward, or a chunk loop plus one, and in both cases the same
+    # chunks a single box would have run -- so no token is ever forwarded by
+    # half a stack, and decode is untouched single-box code.
 
     def _pipeline_warm_prefix_len(self) -> int:
         """How many columns of this prompt are already in the cache.
@@ -2958,82 +2967,79 @@ class PromptProcessingBatch:
         }
 
     def _pipeline_full_depth(self) -> int:
-        """Tokens the pipelined part of this prefill will have written: ``k*C``.
+        """Tokens the pipelined part of this prefill will have written.
 
         The one depth at which a two-box prefill holds a COMPLETE cache before
         the request is over: ``finalize`` has just pulled stage B's caches back
         and installed them, the head owns all ``n_layers``, and the remainder
-        (1..C tokens) has not been forwarded yet.
+        has not been forwarded yet.  It is the ADMITTED depth and not ``k*C``:
+        A5c may have given one chunk back to the head, in which case the
+        remainder is ``C + r`` tokens rather than ``r``
+        (``_pipeline_schedule_plan``).
         """
         return sum(self._pipeline_chunk_schedule())
 
-    def _pipeline_has_checkpoint_ladder(self) -> bool:
-        """Is a checkpoint owed that ONE post-finalize snapshot cannot pay?
+    def _pipeline_schedule_unserved(self, depth: int) -> Optional[str]:
+        """Which checkpoint a pipelined part ``depth`` tokens deep cannot pay.
+
+        ``None`` when every rung and column this request owes is serveable at
+        that depth.  Otherwise the NAME of the first one that is not, which is
+        also A5c's shortening reason: ``exact_column`` or ``vault_rung``.
 
         PP cannot checkpoint MID-prefill: at a chunk boundary half the KV lives
         on the peer and the snapshot would be of a half-populated cache.  What
-        it can do -- A5 -- is take exactly one checkpoint, at full depth,
-        immediately after ``finalize``.  So the refusal narrows from "any rung
-        is owed" to "a rung is owed that the full-depth one cannot stand in
-        for", which is three cases and no more:
+        it can do is take exactly one snapshot at ``depth``, immediately after
+        ``finalize`` (A5), and then run everything past ``depth`` itself, over
+        the full stack, as ordinary single-box ``prompt_step`` chunks (A5b).  So
+        a requirement at column ``X`` is SERVEABLE at ``depth`` when:
 
-        1.  THE VAULT LADDER, when every pending rung is a multiple of the chunk
-            size and none is deeper than ``k*C``, is admitted and COLLAPSED onto
-            the single rung at ``k*C``.  Note that this is not a lucky case, it
-            is the only case: ``align_boundaries`` admits a rung only if it is a
-            positive multiple of ``prefill_step_size`` strictly below the prompt
-            length, and the largest such multiple IS ``k*C``.  So the deepest
-            rung the ladder can ever ask for is exactly the depth PP can serve,
-            and the geometric ladder's halving tail is what gets dropped --
-            counted, per request and per rung, as ``pp_ladder_collapsed`` /
-            ``pp_ladder_rungs_skipped``.  The rung that survives is the one the
-            ladder itself calls dominant ("the deepest rung serves the dominant
-            same-document-new-suffix workload", ``boundary_ladder``); what is
-            lost is early-divergence coverage, for long prompts only, and only
-            while the peer is in use.  An unaligned or too-deep rung is still
-            refused: unaligned would make ``_next_apc_checkpoint_column`` clamp
-            a chunk, and a clamped chunk is a chunk the peer's schedule does not
-            have.
-        2.  APC EXACT (A5b) is admitted whenever its checkpoint COLUMN is at or
-            past ``k*C``, and refused only when it lies strictly inside the
-            pipelined part.  A5 refused it whole; that was wrong about where the
-            column is.  ``checkpoint_len`` is
-            ``len(prompt) - APC_EXACT_PREFIX_GUARD_TOKENS`` (16 by default,
-            ``_apc_exact_checkpoint_len``), so with a remainder
-            ``r = T - k*C in [1, C]`` the column is ``T - 16``:
+        * ``X == depth`` -- the post-finalize snapshot IS it.  For the vault
+          that is the collapse target; for APC exact, ``_pipeline_step`` calls
+          ``_store_apc_exact_checkpoints`` after ``finalize`` and after the
+          column advance, so the store sees all ``n_layers`` over a cache
+          exactly ``depth`` deep.
+        * ``depth < X < T`` -- it lands in the head's own remainder, where the
+          chunk loop clamps to it exactly as it does on one box (``T=40, C=8``,
+          column 36: the pipelined chunks, then a chunk clamped to 4 here, then
+          ``generate()``'s final 4) and the same store fires from the same call
+          site over the same complete cache.  This is A5b's argument, and A5c is
+          nothing but the observation that ``depth`` is a CHOICE: one chunk
+          fewer moves a column out of the pipelined part and into this case.
+        * ``X < depth`` and ``X`` is a vault rung on a multiple of ``C`` -- the
+          collapse drops it and keeps the deepest serveable one instead
+          (``_pipeline_collapse_ladder``).  That is A5's trade: early-divergence
+          coverage for the peer, counted as ``pp_ladder_rungs_skipped``.
 
-            * ``r > 16``  -- the column is INSIDE the remainder, which is the
-              part ``prompt_step`` runs on this box after ``finalize`` over the
-              full stack.  Nothing has to move: the loop clamps its own chunk to
-              the column exactly as it does on one box (``T=40, C=8``,
-              column 36: ``8,8,8,8`` pipelined, then a chunk clamped to 4 on
-              this box, then ``generate()``'s final 4), and
-              ``_store_apc_exact_checkpoints`` fires from the same call site,
-              with the same ``store_exact_cache``, over the same full-depth row
-              snapshot.  This is the DEFAULT served shape: at ``C=2048`` every
-              length outside ``T mod 2048 in [1, 15]`` lands here.
-            * ``r == 16`` -- the column is exactly ``k*C``.  ``_pipeline_step``
-              already calls ``_store_apc_exact_checkpoints`` after ``finalize``
-              and after the column advance, so the store sees all ``n_layers``
-              and a cache exactly ``k*C`` deep.
-            * ``r < 16``  -- the column is strictly inside the pipelined part.
-              THIS is the case that stays refused, under the existing
-              ``apc_checkpoint_ladder`` name: stopping a chunk there would both
-              clamp a chunk the peer's schedule does not have and snapshot a
-              cache whose stage-B layers are empty.
+        and UNSERVEABLE otherwise:
 
-            Note that the column is never MOVED and the store is never
-            reconstructed: the entry is keyed on
-            ``full_input_ids[:checkpoint_len]`` and it is stored at exactly that
-            many tokens, by the single-box code, or it is not stored at all.
-        3.  No pipelined chunks at all (``depth <= 0``) means there is no
-            full-depth point to take, so any pending rung is unserveable.
+        * an APC exact column strictly inside the pipelined part.  The entry is
+          keyed on ``full_input_ids[:checkpoint_len]`` and stored at exactly
+          that many tokens, so it can be neither moved nor dropped; stopping a
+          chunk there would clamp a chunk the peer's schedule does not have AND
+          snapshot a cache whose stage-B layers were never written.
+        * an unaligned rung inside the pipelined part, for the same clamp
+          reason: ``_next_apc_checkpoint_column`` would shorten a chunk the
+          peer's schedule does not have.
+        * a rung at or past the prompt length ``T``.  Left refused exactly as
+          A5 refused it -- and unreachable in the served config, because
+          ``align_boundaries`` admits only multiples of ``C`` strictly below the
+          prompt length.
+
+        The narrowing A5c makes to A5's vault clause is the middle case: a rung
+        DEEPER than the pipelined part used to be refused with the unaligned
+        ones, and it is the same request the APC exact column is (a column in
+        the head's own remainder), so it is admitted on the same argument and
+        stays PENDING through the collapse.
         """
         if not self._apc_meta:
-            return False
+            return None
         apc_on = self._apc_manager is not None and self._apc_mode == "exact"
-        depth = self._pipeline_full_depth()
         step = int(self.prefill_step_size or 0)
+        total = (
+            int(self._inputs_embeds.shape[1])
+            if self._inputs_embeds is not None
+            else 0
+        )
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None:
                 continue
@@ -3044,31 +3050,146 @@ class PromptProcessingBatch:
                 # no left pad, no right pad) and this keeps them from drifting
                 # if one of those ever loosens.
                 column = self._apc_checkpoint_column_for_meta(batch_idx, meta)
-                if column is not None and (depth <= 0 or column < depth):
-                    return True
+                if column is not None and column < depth:
+                    return "exact_column"
             if self._vault is None:
                 continue
             rungs = [int(r) for r in (meta.get("vault_rungs") or ())]
             if not rungs:
                 continue
-            if depth <= 0 or step <= 0:
-                return True
-            if any(r > depth or r % step for r in rungs):
-                return True
-        return False
+            if step <= 0:
+                return "vault_rung"
+            for rung in rungs:
+                if rung < depth and rung % step:
+                    return "vault_rung"
+                if rung > depth and rung >= total:
+                    return "vault_rung"
+        return None
+
+    def _pipeline_schedule_plan(self) -> dict:
+        """The chunks this loop may hand the peer, and why they are that many.
+
+        ONE derivation, read by everything that has to agree with it: the gate's
+        refusal (``_pipeline_has_checkpoint_ladder``), the envelope
+        (``_pipeline_open`` -> ``begin``), the loop's own schedule check
+        (``_pipeline_step``), the collapse depth and the post-finalize
+        checkpoint.  There used to be two -- the ladder predicate measured
+        ``k*C`` while the schedule handed out ``k`` chunks -- and two is exactly
+        the drift A5c would introduce by shortening one of them.
+
+        ``needs_processing`` stops the loop while ``remaining > step`` and
+        ``n = min(step, remaining - 1)`` equals ``step`` on every one of those
+        iterations, so the FULL schedule is fixed the moment the batch is built:
+        ``k = ceil(T/C) - 1`` chunks of ``C``.  A5c may spend one of them:
+
+        * ``k`` chunks serve every checkpoint -> the schedule is ``k``, which is
+          every request A5b already admitted, list for list.
+        * they do not and ``k-1`` do -> the schedule is ``k-1`` (``shortened``,
+          with the reason ``k`` failed on).  The head's post-finalize remainder
+          is now ``C + r`` tokens and it splits them at the column exactly as
+          one box splits them.  This is the case the first served smoke found:
+          at ``C=8192`` the 32,780- and 131,084-token prompts have ``r = 12``,
+          under ``APC_EXACT_PREFIX_GUARD_TOKENS``, so the exact column ``T-16``
+          fell inside the last pipelined chunk and A5b refused BOTH.
+        * ``k-1 <= 0`` -> no schedule at all, and the caller names it
+          ``no_pipelined_chunks`` -- which is what it is, and is not a claim
+          about this request's checkpoints.
+        * ``k-1`` do not serve it either -> ``apc_checkpoint_ladder``, A5's
+          refusal, now genuinely the last resort.
+        * ``k-1`` serve it but are fewer than
+          ``MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS`` ->
+          ``below_min_pipelined_chunks``.  The shortened head pays a whole extra
+          chunk of ``C`` inside the TTFT (~``C/450`` s, +18 s at the served
+          ``C=8192``), so the trade only pays while the pipelined part still
+          dominates: two chunks, i.e. ``T >= ~3C``.  A POLICY refusal, named
+          like ``below_min_tokens`` and not like a shape one.
+
+        ``begin`` re-derives the chunk tuple from the ``depth + 1`` token ids it
+        is handed and ``finalize`` refuses an envelope mismatch, so a drift
+        between this arithmetic and the loop is a failure, never a silent
+        divergence -- and the envelope the tail sees is the SHORTENED list,
+        because ``_pipeline_open`` measures ``depth`` off ``chunks``.
+        """
+        step = int(self.prefill_step_size or 0)
+        total = (
+            int(self._inputs_embeds.shape[1])
+            if self._inputs_embeds is not None
+            else 0
+        )
+        plan = {
+            "chunks": [],
+            "full_chunks": 0,
+            "chunk_size": step,
+            "depth": 0,
+            "shortened": False,
+            "reason": None,
+            "refusal": None,
+        }
+        if step <= 0 or total <= step:
+            return plan
+        full = -(-total // step) - 1
+        plan["full_chunks"] = full
+        unserved = self._pipeline_schedule_unserved(full * step)
+        if unserved is None:
+            plan["chunks"] = [step] * full
+            plan["depth"] = full * step
+            return plan
+        short = full - 1
+        if short <= 0:
+            # Nothing to shorten TO.  Leaving ``refusal`` unset is the point:
+            # the request is refused for having no pipelined chunks, not for a
+            # checkpoint the peer could have served at some other depth.
+            return plan
+        if self._pipeline_schedule_unserved(short * step) is not None:
+            plan["refusal"] = True
+            return plan
+        from ..pipeline_runtime import min_pipelined_chunks
+
+        if short < min_pipelined_chunks():
+            plan["refusal"] = "below_min_pipelined_chunks"
+            return plan
+        plan["chunks"] = [step] * short
+        plan["depth"] = short * step
+        plan["shortened"] = True
+        plan["reason"] = unserved
+        return plan
+
+    def _pipeline_has_checkpoint_ladder(self, plan: Optional[dict] = None):
+        """The refusal this request's checkpoints owe the gate, or ``False``.
+
+        A name and not a bool now: ``apc_checkpoint_ladder`` (``True``) when no
+        admissible depth serves them, ``below_min_pipelined_chunks`` when one
+        does but the TTFT floor refuses to buy it.  ``pipeline_bypass_reason``
+        takes either, the same way it takes ``capture`` and ``warm``.
+
+        Derived from the plan the caller already computed, so the depth the gate
+        judges is the depth the peer is actually sent.
+        """
+        return (plan or self._pipeline_schedule_plan())["refusal"] or False
 
     def _pipeline_collapse_ladder(self, depth: int) -> None:
         """Take the vault rungs out of the chunk loop's way for this request.
 
         Two things have to happen before the first pipelined chunk runs, and
-        both are this method.  The rungs must stop being PENDING, or
-        ``_store_vault_checkpoints`` fires at the chunk boundary they land on
-        and captures a cache whose stage-B layers are empty -- a rung that
-        restores to a fluent wrong answer, which is the one failure a cache
-        change must not introduce.  And they must be REMEMBERED, because a peer
+        both are this method.  A rung the peer will run past must stop being
+        PENDING, or ``_store_vault_checkpoints`` fires at the chunk boundary it
+        lands on and captures a cache whose stage-B layers are empty -- a rung
+        that restores to a fluent wrong answer, which is the one failure a cache
+        change must not introduce.  And it must be REMEMBERED, because a peer
         that dies mid-prefill sends this request back to column 0 single-box,
         where the ladder is exactly as serveable as it was before the peer was
         ever dialled.
+
+        A5c: only the rungs AT OR BELOW ``depth`` are the peer's business.  A
+        rung deeper than the admitted depth -- which A5 refused and A5c admits,
+        and which the default served ladder's ``k*C`` rung becomes the moment
+        the schedule is shortened -- lands in the head's own post-finalize
+        remainder, where the single-box loop clamps to it and stores it from a
+        complete cache.  So it stays pending, is stored at ITS OWN depth rather
+        than collapsed onto another, and is not counted as skipped.  It is still
+        remembered: a fallback re-prefills from column 0 and re-assigns the
+        whole original ladder, which must be the whole ladder whichever side of
+        the depth each rung was on.
         """
         self._pipeline_ladder = None
         if self._vault is None or not self._apc_meta:
@@ -3081,9 +3202,14 @@ class PromptProcessingBatch:
             rungs = [int(r) for r in (meta.get("vault_rungs") or ())]
             if not rungs:
                 continue
+            collapsed = [r for r in rungs if r <= depth]
+            if not collapsed:
+                # Nothing the peer would run past: the ladder is entirely in the
+                # head's remainder and the chunk loop serves it unchanged.
+                continue
             rows[batch_idx] = rungs
-            skipped += sum(1 for r in rungs if r != depth)
-            meta["vault_rungs"] = []
+            skipped += sum(1 for r in collapsed if r != depth)
+            meta["vault_rungs"] = [r for r in rungs if r > depth]
         if not rows:
             return
         self._pipeline_ladder = {"depth": int(depth), "rows": rows}
@@ -3217,19 +3343,11 @@ class PromptProcessingBatch:
     def _pipeline_chunk_schedule(self) -> List[int]:
         """The chunks this loop will hand the peer, in order.
 
-        ``needs_processing`` stops the loop while ``remaining > step``, and
-        ``n = min(step, remaining - 1)`` equals ``step`` on every one of those
-        iterations, so the schedule is fixed the moment the batch is built:
-        ``k = ceil(T/C) - 1`` chunks of ``C``.  ``begin`` re-derives the same
-        tuple from the token ids and ``finalize`` refuses a mismatch, so a drift
-        between this arithmetic and the loop is a failure, never a silent
-        divergence.
+        The admitted schedule, which is ``k = ceil(T/C) - 1`` chunks of ``C``
+        unless A5c shortened it to ``k-1`` -- see ``_pipeline_schedule_plan``,
+        which is where the decision is made and the only place it is made.
         """
-        step = self.prefill_step_size
-        total = int(self._inputs_embeds.shape[1]) if self._inputs_embeds is not None else 0
-        if not step or total <= step:
-            return []
-        return [int(step)] * (-(-total // int(step)) - 1)
+        return list(self._pipeline_schedule_plan()["chunks"])
 
     def _pipeline_should_open(self) -> bool:
         return (
@@ -3246,6 +3364,7 @@ class PromptProcessingBatch:
             acquire_pipeline_slot,
             maybe_open_pipeline,
             note_pipeline_bypass,
+            note_pipeline_schedule_shortened,
             note_pipeline_warm,
             pipeline_bypass_reason,
             pipeline_language_model,
@@ -3279,8 +3398,13 @@ class PromptProcessingBatch:
         # refuses is still recorded under THEIR name, exactly as it was under
         # ``warm_prefix``.
         warm_reason, warm_facts = self._pipeline_warm_facts()
+        # A5c.  Derived ONCE, here: the depth the gate judges below is the depth
+        # the envelope carries and the depth the collapse and the post-finalize
+        # checkpoint use.  Deriving it twice is how a shortened schedule and a
+        # full-depth ladder test would disagree.
+        schedule = self._pipeline_schedule_plan()
         reason = pipeline_bypass_reason(
-            ladder=self._pipeline_has_checkpoint_ladder(),
+            ladder=self._pipeline_has_checkpoint_ladder(schedule),
             capture=capture_refusal,
             warm=warm_reason,
             right_pad=(
@@ -3314,7 +3438,7 @@ class PromptProcessingBatch:
             # been paid for.  Refuse it here, where a fallback is still free.
             note_pipeline_bypass("cache_depth_mismatch")
             return
-        chunks = self._pipeline_chunk_schedule()
+        chunks = list(schedule["chunks"])
         if not chunks:
             note_pipeline_bypass("no_pipelined_chunks")
             return
@@ -3346,6 +3470,16 @@ class PromptProcessingBatch:
             return
         self._pipeline_chunks = chunks
         self._pipeline_chunks_done = 0
+        # Counted HERE and nowhere else: the peer has the envelope, so this is
+        # the first moment a shortening is a fact about a request that ran
+        # rather than about one the gate was still thinking about.
+        if schedule["shortened"]:
+            self._pipeline_schedule_stats = note_pipeline_schedule_shortened(
+                reason=schedule["reason"],
+                full_chunks=schedule["full_chunks"],
+                chunks=len(chunks),
+                chunk_size=int(self.prefill_step_size),
+            )
         # The gate has admitted the ladder; collapse it now, BEFORE the first
         # chunk, so no boundary the chunk loop is about to cross can fire a
         # capture over a half-populated cache.
@@ -3676,11 +3810,12 @@ class PromptProcessingBatch:
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
         if self._pipeline is not None:
-            # Unreachable by the schedule (``_pipeline_chunk_schedule``'s last
-            # chunk is the loop's last chunk, and ``_pipeline_step`` finalizes
-            # there), so this is a guard and not a path: half the KV would be on
-            # the peer.  Falling back restores the whole prompt, which the
-            # forward below then runs unchunked on a fresh cache.
+            # Unreachable by the schedule (``_pipeline_step`` finalizes and
+            # releases the lease on the schedule's LAST chunk, whether that is
+            # the loop's last chunk or -- A5c -- one before it), so this is a
+            # guard and not a path: half the KV would be on the peer.  Falling
+            # back restores the whole prompt, which the forward below then runs
+            # unchunked on a fresh cache.
             self._pipeline_fallback(RuntimeError("prefill ended with the peer open"))
         call_kwargs = dict(self._prompt_kwargs)
         # Prefill leg: hidden captures yes, KDA rollback stash no.  Computed once in

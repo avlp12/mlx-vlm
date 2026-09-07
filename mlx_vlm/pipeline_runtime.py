@@ -10,6 +10,7 @@ everything else has a default::
     MLX_VLM_PIPELINE_RING=10.0.0.1:39400,10.0.0.2:39401   # ring backend (default transport)
     MLX_VLM_PIPELINE_SPLIT=23                      # int, or "auto" for the micro-sweep
     MLX_VLM_PIPELINE_MIN_TOKENS=16384              # below this, stay single-box
+    MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS=2        # A5c: floor on a SHORTENED schedule
     MLX_VLM_PIPELINE_CALIB=~/.cache/mlx_vlm/pipeline_splits.json
     MLX_VLM_PIPELINE_MODEL_SHA256=<verified manifest SHA256>  # required
     MLX_VLM_PIPELINE_SOURCE_REVISION=<source commit SHA1>     # required
@@ -129,6 +130,40 @@ def pipeline_language_model(model):
 # below every number in that table and would have routed prompts the policy
 # says nothing about.
 DEFAULT_MIN_TOKENS = 16384
+
+# A5c.  The floor on the SHORTENED schedule only (a full-depth schedule is not
+# affected by it, and no request that is admitted today is refused by it).
+#
+# Shortening moves one chunk of C off the peer and onto the head, and the head
+# runs it AFTER finalize -- serially, in the TTFT.  At the served rate that is
+# about ``C / 450`` s, i.e. +18 s at ``C = 8192`` (the module receipts bracket
+# it: the chunk costs ``C / 348`` s on one box and saved ``C / 556`` s
+# pipelined, so +9..+24 s), against a whole-request PP saving of ~35 s at 32k
+# and ~2 min at 131k.  So the trade is worth taking only while the pipelined
+# part still dominates what is left of it: keep at least two chunks on the
+# peer, which is ``T >= ~3C``.  Below that the request stays single-box under
+# its own name (``below_min_pipelined_chunks``) rather than pretending its
+# shape is unserveable.
+DEFAULT_MIN_PIPELINED_CHUNKS = 2
+
+
+def min_pipelined_chunks() -> int:
+    """``MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS``, read fresh, never below 1.
+
+    Read per call rather than off ``PipelineSettings`` because the schedule is
+    derived on the BATCH, which has no settings object -- and because a policy
+    an operator can move at runtime is one they can move without a restart.
+    """
+    try:
+        value = int(
+            os.environ.get(
+                "MLX_VLM_PIPELINE_MIN_PIPELINED_CHUNKS",
+                str(DEFAULT_MIN_PIPELINED_CHUNKS),
+            )
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_PIPELINED_CHUNKS
+    return max(1, value)
 
 
 class PipelineSettings:
@@ -803,6 +838,8 @@ class PipelineMetrics:
             self.breaker_state = "closed"
             self.ladder_collapsed = 0
             self.ladder_rungs_skipped = 0
+            self.schedule_shortened = 0
+            self.schedule_shortened_reasons = {}
             self.warm_requests = 0
             self.warm_suffix_hist = {}
 
@@ -855,6 +892,24 @@ class PipelineMetrics:
             self.ladder_collapsed += 1
             self.ladder_rungs_skipped += max(0, int(skipped))
 
+    def note_schedule_shortened(self, reason: str):
+        """One request whose pipelined schedule gave a chunk back to the head.
+
+        A5c.  Counted by REASON as well as in total because the two reasons are
+        different fleet facts: ``exact_column`` is the APC guard remainder
+        (``T mod C < 16``, ~0.73 % of lengths at C=2048 and 100 % of the
+        exact-multiple harness targets), ``vault_rung`` is a ladder rung inside
+        the last pipelined chunk.  A shortening that suddenly fires on every
+        request is a chunk-size or ladder-policy change, and without the reason
+        an operator cannot tell which.
+        """
+        with self._lock:
+            self.schedule_shortened += 1
+            key = str(reason or "unknown")
+            self.schedule_shortened_reasons[key] = (
+                self.schedule_shortened_reasons.get(key, 0) + 1
+            )
+
     def note_warm(self, suffix_len: int, chunk_size: int):
         """One warm-prefix refusal, bucketed by the suffix it did not pipeline.
 
@@ -886,6 +941,10 @@ class PipelineMetrics:
                 "pp_breaker_trips": self.breaker_trips,
                 "pp_ladder_collapsed": self.ladder_collapsed,
                 "pp_ladder_rungs_skipped": self.ladder_rungs_skipped,
+                "pp_schedule_shortened": self.schedule_shortened,
+                "pp_schedule_shortened_reason": dict(
+                    self.schedule_shortened_reasons
+                ),
                 "pp_warm_requests": self.warm_requests,
                 "pp_warm_suffix_tokens_hist": dict(self.warm_suffix_hist),
             }
@@ -1215,6 +1274,29 @@ def note_pipeline_ladder_collapsed(skipped: int = 0) -> None:
     METRICS.note_ladder_collapsed(skipped)
 
 
+def note_pipeline_schedule_shortened(
+    *, reason: str, full_chunks: int, chunks: int, chunk_size: int
+) -> dict:
+    """Record ONE request whose schedule was shortened; return its stats.
+
+    A5c, and the same two-things-at-once shape ``note_pipeline_warm`` has: the
+    aggregate (``pp_schedule_shortened`` + its reason histogram) is what an
+    operator diffs out of ``/metrics``, the return value is the per-request
+    record the batch keeps on itself so a test can read the exact numbers the
+    schedule was derived from.
+
+    Called from the ADMITTED path only -- after ``begin`` has succeeded -- so
+    the counter never counts a shortening that no peer ever ran.
+    """
+    METRICS.note_schedule_shortened(reason)
+    return {
+        "reason": str(reason),
+        "full_chunks": int(full_chunks),
+        "chunks": int(chunks),
+        "chunk_size": int(chunk_size),
+    }
+
+
 def note_pipeline_warm(*, prefix_len: int, suffix_len: int, chunk_size: int) -> dict:
     """Record ONE warm request's prefix/suffix/chunk split; return its stats.
 
@@ -1270,7 +1352,16 @@ def _pipeline_bypass_reason(
     right_pad=False,
 ):
     if ladder:
-        return "apc_checkpoint_ladder"
+        # A5c, and the same string-or-bool idiom ``capture`` and ``warm`` use.
+        # The BATCH call site derives the schedule, so it is the only place that
+        # can tell "this request's checkpoints are unserveable at any admissible
+        # depth" (``apc_checkpoint_ladder``, unchanged) from "shortening the
+        # schedule by one chunk WOULD serve them, and the TTFT floor says that
+        # trade is not worth taking at this length"
+        # (``below_min_pipelined_chunks``, which is a policy refusal like
+        # ``below_min_tokens`` and not a shape one).  ``generate_step``'s call
+        # site passes a bool and keeps the historical name.
+        return ladder if isinstance(ladder, str) else "apc_checkpoint_ladder"
     if capture:
         # A6.  ``capture`` used to be a bare "a hidden-reading drafter is
         # attached", which refused the DEFAULT served config outright.  Both
