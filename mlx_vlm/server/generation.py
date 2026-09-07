@@ -35,6 +35,10 @@ from ..generate import (
     _merge_prefill_prompt_kwargs,
     wired_limit,
 )
+from ..generate.common import (
+    next_prefill_chunk,
+    prefill_logits_keep_kwargs,
+)
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
@@ -346,7 +350,10 @@ def _run_chunked_speculative_prefill(
         and remaining_embeds.shape[1] > prefill_step_size
     ):
         while remaining_embeds.shape[1] > 1:
-            n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
+            # L35(b): ``min(step, remaining)`` unless the tail merge is on.
+            n_to_process = next_prefill_chunk(
+                remaining_embeds.shape[1] - 1, prefill_step_size
+            )
             chunk_kwargs = {
                 **_slice_prefill_kwargs(remaining_kwargs, sequence_keys, n_to_process),
                 **chunk_capture_kwargs,
@@ -374,6 +381,14 @@ def _run_chunked_speculative_prefill(
 
     final_kwargs = {**remaining_kwargs, **capture_kwargs}
     final_kwargs["inputs_embeds"] = remaining_embeds
+    # L35(a).  After the loop above this forward is one token wide and the kwarg
+    # is withheld; it is wide only when the prompt was never chunked (short
+    # prompt, or a drafter whose policy declines chunking), which is precisely
+    # the case that used to project the WHOLE prompt into vocab space to sample
+    # its last row (``_sample_last_token``).
+    final_kwargs.update(
+        prefill_logits_keep_kwargs(lm, remaining_embeds.shape[1])
+    )
     with mx.stream(generation_stream):
         out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
     accumulator.append(out)
