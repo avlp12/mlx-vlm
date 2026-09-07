@@ -1,6 +1,7 @@
 import contextlib
 import os
 import threading
+from functools import partial
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -220,6 +221,109 @@ def _idx_fast_enabled() -> bool:
     if _IDX_FAST_ENV is None:
         _IDX_FAST_ENV = _env_flag("MLX_VLM_GLM5_IDX_FAST", "1")
     return _IDX_FAST_ENV
+
+
+_IDX_FUSED_ENV = None
+_IDX_FUSED_VERIFY_ENV = None
+
+
+def _idx_fused_enabled() -> bool:
+    """V2e: minimum-dispatch decode indexer (``T > index_topk``, S == 1, B == 1).
+
+    ``_decode_fast`` (``MLX_VLM_GLM5_IDX_FAST``) removed the O(T) *arithmetic*
+    from the indexer's decode step but left its LAUNCH count untouched: the P0
+    dispatch census measures 47 Metal dispatches per DSA layer at depth 4096
+    against 9 at depth 512 (receipts
+    ``V3_P0_CENSUS_20260907/{d512,d4096}_e288.json``), i.e. +38 x 11 layers =
+    +418 launches per step, ~2.3 ms at the measured 5.51 us/dispatch -- which is
+    the whole of the measured depth gradient (37.4 tok/s at p512 -> 35.0 at 4k),
+    a gradient the byte model puts at only -0.8 %.
+
+    This path issues the same selection with the dead launches removed:
+      * the pool INDEX and VALIDITY buffers are dropped -- with a single
+        unpadded stream ``pool_indices[j][m] == j*kpool + m`` and a pool is
+        valid iff it is complete, both closed forms on the host, so the
+        per-step index/validity slice-updates, the index gather, the two
+        int64->int32 casts and the candidate mask all go;
+      * the trailing-pool softmax runs over the ``n <= kpool`` rows that
+        actually exist instead of a kpool-wide masked gather (the masked lanes
+        contribute exp(-1e30 - max) == 0 exactly, so this is a bit-identity);
+      * the surviving elementwise chains are ``mx.compile``-fused;
+      * the query scale's descending sort is obtained by negating the (four
+        element) head-weight vector rather than the [P] score vector -- IEEE
+        negation and addition are sign-symmetric, so the sorted array is
+        bit-identical up to the sign of zero, which a comparison sort orders
+        the same way;
+      * the indexer's KV cache values half is zero-width, so its slice-update
+        and the ``mx.zeros`` that feeds it are skipped.
+
+    Default OFF; byte-identical to ``_decode_fast`` when unset.  Only ever
+    reached at ``S == 1`` -- prefill and S>1 verify blocks are structurally out
+    of scope (see the gate in ``Glm5NextIndexer.__call__``).
+    """
+    global _IDX_FUSED_ENV
+    if _IDX_FUSED_ENV is None:
+        _IDX_FUSED_ENV = _env_flag("MLX_VLM_GLM5_INDEXER_DECODE_FUSED", "0")
+    return _IDX_FUSED_ENV
+
+
+def _idx_fused_verify() -> bool:
+    """Run ``_decode_fast`` alongside and assert the two agree, element for element."""
+    global _IDX_FUSED_VERIFY_ENV
+    if _IDX_FUSED_VERIFY_ENV is None:
+        _IDX_FUSED_VERIFY_ENV = _env_flag("MLX_VLM_GLM5_INDEXER_DECODE_FUSED_VERIFY")
+    return _IDX_FUSED_VERIFY_ENV
+
+
+# shape-keyed, deliberately: ``n`` only ever takes the ``index_kpool`` values
+# 1..kpool, so the trace cache is bounded at 4 entries.  ``shapeless=True`` here
+# faults MLX 0.32.1 (bus error) -- the softmax/sum over a symbolic axis.
+@partial(mx.compile, shapeless=False)
+def _idx_tail_pool_fused(gg, gk, ape_n):
+    """Trailing-pool gate softmax + weighted sum, over the ``n`` real rows only.
+
+    Eager (``_pool_tail``) gathers ``kpool`` rows with the last one replicated,
+    adds the ape, masks the replicas to -1e30, softmaxes over ``kpool``, scrubs
+    NaN and contracts.  The replicas land at ``exp(-1e30 - max) == 0.0``
+    exactly, ``x + 0.0 == x`` and ``0.0 * finite == 0.0``, so dropping them
+    changes no bit of either the softmax denominator or the contraction -- and
+    the NaN scrub is unreachable once at least one row is real (n >= 1 always,
+    the caller asserts it).
+    """
+    logits = gg + ape_n
+    probs = mx.softmax(logits, axis=2)
+    return mx.sum(probs * gk, axis=2)
+
+
+# shapeless: the pool count P grows by one every ``index_kpool`` decode steps, so
+# a shape-keyed trace would compile a NEW kernel every fourth step for the rest of
+# the generation.  Every op here is elementwise, so one trace serves every P.
+@partial(mx.compile, shapeless=True)
+def _idx_relu_scores_fused(scores, scale):
+    # ``scale`` is an mx.array leaf, not a python float: mx.compile keys its
+    # trace on the ARRAYS it is handed, so a python scalar would be frozen into
+    # the trace as a constant.  mx.array(float, float32) and the implicit
+    # float64 -> float32 weak-scalar promotion round identically, so this is the
+    # same product the eager path forms.
+    return mx.maximum(scores * scale, 0.0)
+
+
+# shape-keyed: ``selected`` is [B, 1, select_k] and ``select_k`` is pinned at
+# ``index_topk // index_kpool`` for the whole active regime, so this is one trace.
+@partial(mx.compile, shapeless=False)
+def _idx_expand_pools_fused(selected, kp, offsets):
+    """``pool_indices`` gathered at ``selected`` -- as arithmetic, not a gather.
+
+    With a single unpadded stream ``_pool_layout`` anchors at ``first_key == 0``
+    and every candidate pool is complete, so pool ``j`` covers exactly the
+    positions ``j*kpool .. j*kpool + kpool - 1``.  The eager path materialises
+    that table into ``pool_indices`` and take_along_axis'es it; here it is one
+    fused multiply-add over the [select_k] winners.
+    """
+    # ``mx.argsort`` returns uint32; the cast rides INSIDE the fused kernel, so
+    # the result is already int32 and the eager path's trailing ``astype`` (its
+    # pool table is int64) is not emitted at all.
+    return selected.astype(mx.int32)[..., None] * kp + offsets
 
 
 # L13 (2026-09-05): compile the KDA "glue" -- the pure-array ops between the
@@ -1680,6 +1784,29 @@ def _batch_row_valid(cache, B, lo, n):
     return mx.arange(lo, lo + n)[None, :] >= left_padding[:, None]
 
 
+def _indexer_pool_state(cache):
+    """``(pool_keys, t_prev)`` of whichever incremental pool store the cache holds.
+
+    Three stores can be live, and exactly one is at a time: ``_ffpool`` (V2e
+    fused, keys only), ``_fpool`` (``MLX_VLM_GLM5_IDX_FAST``) and ``_pool`` (the
+    eager incremental pool).  Each owner nulls the other two when it takes over
+    (``_pool_buffers``, ``_pool_buffers_fused``, the eager rebuild), so this is a
+    lookup, not a merge.  Returns None when the cache has no pool at all.
+    """
+    if cache is None:
+        return None
+    buf = getattr(cache, "_ffpool", None)
+    if buf is not None:
+        return buf[0], buf[1]
+    buf = getattr(cache, "_fpool", None)
+    if buf is not None:
+        return buf[0], buf[3]
+    buf = getattr(cache, "_pool", None)
+    if buf is not None:
+        return buf[0], buf[3]
+    return None
+
+
 class Glm5NextIndexer(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -1957,6 +2084,283 @@ class Glm5NextIndexer(nn.Module):
         vals = [(T - c + o) if o < c else -1 for o in range(kp - 1)]
         return mx.broadcast_to(mx.array(vals, dtype=dtype), (B, 1, kp - 1))
 
+    # ---------------------------------------------------------------- fused
+    # V2e: the same selection as ``_decode_fast`` with the dead LAUNCHES gone.
+    # See ``_idx_fused_enabled`` for the census that motivates it.  Everything
+    # here is guarded by that flag and by the ``_decode_fast`` eligibility gate,
+    # so ``S == 1`` and ``B == 1`` are preconditions, not checks.
+
+    def _pool_buffers_fused(self, cache):
+        """Append-only store for the fused path: pooled KEYS only.
+
+        ``_pool_buffers`` also carries ``pool_indices`` ([cap, kpool] int64) and
+        ``pool_valid`` ([cap] bool).  Neither survives here: with a single
+        unpadded stream both are closed forms in the position (see
+        ``_idx_expand_pools_fused`` and ``_decode_fused``'s ``R``), so keeping
+        them would buy two slice-updates, a gather and two dtype casts per layer
+        per step for information the host already has.
+
+        Like ``_pool_buffers`` this takes ownership: ``_pool``/``_fpool`` are
+        dropped so that if the path ever becomes ineligible mid-stream the
+        fallback is a correct full rebuild rather than a stale prefix.
+        """
+        kp = self.index_kpool
+        buf = getattr(cache, "_ffpool", None)
+        if buf is not None:
+            return buf
+        fbuf = getattr(cache, "_fpool", None)
+        if fbuf is not None:
+            ck, t_prev = fbuf[0], fbuf[3]
+            n = t_prev // kp
+        else:
+            ck, _ci, _cv, t_prev = cache._pool
+            n = ck.shape[1]
+        B = ck.shape[0]
+        cap = ((n + _IDX_POOL_STEP - 1) // _IDX_POOL_STEP + 1) * _IDX_POOL_STEP
+        pk = mx.zeros((B, cap, self.head_dim), dtype=ck.dtype)
+        pk[:, :n] = ck[:, :n]
+        buf = [pk, t_prev, cap]
+        cache._ffpool = buf
+        cache._pool = None
+        cache._fpool = None
+        return buf
+
+    def _pool_tail_fused(self, tail, n):
+        """``_pool_tail`` with the replica gather and the candidate mask removed.
+
+        ``tail`` is the contiguous ``[B, n, 2*head_dim+1]`` slice of the indexer
+        cache holding the current (incomplete or just-completed) pool, so the
+        key and gate halves are plain views -- the eager path's two
+        ``mx.take``s exist only to widen ``n`` rows to ``kpool`` rows whose
+        extra lanes are then masked to -1e30.  Dropping them is exact; see
+        ``_idx_tail_pool_fused``.
+        """
+        hd = self.head_dim
+        if not 1 <= n <= self.index_kpool:
+            raise ValueError(
+                f"indexer fused tail expects 1..{self.index_kpool} tokens, got {n}"
+            )
+        gk = tail[..., :hd][:, None]
+        gg = tail[..., hd : 2 * hd][:, None]
+        return _idx_tail_pool_fused(
+            gg, gk, self.index_kpool_compress_ape[None, None, :n]
+        )
+
+    def _fused_valid(self, P, R):
+        """[1, 1, P] candidate mask: the first R pools, cached per (P, R).
+
+        Only two shapes ever occur for a given P (R == P and R == P - 1), and P
+        advances one pool every ``index_kpool`` steps, so this is a host-side
+        constant, not a per-step dispatch.
+        """
+        c = getattr(self, "_fvm", None)
+        if c is None or c[0] != (P, R):
+            c = ((P, R), (mx.arange(P) < R).reshape(1, 1, P))
+            self._fvm = c
+        return c[1]
+
+    def _fused_consts(self, dtype):
+        """Host-side constants the fused step reuses across steps and layers."""
+        kp = self.index_kpool
+        c = getattr(self, "_fxc", None)
+        if c is None or c[0] != dtype:
+            c = (
+                dtype,
+                mx.array(kp, dtype=mx.int32),
+                mx.arange(kp, dtype=mx.int32),
+                mx.ones((1, 1, 1), dtype=dtype),
+            )
+            self._fxc = c
+        return c[1:]
+
+    def _fused_scale(self, dtype):
+        """``softmax_scale`` as an array of the SCORE dtype.
+
+        LOAD BEARING: the eager path writes ``scores * self.softmax_scale`` with
+        a python float, which MLX treats as a WEAK scalar -- it takes the dtype
+        of the array and the product stays bfloat16.  Handing ``mx.compile`` a
+        float32 0-d array instead promotes the whole score vector to float32,
+        which is not the same argsort input (measured: the selection stays the
+        same set but the tied pools permute).  A python float cannot be passed
+        through ``mx.compile`` either -- it would be frozen into the trace -- so
+        the constant is materialised at the score dtype and cached.
+        """
+        c = getattr(self, "_fsc", None)
+        if c is None or c[0] != dtype:
+            c = (dtype, mx.array(self.softmax_scale, dtype=dtype))
+            self._fsc = c
+        return c[1]
+
+    def _append_packed(self, cache, packed):
+        """Append one packed row to the indexer cache, keys only.
+
+        The indexer's KV cache is a ``KVCache`` whose VALUES half is zero-width
+        (``mx.zeros((B, 1, S, 0))`` at the call site): every step it allocates
+        that zero-width array and slice-updates it into a zero-width buffer --
+        two dispatches per DSA layer for no bytes.  Take the shortcut only when
+        the buffer provably has room and the values half really is zero-width;
+        anything else (first write, growth) goes through ``update_and_fetch`` so
+        the two halves keep the same capacity.
+        """
+        keys = cache.keys
+        values = cache.values
+        prev = cache.offset
+        if (
+            keys is not None
+            and values is not None
+            and values.shape[-1] == 0
+            and values.shape[2] == keys.shape[2]
+            and prev + 1 <= keys.shape[2]
+        ):
+            cache.offset = prev + 1
+            keys[..., prev : cache.offset, :] = packed
+            return keys[..., : cache.offset, :]
+        B = packed.shape[0]
+        k, _ = cache.update_and_fetch(packed, mx.zeros((B, 1, 1, 0), dtype=packed.dtype))
+        return k
+
+    def _decode_fused_reference(self, x, q, cache, T):
+        """The eager formulation of the same step, from the fused pool store.
+
+        ``MLX_VLM_GLM5_INDEXER_DECODE_FUSED_VERIFY=1`` only.  It rebuilds the
+        pool INDEX table and the candidate mask that ``_decode_fused`` proves
+        away, and takes the eager selection ops (mask -> negate -> argsort ->
+        two take_along_axis -> mask) verbatim, so a disagreement localises to
+        the algebra rather than to the pool store.
+        """
+        kp = self.index_kpool
+        B = x.shape[0]
+        pk, t_prev, _cap = cache._ffpool
+        P = t_prev // kp + 1
+        pool_keys = pk[:, :P]
+        pool_indices = (mx.arange(P * kp, dtype=mx.int32).reshape(1, P, kp))
+        pool_indices = mx.where(pool_indices < T, pool_indices, -1)
+        pool_indices = mx.broadcast_to(pool_indices, (B, P, kp))
+        pool_valid = mx.broadcast_to(
+            (mx.arange(P) + 1) * kp <= T, (B, P)
+        )
+        select_k = min(self.index_topk // kp, P)
+        scores = q @ pool_keys[:, None].swapaxes(-1, -2)
+        scores = mx.maximum(scores * self.softmax_scale, 0.0)
+        weights = self.weights_proj(x) * (self._scale_heads**-0.5)
+        index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
+        valid_candidates = mx.broadcast_to(pool_valid[:, None], (B, 1, P))
+        index_scores = mx.where(valid_candidates, index_scores, -1e30)
+        order = mx.argsort(-index_scores, axis=-1)
+        selected = order[..., :select_k]
+        selected_valid = mx.take_along_axis(valid_candidates, selected, axis=-1)
+        sel_exp = mx.broadcast_to(selected[..., None], (B, 1, select_k, kp))
+        topk = mx.take_along_axis(
+            mx.broadcast_to(pool_indices[:, None], (B, 1, P, kp)), sel_exp, axis=2
+        ).reshape(B, 1, select_k * kp)
+        sv = mx.broadcast_to(selected_valid[..., None], (B, 1, select_k, kp)).reshape(
+            B, 1, select_k * kp
+        )
+        topk = mx.where(sv, topk, -1)
+        if self.index_kpool_always_select_tail and kp > 1:
+            topk = mx.concatenate([topk, self._tail_fast(B, T, topk.dtype)], axis=-1)
+        width = self.index_topk + (
+            kp - 1 if (self.index_kpool_always_select_tail and kp > 1) else 0
+        )
+        if topk.shape[-1] < width:
+            topk = mx.concatenate(
+                [topk, mx.full((B, 1, width - topk.shape[-1]), -1, dtype=topk.dtype)],
+                axis=-1,
+            )
+        return topk[:, None, ..., :width].astype(mx.int32)
+
+    def _decode_fused(self, x, q, packed_full, cache, T):
+        kp, hd = self.index_kpool, self.head_dim
+        B = packed_full.shape[0]
+
+        # --- eligibility, resolved on the host BEFORE any buffer is touched --
+        # A pool is a candidate iff it is COMPLETE (``pool_valid`` in
+        # ``_pool_layout`` is ``all(grouped_valid)``; with no padding the only
+        # incomplete pool is the trailing one), so R = T // kpool pools are
+        # candidates out of P.
+        #
+        # LOAD BEARING: the ranking still runs over all P, not over the R-prefix.
+        # ``mx.argsort`` is not stable and its tie order depends on the LENGTH of
+        # the axis it sorts (measured: at depth 4096 the score vector carries
+        # ~459 exact duplicate values out of 1024, and ranking 1024 instead of
+        # 1025 permutes tied pools).  The selection would still be the same SET;
+        # it would not be the same array, and _gathered_attention reduces over
+        # that axis.  So the incomplete pool stays in the ranking, pushed out by
+        # the same +/-1e30 sentinel the eager path uses.
+        #
+        # ``select_k <= R`` is what makes the sentinel sufficient (the incomplete
+        # pool can never win a slot, so the eager path's selected_valid gather
+        # and its mask are the identity).  The active regime T > index_topk gives
+        # R >= index_topk // kpool == select_k always; decline rather than guess
+        # if it ever does not -- and decline BEFORE allocating, so a decline
+        # leaves ``_decode_fast``'s state intact.
+        n_stable = (T - 1) // kp        # the gate guarantees t_prev == T - 1
+        P = n_stable + 1
+        R = T // kp
+        select_k = min(self.index_topk // kp, P)
+        if select_k > R or self._tp_reduce is not None:
+            return None
+
+        kp_arr, offsets, _ones = self._fused_consts(packed_full.dtype)
+        buf = self._pool_buffers_fused(cache)
+        pk, t_prev, cap = buf
+
+        # --- repool the trailing pool, in place (one slice-update) -----------
+        s0 = n_stable * kp
+        n = T - s0                      # 1..kp, known on the host
+        pk_s = self._pool_tail_fused(packed_full[:, s0:], n)
+        if P > cap:
+            cap += _IDX_POOL_STEP
+            grow = mx.zeros((B, cap, hd), dtype=pk.dtype)
+            grow[:, : pk.shape[1]] = pk
+            pk = grow
+        pk[:, n_stable:P] = pk_s
+        buf[:] = [pk, T, cap]
+
+        # --- scoring ---------------------------------------------------------
+        scores = q @ pk[:, :P][:, None].swapaxes(-1, -2)
+        relu_scores = _idx_relu_scores_fused(scores, self._fused_scale(scores.dtype))
+        # The sort below wants DESCENDING scores.  The eager path negates the
+        # [R] score vector; negating the four-element head-weight vector
+        # instead is the same array bit for bit (IEEE multiply and add are both
+        # sign-symmetric under round-to-nearest-even, so the whole contraction
+        # negates exactly) except that an all-zero score may come out +0.0
+        # where the eager path has -0.0 -- and MLX's sort is comparison-based,
+        # under which those two are equal, so the tie order is unchanged.
+        weights_neg = self.weights_proj(x) * (-(self._scale_heads**-0.5))
+        neg_index_scores = (weights_neg[:, :, None, :] @ relu_scores).squeeze(2)
+
+        if R < P:
+            # exactly one incomplete pool; mask it with the negated sentinel
+            # (-(-1e30) == 1e30 exactly).  When R == P every pool is complete and
+            # the eager mask is a no-op on identical values, so it is skipped
+            # without changing a bit -- or the sorted length.
+            neg_index_scores = mx.where(
+                self._fused_valid(P, R), neg_index_scores, 1e30
+            )
+        order = mx.argsort(neg_index_scores, axis=-1)
+        selected = order[..., :select_k]
+        # Every selected pool is complete, so ``selected_valid`` is all-True and
+        # the eager path's gather + mask is the identity; the pool -> position
+        # expansion is arithmetic instead of a table gather.
+        topk = _idx_expand_pools_fused(selected, kp_arr, offsets).reshape(
+            B, 1, select_k * kp
+        )
+
+        if self.index_kpool_always_select_tail and kp > 1:
+            topk = mx.concatenate([topk, self._tail_fast(B, T, topk.dtype)], axis=-1)
+        width = self.index_topk + (
+            kp - 1 if (self.index_kpool_always_select_tail and kp > 1) else 0
+        )
+        if topk.shape[-1] < width:
+            topk = mx.concatenate(
+                [topk, mx.full((B, 1, width - topk.shape[-1]), -1, dtype=topk.dtype)],
+                axis=-1,
+            )
+        # int32 already: ``offsets``/``kp_arr`` are int32, so the astype the
+        # eager path needs (its pool table is int64) is not even emitted.
+        return topk[:, None, ..., :width].astype(mx.int32)
+
     def __call__(self, x, qr, mask, cache=None):
         B, S, _ = x.shape
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim)
@@ -1978,21 +2382,51 @@ class Glm5NextIndexer(nn.Module):
         # takes no attention mask at all, see _gathered_attention -- attended
         # them.  Derive it from the row's real length instead, which the batched
         # cache already carries, so the mask's RANK stops mattering.
-        if mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S):
+        # V2e: on the fused decode rail the validity column is provably all-ones
+        # (single unpadded row, no mask), so it is a cached constant rather than
+        # an ``mx.ones`` + ``astype`` pair -- and the cache append skips the
+        # zero-width VALUES half entirely.  ``valid_cur`` stays lazy because the
+        # eager tail below still needs it if this step turns out ineligible.
+        #
+        # ``type(cache) is KVCache`` exactly, not isinstance and not a
+        # ``left_padding`` probe: ``_append_packed`` writes ``cache.offset`` and
+        # ``cache.keys`` directly, and a BatchKVCache carries its write cursor in
+        # ``_idx`` with ``offset`` meaning a per-row LENGTH -- a shape of cache
+        # this shortcut must never be handed.  ``_batch_row_valid`` also declines
+        # for a plain KVCache (no ``left_padding``), which is what makes the
+        # all-ones constant the same column the eager path would have written.
+        fused = (
+            _idx_fused_enabled()
+            and S == 1
+            and B == 1
+            and cache is not None
+            and mask is None
+            and self._tp_reduce is None
+            and type(cache) is KVCache
+        )
+        valid_cur = None
+        if fused:
+            valid_col = self._fused_consts(k.dtype)[2]
+        elif mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S):
             valid_cur = mask
         else:
             valid_cur = _batch_row_valid(cache, B, getattr(cache, "_idx", 0), S)
             if valid_cur is None:
                 valid_cur = mx.ones((B, S), dtype=mx.bool_)
+        if valid_cur is not None:
+            valid_col = valid_cur.astype(k.dtype)[..., None]
 
         # Pack per-token state and append to the indexer cache so pooling/selection
         # run over the full cached sequence -- unifies prefill and incremental decode.
-        packed = mx.concatenate(
-            [k, gate_scores, valid_cur.astype(k.dtype)[..., None]], axis=-1
-        )
+        packed = mx.concatenate([k, gate_scores, valid_col], axis=-1)
         if cache is not None:
-            keys, _ = cache.update_and_fetch(packed[:, None], mx.zeros((B, 1, S, 0)))
-            packed_full = keys[:, 0]
+            if fused:
+                packed_full = self._append_packed(cache, packed[:, None])[:, 0]
+            else:
+                keys, _ = cache.update_and_fetch(
+                    packed[:, None], mx.zeros((B, 1, S, 0))
+                )
+                packed_full = keys[:, 0]
         else:
             packed_full = packed
         T = packed_full.shape[1]
@@ -2006,6 +2440,7 @@ class Glm5NextIndexer(nn.Module):
         # since the pool cache was last built, and a pool state to build on.
         # Anything else (prefill, S>1 verify block, batched or left-padded
         # decode, a rollback that shortened the cache) takes the eager path.
+        pool_state = _indexer_pool_state(cache)
         if (
             _idx_fast_enabled()
             and S == 1
@@ -2013,16 +2448,30 @@ class Glm5NextIndexer(nn.Module):
             and cache is not None
             and mask is None
             and getattr(cache, "_no_pad", False)
-            and (
-                getattr(cache, "_fpool", None) is not None
-                or getattr(cache, "_pool", None) is not None
-            )
-            and (cache._fpool[3] if getattr(cache, "_fpool", None) is not None
-                 else cache._pool[3]) == T - 1
-            and (cache._fpool[0] if getattr(cache, "_fpool", None) is not None
-                 else cache._pool[0]).shape[0] == B
+            and pool_state is not None
+            and pool_state[1] == T - 1
+            and pool_state[0].shape[0] == B
         ):
-            return self._decode_fast(x, q, packed_full, cache, T)
+            if fused:
+                # ``_decode_fused`` declines (returns None) BEFORE it touches any
+                # buffer, so a decline leaves ``_decode_fast``'s state intact.
+                out = self._decode_fused(x, q, packed_full, cache, T)
+                if out is not None:
+                    if _idx_fused_verify():
+                        _assert_same(
+                            "indexer_decode_fused",
+                            [out],
+                            [self._decode_fused_reference(x, q, cache, T)],
+                        )
+                    return out
+            if getattr(cache, "_ffpool", None) is None:
+                return self._decode_fast(x, q, packed_full, cache, T)
+        if valid_cur is None:
+            # The fused packing above skipped it; this step turned out
+            # ineligible, so the eager tail needs the real thing.  ``fused``
+            # required ``left_padding is None``, which is exactly the case in
+            # which ``_batch_row_valid`` declines, so it is all-ones.
+            valid_cur = mx.ones((B, S), dtype=mx.bool_)
         k_full, gate_full, valid_ch = mx.split(
             packed_full, [self.head_dim, 2 * self.head_dim], axis=-1
         )
@@ -2102,6 +2551,7 @@ class Glm5NextIndexer(nn.Module):
         if cache is not None:
             cache._pool = (pool_keys, pool_indices, pool_valid, T)
             cache._fpool = None
+            cache._ffpool = None
         P = pool_keys.shape[1]
         select_k = min(self.index_topk // self.index_kpool, P)
         pool_end = mx.clip(pool_indices[..., -1], 0, kv_len - 1)
@@ -2838,6 +3288,7 @@ def trim_sparse_cache(cache, trim: int, index_kpool: int) -> None:
     indexer_cache = cache[1]
     if trim > 0:
         indexer_cache._fpool = None
+        indexer_cache._ffpool = None
     pool = getattr(indexer_cache, "_pool", None)
     if pool is None:
         return
@@ -2924,6 +3375,7 @@ def give_back_sparse_cache_rows(cache, extra: mx.array) -> None:
     indexer_cache = cache[1]
     indexer_cache._pool = None
     indexer_cache._fpool = None
+    indexer_cache._ffpool = None
     # The pools above were computed from a `valid` that is now stale; say so,
     # rather than leaving the fast path's precondition asserting the opposite
     # until the next eager forward recomputes it.
