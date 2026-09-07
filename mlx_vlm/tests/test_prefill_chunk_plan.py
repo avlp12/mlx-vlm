@@ -609,6 +609,98 @@ class TestChunkPlanIsNotBitExact:
         assert worst < 1e-4, worst
 
 
+# --------------------------------------- tail_min is clamped to step
+
+
+class TestTailMinIsClampedToStep:
+    """``effective_tail_min = min(tail_min, step)``.
+
+    ``TAIL_MIN`` is an ABSOLUTE token count whose default (1024) was sized for
+    the shipped 8192 step.  Read literally it is not scale-free: at a step below
+    the threshold the "short tail" band covers every prompt the loop will ever
+    see, so the merge folds the WHOLE prompt into one chunk and chunked prefill
+    silently stops happening -- with an activation peak unbounded relative to the
+    step it was configured against.  The clamp bounds a merged chunk at
+    ``2*step - 1`` and is a no-op wherever ``step >= tail_min``, which includes
+    both step sizes in service: 8192 (serving default) and 2048 (PP prefill).
+    """
+
+    def _reference(self, remaining, step, tail_min):
+        """The pre-clamp rule, evaluated where the clamp cannot bite."""
+        assert tail_min <= step, "reference only valid where the clamp is a no-op"
+        plan = []
+        left = remaining
+        while left > 0:
+            if left <= step:
+                n = left
+            elif step < left < step + tail_min:
+                n = left
+            else:
+                n = step
+            plan.append(n)
+            left -= n
+        return plan
+
+    # ---- the clamp bites: small step, shipped threshold
+
+    def test_a_merged_chunk_never_exceeds_two_steps(self):
+        for remaining in range(65, 4096):
+            plan = plan_prefill_chunks(remaining, 64, tail_min=1024, enabled=True)
+            assert sum(plan) == remaining
+            assert max(plan) <= 2 * 64 - 1, (remaining, max(plan))
+
+    @pytest.mark.parametrize("remaining", [129, 200, 512, 1088, 4096])
+    def test_chunking_still_happens_past_two_steps(self, remaining):
+        # Without the clamp every one of these is a single chunk of ``remaining``
+        # (all are < 64 + 1024), i.e. no chunked prefill at all.
+        plan = plan_prefill_chunks(remaining, 64, tail_min=1024, enabled=True)
+        assert len(plan) >= 2, plan
+        assert plan[:-1] == [64] * (len(plan) - 1)
+        assert sum(plan) == remaining
+
+    def test_the_band_that_still_merges_is_the_last_cell_only(self):
+        # step < remaining < 2*step is the whole merge band at step 64.
+        assert plan_prefill_chunks(100, 64, tail_min=1024, enabled=True) == [100]
+        assert plan_prefill_chunks(127, 64, tail_min=1024, enabled=True) == [127]
+        assert plan_prefill_chunks(128, 64, tail_min=1024, enabled=True) == [64, 64]
+
+    def test_balance_mode_is_clamped_too(self):
+        for remaining in range(65, 1024):
+            plan = plan_prefill_chunks(
+                remaining, 64, tail_min=1024, mode="balance", enabled=True
+            )
+            assert sum(plan) == remaining
+            assert max(plan) <= 64
+
+    # ---- the clamp is a no-op at both step sizes in service
+
+    @pytest.mark.parametrize("step", [8192, 2048])
+    @pytest.mark.parametrize(
+        "remaining",
+        [1, 537, 2047, 2048, 2049, 3071, 3072, 8191, 8192, 8193, 8729, 9215,
+         9216, 16384, 33305, 131071],
+    )
+    def test_the_shipped_step_sizes_are_untouched(self, step, remaining):
+        assert plan_prefill_chunks(
+            remaining, step, tail_min=1024, enabled=True
+        ) == self._reference(remaining, step, 1024)
+
+    def test_the_two_receipts_plans_are_the_ones_the_rail_measured(self):
+        # 33,305 = 4*8192 + 537 (PFINAL as-fed 32k) and the same prompt at the
+        # PP step of 2048 -- both identical to the pre-clamp commit.
+        assert plan_prefill_chunks(33305, 8192, tail_min=1024, enabled=True) == [
+            8192, 8192, 8192, 8729
+        ]
+        assert plan_prefill_chunks(33305, 2048, tail_min=1024, enabled=True) == (
+            [2048] * 15 + [2585]
+        )
+
+    def test_a_threshold_below_the_step_is_still_honoured_exactly(self):
+        # The clamp only ever lowers, so a deliberately small threshold is not
+        # touched: 8192 + 100 merges at tail_min 1024 but not at tail_min 64.
+        assert next_prefill_chunk(8292, 8192, tail_min=1024, enabled=True) == 8292
+        assert next_prefill_chunk(8292, 8192, tail_min=64, enabled=True) == 8192
+
 # ------------------------------------------------ the "0 0" revert contract
 
 

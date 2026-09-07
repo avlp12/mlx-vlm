@@ -249,8 +249,9 @@ def next_prefill_chunk(
     and can only shorten, so a checkpointing request silently gets the old plan
     rather than a missed rung.
 
-    ``grow``    -- one chunk of ``remaining`` (<= step + tail_min - 1).  Costs up
-                   to (tail_min-1)/step more activation peak on one chunk.
+    ``grow``    -- one chunk of ``remaining`` (<= step + tail_min - 1, and
+                   ``tail_min`` is clamped to ``step``, so <= 2*step - 1).  Costs
+                   up to (tail_min-1)/step more activation peak on one chunk.
     ``balance`` -- two chunks of ceil/floor ``remaining/2``, memory-neutral, but
                    L7B's per-chunk rate falls with chunk size (209 tok/s at 8192
                    vs 200 at 4096), so it is expected to be the slower arm; it
@@ -277,6 +278,16 @@ def next_prefill_chunk(
     if not enabled:
         return step
     tail_min = prefill_tail_min() if tail_min is None else max(0, int(tail_min))
+    # ``tail_min`` is an ABSOLUTE token count sized for the shipped 8192 step, so
+    # it is clamped to ``step``: without this, any deployment whose step is below
+    # the threshold stops chunking altogether (at step 64 a 1024 threshold merges
+    # every prompt up to 1088 columns into ONE chunk), and the activation peak of
+    # the merged cell is unbounded relative to the step it was sized against.
+    # With it, a merged chunk is never wider than ``2 * step - 1``.  No-op at
+    # every step >= tail_min, which includes the serving default (8192) and the
+    # pipeline-parallel prefill step (2048), so the plans the I1437 rail measured
+    # are bit-for-bit the plans this produces.
+    tail_min = min(tail_min, step)
     if tail_min <= 0 or remaining >= step + tail_min:
         return step
     # step < remaining < step + tail_min: one full chunk plus a short tail.
