@@ -64,6 +64,8 @@ class _TwinLM:
         self.rollbacks = []
         self.caches = []
         self._h, self._v = hidden, vocab
+        self.model = SimpleNamespace(embed_tokens=lambda ids: mx.repeat((ids + 1)[:, :, None], hidden, axis=2))
+        self.last_inputs_embeds = None
 
     def make_cache(self):
         c = ["cache", len(self.caches)]
@@ -71,6 +73,7 @@ class _TwinLM:
         return c
 
     def __call__(self, ids, cache=None, **kw):
+        self.last_inputs_embeds = kw.get("inputs_embeds")
         captured = kw.get("capture_layer_ids") is not None
         self.forwards.append((ids.shape[0], ids.shape[1], captured))
         return SimpleNamespace(
@@ -97,6 +100,18 @@ def test_worker_makes_a_cache_then_forwards_into_it():
     assert st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2, 3])) is True
     assert lm.forwards == [(1, 3, False)]
     assert len(lm.caches) == 1
+
+
+def test_worker_rebuilds_left_zero_padded_text_embeddings():
+    lm = _TwinLM(); st = W._WorkerState(lm)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    row = W.encode(W.OP_FORWARD, 1, (2, 3), [0, 0, 3, 4, 5, 6], n=64,
+                   flags=W.FLAG_LEFT_ZERO_PAD)
+    st.handle(W.decode(row))
+    got = lm.last_inputs_embeds
+    assert mx.all(got[0, :2] == 0).item()
+    assert mx.all(got[0, 2] == 4).item()
+    assert mx.all(got[1] == mx.array([[5] * 4, [6] * 4, [7] * 4])).item()
 
 
 def test_worker_replaces_the_cache_on_a_new_epoch():

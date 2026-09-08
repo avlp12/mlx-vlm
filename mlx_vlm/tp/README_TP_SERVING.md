@@ -30,7 +30,7 @@ rung?" — the answer is a second collective with the roles swapped, not a socke
     op   verb            carries                       who acts
     0    EXIT            —                             rank 1 stops
     1    MAKE_CACHE      epoch                         rank 1 builds an EMPTY cache
-    2    FORWARD         epoch, (b,s), ids, capture    both ranks run the forward
+    2    FORWARD         epoch, (b,s), ids, flags      both ranks run the forward
     3    ROLLBACK        epoch, accepted[], block      each rank rolls back its own half
     4    VAULT_STORE     epoch, name, prefix_len       each rank checkpoints its own half
     5    VAULT_RESTORE   epoch, name, prefix_len       each rank restores its own half, + ack
@@ -46,9 +46,11 @@ Rank 1's cache must always be reconstructible from what rank 0 announced. Three
 things can break that, and each has a verb or a refusal rather than a silent
 divergence:
 
-* a forward rank 1 cannot reproduce from token ids (**multimodal
-  `inputs_embeds`**) → refused. Checked per call, never cached: whether a prefill
-  is multimodal is a property of the request, not of the model.
+* A text forward whose embeddings are exactly `embed_tokens(ids)` is replayed
+  directly. Heterogeneous batches use a `LEFT_ZERO_PAD` flag when embeddings
+  exactly match BatchGenerator's deterministic leading-zero transform; rank 1
+  rebuilds that same transform. Every other embedding, including multimodal
+  splices, is refused. The equality check runs per call and is never cached.
 * a **mutation of the cache outside a forward** (speculative rollback, vault
   restore) → announced.
 * a cache that arrives **already populated but never announced** → refused.

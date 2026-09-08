@@ -320,6 +320,31 @@ def test_prefill_embeds_refused_when_not_reconstructible(monkeypatch):
         m(ids, cache=[], inputs_embeds=mx.ones((1, 3, 8)))
 
 
+def test_heterogeneous_text_batch_zero_padding_is_reconstructible(monkeypatch):
+    """BatchGenerator zero-pads embeddings where its token ids are left-padded."""
+    import mlx.core as mx
+
+    ids = mx.array([[0, 0, 3], [4, 5, 6]], dtype=mx.int32)
+    ref = mx.repeat((ids + 1)[:, :, None], 4, axis=2).astype(mx.float32)
+    pad = mx.array([[True, True, False], [False, False, False]])[:, :, None]
+    emb = mx.where(pad, mx.zeros_like(ref), ref)
+    m, sent = _mirror(monkeypatch, _EmbLM(ref))
+    m(ids, cache=[], inputs_embeds=emb, mask=mx.ones((2, 3)))
+    fwd = [s for s in sent if s.op == T.OP_FORWARD][-1]
+    assert fwd.flags & T.FLAG_LEFT_ZERO_PAD
+
+
+def test_left_padding_exception_still_refuses_arbitrary_embeddings(monkeypatch):
+    import mlx.core as mx
+
+    ids = mx.array([[0, 0, 3], [4, 5, 6]], dtype=mx.int32)
+    ref = mx.repeat((ids + 1)[:, :, None], 4, axis=2).astype(mx.float32)
+    altered = mx.where(mx.array([[False, False, False], [False, True, False]])[:, :, None], mx.full_like(ref, 99), ref)
+    m, _ = _mirror(monkeypatch, _EmbLM(ref))
+    with pytest.raises(T.TPUnavailable, match="multimodal"):
+        m(ids, cache=[], inputs_embeds=altered)
+
+
 def test_embeds_verdict_is_not_cached(monkeypatch):
     """Regression: whether a prefill is multimodal is a property of the REQUEST.
 

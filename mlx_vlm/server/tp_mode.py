@@ -53,13 +53,13 @@ logger = logging.getLogger(__name__)
 
 from ..tp.worker import (  # noqa: F401  re-exported for the rank-0 side
     ENV_HOSTS, ENV_MAX_TOK, ENV_RANK, ENV_WORKER_PY, ENV_WORKER_SRC,
-    ENV_WORKER_MODEL, FLAG_CAPTURE, FLAG_HAS_NAME, HEADER, NAME_WORDS,
-    PROTO_VERSION,
+    ENV_WORKER_MODEL, FLAG_CAPTURE, FLAG_HAS_NAME, FLAG_LEFT_ZERO_PAD, HEADER,
+    NAME_WORDS, PROTO_VERSION,
     OP_EXIT, OP_FORWARD, OP_MAKE_CACHE, OP_ROLLBACK, OP_VAULT_RESTORE,
     OP_VAULT_STORE, Ctrl, TPDesync, TPUnavailable,
     _ack_recv, _ctrl_recv, _ctrl_send, _max_tok, decode, encode,
-    name_to_words, preflight, tp_enabled, tp_hosts, tp_rank, words_to_name,
-    worker_loop,
+    name_to_words, preflight, text_embeddings, tp_enabled, tp_hosts, tp_rank,
+    words_to_name, worker_loop,
 )
 
 # How long a single announced step may take before we conclude the peer is
@@ -327,7 +327,7 @@ class MirroredLanguageModel:
         return False
 
     # ------------------------------------------------------------ discipline
-    def _embeds_are_just_the_ids(self, inputs, embeds) -> bool:
+    def _reconstructible_embed_flag(self, inputs, embeds):
         """Is ``inputs_embeds`` exactly what rank 1 gets by embedding the ids?
 
         generate_step passes inputs_embeds on every prefill (generate/ar.py, the
@@ -352,12 +352,17 @@ class MirroredLanguageModel:
             inner = getattr(self._lm, "model", None)
             emb = getattr(inner, "embed_tokens", None)
             if emb is None:
-                return False
+                return None
             ref = emb(inputs)
-            return bool(ref.shape == embeds.shape and mx.all(ref == embeds).item())
+            if ref.shape == embeds.shape and mx.all(ref == embeds).item():
+                return 0
+            padded = text_embeddings(self._lm, inputs, left_zero_pad=True)
+            if padded.shape == embeds.shape and mx.all(padded == embeds).item():
+                return FLAG_LEFT_ZERO_PAD
+            return None
         except Exception:
             logger.warning("tp: inputs_embeds check failed", exc_info=True)
-            return False
+            return None
 
     def _require_reconstructible(self, cache) -> None:
         if _cache_is_empty(cache):
@@ -379,7 +384,8 @@ class MirroredLanguageModel:
         embeds = kw.get("inputs_embeds")
         if inputs is None:
             raise TPUnavailable("TP mode needs token ids to mirror a forward")
-        if embeds is not None and not self._embeds_are_just_the_ids(inputs, embeds):
+        embed_flag = 0 if embeds is None else self._reconstructible_embed_flag(inputs, embeds)
+        if embed_flag is None:
             raise TPUnavailable(
                 "TP mode cannot mirror inputs_embeds that are not embed_tokens("
                 "inputs) -- multimodal prefill is unsupported in TP mode")
@@ -403,7 +409,7 @@ class MirroredLanguageModel:
             self._ensure_epoch(cache)
             shape = getattr(inputs, "shape", ("?", "?"))
             self._announce(OP_FORWARD, inputs,
-                           flags=FLAG_CAPTURE if capture else 0,
+                           flags=(FLAG_CAPTURE if capture else 0) | embed_flag,
                            label=f"announce forward b={shape[0]} s={shape[1]}")
             # The watchdog has to cover the FORWARD ITSELF, not just the
             # announcement.  The announcement is one collective; the forward is

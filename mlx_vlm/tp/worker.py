@@ -45,7 +45,7 @@ ENV_WORKER_MODEL = "MLX_VLM_GLM5_TP_WORKER_MODEL"
 # old rank 1 contributes zeros, which reproduces rank 0's view instead of
 # cancelling it, so the very first verb with a nonzero epoch reads as a
 # disagreement and every TP serve dies on op2.
-PROTO_VERSION = 4
+PROTO_VERSION = 5
 
 OP_EXIT, OP_MAKE_CACHE, OP_FORWARD = 0, 1, 2
 OP_ROLLBACK = 3         # speculative round rejected: roll my own shard back
@@ -75,6 +75,7 @@ ECHO_WORDS = 3          # last_b, last_s, last_epoch
 # Flags
 FLAG_CAPTURE = 1 << 0   # this forward is a speculative verify: allocate gdn_sink
 FLAG_HAS_NAME = 1 << 1  # the name words are a rung name, not padding
+FLAG_LEFT_ZERO_PAD = 1 << 2  # reproduce BatchGenerator's deterministic text pad
 
 
 def tp_hosts() -> List[str]:
@@ -189,6 +190,30 @@ class Ctrl(NamedTuple):
     @property
     def capture(self) -> bool:
         return bool(self.flags & FLAG_CAPTURE)
+
+    @property
+    def left_zero_pad(self) -> bool:
+        return bool(self.flags & FLAG_LEFT_ZERO_PAD)
+
+
+def text_embeddings(lm, ids, *, left_zero_pad=False):
+    """Rebuild text embeddings, including BatchGenerator's leading zero pad."""
+    import mlx.core as mx
+
+    embeds = lm.model.embed_tokens(ids)
+    if not left_zero_pad:
+        return embeds
+    rows = ids.tolist()
+    leading = []
+    for row in rows:
+        n = 0
+        while n < len(row) and row[n] == 0:
+            n += 1
+        leading.append(n)
+    mask = mx.array(
+        [[i < n for i in range(len(rows[0]))] for n in leading]
+    )[:, :, None]
+    return mx.where(mask, mx.zeros_like(embeds), embeds)
 
 
 def name_to_words(name: str) -> List[int]:
@@ -575,6 +600,8 @@ class _WorkerState:
             # half back.  Rank 1 passes the empty list: it allocates the sink
             # without capturing hidden states, which only rank 0's drafter reads.
             kw = {"capture_layer_ids": []} if msg.capture else {}
+            if msg.left_zero_pad:
+                kw["inputs_embeds"] = text_embeddings(self.lm, ids, left_zero_pad=True)
             from ..tp.transport import collective_count, reset_forward_counter
 
             n0 = collective_count()
