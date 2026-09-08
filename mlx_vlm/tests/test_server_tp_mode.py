@@ -255,6 +255,17 @@ def test_empty_cache_detection():
     assert T._cache_is_empty([_ArraysLike(True)]) is False
 
 
+def test_batch_cache_vector_offset_uses_empty_contract():
+    """Fresh left-padded batch offsets are vectors, including negative values."""
+    import mlx.core as mx
+    from mlx_vlm.models.cache import BatchKVCache
+
+    c = BatchKVCache([2, 0])
+    assert T._cache_is_empty([c]) is True
+    c.update_and_fetch(mx.zeros((2, 1, 1, 4)), mx.zeros((2, 1, 1, 4)))
+    assert T._cache_is_empty([c]) is False
+
+
 def test_unknown_cache_kind_is_treated_as_populated():
     """A cache type this file has never seen must not be assumed empty: guessing
     would turn a new upstream cache class into a silent desync."""

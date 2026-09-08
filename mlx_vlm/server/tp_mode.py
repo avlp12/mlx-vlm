@@ -117,14 +117,19 @@ def _cache_is_empty(cache) -> bool:
             if not _cache_is_empty(sub):
                 return False
             continue
+        entries = getattr(c, "cache", None)       # ArraysCache
+        if entries is not None:
+            if any(e is not None for e in entries):
+                return False
+            continue
+        empty = getattr(c, "empty", None)
+        if callable(empty):                       # standard cache contract
+            if not bool(empty()):
+                return False
+            continue
         off = getattr(c, "offset", None)
         if off is not None:
             if int(off) != 0:
-                return False
-            continue
-        entries = getattr(c, "cache", None)       # ArraysCache (KDA)
-        if entries is not None:
-            if any(e is not None for e in entries):
                 return False
             continue
         # Unknown cache type: treat as non-empty.  Guessing "empty" here would
