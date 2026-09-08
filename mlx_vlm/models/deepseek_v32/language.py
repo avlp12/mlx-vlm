@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -283,6 +284,48 @@ class MoEGate(nn.Module):
         )
 
 
+# K5 (V5, 2026-09-08).  MLX_VLM_GLM5_MOE_COMBINE_MATMUL -- opt-in, default OFF.
+#
+# The shipped combine is ``(y * scores[..., None]).sum(-2)``.  ``y`` is the routed-expert
+# output, [B, S, top_k, hidden] in bf16; ``scores`` comes out of ``group_expert_select``
+# in FLOAT32 (the router is deliberately fp32 -- glm5_next/language.py's Glm5NextMoEGate
+# keeps near-tie top-k membership matching the reference).  MLX promotes, so the product
+# is a float32 tensor of the same shape as y: at chunk 8,192, top_k 8, hidden 4,096 that
+# is 537 MB of bf16 read, 1,074 MB of fp32 written, 1,074 MB read back by the sum and
+# 268 MB written -- ~3.0 GB per sparse layer, 42 layers per chunk, and the V5 SW
+# decomposition puts it at 175 ms/step = 1.0 % of the step.
+#
+# The contraction is a batched matvec: out[b, s, :] = sum_k scores[b, s, k] * y[b, s, k, :].
+# Expressed as ``scores[..., None, :] @ y`` MLX runs one GEMM whose accumulator is fp32
+# inside the kernel, reads y once, and never materialises the fp32 product at all.
+#
+# NOT BIT-IDENTICAL, by construction and in two ways: the scores are rounded to y's dtype
+# (bf16, ~2**-9 relative) before they multiply, and the reduction over top_k is the GEMM's
+# accumulation order rather than mx.sum's.  This arm therefore goes through the KL gate,
+# not through a fingerprint.  Where y is already float32 the cast is exact and only the
+# accumulation order differs.
+_MOE_COMBINE_ON = ("1", "true", "yes", "on")
+
+
+def _moe_combine_matmul_enabled() -> bool:
+    """``MLX_VLM_GLM5_MOE_COMBINE_MATMUL``; read per call (L40 EnvSpec ``per_call``).
+
+    Read once per MoE layer per forward.  NOTE for the in-process arm switcher: at
+    B == 1 and S <= 8 this call happens inside ``Glm5NextDecoderLayer._ffn_c``, an
+    ``mx.compile``d trace, so the value is frozen into that per-shape trace on first
+    use; prefill widths are not compiled and re-read it every forward.
+    """
+    return os.environ.get("MLX_VLM_GLM5_MOE_COMBINE_MATMUL", "").strip().lower() in _MOE_COMBINE_ON
+
+
+def moe_combine(y: mx.array, scores: mx.array) -> mx.array:
+    """Weighted sum over the top_k axis: ``sum_k scores[..., k] * y[..., k, :]``."""
+    if _moe_combine_matmul_enabled():
+        # [B, S, 1, k] @ [B, S, k, H] -> [B, S, 1, H]; no fp32 [B, S, k, H] anywhere.
+        return (scores[..., None, :].astype(y.dtype) @ y).squeeze(-2)
+    return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+
 class DeepseekV32MoE(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -309,7 +352,7 @@ class DeepseekV32MoE(nn.Module):
 
         inds, scores = self.gate(x)
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = moe_combine(y, scores)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(x)
 
