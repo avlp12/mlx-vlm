@@ -10,12 +10,15 @@ from ..models import cache
 from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
+    _finish_round_timing,
     _forced_prefix_len,
     _record_budget_clamp,
     _record_draft_seconds,
+    _record_round_timing,
     _record_speculative_round,
     _record_verify_seconds,
     _reset_budget_clamp,
+    _round_timer_cache_arrays,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
@@ -845,6 +848,28 @@ def _mtp_rounds(
         kv_valid_len=kv_offset,
     )
 
+    # Round timers: same env gate and same cumulative attributes as
+    # ``_mtp_rounds_batch`` (``MLX_VLM_MTP_ROUND_TIMERS``), extended with the
+    # accept/emit and rollback buckets and a per-round row, exactly as the
+    # scalar DFlash loop does.  OFF by default; every site below is a bare
+    # ``if timed:`` so the default path keeps the statements it had.
+    #
+    # This loop YIELDS in the middle of a round -- the drafter cache sync, the
+    # rollback and the shared-KV update all run after the tokens leave -- so the
+    # row is published before the yields and completed after them, and the
+    # consumer's time inside the yield is charged to nobody.
+    timed = _mtp_round_timers_enabled()
+    round_started = 0.0
+    draft_started = 0.0
+    draft_finished = 0.0
+    verify_finished = 0.0
+    yield_started = 0.0
+    yield_finished = 0.0
+    accept_verified_finished = 0.0
+    rollback_started = 0.0
+    rollback_finished = 0.0
+    row = None
+
     b = first_bonus
     emitted = 1  # caller already yielded the first bonus
 
@@ -857,6 +882,8 @@ def _mtp_rounds(
         pause_ctl._drafter = draft_model
 
     while emitted < max_tokens:
+        if timed:
+            round_started = time.perf_counter()
         if pause_ctl is not None:
             pause_ctl.mark()
             bs = pause_ctl.block_total(max_tokens - emitted)
@@ -874,6 +901,8 @@ def _mtp_rounds(
             if bs <= 1:
                 break
 
+        if timed:
+            draft_started = time.perf_counter()
         draft_tokens = sampler_rng.draft_tokens(
             draft_model.draft_block,
             b,
@@ -884,6 +913,11 @@ def _mtp_rounds(
             token_dtype,
             **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
         )
+        if timed:
+            # Same wait, same place as _mtp_rounds_batch.
+            mx.eval(draft_tokens)
+            draft_finished = time.perf_counter()
+            _record_draft_seconds(draft_model, draft_finished - draft_started)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
@@ -896,6 +930,10 @@ def _mtp_rounds(
                 sampler,
                 sample_target_tokens=greedy_sampling,
             )
+        if timed:
+            mx.eval(verify.hidden)
+            verify_finished = time.perf_counter()
+            _record_verify_seconds(draft_model, verify_finished - draft_finished)
         accepted, new_tokens = _mtp_acceptance_walk(
             lm,
             verify,
@@ -912,11 +950,31 @@ def _mtp_rounds(
         if pause_ctl is not None:
             pause_ctl.record(bs, accepted=accepted, n_draft=bs - 1)
 
+        if timed:
+            yield_started = time.perf_counter()
+            row = _record_round_timing(
+                draft_model,
+                loop="mtp_scalar",
+                draft=draft_finished - draft_started,
+                verify=verify_finished - draft_finished,
+                emit=yield_started - verify_finished,
+                rollback=0.0,
+                total=yield_started - round_started,
+                accepted=accepted,
+                depth=bs - 1,
+                emitted=len(new_tokens),
+                complete=False,
+            )
+
         for tok in new_tokens:
             yield tok, None
             emitted += 1
             if emitted >= max_tokens:
                 return
+
+        if timed:
+            # The yield is over: the consumer's time is not the round's.
+            yield_finished = time.perf_counter()
 
         # Keep the drafter's own cache in sync every round -- including paused rounds
         # (the bonus token still advances the sequence) -- so a resumed drafting round
@@ -933,15 +991,28 @@ def _mtp_rounds(
                 token_dtype,
                 **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
             )
+        if timed:
+            # The drafter cache sync is a DRAFTER forward: draft-side cost, in
+            # the draft bucket, even though it runs after the tokens left.
+            accept_verified_finished = time.perf_counter()
 
         # Hidden for next round: pick the slot of the newly accepted bonus.
         hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
         b = new_tokens[-1] if new_tokens else b
+        if timed:
+            rollback_started = time.perf_counter()
 
         rollback = getattr(lm, "rollback_speculative_cache", None)
         if accepted < bs - 1 and callable(rollback):
             with mx.stream(generation_stream):
                 rollback(prompt_cache, verify.gdn_states, accepted, bs)
+            if timed:
+                # The third sync (see dflash.py::_round_timers_enabled): without
+                # it the rollback is a graph build and its cost lands in the next
+                # round's verify.
+                mx.eval(_round_timer_cache_arrays(prompt_cache))
+        if timed:
+            rollback_finished = time.perf_counter()
 
         next_shared_kv = _slice_shared_kv_after_reject(
             verify.shared_kv_states, bs - (accepted + 1)
@@ -953,6 +1024,19 @@ def _mtp_rounds(
             position=_mtp_draft_position(kv_offset),
             kv_valid_len=kv_offset,
         )
+
+        if timed:
+            now = time.perf_counter()
+            _finish_round_timing(
+                draft_model,
+                row,
+                draft=accept_verified_finished - yield_finished,
+                emit=(rollback_started - accept_verified_finished)
+                + (now - rollback_finished),
+                rollback=rollback_finished - rollback_started,
+                total=now - yield_finished,
+            )
+            row = None
 
         if emitted % 256 == 0:
             mx.clear_cache()

@@ -19,12 +19,14 @@ from .common import (
     _record_budget_clamp,
     _record_draft_seconds,
     _record_per_row_rollback,
+    _record_round_timing,
     _record_speculative_round,
     _record_uniform_clamp,
     _record_verify_seconds,
     _reset_budget_clamp,
     _reset_per_row_rollback,
     _reset_uniform_clamp,
+    _round_timer_cache_arrays,
     _speculative_walk,
     _speculative_walk_batch,
     _SpeculativeSamplerRNG,
@@ -76,6 +78,15 @@ def _round_timers_enabled() -> bool:
     meaningful if each half is waited for, so the timing arm forces an
     ``mx.eval`` between the draft and the verify that the untimed path does not
     do.  Read the arms against each OTHER, never against an untimed run.
+
+    Honoured by BOTH round loops.  ``_dflash_rounds_batch`` splits the round in
+    two (draft / verify).  The scalar ``_dflash_rounds`` -- the loop a served
+    B == 1 request actually takes (``speculative/utils.py``: ``batch_size == 1
+    and admission is None``) -- splits it in four, adding the accept/emit
+    bookkeeping and the cache rollback, and appends a per-round row (see
+    ``common.py::_record_round_timing``).  The rollback bucket costs a THIRD
+    ``mx.eval`` that the batch loop does not do; every row carries
+    ``sync_added: True`` for it.
     """
     global _ROUND_TIMERS_ENV
     if _ROUND_TIMERS_ENV is None:
@@ -1082,6 +1093,25 @@ def _dflash_rounds(
     # ingests the whole context in one go.
     pending_hidden: Optional[mx.array] = None
 
+    # Round timers, on the same env gate and the same cumulative attributes the
+    # batch loop writes (``MLX_VLM_DFLASH_ROUND_TIMERS``,
+    # ``speculative_draft_seconds``/``speculative_verify_seconds``).  Until this
+    # existed the gate was a silent no-op on the SERVED single-stream path --
+    # the only path a B == 1 request takes -- so the ms/round the decode cost
+    # model is refitted from came from the one loop the timers never covered.
+    #
+    # ``timed`` is resolved ONCE and every site below is a bare ``if timed:``:
+    # with the variable off the loop executes exactly the statements it did
+    # before the timers existed (no perf_counter, no mx.eval, no attribute
+    # write), so the default path is byte-identical.
+    timed = _round_timers_enabled()
+    round_started = 0.0
+    draft_started = 0.0
+    draft_finished = 0.0
+    verify_finished = 0.0
+    emit_finished = 0.0
+    rollback_finished = 0.0
+
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
     if structured_ledger is not None:
@@ -1091,6 +1121,8 @@ def _dflash_rounds(
         structured_ledger.commit([b])
 
     while emitted < max_tokens:
+        if timed:
+            round_started = time.perf_counter()
         # An emit cap narrows the block the same way a nearly-exhausted
         # ``max_tokens`` does: there is no point drafting past what the round is
         # allowed to emit.  A cap of 0 (a forced round) does NOT narrow it --
@@ -1134,6 +1166,11 @@ def _dflash_rounds(
             else sampler
         )
 
+        if timed:
+            # Covers BOTH block sources: the drafter forward and the grammar
+            # fast-forward that replaces it (a round with no drafter call is a
+            # round whose draft cost is the ledger query, not zero).
+            draft_started = time.perf_counter()
         # D6 Tier A -- grammar fast-forward.  ``compute_ff_tokens`` costs ~0.01 ms
         # and, where the grammar forces a run of tokens (structural JSON, enum
         # bodies), it IS the block: acceptance 1.0 with no drafter forward at all.
@@ -1177,6 +1214,11 @@ def _dflash_rounds(
                 draft_tokens = place_forced_draft_prefix(draft_tokens, [forced_ids])
             mx.async_eval(draft_tokens)
             draft_host = None
+        if timed:
+            # Same wait, same place as _dflash_rounds_batch (:1596).
+            mx.eval(draft_tokens)
+            draft_finished = time.perf_counter()
+            _record_draft_seconds(draft_model, draft_finished - draft_started)
 
         if forced:
             # Both forced runs fired.  The grammar owns the whole block, so the
@@ -1231,6 +1273,11 @@ def _dflash_rounds(
             mx.async_eval(walk_packed if deferred_walk else target_tokens, hidden)
         else:
             mx.async_eval(hidden)
+        if timed:
+            # Same wait, same place as _dflash_rounds_batch (:1620).
+            mx.eval(walk_packed if (greedy_sampling and deferred_walk) else hidden)
+            verify_finished = time.perf_counter()
+            _record_verify_seconds(draft_model, verify_finished - draft_finished)
 
         if greedy_sampling and deferred_walk:
             accepted, new_tokens = _speculative_walk_deferred_greedy(
@@ -1266,6 +1313,11 @@ def _dflash_rounds(
         # bonus, rollback length) is keyed to what was actually emitted -- feed
         # them the pre-truncation count and the round leaves live KV for tokens
         # the stream never produced.
+        if timed:
+            # The number the loop REPORTS for this round (``accept_lens``), kept
+            # before the emit budget rewrites ``accepted`` below, so a timing row
+            # and the acceptance receipt can never disagree.
+            walk_accepted = accepted
         _record_speculative_round(draft_model, accepted, bs - 1)
         _record_batch_round(draft_model, 1)
         emitted_accepted = accepted_from_emitted(new_tokens)
@@ -1277,15 +1329,50 @@ def _dflash_rounds(
             hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
 
+        if timed:
+            emit_finished = time.perf_counter()
+
         if accepted < bs - 1:
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
                     prompt_cache, verify_out.gdn_states, accepted, bs
                 )
+            if timed:
+                # The THIRD sync, the one the batch loop does not have: the
+                # rollback only BUILDS a graph (the KDA replay's ``state_n``, the
+                # trimmed KV), so without a wait its cost would be charged to the
+                # next round's verify and the fixed term of the round model would
+                # be attributed to the wrong bucket.  Nothing extra is computed --
+                # the next round would have had to evaluate the same arrays.
+                mx.eval(_round_timer_cache_arrays(prompt_cache))
+        # A full-accept round rolls nothing back and is charged nothing.
+        if timed:
+            rollback_finished = time.perf_counter()
 
         if hidden_is_prepared and emitted + len(new_tokens) < max_tokens:
             hidden = prepare_target_hidden(hidden)
             mx.async_eval(hidden)
+
+        if timed:
+            # Recorded BEFORE the yields: the emit loop below can ``return``
+            # mid-round on the max_tokens edge, and a receipt that silently drops
+            # the last round of every request is a biased receipt.  The round's
+            # own span therefore ends here and excludes the consumer's time
+            # inside the yield (detokenisation, HTTP), which is not round cost.
+            now = time.perf_counter()
+            _record_round_timing(
+                draft_model,
+                loop="dflash_scalar",
+                draft=draft_finished - draft_started,
+                verify=verify_finished - draft_finished,
+                emit=emit_finished - verify_finished,
+                rollback=rollback_finished - emit_finished,
+                total=now - round_started,
+                accepted=walk_accepted,
+                depth=bs - 1,
+                emitted=len(new_tokens),
+                accepted_emitted=accepted,
+            )
 
         # Emit after scheduling the next context projection so its execution
         # can overlap server-side detokenization and response handling.

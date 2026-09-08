@@ -529,6 +529,186 @@ def _record_verify_seconds(draft_model: nn.Module, seconds: float) -> None:
     )
 
 
+def _record_emit_seconds(draft_model: nn.Module, seconds: float) -> None:
+    """Wall clock inside the ACCEPT/EMIT bookkeeping of a round (opt-in)."""
+    draft_model.speculative_emit_seconds = (
+        getattr(draft_model, "speculative_emit_seconds", 0.0) + float(seconds)
+    )
+
+
+def _record_rollback_seconds(draft_model: nn.Module, seconds: float) -> None:
+    """Wall clock inside the CACHE ROLLBACK of a round (opt-in timing arm)."""
+    draft_model.speculative_rollback_seconds = (
+        getattr(draft_model, "speculative_rollback_seconds", 0.0) + float(seconds)
+    )
+
+
+# Rows kept in the per-round ring.  A gen1024 single-stream request produces at
+# most 1024 rounds, so this holds several panels' worth and still cannot grow
+# without bound on a long-lived server.
+ROUND_TIMING_RING = 4096
+
+# The evals the timing arm adds, in the order the round hits them.  ``draft``
+# and ``verify`` are exactly the two the BATCH loop already forces
+# (dflash.py::_dflash_rounds_batch, mtp.py::_mtp_rounds_batch); ``rollback`` is
+# the one the batch loop does NOT have, and it is what turns the rollback bucket
+# from a graph-build cost into the real KDA replay + KV trim.  Reported next to
+# every row as ``sync_added`` so no reader can mistake a timed round for the
+# untimed pipeline.
+ROUND_TIMER_SYNC_POINTS = ("draft", "verify", "rollback")
+
+
+def _round_timer_cache_arrays(caches: Optional[List[Any]]) -> List[mx.array]:
+    """The arrays a speculative rollback WROTE, for the timing arm to wait on.
+
+    Deliberately NOT ``entry.state``: several cache classes build that property
+    out of fresh ``keys[..., :offset, :]`` slices, so evaluating it would
+    materialise a copy of the whole KV every round -- work the untimed path
+    never does, charged to the bucket being measured.  Only objects the rollback
+    assigns into are collected (``ArraysCache.cache`` for the KDA recurrent
+    state and conv window, ``keys``/``values`` for the MLA + indexer caches),
+    each of which the next round would have had to evaluate anyway.
+    """
+    arrays: List[mx.array] = []
+
+    def _visit(entry: Any, depth: int) -> None:
+        if entry is None or depth > 2:
+            return
+        if isinstance(entry, mx.array):
+            arrays.append(entry)
+            return
+        if isinstance(entry, (list, tuple)):
+            for item in entry:
+                _visit(item, depth + 1)
+            return
+        subs = getattr(entry, "caches", None)
+        if isinstance(subs, (list, tuple)):
+            for sub in subs:
+                _visit(sub, depth + 1)
+        held = getattr(entry, "cache", None)
+        if isinstance(held, (list, tuple)):
+            for item in held:
+                if isinstance(item, mx.array):
+                    arrays.append(item)
+        for name in ("keys", "values"):
+            value = getattr(entry, name, None)
+            if isinstance(value, mx.array):
+                arrays.append(value)
+
+    for entry in caches or []:
+        try:
+            _visit(entry, 0)
+        except Exception:  # noqa: BLE001 - a timing arm may never break a round
+            continue
+    return arrays
+
+
+def _record_round_timing(
+    draft_model: nn.Module,
+    *,
+    loop: str,
+    draft: float,
+    verify: float,
+    emit: float,
+    rollback: float,
+    total: float,
+    accepted,
+    depth: int,
+    emitted: int,
+    accepted_emitted=None,
+    complete: bool = True,
+) -> dict:
+    """One round's wall-clock split, on the SAME channel as the batch loop.
+
+    The cumulative ``speculative_draft_seconds``/``speculative_verify_seconds``
+    attributes are written by ``_record_draft_seconds``/``_record_verify_seconds``
+    at the round's own sites, exactly as the batch loop writes them, so a reader
+    that only knows the batch schema (``server/app.py::_speculative_stats_snapshot``
+    -> ``GET /metrics``, which is what bench/ops/gdn_e2e_arms.py parses) sees the
+    scalar loop's halves in the fields it already reads.  This adds the two
+    buckets the batch loop never had (``emit``, ``rollback``), their cumulative
+    totals, and the PER-ROUND rows -- the thing an N=1 round-cost model
+    (round = fixed + slope * accepted) cannot be fitted without.
+
+    ``other`` closes the record: ``draft + verify + emit + rollback + other ==
+    total`` by construction, ``other`` being the round's un-timed prologue (the
+    block-size/emit-plan arithmetic) plus the next-round context projection's
+    issue cost -- both Python-level and microsecond-scale, which is what the
+    5 % sum check in the tests pins.
+    """
+    row = {
+        "i": int(getattr(draft_model, "speculative_timed_rounds", 0) or 0),
+        "loop": loop,
+        "draft": float(draft),
+        "verify": float(verify),
+        "emit": float(emit),
+        "rollback": float(rollback),
+        "other": float(total) - float(draft + verify + emit + rollback),
+        "total": float(total),
+        "accepted": accepted,
+        "accepted_emitted": accepted if accepted_emitted is None else accepted_emitted,
+        "depth": int(depth),
+        "emitted": int(emitted),
+        # The timed round is NOT the untimed pipeline: see ROUND_TIMER_SYNC_POINTS.
+        "sync_added": True,
+        "complete": bool(complete),
+    }
+    _record_emit_seconds(draft_model, emit)
+    _record_rollback_seconds(draft_model, rollback)
+    draft_model.speculative_round_seconds = (
+        getattr(draft_model, "speculative_round_seconds", 0.0) + float(total)
+    )
+    draft_model.speculative_timed_rounds = (
+        int(getattr(draft_model, "speculative_timed_rounds", 0) or 0) + 1
+    )
+    rows = getattr(draft_model, "speculative_round_timings", None)
+    if rows is None:
+        rows = []
+        draft_model.speculative_round_timings = rows
+    rows.append(row)
+    if len(rows) > ROUND_TIMING_RING:
+        del rows[: len(rows) - ROUND_TIMING_RING]
+    return row
+
+
+def _finish_round_timing(
+    draft_model: nn.Module,
+    row: Optional[dict],
+    *,
+    draft: float = 0.0,
+    emit: float = 0.0,
+    rollback: float = 0.0,
+    total: float = 0.0,
+) -> None:
+    """Add a round's POST-YIELD spans to a row already in the ring.
+
+    ``_mtp_rounds`` yields in the middle of its round -- the drafter cache sync,
+    the rollback and the shared-KV update all happen after the tokens have left
+    -- so the row has to be published before the yields (a round loop can
+    ``return`` from inside one, and a receipt that drops the last round of every
+    request is a biased receipt) and completed afterwards.  The row object in
+    the ring IS this dict, so the update is visible to any reader that already
+    holds it.  ``total`` here is the post-yield span only: the time the CONSUMER
+    spent inside the yield is never part of a round.
+    """
+    if row is None:
+        return
+    row["draft"] += float(draft)
+    row["emit"] += float(emit)
+    row["rollback"] += float(rollback)
+    row["total"] += float(total)
+    row["other"] = row["total"] - (
+        row["draft"] + row["verify"] + row["emit"] + row["rollback"]
+    )
+    row["complete"] = True
+    _record_draft_seconds(draft_model, draft)
+    _record_emit_seconds(draft_model, emit)
+    _record_rollback_seconds(draft_model, rollback)
+    draft_model.speculative_round_seconds = (
+        getattr(draft_model, "speculative_round_seconds", 0.0) + float(total)
+    )
+
+
 def speculative_clamp_snapshot(draft_model: nn.Module) -> Tuple[int, int, int, int]:
     """Capture the lifetime clamp / per-row / batch-round counters for diffing.
 
