@@ -626,6 +626,73 @@ def _gather_q_chunk_for(kv_len: int, dim: int) -> int:
         chunk *= 2
     return max(_GATHER_Q_CHUNK_MIN, min(_GATHER_Q_CHUNK, chunk))
 
+
+# K1 (V5, 2026-09-08).  MLX_VLM_GLM5_DSA_Q_CHUNK_FULL -- opt-in, default OFF.
+#
+# ``_gather_q_chunk_for`` above defends against the 2**31 element bound of
+# ``GatherAxis::eval_gpu`` (mlx/backend/metal/indexing.cpp:454, ``large = idx.size() >
+# INT32_MAX || src.size() > INT32_MAX``), whose operand in the EAGER path is the
+# broadcast ``(B, chunk, Kv, dim)``: the bound therefore moves with the cache depth and
+# the chunk has to shrink (256 at 8k, 64 at 32k, 16 at 133k).  Since I1507 the DEFAULT
+# gather path is ``take`` (sparse_mla_attn.gather_latents_take), whose operands are a
+# ``[B*Kv, dim]`` source and a ``[B*lc, topk]`` index list -- neither is the broadcast,
+# and the language.py:2896-2900 comment already says the shrink is not needed there and
+# defers widening to its own lever.  This is that lever.
+#
+# WHAT THE ``take`` PATH ACTUALLY BOUNDS (mlx @ ed17ab9f, read, not assumed):
+#   * ``Gather::eval_gpu`` (indexing.cpp:81-84) computes ``large`` from src/idx/out sizes
+#     and instantiates ``gather_front`` with ``LocT = int64_t`` whenever ANY of them
+#     exceeds INT32_MAX.  The addressing arithmetic
+#     (kernels/indexing/gather_front.h:16-18, ``LocT src_idx = stride * idx``) is
+#     therefore correct at any element count: there is NO 2**31 element cliff on this
+#     path, only a (slower) 64-bit variant.  So element count is not a reason to shrink.
+#   * What IS a hard bound is the grid.  gather_front is dispatched at
+#     ``grid = (ceil(slice_size / work_per_thread), indices.size(), 1)``
+#     (indexing.cpp:118-127) and the kernel reads its position as ``uint2`` -- a 32-bit
+#     lane id.  ``indices.size() = B * lc * topk`` must stay below 2**32.
+#   * ``src.shape(0) = B * Kv`` is passed as ``const constant int&`` (gather_front.h:13),
+#     i.e. int32, but it does not depend on the query chunk at all.
+#
+# So the largest chunk this path can serve in ONE gather is ``(2**32 - 1) // (B * topk)``
+# -- 2,094,588 queries at B=1, topk=2051, i.e. every prefill chunk this fork will ever
+# build is a SINGLE gather.  The shrink is pure loss here: at 32k it splits an 8,192-row
+# chunk into 128 iterations (128 gathers + 128 SDPAs + a 128-way concatenate per DSA
+# layer, ~94 % of the step's dispatches).
+#
+# IDENTITY.  Queries are independent: each (b, query) row gathers its own topk latents and
+# runs its own softmax over them, and the chunk loop only changes how many such rows share
+# one dispatch.  R5_identity_cliff_c1.json already measured byte-identical logits across
+# chunks 512/128/64 on the eager path for exactly this reason.  Expected bit-identical;
+# asserted on CPU in tests/test_glm5_next_dsa_q_chunk_full.py and fingerprinted on GPU by
+# the Stage-B arm.
+#
+# COST TO WATCH: the gathered transient is O(chunk * topk * dim) and is now the whole
+# chunk at once -- 17.2 GB per DSA layer at 8,192 x 2051 x 512 bf16 instead of 134 MB at a
+# time.  That is the falsifier's peak-RSS kill criterion, not a correctness matter.
+_TAKE_GRID_LIMIT = 2**32 - 1
+
+
+def _take_path_q_chunk_max(batch: int, topk: int) -> int:
+    """Largest query chunk one ``gather_front`` dispatch can address, or 0 if unknown.
+
+    ``indices.size() = batch * chunk * topk`` is the gather's grid-y extent and the
+    kernel's thread position is a ``uint2``, so the product must stay below 2**32.
+    Returns 0 for degenerate shapes so the caller keeps the derived chunk.
+    """
+    if batch <= 0 or topk <= 0:
+        return 0
+    return int(_TAKE_GRID_LIMIT // (batch * topk))
+
+
+def _dsa_q_chunk_full() -> bool:
+    """``MLX_VLM_GLM5_DSA_Q_CHUNK_FULL`` -- read per call, never latched.
+
+    Per-call so the L40 KL gate / l7b ABBA driver can switch arms inside one process
+    (EnvSpec mode ``per_call``).  It is read once per DSA layer per forward, outside
+    every inner loop.
+    """
+    return _env_flag("MLX_VLM_GLM5_DSA_Q_CHUNK_FULL")
+
 # Context length above which gathered prefill beats the dense masked path.
 #
 # HISTORY, because the number moved twice and for different reasons.  The PR's
@@ -2889,16 +2956,24 @@ class Glm5NextSparseAttention(nn.Module):
         # speculative verify block) every candidate chunk exceeds L, so this is
         # a single iteration exactly as before.
         q_chunk = _gather_q_chunk_for(Kv, dim)
+        # K1: on the default ``take`` path the 2**31 operand the shrink defends
+        # against does not exist (see _take_path_q_chunk_max above).  With the flag
+        # set the chunk is the whole query block, shrunk ONLY by the take path's own
+        # grid bound.  Unset: this branch is dead and q_chunk is byte-for-byte the
+        # derived value.
+        if _mode == "take" and _dsa_q_chunk_full():
+            bound = _take_path_q_chunk_max(B, topk)
+            if bound > 0:
+                q_chunk = max(1, min(L, bound))
         for a0 in range(0, L, q_chunk):
             a1 = min(a0 + q_chunk, L)
             lc = a1 - a0
             if _mode == "take":
                 # Same [B, lc, topk, dim] tensor, element for element, off MLX's
-                # gather_front kernel instead of gather_axis.  The query chunk is
-                # deliberately NOT widened here even though the 2**31 operand that
-                # _gather_q_chunk_for defends against no longer exists on this path
-                # (the source is [B*Kv, dim], not the broadcast [B, lc, Kv, dim]) --
-                # that is a second lever and belongs in its own cell.
+                # gather_front kernel instead of gather_axis.  Widening the query
+                # chunk here (the 2**31 operand _gather_q_chunk_for defends against
+                # does not exist on this path: the source is [B*Kv, dim], not the
+                # broadcast [B, lc, Kv, dim]) is K1, the opt-in above.
                 kv_g = _gather_latents_take(kv_latent, clamped[:, a0:a1, :])
             else:
                 kv_g = mx.take_along_axis(
