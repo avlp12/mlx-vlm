@@ -185,3 +185,136 @@ class TestMoeGate:
         assert i_pre.shape[-1] == 6
         assert mx.array_equal(i_dec_before, i_dec_after).item()
         assert mx.array_equal(s_dec_before, s_dec_after).item()
+
+
+# ---------------------------------------------------------------------- M2
+def _indexer_config(index_topk=64):
+    return TextConfig.from_dict(dict(
+        model_type="glm5_next_text", vocab_size=256, hidden_size=64,
+        intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=4, n_shared_experts=1,
+        n_routed_experts=8, routed_scaling_factor=2.5, kv_lora_rank=32,
+        q_lora_rank=32, qk_rope_head_dim=0, v_head_dim=16, qk_nope_head_dim=16,
+        num_experts_per_tok=2, first_k_dense_replace=0,
+        max_position_embeddings=4096, rms_norm_eps=1e-05, index_topk=index_topk,
+        index_head_dim=16, index_n_heads=2, layer_types=["full_attention"],
+        mlp_layer_types=["sparse"],
+        linear_attn_config={"num_heads": 2, "gate_lower_bound": -5.0,
+                            "head_dim": 32, "short_conv_kernel_size": 4},
+    ))
+
+
+class TestDsaTopKSelection:
+    def test_unset_returns_the_configured_topk(self):
+        for rows in (1, 8, 512, 8192):
+            assert glm5._prefill_dsa_topk(2048, rows) == 2048
+
+    def test_arm_applies_only_at_or_above_the_floor(self):
+        os.environ[DSA_KEY] = "1536"
+        for rows in (1, 8, 511):
+            assert glm5._prefill_dsa_topk(2048, rows) == 2048, rows
+        for rows in (512, 8192):
+            assert glm5._prefill_dsa_topk(2048, rows) == 1536, rows
+
+    @pytest.mark.parametrize("bad", ["0", "-8", "4096", "sixteen"])
+    def test_bad_values_raise(self, bad):
+        os.environ[DSA_KEY] = bad
+        with pytest.raises(ValueError):
+            glm5._prefill_dsa_topk(2048, 8192)
+
+    def test_below_the_floor_a_bad_value_is_never_read(self):
+        os.environ[DSA_KEY] = "nonsense"
+        assert glm5._prefill_dsa_topk(2048, 1) == 2048
+
+    def test_the_floor_is_shared_with_m1(self):
+        os.environ[FLOOR_KEY] = "1024"
+        os.environ[DSA_KEY] = "1536"
+        os.environ[MOE_KEY] = "7"
+        assert glm5._prefill_dsa_topk(2048, 600) == 2048
+        assert dsv32.prefill_moe_top_k(8, 600) == 8
+        assert glm5._prefill_dsa_topk(2048, 1024) == 1536
+        assert dsv32.prefill_moe_top_k(8, 1024) == 7
+
+
+class TestIndexerForward:
+    def _indexer(self, index_topk=64, seed=0):
+        mx.random.seed(seed)
+        cfg = _indexer_config(index_topk)
+        idx = glm5.Glm5NextIndexer(cfg)
+
+        def rand(tree):
+            if isinstance(tree, dict):
+                return {k: rand(v) for k, v in tree.items()}
+            if isinstance(tree, list):
+                return [rand(v) for v in tree]
+            return mx.random.normal(tree.shape) * 0.1
+
+        idx.update(rand(idx.parameters()))
+        mx.eval(idx.parameters())
+        return idx, cfg
+
+    def _run(self, idx, cfg, S):
+        mx.random.seed(5)
+        x = mx.random.normal((1, S, cfg.hidden_size)) * 0.3
+        qr = mx.random.normal((1, S, cfg.q_lora_rank)) * 0.3
+        out = idx(x, qr, None, cache=None)
+        mx.eval(out)
+        return out
+
+    def test_default_width_at_a_prefill_length(self):
+        idx, cfg = self._indexer()
+        out = self._run(idx, cfg, 600)
+        # index_topk + (kpool - 1) tail
+        assert out.shape[-1] == cfg.index_topk + cfg.index_kpool - 1
+
+    def test_arm_narrows_only_the_prefill_path(self):
+        idx, cfg = self._indexer()
+        ref = self._run(idx, cfg, 600)
+        os.environ[DSA_KEY] = "32"
+        arm = self._run(idx, cfg, 600)
+        assert ref.shape[-1] == 67 and arm.shape[-1] == 35
+        # the kept selections are a subset of the reference's, per query row
+        r = set(np.array(ref, copy=False).reshape(-1).tolist()) - {-1}
+        a = set(np.array(arm, copy=False).reshape(-1).tolist()) - {-1}
+        assert a <= r
+
+    def test_arm_is_inert_below_the_floor(self):
+        idx, cfg = self._indexer()
+        ref = self._run(idx, cfg, 200)
+        os.environ[DSA_KEY] = "32"
+        arm = self._run(idx, cfg, 200)
+        assert mx.array_equal(ref, arm).item()
+
+    def test_default_is_bit_identical_with_the_floor_raised(self):
+        idx, cfg = self._indexer()
+        ref = self._run(idx, cfg, 600)
+        os.environ[DSA_KEY] = "32"
+        os.environ[FLOOR_KEY] = "100000"
+        arm = self._run(idx, cfg, 600)
+        assert mx.array_equal(ref, arm).item()
+
+    def test_decode_after_a_narrowed_prefill_keeps_the_configured_topk(self):
+        """The three decode-fast consumers read self.index_topk unconditionally.
+
+        Run a real prefill into a cache with the arm set, then one decode step: the
+        decode step must return the CONFIGURED width, not the narrowed one.
+        """
+        from mlx_vlm.models.cache import KVCache
+
+        idx, cfg = self._indexer()
+        os.environ[DSA_KEY] = "32"
+        cache = KVCache()
+        mx.random.seed(5)
+        x = mx.random.normal((1, 600, cfg.hidden_size)) * 0.3
+        qr = mx.random.normal((1, 600, cfg.q_lora_rank)) * 0.3
+        pre = idx(x, qr, None, cache=cache)
+        mx.eval(pre)
+        assert pre.shape[-1] == 35, "prefill did not take the narrowed path"
+
+        x1 = mx.random.normal((1, 1, cfg.hidden_size)) * 0.3
+        qr1 = mx.random.normal((1, 1, cfg.q_lora_rank)) * 0.3
+        dec = idx(x1, qr1, None, cache=cache)
+        mx.eval(dec)
+        assert dec.shape[-1] == cfg.index_topk + cfg.index_kpool - 1, (
+            f"decode width {dec.shape[-1]} was narrowed by a prefill-only lever"
+        )

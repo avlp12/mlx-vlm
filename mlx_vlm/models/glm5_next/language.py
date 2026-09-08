@@ -20,6 +20,7 @@ from ..deepseek_v32.language import Model as DSV32Model
 from ..deepseek_v32.language import (
     MoEGate,
     group_expert_select,
+    is_prefill_rows,
     prefill_moe_top_k,
 )
 from ..gated_delta import gated_delta_update
@@ -1939,6 +1940,48 @@ def _indexer_pool_state(cache):
     return None
 
 
+# M2 (V5, 2026-09-08).  MLX_VLM_GLM5_PREFILL_DSA_TOPK -- prefill-only DSA indexer top-k.
+#
+# ``Glm5NextIndexer.index_topk`` (args.index_topk, 2048 on GLM-5.3-Flash) is a single
+# constant feeding FOUR consumers: the three decode-fast paths (_decode_fast,
+# _decode_fused and its reference) and the general/chunked path that prefill takes.
+# This lever moves ONLY the general path's ``select_k`` and ``output_width``, and only
+# for forwards at or above the shared prefill row floor (see deepseek_v32.language
+# ``is_prefill_rows``) -- so decode keeps k = 2048 whichever path it takes, and a
+# speculative verify block does too.
+#
+# The DSA attention downstream reads the width off the tensor it is handed
+# (``topk = sel.shape[-1]`` in _gathered_attention), so a narrower selection needs no
+# other change; the gathered transient and the SDPA shrink with it.
+#
+# NOT free and not identity: fewer selected latents is a different attention, gated by
+# the KL panel (cap 0.042075), never by a fingerprint.  Note also that the short-context
+# BYPASS (``T <= self.index_topk``) deliberately keeps the CONFIGURED 2048: below that
+# depth the indexer selects everything anyway and the arm would only change which
+# short prompts skip the indexer, which is not the thing being measured.
+def _prefill_dsa_topk(configured: int, rows: int) -> int:
+    """``MLX_VLM_GLM5_PREFILL_DSA_TOPK``; ``configured`` unless set AND rows >= floor.
+
+    Out of range (<= 0, or > configured) and non-integer values raise: a silently
+    clamped arm would score a vacuous KL of 0 and read as a PASS.
+    """
+    raw = os.environ.get("MLX_VLM_GLM5_PREFILL_DSA_TOPK", "").strip()
+    if not raw or not is_prefill_rows(rows):
+        return configured
+    try:
+        k = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"MLX_VLM_GLM5_PREFILL_DSA_TOPK={raw!r} is not an integer"
+        ) from None
+    if not 1 <= k <= configured:
+        raise ValueError(
+            f"MLX_VLM_GLM5_PREFILL_DSA_TOPK={k} is outside [1, {configured}] "
+            "(the configured index_topk); it can only ever REDUCE the selection"
+        )
+    return k
+
+
 class Glm5NextIndexer(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -2685,11 +2728,16 @@ class Glm5NextIndexer(nn.Module):
             cache._fpool = None
             cache._ffpool = None
         P = pool_keys.shape[1]
-        select_k = min(self.index_topk // self.index_kpool, P)
+        # M2: prefill-only indexer top-k.  This is the general/chunked path -- the one
+        # prefill takes; the three decode-fast paths above keep ``self.index_topk``
+        # unconditionally.  Unset, or below the prefill row floor, ``index_topk`` is
+        # ``self.index_topk`` and the two lines below are the base ones.
+        index_topk = _prefill_dsa_topk(self.index_topk, S)
+        select_k = min(index_topk // self.index_kpool, P)
         pool_end = mx.clip(pool_indices[..., -1], 0, kv_len - 1)
         pool_keys_t = pool_keys[:, None].swapaxes(-1, -2)
         tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
-        output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
+        output_width = index_topk + (self.index_kpool - 1 if tail_on else 0)
 
         # Chunk over the query dimension. A one-shot prefill otherwise materializes
         # [B, S, n_heads, P] scores (O(S*P)) and OOMs at long context; chunking bounds
