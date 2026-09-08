@@ -17,7 +17,12 @@ from ..cache import ArraysCache, BatchKVCache, CacheList, KVCache, dynamic_roll
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
-from ..deepseek_v32.language import MoEGate, group_expert_select
+from ..deepseek_v32.language import (
+    MoEGate,
+    group_expert_select,
+    is_prefill_rows,
+    prefill_moe_top_k,
+)
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
@@ -344,6 +349,50 @@ def _kda_glue_compile_enabled() -> bool:
     return _KDA_GLUE_COMPILE_ENV
 
 
+# K6 (V5, 2026-09-08).  MLX_VLM_GLM5_KDA_GLUE_COMPILE_MIN_ROWS -- a ROW FLOOR on the
+# flag above, default unset = today's behaviour exactly.
+#
+# The two measurements the flag carries are not in conflict once the shapes are read.
+# L13 measured +1 % on PREFILL, where S is a whole chunk (8,192 rows) and the compiled
+# glue fuses ~10 bandwidth-bound elementwise passes over an [S, 3*qkv_dim] tensor.
+# I1310 measured DFlash2 acceptance 4.82 -> 3.27 per round (68.3 -> 47.7 tok/s) -- and
+# that is the SPECULATIVE VERIFY path, S = 8, where the same trace is re-entered per
+# round at a tiny shape.  The default went back OFF because the verify regression is
+# the one that ships; the prefill win was thrown away with it.
+#
+# A row floor separates them by construction: at S >= 512 no verify block exists (the
+# decoder's own compile gate uses S <= 8 for decode + verify, language.py:3130/3145, and
+# adaptive-K only varies S inside that window), so the floor arm cannot reach the path
+# I1310 killed.  512 is the registered value for the V5 arm and is also K6's own
+# minimum in the plan; any positive value is accepted.
+#
+# SEMANTICS.  Unset (or 0) -> the boolean flag alone decides, exactly as before.  Set to
+# N > 0 -> the floor ALONE decides: compile iff S >= N, whether or not the boolean flag
+# is set.  That keeps the epsilon arm a single assignment; setting both is redundant,
+# not contradictory.  The floor is read per call (L40 EnvSpec ``per_call``); the boolean
+# stays latched, as it was.
+#
+# IDENTITY IS NOT ASSUMED: mx.compile may fuse and reassociate the glue's elementwise
+# chains.  tests/test_glm5_next_kda_glue_floor.py compares compiled against eager on CPU
+# and reports the result; the campaign gate for this arm is the spec rail (I1310's rule),
+# not an identity claim.
+def _kda_glue_compile_min_rows() -> int:
+    """``MLX_VLM_GLM5_KDA_GLUE_COMPILE_MIN_ROWS``; 0 (unset/garbage) = no floor."""
+    raw = os.environ.get("MLX_VLM_GLM5_KDA_GLUE_COMPILE_MIN_ROWS", "")
+    try:
+        return max(0, int(raw.strip() or 0))
+    except ValueError:
+        return 0
+
+
+def _kda_glue_compile_for(rows: int) -> bool:
+    """Should the S>1 (prefill) KDA glue run through mx.compile at this width?"""
+    floor = _kda_glue_compile_min_rows()
+    if floor > 0:
+        return rows >= floor
+    return rows > 1 and _kda_glue_compile_enabled()
+
+
 _MLA_ABSORB_MULTI_ENV = None
 
 
@@ -625,6 +674,73 @@ def _gather_q_chunk_for(kv_len: int, dim: int) -> int:
     while chunk * 2 <= bound:
         chunk *= 2
     return max(_GATHER_Q_CHUNK_MIN, min(_GATHER_Q_CHUNK, chunk))
+
+
+# K1 (V5, 2026-09-08).  MLX_VLM_GLM5_DSA_Q_CHUNK_FULL -- opt-in, default OFF.
+#
+# ``_gather_q_chunk_for`` above defends against the 2**31 element bound of
+# ``GatherAxis::eval_gpu`` (mlx/backend/metal/indexing.cpp:454, ``large = idx.size() >
+# INT32_MAX || src.size() > INT32_MAX``), whose operand in the EAGER path is the
+# broadcast ``(B, chunk, Kv, dim)``: the bound therefore moves with the cache depth and
+# the chunk has to shrink (256 at 8k, 64 at 32k, 16 at 133k).  Since I1507 the DEFAULT
+# gather path is ``take`` (sparse_mla_attn.gather_latents_take), whose operands are a
+# ``[B*Kv, dim]`` source and a ``[B*lc, topk]`` index list -- neither is the broadcast,
+# and the language.py:2896-2900 comment already says the shrink is not needed there and
+# defers widening to its own lever.  This is that lever.
+#
+# WHAT THE ``take`` PATH ACTUALLY BOUNDS (mlx @ ed17ab9f, read, not assumed):
+#   * ``Gather::eval_gpu`` (indexing.cpp:81-84) computes ``large`` from src/idx/out sizes
+#     and instantiates ``gather_front`` with ``LocT = int64_t`` whenever ANY of them
+#     exceeds INT32_MAX.  The addressing arithmetic
+#     (kernels/indexing/gather_front.h:16-18, ``LocT src_idx = stride * idx``) is
+#     therefore correct at any element count: there is NO 2**31 element cliff on this
+#     path, only a (slower) 64-bit variant.  So element count is not a reason to shrink.
+#   * What IS a hard bound is the grid.  gather_front is dispatched at
+#     ``grid = (ceil(slice_size / work_per_thread), indices.size(), 1)``
+#     (indexing.cpp:118-127) and the kernel reads its position as ``uint2`` -- a 32-bit
+#     lane id.  ``indices.size() = B * lc * topk`` must stay below 2**32.
+#   * ``src.shape(0) = B * Kv`` is passed as ``const constant int&`` (gather_front.h:13),
+#     i.e. int32, but it does not depend on the query chunk at all.
+#
+# So the largest chunk this path can serve in ONE gather is ``(2**32 - 1) // (B * topk)``
+# -- 2,094,588 queries at B=1, topk=2051, i.e. every prefill chunk this fork will ever
+# build is a SINGLE gather.  The shrink is pure loss here: at 32k it splits an 8,192-row
+# chunk into 128 iterations (128 gathers + 128 SDPAs + a 128-way concatenate per DSA
+# layer, ~94 % of the step's dispatches).
+#
+# IDENTITY.  Queries are independent: each (b, query) row gathers its own topk latents and
+# runs its own softmax over them, and the chunk loop only changes how many such rows share
+# one dispatch.  R5_identity_cliff_c1.json already measured byte-identical logits across
+# chunks 512/128/64 on the eager path for exactly this reason.  Expected bit-identical;
+# asserted on CPU in tests/test_glm5_next_dsa_q_chunk_full.py and fingerprinted on GPU by
+# the Stage-B arm.
+#
+# COST TO WATCH: the gathered transient is O(chunk * topk * dim) and is now the whole
+# chunk at once -- 17.2 GB per DSA layer at 8,192 x 2051 x 512 bf16 instead of 134 MB at a
+# time.  That is the falsifier's peak-RSS kill criterion, not a correctness matter.
+_TAKE_GRID_LIMIT = 2**32 - 1
+
+
+def _take_path_q_chunk_max(batch: int, topk: int) -> int:
+    """Largest query chunk one ``gather_front`` dispatch can address, or 0 if unknown.
+
+    ``indices.size() = batch * chunk * topk`` is the gather's grid-y extent and the
+    kernel's thread position is a ``uint2``, so the product must stay below 2**32.
+    Returns 0 for degenerate shapes so the caller keeps the derived chunk.
+    """
+    if batch <= 0 or topk <= 0:
+        return 0
+    return int(_TAKE_GRID_LIMIT // (batch * topk))
+
+
+def _dsa_q_chunk_full() -> bool:
+    """``MLX_VLM_GLM5_DSA_Q_CHUNK_FULL`` -- read per call, never latched.
+
+    Per-call so the L40 KL gate / l7b ABBA driver can switch arms inside one process
+    (EnvSpec mode ``per_call``).  It is read once per DSA layer per forward, outside
+    every inner loop.
+    """
+    return _env_flag("MLX_VLM_GLM5_DSA_Q_CHUNK_FULL")
 
 # Context length above which gathered prefill beats the dense masked path.
 #
@@ -1718,10 +1834,12 @@ class Glm5NextLinearAttention(nn.Module):
         fg = self.forget_gate
         # KDA glue compile: eager S>1 path only (prefill). Decode (S=1)
         # already returned above via _fused_kda_step/_fused_kda_block; the
-        # S>1 guard here is belt-and-suspenders so this flag can never touch
-        # that path even if fused KDA is disabled and S==1 somehow reaches
-        # here.
-        if S > 1 and _kda_glue_compile_enabled():
+        # S>1 guard inside _kda_glue_compile_for is belt-and-suspenders so this
+        # flag can never touch that path even if fused KDA is disabled and S==1
+        # somehow reaches here.  K6 (..._MIN_ROWS) raises that guard to a row
+        # floor so the prefill win can be taken without the S=8 verify shape
+        # I1310 killed; unset, this is the same predicate as before.
+        if _kda_glue_compile_for(S):
             if self._kda_glue_pre_c is None:
                 self._kda_glue_pre_c = mx.compile(self._kda_glue_pre)
             q, k, v, a = self._kda_glue_pre_c(conv_input, fa_o)
@@ -1767,7 +1885,7 @@ class Glm5NextLinearAttention(nn.Module):
             cache[1] = state
             cache.advance(S)
 
-        if S > 1 and _kda_glue_compile_enabled():
+        if _kda_glue_compile_for(S):
             if self._kda_glue_post_c is None:
                 self._kda_glue_post_c = mx.compile(self._kda_glue_post)
             return self._kda_glue_post_c(out, ga_o)
@@ -1820,6 +1938,48 @@ def _indexer_pool_state(cache):
     if buf is not None:
         return buf[0], buf[3]
     return None
+
+
+# M2 (V5, 2026-09-08).  MLX_VLM_GLM5_PREFILL_DSA_TOPK -- prefill-only DSA indexer top-k.
+#
+# ``Glm5NextIndexer.index_topk`` (args.index_topk, 2048 on GLM-5.3-Flash) is a single
+# constant feeding FOUR consumers: the three decode-fast paths (_decode_fast,
+# _decode_fused and its reference) and the general/chunked path that prefill takes.
+# This lever moves ONLY the general path's ``select_k`` and ``output_width``, and only
+# for forwards at or above the shared prefill row floor (see deepseek_v32.language
+# ``is_prefill_rows``) -- so decode keeps k = 2048 whichever path it takes, and a
+# speculative verify block does too.
+#
+# The DSA attention downstream reads the width off the tensor it is handed
+# (``topk = sel.shape[-1]`` in _gathered_attention), so a narrower selection needs no
+# other change; the gathered transient and the SDPA shrink with it.
+#
+# NOT free and not identity: fewer selected latents is a different attention, gated by
+# the KL panel (cap 0.042075), never by a fingerprint.  Note also that the short-context
+# BYPASS (``T <= self.index_topk``) deliberately keeps the CONFIGURED 2048: below that
+# depth the indexer selects everything anyway and the arm would only change which
+# short prompts skip the indexer, which is not the thing being measured.
+def _prefill_dsa_topk(configured: int, rows: int) -> int:
+    """``MLX_VLM_GLM5_PREFILL_DSA_TOPK``; ``configured`` unless set AND rows >= floor.
+
+    Out of range (<= 0, or > configured) and non-integer values raise: a silently
+    clamped arm would score a vacuous KL of 0 and read as a PASS.
+    """
+    raw = os.environ.get("MLX_VLM_GLM5_PREFILL_DSA_TOPK", "").strip()
+    if not raw or not is_prefill_rows(rows):
+        return configured
+    try:
+        k = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"MLX_VLM_GLM5_PREFILL_DSA_TOPK={raw!r} is not an integer"
+        ) from None
+    if not 1 <= k <= configured:
+        raise ValueError(
+            f"MLX_VLM_GLM5_PREFILL_DSA_TOPK={k} is outside [1, {configured}] "
+            "(the configured index_topk); it can only ever REDUCE the selection"
+        )
+    return k
 
 
 class Glm5NextIndexer(nn.Module):
@@ -2568,11 +2728,16 @@ class Glm5NextIndexer(nn.Module):
             cache._fpool = None
             cache._ffpool = None
         P = pool_keys.shape[1]
-        select_k = min(self.index_topk // self.index_kpool, P)
+        # M2: prefill-only indexer top-k.  This is the general/chunked path -- the one
+        # prefill takes; the three decode-fast paths above keep ``self.index_topk``
+        # unconditionally.  Unset, or below the prefill row floor, ``index_topk`` is
+        # ``self.index_topk`` and the two lines below are the base ones.
+        index_topk = _prefill_dsa_topk(self.index_topk, S)
+        select_k = min(index_topk // self.index_kpool, P)
         pool_end = mx.clip(pool_indices[..., -1], 0, kv_len - 1)
         pool_keys_t = pool_keys[:, None].swapaxes(-1, -2)
         tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
-        output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
+        output_width = index_topk + (self.index_kpool - 1 if tail_on else 0)
 
         # Chunk over the query dimension. A one-shot prefill otherwise materializes
         # [B, S, n_heads, P] scores (O(S*P)) and OOMs at long context; chunking bounds
@@ -2889,16 +3054,24 @@ class Glm5NextSparseAttention(nn.Module):
         # speculative verify block) every candidate chunk exceeds L, so this is
         # a single iteration exactly as before.
         q_chunk = _gather_q_chunk_for(Kv, dim)
+        # K1: on the default ``take`` path the 2**31 operand the shrink defends
+        # against does not exist (see _take_path_q_chunk_max above).  With the flag
+        # set the chunk is the whole query block, shrunk ONLY by the take path's own
+        # grid bound.  Unset: this branch is dead and q_chunk is byte-for-byte the
+        # derived value.
+        if _mode == "take" and _dsa_q_chunk_full():
+            bound = _take_path_q_chunk_max(B, topk)
+            if bound > 0:
+                q_chunk = max(1, min(L, bound))
         for a0 in range(0, L, q_chunk):
             a1 = min(a0 + q_chunk, L)
             lc = a1 - a0
             if _mode == "take":
                 # Same [B, lc, topk, dim] tensor, element for element, off MLX's
-                # gather_front kernel instead of gather_axis.  The query chunk is
-                # deliberately NOT widened here even though the 2**31 operand that
-                # _gather_q_chunk_for defends against no longer exists on this path
-                # (the source is [B*Kv, dim], not the broadcast [B, lc, Kv, dim]) --
-                # that is a second lever and belongs in its own cell.
+                # gather_front kernel instead of gather_axis.  Widening the query
+                # chunk here (the 2**31 operand _gather_q_chunk_for defends against
+                # does not exist on this path: the source is [B*Kv, dim], not the
+                # broadcast [B, lc, Kv, dim]) is K1, the opt-in above.
                 kv_g = _gather_latents_take(kv_latent, clamped[:, a0:a1, :])
             else:
                 kv_g = mx.take_along_axis(
@@ -3010,10 +3183,17 @@ class Glm5NextMoEGate(MoEGate):
         if w.dtype != mx.float32:
             w = w.astype(mx.float32)
         logits = x.astype(mx.float32) @ w.T
+        # M1: prefill-only MoE top-k (MLX_VLM_GLM5_PREFILL_MOE_TOPK).  ``x`` is
+        # [B, S, hidden] here -- the FFN half runs after the mHC collapse -- so the
+        # sequence axis is -2.  Unset, or below the prefill row floor, this is
+        # ``self.top_k`` and the call is byte-for-byte the one below it.
+        top_k = prefill_moe_top_k(
+            self.top_k, x.shape[-2] if x.ndim >= 2 else 1
+        )
         return group_expert_select(
             logits,
             self.e_score_correction_bias,
-            self.top_k,
+            top_k,
             self.n_group,
             self.topk_group,
             self.routed_scaling_factor,

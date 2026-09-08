@@ -37,6 +37,7 @@ from ..generate import (
 )
 from ..generate.common import (
     next_prefill_chunk,
+    prefill_keep_cache_enabled,
     prefill_logits_keep_kwargs,
 )
 from ..generate.diffusion import (
@@ -446,7 +447,11 @@ def _run_chunked_speculative_prefill(
             remaining_kwargs = _drop_prefill_kwargs(
                 remaining_kwargs, sequence_keys, n_to_process
             )
-            mx.clear_cache()
+            # R-cc, same lever as generate/ar.py's chunk loop: with
+            # MLX_VLM_GLM5_PREFILL_KEEP_CACHE=1 the allocator pool survives the
+            # chunk boundary.  Unset: cleared, exactly as before.
+            if not prefill_keep_cache_enabled():
+                mx.clear_cache()
 
     final_kwargs = {**remaining_kwargs, **capture_kwargs}
     final_kwargs["inputs_embeds"] = remaining_embeds

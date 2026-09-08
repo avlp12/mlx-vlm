@@ -215,5 +215,128 @@ class TestMoESegmentAlign(unittest.TestCase):
                             f"not bit-identical at B={B}")
 
 
+class TestMoESegmentAlign32(unittest.TestCase):
+    """K2 (V5, 2026-09-08): align 32 is the value that matches the shipped tile.
+
+    ``GatherQMM::eval_gpu`` uses bm = 32 (not 16) whenever M/E >= 32 and group_size >= 64
+    (mlx quantized.cpp:1697-1701), which is every prefill chunk of this model (M/E = 227.6).
+    Padding to 16 therefore leaves ~half the straddles AND breaks ``align_M`` (67,568 % 32
+    == 16); padding to 32 removes every straddle and restores ``align_M``.  These tests pin
+    the two properties that make the arm shippable: the row layout is what the tile wants,
+    and the real rows are still bit-identical to the unpadded ones.
+    """
+
+    E = 32
+    TOPK = 4
+    K = 128
+    N = 64
+
+    def setUp(self):
+        self.saved = {"MLX_VLM_MOE_SEGMENT_ALIGN": os.environ.get("MLX_VLM_MOE_SEGMENT_ALIGN")}
+
+    def tearDown(self):
+        _reload(**self.saved)
+
+    def test_32_is_accepted_by_the_existing_knob(self):
+        S = _reload(MLX_VLM_MOE_SEGMENT_ALIGN="32")
+        self.assertEqual(S._moe_segment_align(), 32)
+
+    def test_every_segment_is_a_whole_number_of_32_row_tiles(self):
+        """The straddle count is zero and R_pad % 32 == 0, i.e. align_M is restored."""
+        S = _reload(MLX_VLM_MOE_SEGMENT_ALIGN="32")
+        rng = np.random.default_rng(11)
+        idx = np.sort(rng.integers(0, self.E, size=8192)).astype(np.uint32)
+        order_pad, real_pos = S._segment_align_order(mx.array(idx), self.E, 32)
+        mx.eval(order_pad, real_pos)
+        op = np.array(order_pad)
+        counts = np.bincount(idx, minlength=self.E)
+        padded = ((counts + 31) // 32) * 32
+        self.assertEqual(len(op), int(padded.sum()))
+        self.assertEqual(len(op) % 32, 0, "R_pad is not a multiple of bm=32: align_M stays false")
+        experts_of_padded = idx[op]
+        pos = 0
+        for e in range(self.E):
+            if padded[e] == 0:
+                continue
+            self.assertEqual(pos % 32, 0, f"segment for expert {e} is not bm=32 aligned")
+            seg = experts_of_padded[pos:pos + padded[e]]
+            self.assertTrue((seg == e).all(), f"expert {e} segment is contaminated")
+            pos += padded[e]
+
+    def test_only_align_32_guarantees_the_shipped_tile_is_aligned(self):
+        """align_M under bm=32: always true at align 32, a coin flip at align 16.
+
+        R_pad(32) is a sum of multiples of 32, so ``align_M`` holds by construction.
+        R_pad(16) is a multiple of 32 only when an EVEN number of experts happen to have
+        an odd count of 16-row tiles -- so on some draws align 16 accidentally aligns and
+        on others it does not.  Both halves are asserted: 32 never fails, and 16 fails on
+        at least one ordinary draw.
+        """
+        rng = np.random.default_rng(11)
+        misaligned_16 = 0
+        for _ in range(32):
+            idx = rng.integers(0, self.E, size=8192)
+            counts = np.bincount(idx, minlength=self.E)
+            r16 = int((((counts + 15) // 16) * 16).sum())
+            r32 = int((((counts + 31) // 32) * 32).sum())
+            self.assertEqual(r32 % 32, 0)
+            self.assertGreaterEqual(r32, r16)   # 32 pads at least as hard: the memory cost
+            misaligned_16 += int(r16 % 32 != 0)
+        self.assertGreater(misaligned_16, 0,
+                           "align 16 never broke align_M in 32 draws -- re-check the model")
+
+    def _run_arm(self, align, x, indices, w, scales, biases):
+        S = _reload(MLX_VLM_MOE_SEGMENT_ALIGN=align)
+        xx = mx.expand_dims(x, (-2, -3))
+        xs, ids, inv = S._gather_sort(xx, indices, num_experts=self.E)
+        o = mx.gather_qmm(xs, w, scales=scales, biases=biases, rhs_indices=ids,
+                          transpose=True, group_size=64, bits=4, sorted_indices=True)
+        return S._scatter_unsort(o, inv, indices.shape).squeeze(-2), xs.shape[0]
+
+    def test_bit_exact_against_no_padding_and_against_align_16(self):
+        for R in (2048, 8192, 16384):
+            rng = np.random.default_rng(R + 1)
+            idx_np = rng.integers(0, self.E, size=R).astype(np.uint32)
+            indices = mx.array(idx_np.reshape(R // self.TOPK, self.TOPK))
+            x = mx.random.normal((R // self.TOPK, self.K)).astype(mx.bfloat16)
+            wq = mx.random.normal((self.E, self.N, self.K)).astype(mx.bfloat16)
+            w, scales, biases = mx.quantize(wq, group_size=64, bits=4)
+            mx.eval(x, indices, w, scales, biases)
+
+            off, rows_off = self._run_arm("0", x, indices, w, scales, biases)
+            a16, rows_16 = self._run_arm("16", x, indices, w, scales, biases)
+            a32, rows_32 = self._run_arm("32", x, indices, w, scales, biases)
+            mx.eval(off, a16, a32)
+
+            counts = np.bincount(idx_np, minlength=self.E)
+            self.assertEqual(rows_off, R)
+            self.assertEqual(rows_32, int((((counts + 31) // 32) * 32).sum()))
+            self.assertGreater(rows_32, rows_16,
+                               f"align 32 did not pad more than 16 at R={R}: check is vacuous")
+            self.assertTrue(bool(mx.all(off == a32).item()),
+                            f"align 32 is not bit-identical to unpadded at R={R}; "
+                            f"max|d|={float(mx.abs(off.astype(mx.float32) - a32.astype(mx.float32)).max())}")
+            self.assertTrue(bool(mx.all(a16 == a32).item()),
+                            f"align 32 differs from align 16 at R={R}")
+
+    def test_bit_exact_with_a_batch_axis(self):
+        for B in (2, 8):
+            T = 64
+            rng = np.random.default_rng(200 + B)
+            idx_np = rng.integers(0, self.E, size=(B, T, self.TOPK)).astype(np.uint32)
+            indices = mx.array(idx_np)
+            x = mx.random.normal((B, T, self.K)).astype(mx.bfloat16)
+            wq = mx.random.normal((self.E, self.N, self.K)).astype(mx.bfloat16)
+            w, scales, biases = mx.quantize(wq, group_size=64, bits=4)
+            mx.eval(x, indices, w, scales, biases)
+            off, rows_off = self._run_arm("0", x, indices, w, scales, biases)
+            a32, rows_32 = self._run_arm("32", x, indices, w, scales, biases)
+            mx.eval(off, a32)
+            self.assertEqual(rows_off, int(indices.size))
+            self.assertGreater(rows_32, rows_off, f"padding did not fire at B={B}")
+            self.assertEqual(off.shape[:2], (B, T))
+            self.assertTrue(bool(mx.all(off == a32).item()), f"not bit-identical at B={B}")
+
+
 if __name__ == "__main__":
     unittest.main()

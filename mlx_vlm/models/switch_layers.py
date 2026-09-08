@@ -56,6 +56,38 @@ def _moe_segment_align() -> int:
     DEFAULT OFF.  Recommended ON for B=1 prefill once the peak-memory gate is re-fitted; keep it
     OFF under batched serving until B=8/16 peaks exist.  ``MLX_VLM_MOE_SEGMENT_ALIGN=16`` to
     enable (``1``, ``true`` and ``on`` are accepted and mean 16).
+
+    K2 (V5, 2026-09-08): **16 IS THE WRONG ALIGNMENT FOR THIS MODEL; 32 IS.**  The docstring
+    above says the kernel tiles rows at BM = 16, and that is only true for the NARROW tile.
+    ``GatherQMM::eval_gpu`` picks the tile in mlx/backend/metal/quantized.cpp:1697-1701:
+
+        int bm = 16, bn = 32, bk = 32;  int wm = 1, wn = 2;
+        if (M / E >= 32 && group_size >= 64) { bm = 32; bn = 64; }
+        const bool align_M = (M % bm) == 0;
+
+    GLM-5.3-Flash prefill is M = chunk * top_k = 8192 * 8 = 65,536 rows over E = 288 experts,
+    i.e. M/E = 227.6, and the weights are group_size 64 -- so the shipped path ALWAYS takes
+    bm = 32, never 16.  Consequences, for one 8,192-token chunk (R = 65,536, E = 288), counting
+    tiles + straddling experts:
+
+        arm            rows      passes @bm=32          align_M
+        natural        65,536    2,048 + 280 = 2,328    true   (65536 % 32 == 0)
+        align 16       67,568    2,112 + ~144 = 2,256   FALSE  (67568 % 32 == 16)
+        align 32       70,144    2,192 +   0 = 2,192    true   (70144 % 32 == 0)
+
+    Padding to 16 pays ALL the padding rows, removes only about half the straddles, and on top
+    of that breaks ``align_M`` -- the kernel then takes its bounds-checked variant for every
+    tile.  Padding to 32 removes every straddle by construction and restores ``align_M``,
+    because a sum of multiples of 32 is a multiple of 32.  The parsing below is already
+    general (``MLX_VLM_MOE_SEGMENT_ALIGN=32``); what was missing was the reason to use it.
+    Bit-exactness is unchanged by the value of the alignment: padding rows repeat their
+    segment's last row and ``real_pos`` discards them, whatever the multiple
+    (tests/test_moe_segment_align.py::TestMoESegmentAlign32).
+
+    Not free: at align 32 the padded row count is +7.0 % against +3.1 % at 16 on the real
+    router, so the transient-memory cost roughly doubles.  The static sync-free bound
+    ``R + (align-1)*E`` is worse still at 32 (+8,928 rows = 2,336 passes >= natural 2,328),
+    i.e. it has zero win by construction -- do not "optimise" the host sync away that way.
     """
     global _SEG_ALIGN_ENV
     if _SEG_ALIGN_ENV is None:

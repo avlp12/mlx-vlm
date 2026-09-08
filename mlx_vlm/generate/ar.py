@@ -58,6 +58,7 @@ from .common import (
     generation_stream,
     maybe_quantize_kv_cache,
     next_prefill_chunk,
+    prefill_keep_cache_enabled,
     prefill_logits_keep_kwargs,
     wired_limit,
 )
@@ -723,7 +724,13 @@ def generate_step(
                             prompt_cache_checkpoint(reached, prompt_cache)
                         inputs_embeds = inputs_embeds[:, n_to_process:]
                         input_ids = input_ids[:, n_to_process:]
-                        mx.clear_cache()
+                        # R-cc: MLX_VLM_GLM5_PREFILL_KEEP_CACHE=1 keeps the
+                        # allocator pool across chunks (bit-identical; trades peak
+                        # RSS for the next chunk's re-allocation + first-touch
+                        # faults, which land inside the forward).  Unset: cleared,
+                        # exactly as before.
+                        if not prefill_keep_cache_enabled():
+                            mx.clear_cache()
                         pbar.update(n_to_process)
 
                 if pipeline is not None:
@@ -4111,7 +4118,9 @@ class PromptProcessingBatch:
             self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
                 k, self._prompt_kwargs[k], start=n
             )
-        mx.clear_cache()
+        # R-cc, same lever as the single-stream chunk loop above.
+        if not prefill_keep_cache_enabled():
+            mx.clear_cache()
         return n
 
     def prompt_step(self) -> int:
@@ -4224,7 +4233,9 @@ class PromptProcessingBatch:
             self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
                 k, self._prompt_kwargs[k], start=n
             )
-        mx.clear_cache()
+        # R-cc, same lever as the single-stream chunk loop above.
+        if not prefill_keep_cache_enabled():
+            mx.clear_cache()
         return n
 
     def record_prompt_time(self, elapsed_s: float) -> None:
