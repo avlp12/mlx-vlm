@@ -29,7 +29,7 @@ rung?" — the answer is a second collective with the roles swapped, not a socke
 
     op   verb            carries                       who acts
     0    EXIT            —                             rank 1 stops
-    1    MAKE_CACHE      epoch                         rank 1 builds an EMPTY cache
+    1    MAKE_CACHE      epoch, left_padding[]         rank 1 builds the same EMPTY cache
     2    FORWARD         epoch, (b,s), ids, flags      both ranks run the forward
     3    ROLLBACK        epoch, accepted[], block      each rank rolls back its own half
     4    VAULT_STORE     epoch, name, prefix_len       each rank checkpoints its own half
@@ -51,8 +51,13 @@ divergence:
   exactly match BatchGenerator's deterministic leading-zero transform; rank 1
   rebuilds that same transform. Every other embedding, including multimodal
   splices, is refused. The equality check runs per call and is never cached.
+  `MAKE_CACHE` also carries the exact per-row left-padding vector, and rank 1
+  converts the same cache leaves to batch-aware caches before prefill. Protocol
+  version 6 makes an older peer fail the fixed-width handshake before serving.
 * a **mutation of the cache outside a forward** (speculative rollback, vault
-  restore) → announced.
+  restore) → announced. Filtering, reordering, or extending a live batch cache
+  changes its padding signature and is refused because no control verb mirrors
+  that row operation.
 * a cache that arrives **already populated but never announced** → refused.
   `OP_MAKE_CACHE` says "build an EMPTY cache", so rank 1 would start from
   nothing while rank 0 starts from history. Known producers: continuous batching

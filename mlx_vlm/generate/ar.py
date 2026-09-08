@@ -1647,6 +1647,9 @@ class GenerationBatch:
 
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
+        refuse = getattr(self._language_model, "refuse_batch_row_change", None)
+        if callable(refuse) and self.uids and other.uids:
+            refuse("extend")
         self_was_empty = len(self.uids) == 0
         if not self_was_empty and len(other.uids) > 0:
             self._eval_pending_state()
@@ -1724,6 +1727,9 @@ class GenerationBatch:
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
+        refuse = getattr(self._language_model, "refuse_batch_row_change", None)
+        if callable(refuse) and keep != list(range(len(self.uids))):
+            refuse("filter/reorder")
         if len(keep) < len(self.uids):
             self._eval_pending_state()
 

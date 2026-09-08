@@ -45,7 +45,7 @@ ENV_WORKER_MODEL = "MLX_VLM_GLM5_TP_WORKER_MODEL"
 # old rank 1 contributes zeros, which reproduces rank 0's view instead of
 # cancelling it, so the very first verb with a nonzero epoch reads as a
 # disagreement and every TP serve dies on op2.
-PROTO_VERSION = 5
+PROTO_VERSION = 6
 
 OP_EXIT, OP_MAKE_CACHE, OP_FORWARD = 0, 1, 2
 OP_ROLLBACK = 3         # speculative round rejected: roll my own shard back
@@ -563,10 +563,25 @@ class _WorkerState:
             c = self.caches[epoch] = self.lm.make_cache()
         return c
 
-    def new_cache(self, epoch: int):
+    def new_cache(self, epoch: int, left_padding=None):
         # One live cache in mode-level TP: rank 0 drives one conversation at a
         # time, and holding the old one would only pin its KV.
         c = self.lm.make_cache()
+        if left_padding is not None:
+            from ..models import cache as cache_mod
+            import mlx.core as mx
+
+            def to_batch(entry):
+                if isinstance(entry, cache_mod.CacheList):
+                    return cache_mod.CacheList(*(to_batch(x) for x in entry.caches))
+                if isinstance(entry, cache_mod.KVCache):
+                    return cache_mod.BatchKVCache(left_padding)
+                if isinstance(entry, cache_mod.ArraysCache):
+                    entry.left_padding = mx.array(left_padding)
+                    return entry
+                raise TPUnavailable(
+                    f"tp worker cannot batch cache type {type(entry).__name__}")
+            c = [to_batch(entry) for entry in c]
         self.caches = {epoch: c}
         self.epoch = epoch
         self.last_gdn = None
@@ -584,7 +599,7 @@ class _WorkerState:
             return False
 
         if msg.op == OP_MAKE_CACHE:
-            self.new_cache(msg.epoch)
+            self.new_cache(msg.epoch, msg.ids)
             return True
 
         if msg.op == OP_FORWARD:

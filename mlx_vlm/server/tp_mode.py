@@ -138,6 +138,36 @@ def _cache_is_empty(cache) -> bool:
     return True
 
 
+def _cache_left_padding(cache):
+    """Return one agreed batch-padding vector, or refuse mixed cache shapes."""
+    vectors = []
+
+    def visit(entry):
+        sub = getattr(entry, "caches", None)
+        if sub is not None:
+            for child in sub:
+                visit(child)
+            return
+        # ArraysCache.left_padding is a live mask cursor: advance() subtracts
+        # from the property after every forward.  Its private backing vector is
+        # the stable row-composition value that filter()/extend() replace.
+        padding = getattr(entry, "_left_padding", None)
+        if padding is None:
+            padding = getattr(entry, "left_padding", None)
+        vectors.append(
+            None if padding is None else tuple(int(x) for x in padding.tolist())
+        )
+
+    for entry in cache or ():
+        visit(entry)
+    present = [v for v in vectors if v is not None]
+    if not present:
+        return None
+    if len(present) != len(vectors) or any(v != present[0] for v in present):
+        raise TPDesync("TP batch cache entries disagree on left padding")
+    return list(present[0])
+
+
 class _Watchdog:
     """Bound the wall time of one announced step, with O(1) cost per step.
 
@@ -282,6 +312,7 @@ class MirroredLanguageModel:
         # Cost is bounded: one extra cache stays alive between generations, and
         # during steady decode it is the same object we are already using.
         self._last_cache_obj = None
+        self._last_batch_signature = None
         self._lock = threading.RLock()
         self._closed = False
         self.shard_report = shard_report
@@ -446,13 +477,22 @@ class MirroredLanguageModel:
     def _ensure_epoch(self, cache) -> None:
         """Announce a fresh cache if this is one rank 1 has not been told about."""
         cid = id(cache)
+        padding = _cache_left_padding(cache)
+        signature = None if padding is None else tuple(padding)
         if cid == self._last_cache_id and cache is self._last_cache_obj:
+            if signature != self._last_batch_signature:
+                raise TPDesync("TP batch cache row composition changed without a control verb")
             return
         self._require_reconstructible(cache)
         self._epoch += 1
         self._last_cache_id = cid
         self._last_cache_obj = cache
-        self._announce(OP_MAKE_CACHE, None, label="make_cache")
+        self._last_batch_signature = signature
+        self._announce(OP_MAKE_CACHE, padding, label="make_cache")
+
+    def refuse_batch_row_change(self, operation: str) -> None:
+        raise TPDesync(
+            f"TP batch cache {operation} has no rank-1 control verb")
 
     def _release_peer(self, why: str) -> None:
         """Best-effort EXIT so rank 1 is never left blocked in the control wait.
