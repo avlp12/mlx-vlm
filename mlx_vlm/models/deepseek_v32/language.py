@@ -223,6 +223,80 @@ class DeepseekV32Attention(nn.Module):
         return self.o_proj(output)
 
 
+# ---------------------------------------------------------------------------
+# M1/M2 (V5, 2026-09-08).  Prefill-only FLOP cuts: what "prefill" means here.
+#
+# Nothing in this stack carries a prefill/decode flag.  ``n_to_process`` stops at the
+# server/generate layer, the model sees only shapes, and "S > 1" is NOT prefill: the
+# speculative verify block is S = 8 (and adaptive-K varies S inside that window), which
+# is precisely the shape I1310 showed is quality-sensitive.  So the condition used by
+# both prefill-only levers is a ROW FLOOR on the sequence axis of the call:
+#
+#     prefill  :=  rows >= MLX_VLM_GLM5_PREFILL_TOPK_MIN_ROWS  (default 512)
+#
+# and the floor is shared by M1 (MoE top-k) and M2 (DSA indexer top-k) so a run can
+# never have one of them think it is in prefill and the other not.  Properties:
+#   * decode (S = 1) and every speculative verify block (S <= 8 by the decoder's own
+#     compile gate, glm5_next/language.py) are excluded by two orders of magnitude;
+#   * the shipped prefill chunk is 8,192 and the tail-merge floor is 1,024, so a normal
+#     prefill is entirely above the floor.  A prompt whose LAST chunk is shorter than
+#     512 processes that tail at the full, unmodified top-k -- the arm is then weaker,
+#     never stronger, than advertised, which is the safe direction;
+#   * a batched forward uses the same rule per forward (rows is the shared sequence
+#     length), so B > 1 prefill is included and B > 1 decode is not.
+_PREFILL_ROW_FLOOR_DEFAULT = 512
+
+
+def prefill_row_floor() -> int:
+    """``MLX_VLM_GLM5_PREFILL_TOPK_MIN_ROWS``, default 512.  <= 0 is refused."""
+    raw = os.environ.get("MLX_VLM_GLM5_PREFILL_TOPK_MIN_ROWS", "").strip()
+    if not raw:
+        return _PREFILL_ROW_FLOOR_DEFAULT
+    try:
+        val = int(raw)
+    except ValueError:
+        return _PREFILL_ROW_FLOOR_DEFAULT
+    return val if val > 0 else _PREFILL_ROW_FLOOR_DEFAULT
+
+
+def is_prefill_rows(rows: int) -> bool:
+    """Is a forward this wide a PREFILL forward, for the M1/M2 levers?"""
+    return int(rows) >= prefill_row_floor()
+
+
+def prefill_moe_top_k(configured_top_k: int, rows: int) -> int:
+    """M1: ``MLX_VLM_GLM5_PREFILL_MOE_TOPK``.  Returns ``configured_top_k`` unless set.
+
+    Only the number of experts changes.  ``group_expert_select`` renormalises the kept
+    scores over exactly the k it is given (``scores / scores.sum(-1, keepdims=True)``
+    when ``norm_topk_prob``), so k = 7 renormalises over 7 the same way the model
+    renormalises over 8 -- there is no separate renormalisation to keep in step.
+
+    ``group_expert_select`` is ``mx.compile``d and takes ``top_k`` as a python int;
+    MLX hashes non-array arguments into the trace key (mlx python/src/transforms.cpp:
+    489-499), so a second k value simply compiles a second trace -- the k = 8 trace,
+    and therefore the decode path, is untouched.
+
+    A value outside [1, configured_top_k] is a typo, not a lever: raise rather than
+    silently clamp, which would make an arm vacuous and score a false PASS.
+    """
+    raw = os.environ.get("MLX_VLM_GLM5_PREFILL_MOE_TOPK", "").strip()
+    if not raw or not is_prefill_rows(rows):
+        return configured_top_k
+    try:
+        k = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"MLX_VLM_GLM5_PREFILL_MOE_TOPK={raw!r} is not an integer"
+        ) from None
+    if not 1 <= k <= configured_top_k:
+        raise ValueError(
+            f"MLX_VLM_GLM5_PREFILL_MOE_TOPK={k} is outside [1, {configured_top_k}] "
+            "(the configured num_experts_per_tok); it can only ever REDUCE the top-k"
+        )
+    return k
+
+
 @mx.compile
 def group_expert_select(
     gates,

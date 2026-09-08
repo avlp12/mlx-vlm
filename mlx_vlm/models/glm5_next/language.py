@@ -17,7 +17,11 @@ from ..cache import ArraysCache, BatchKVCache, CacheList, KVCache, dynamic_roll
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
-from ..deepseek_v32.language import MoEGate, group_expert_select
+from ..deepseek_v32.language import (
+    MoEGate,
+    group_expert_select,
+    prefill_moe_top_k,
+)
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
@@ -3131,10 +3135,17 @@ class Glm5NextMoEGate(MoEGate):
         if w.dtype != mx.float32:
             w = w.astype(mx.float32)
         logits = x.astype(mx.float32) @ w.T
+        # M1: prefill-only MoE top-k (MLX_VLM_GLM5_PREFILL_MOE_TOPK).  ``x`` is
+        # [B, S, hidden] here -- the FFN half runs after the mHC collapse -- so the
+        # sequence axis is -2.  Unset, or below the prefill row floor, this is
+        # ``self.top_k`` and the call is byte-for-byte the one below it.
+        top_k = prefill_moe_top_k(
+            self.top_k, x.shape[-2] if x.ndim >= 2 else 1
+        )
         return group_expert_select(
             logits,
             self.e_score_correction_bias,
-            self.top_k,
+            top_k,
             self.n_group,
             self.topk_group,
             self.routed_scaling_factor,
