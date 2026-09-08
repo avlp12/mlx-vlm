@@ -256,3 +256,14 @@ def test_a_beacon_that_will_not_start_does_not_stop_the_serve(monkeypatch):
 
     monkeypatch.setattr(HB, "init_beacon", _boom)
     assert T._start_rank0_beacon(["10.0.0.1", "10.0.0.2"]) is False
+
+
+def test_the_rank0_beacon_has_its_own_kill_switch(monkeypatch):
+    """One env var isolates the only new per-reduce code on rank 0's hot path."""
+    calls = []
+    monkeypatch.setattr(HB, "init_beacon",
+                        lambda r, s=2, **k: calls.append(r) or SimpleNamespace(
+                            note=lambda *a, **kw: None))
+    monkeypatch.setenv("MLX_VLM_TP_HB_RANK0", "0")
+    assert T._start_rank0_beacon(["10.0.0.1", "10.0.0.2"]) is False
+    assert calls == [], "the switch must stop the beacon, not just mute it"

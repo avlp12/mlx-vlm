@@ -34,6 +34,8 @@ import pytest
 
 import mlx_vlm.tp.worker as W
 from mlx_vlm.server import tp_mode as T
+from mlx_vlm.tests import tp_wire
+from mlx_vlm.tests.tp_wire import PeerNeverCame as _PeerNeverCame
 
 mx.set_default_device(mx.cpu)
 
@@ -42,123 +44,25 @@ CTRL_WORDS = W.HEADER + N
 
 
 # =============================================================================
-# A two-rank transport, in one process
+# A two-rank transport, in one process (mlx_vlm/tests/tp_wire.py)
 # =============================================================================
-class _PeerNeverCame(Exception):
-    """A collective whose other half never arrived: the hang, bounded."""
-
-
-class _Wire:
-    """Pair the i-th collective of rank 0 with the i-th of rank 1.
-
-    That pairing IS the protocol: there is no side channel, so "rank 0 issued a
-    collective rank 1 did not" cannot be detected by the transport -- it is only
-    visible later, as the wrong two buffers meeting.  jaccl does not report a
-    size mismatch either (worker.py records 8 elements against 256 completing
-    silently and returning 3.0 to both ranks), so the model here is the
-    conservative one: each rank gets its own buffer plus whatever prefix of the
-    peer's overlaps it.  The property that matters is the one the echo check was
-    built for -- the reserved words at the TAIL keep the contributor's own value
-    when the peer's buffer is a different length, so they stop cancelling.
-    """
-
-    def __init__(self, timeout=10.0):
-        self.slots = {}
-        self.cv = threading.Condition()
-        self.timeout = timeout
-        self.pairs = []
-
-    def _index(self, rank):
-        return self.slots.setdefault(f"n{rank}", 0)
-
-    def exchange(self, rank, row):
-        with self.cv:
-            i = self.slots.get(f"n{rank}", 0)
-            self.slots[f"n{rank}"] = i + 1
-            self.slots[(rank, i)] = list(row)
-            self.cv.notify_all()
-            peer = 1 - rank
-            if not self.cv.wait_for(lambda: (peer, i) in self.slots, self.timeout):
-                raise _PeerNeverCame(
-                    f"rank {rank} waited {self.timeout}s for the peer's "
-                    f"collective #{i}: this is the live hang, in a test")
-            other = self.slots[(peer, i)]
-        out = list(row)
-        for k in range(min(len(out), len(other))):
-            out[k] += other[k]
-        return out
-
-
-def _patch_transport(monkeypatch, wire):
-    """One ``all_sum`` for both ranks; the caller is identified by thread name."""
-    import mlx_vlm.tp.transport as X
-
-    def all_sum(x):
-        rank = 0 if threading.current_thread().name == "rank0" else 1
-        row = x[0].tolist() if x.ndim == 2 else x.reshape(-1).tolist()
-        return mx.array([wire.exchange(rank, [int(v) for v in row])],
-                        dtype=mx.int32)
-
-    monkeypatch.setattr(X, "all_sum", all_sum)
-    monkeypatch.setattr(X, "driving", lambda: __import__("contextlib").nullcontext())
-    monkeypatch.setattr(X, "set_epoch", lambda e: None)
-
-
-def _rank1_worker_module():
-    """A SECOND copy of tp.worker, so rank 1 has its own ``_LAST_SHAPE``.
-
-    The echo agreement is a comparison of two per-rank module globals.  Running
-    both ranks against one import would compare a value with itself and could
-    never fail -- which is to say it would never reproduce anything.
-    """
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("_tp_worker_rank1", W.__file__)
-    mod = importlib.util.module_from_spec(spec)
-    mod.__package__ = "mlx_vlm.tp"          # so ``from ..tp.transport`` resolves
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def _data_reduce(rank, wire, width=32):
     """One collective from inside a sharded forward: not a control message."""
-    wire.exchange(rank, [0] * width)
+    wire.data_reduce(rank, width)
 
 
 def _run_pair(monkeypatch, rank0_script, rank1_steps):
-    """Drive both ranks to completion; return (rank0 error, rank1 error)."""
-    monkeypatch.setenv(W.ENV_MAX_TOK, str(N))
-    wire = _Wire()
-    _patch_transport(monkeypatch, wire)
-    R1 = _rank1_worker_module()
-    W._LAST_SHAPE[:] = [0, 0, 0]
-    R1._LAST_SHAPE[:] = [0, 0, 0]
-    W.clear_peer_gone()
-    R1.clear_peer_gone()
-    out = {}
+    """Drive both ranks; rank 1 decodes ``rank1_steps`` verbs and mirrors each
+    forward with its own share of the reduces."""
+    def rank1(wire, R1):
+        for _ in range(rank1_steps):
+            msg = R1._ctrl_recv()
+            if msg.op == W.OP_FORWARD:
+                for _ in range(3):
+                    _data_reduce(1, wire)
 
-    def r0():
-        try:
-            rank0_script(wire)
-        except BaseException as e:            # noqa: BLE001 - reported, not raised
-            out["r0"] = e
-
-    def r1():
-        try:
-            for _ in range(rank1_steps):
-                msg = R1._ctrl_recv()
-                if msg.op == W.OP_FORWARD:
-                    for _ in range(3):        # rank 1's own share of the forward
-                        _data_reduce(1, wire)
-        except BaseException as e:            # noqa: BLE001
-            out["r1"] = e
-
-    t0 = threading.Thread(target=r0, name="rank0")
-    t1 = threading.Thread(target=r1, name="rank1")
-    t1.start(); t0.start()
-    t0.join(20); t1.join(20)
-    assert not t0.is_alive() and not t1.is_alive(), "a rank never finished"
-    return out.get("r0"), out.get("r1")
+    return tp_wire.run_pair(monkeypatch, rank0_script, rank1, max_tok=N,
+                            join_s=20.0)
 
 
 def test_an_unannounced_verify_desyncs_rank_1():
@@ -375,3 +279,23 @@ def test_load_accepts_the_hooks_glm5_next_actually_has():
         def speculative_argmax_from_hidden(self, h): ...
 
     T._refuse_unmirrored_speculative_hooks(_Glm5Like())   # must not raise
+
+
+def test_the_stack_proxy_is_isinstance_transparent():
+    """A proxy that changes a branch is worse than no proxy at all."""
+    import mlx.nn as nn
+
+    class _Stack(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = []
+
+    pair = _ScriptedMTPPair(plan=[None])
+    pair.model = _Stack()
+    mirror = T.MirroredLanguageModel(pair)
+    proxy = mirror.model
+    assert isinstance(proxy, nn.Module), "callers branch on this"
+    assert proxy.layers == []
+    assert mirror.model is proxy, "a fresh proxy per read breaks identity tests"
+    with pytest.raises(T.TPDesync):
+        proxy(mx.zeros((1, 2), dtype=mx.int32))

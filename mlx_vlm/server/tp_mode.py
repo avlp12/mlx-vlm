@@ -343,6 +343,18 @@ class _ReadOnlyStack:
     def __init__(self, inner):
         object.__setattr__(self, "_inner", inner)
 
+    @property
+    def __class__(self):
+        """Answer isinstance() as the wrapped stack.
+
+        A proxy that fails ``isinstance(x, nn.Module)`` does not raise -- it
+        makes some caller take its OTHER branch, quietly, and a quiet branch
+        change on the serving path is exactly the class of bug this whole file
+        exists to prevent.  Special methods (including ``__call__`` below) are
+        still looked up on the real type, so the refusal is unaffected.
+        """
+        return type(object.__getattribute__(self, "_inner"))
+
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_inner"), name)
 
@@ -995,6 +1007,16 @@ def _start_rank0_beacon(hosts) -> bool:
     not start is only detection speed -- the step timeout still bounds an armed
     step -- so the failure is logged and serving continues.
     """
+    # One switch, rank 0 only.  ``MLX_VLM_TP_HB`` disables the beacon on both
+    # ranks and is not forwarded to the worker by ``launch_worker``, so it cannot
+    # answer "is rank 0's beacon implicated?" on its own.  This can: set
+    # MLX_VLM_TP_HB_RANK0=0 and everything else about the arm is unchanged,
+    # including rank 1's beacon, which has been running since long before this.
+    if os.environ.get("MLX_VLM_TP_HB_RANK0", "1") in ("0", "false", "no", "off"):
+        logger.info("tp: rank-0 heartbeat beacon disabled by "
+                    "MLX_VLM_TP_HB_RANK0; a peer that exits will only be "
+                    "noticed by the step timeout")
+        return False
     try:
         from ..tp import heartbeat as _hb
 
