@@ -344,6 +344,50 @@ def _kda_glue_compile_enabled() -> bool:
     return _KDA_GLUE_COMPILE_ENV
 
 
+# K6 (V5, 2026-09-08).  MLX_VLM_GLM5_KDA_GLUE_COMPILE_MIN_ROWS -- a ROW FLOOR on the
+# flag above, default unset = today's behaviour exactly.
+#
+# The two measurements the flag carries are not in conflict once the shapes are read.
+# L13 measured +1 % on PREFILL, where S is a whole chunk (8,192 rows) and the compiled
+# glue fuses ~10 bandwidth-bound elementwise passes over an [S, 3*qkv_dim] tensor.
+# I1310 measured DFlash2 acceptance 4.82 -> 3.27 per round (68.3 -> 47.7 tok/s) -- and
+# that is the SPECULATIVE VERIFY path, S = 8, where the same trace is re-entered per
+# round at a tiny shape.  The default went back OFF because the verify regression is
+# the one that ships; the prefill win was thrown away with it.
+#
+# A row floor separates them by construction: at S >= 512 no verify block exists (the
+# decoder's own compile gate uses S <= 8 for decode + verify, language.py:3130/3145, and
+# adaptive-K only varies S inside that window), so the floor arm cannot reach the path
+# I1310 killed.  512 is the registered value for the V5 arm and is also K6's own
+# minimum in the plan; any positive value is accepted.
+#
+# SEMANTICS.  Unset (or 0) -> the boolean flag alone decides, exactly as before.  Set to
+# N > 0 -> the floor ALONE decides: compile iff S >= N, whether or not the boolean flag
+# is set.  That keeps the epsilon arm a single assignment; setting both is redundant,
+# not contradictory.  The floor is read per call (L40 EnvSpec ``per_call``); the boolean
+# stays latched, as it was.
+#
+# IDENTITY IS NOT ASSUMED: mx.compile may fuse and reassociate the glue's elementwise
+# chains.  tests/test_glm5_next_kda_glue_floor.py compares compiled against eager on CPU
+# and reports the result; the campaign gate for this arm is the spec rail (I1310's rule),
+# not an identity claim.
+def _kda_glue_compile_min_rows() -> int:
+    """``MLX_VLM_GLM5_KDA_GLUE_COMPILE_MIN_ROWS``; 0 (unset/garbage) = no floor."""
+    raw = os.environ.get("MLX_VLM_GLM5_KDA_GLUE_COMPILE_MIN_ROWS", "")
+    try:
+        return max(0, int(raw.strip() or 0))
+    except ValueError:
+        return 0
+
+
+def _kda_glue_compile_for(rows: int) -> bool:
+    """Should the S>1 (prefill) KDA glue run through mx.compile at this width?"""
+    floor = _kda_glue_compile_min_rows()
+    if floor > 0:
+        return rows >= floor
+    return rows > 1 and _kda_glue_compile_enabled()
+
+
 _MLA_ABSORB_MULTI_ENV = None
 
 
@@ -1785,10 +1829,12 @@ class Glm5NextLinearAttention(nn.Module):
         fg = self.forget_gate
         # KDA glue compile: eager S>1 path only (prefill). Decode (S=1)
         # already returned above via _fused_kda_step/_fused_kda_block; the
-        # S>1 guard here is belt-and-suspenders so this flag can never touch
-        # that path even if fused KDA is disabled and S==1 somehow reaches
-        # here.
-        if S > 1 and _kda_glue_compile_enabled():
+        # S>1 guard inside _kda_glue_compile_for is belt-and-suspenders so this
+        # flag can never touch that path even if fused KDA is disabled and S==1
+        # somehow reaches here.  K6 (..._MIN_ROWS) raises that guard to a row
+        # floor so the prefill win can be taken without the S=8 verify shape
+        # I1310 killed; unset, this is the same predicate as before.
+        if _kda_glue_compile_for(S):
             if self._kda_glue_pre_c is None:
                 self._kda_glue_pre_c = mx.compile(self._kda_glue_pre)
             q, k, v, a = self._kda_glue_pre_c(conv_input, fa_o)
@@ -1834,7 +1880,7 @@ class Glm5NextLinearAttention(nn.Module):
             cache[1] = state
             cache.advance(S)
 
-        if S > 1 and _kda_glue_compile_enabled():
+        if _kda_glue_compile_for(S):
             if self._kda_glue_post_c is None:
                 self._kda_glue_post_c = mx.compile(self._kda_glue_post)
             return self._kda_glue_post_c(out, ga_o)
