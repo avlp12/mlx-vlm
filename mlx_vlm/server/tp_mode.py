@@ -56,10 +56,10 @@ from ..tp.worker import (  # noqa: F401  re-exported for the rank-0 side
     ENV_WORKER_MODEL, FLAG_CAPTURE, FLAG_HAS_NAME, HEADER, NAME_WORDS,
     PROTO_VERSION,
     OP_EXIT, OP_FORWARD, OP_MAKE_CACHE, OP_ROLLBACK, OP_VAULT_RESTORE,
-    OP_VAULT_STORE, Ctrl, TPDesync, TPUnavailable,
-    _ack_recv, _ctrl_recv, _ctrl_send, _max_tok, decode, encode,
-    name_to_words, preflight, tp_enabled, tp_hosts, tp_rank, words_to_name,
-    worker_loop,
+    OP_VAULT_STORE, Ctrl, TPDesync, TPPeerGone, TPUnavailable,
+    _ack_recv, _ctrl_recv, _ctrl_send, _max_tok, clear_peer_gone, decode,
+    encode, mark_peer_gone, name_to_words, peer_gone, preflight, tp_enabled,
+    tp_hosts, tp_rank, words_to_name, worker_loop,
 )
 
 # How long a single announced step may take before we conclude the peer is
@@ -142,14 +142,38 @@ class _Watchdog:
     this adds over arming a timer per forward is that it costs a tuple store on
     the hot path instead of a thread launch: at B=8 the server takes ~20 steps a
     second, and a per-step ``threading.Timer`` is a measurable fraction of one.
+
+    WHY IT DID NOT FIRE ON 2026-09-08.  The timeout arm only looks at
+    ``_inflight``, and ``_inflight`` is only set by ``_announce``/``_guard`` --
+    i.e. by forwards that go THROUGH the mirror.  The MTP verify did not: it
+    reached past the wrapper (``speculative/mtp.py`` -> ``lm.speculative_verify_
+    hidden`` -> the raw model) and spun in an unarmed, unannounced collective, so
+    the loop below saw ``None`` on every one of its 2400 polls and had nothing to
+    time.  The thread was running and healthy the whole time; there was simply
+    nothing armed.
+
+    Two changes follow from that.  The forward path is fixed so nothing bypasses
+    the mirror (that is the real repair), and the loop below also polls a PEER
+    verdict, which does not depend on anything being armed: a peer that
+    announced EXITING is a fact about the pair, not about a step.  When nothing
+    is in flight the verdict is only RECORDED -- the next control verb then
+    raises ``TPPeerGone`` and the server unwinds normally -- because a peer that
+    exits while the server is idle (an orderly shutdown) must not abort us.
     """
 
-    def __init__(self, timeout_s: float, poll_s: float = 1.0, on_timeout=None):
+    def __init__(self, timeout_s: float, poll_s: float = 1.0, on_timeout=None,
+                 peer_probe=None, on_peer_gone=None):
         self.timeout_s = timeout_s
         self.poll_s = poll_s
         self._inflight: Optional[tuple] = None
         self._stop = threading.Event()
         self._on_timeout = on_timeout or self._abort
+        # Injectable so the fire path is testable without a group.  Default is
+        # the module gate, which reads the heartbeat's already-received state
+        # and does no I/O.
+        self._peer_probe = peer_probe or peer_gone
+        self._on_peer_gone = on_peer_gone or mark_peer_gone
+        self.peer_gone_reason: Optional[str] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self):
@@ -170,13 +194,31 @@ class _Watchdog:
 
     def _loop(self):
         while not self._stop.wait(self.poll_s):
-            inflight = self._inflight
-            if inflight is None:
-                continue
-            label, started = inflight
-            waited = time.monotonic() - started
-            if waited > self.timeout_s and self._inflight is inflight:
-                self._on_timeout(label, waited)
+            self.poll_once()
+
+    def poll_once(self) -> None:
+        """One watchdog tick.  Split out so a test can drive it directly."""
+        inflight = self._inflight
+        gone = None
+        try:
+            gone = self._peer_probe()
+        except Exception:  # pragma: no cover - a probe must never kill the loop
+            logger.debug("[tp watchdog] peer probe failed", exc_info=True)
+        if gone is not None and self.peer_gone_reason is None:
+            self.peer_gone_reason = gone
+            self._on_peer_gone(gone)
+        if inflight is None:
+            return
+        label, started = inflight
+        waited = time.monotonic() - started
+        if gone is not None and self._inflight is inflight:
+            # A step IS in flight and the peer is gone: the thread running it is
+            # already inside the collective and cannot be unwound from here.
+            # Exit, the same as a timeout -- but now, instead of after 300 s.
+            self._on_timeout(f"{label} (peer gone: {gone})", waited)
+            return
+        if waited > self.timeout_s and self._inflight is inflight:
+            self._on_timeout(label, waited)
 
     @staticmethod
     def _abort(label: str, waited: float):
@@ -253,6 +295,85 @@ _RANK0_ONLY_KWARGS = {
 }
 
 
+# Attributes that run a sharded forward and are NOT implemented on the mirror.
+# Handing one of these out is how a rank-0-only forward gets issued: the caller
+# reaches past the wrapper, 101 all_sums happen with nothing announced, and the
+# ranks are out of phase from then on.  Refused by name in ``__getattr__``.
+#
+# ``speculative_verify_hidden`` / ``speculative_verify_logits`` are deliberately
+# ABSENT: they are implemented on the mirror (they announce, then delegate), so
+# ``__getattr__`` is never reached for them.  Anything added upstream that runs a
+# forward belongs here until it is given the same treatment.
+# It is EMPTY today, and that is the correct state: every hook that exists in
+# this tree is either mirrored or inert, and ``_refuse_unmirrored_speculative_
+# hooks`` refuses anything else AT LOAD.  This exists as the second rail, for a
+# hook attached to an instance after load (where the load-time scan of the class
+# cannot see it) -- add the name here and it becomes a refusal instead of a
+# forty-minute hang.
+_UNMIRRORABLE_FORWARD_HOOKS = frozenset()
+
+# Attributes that are safe to hand out because they issue NO collective.  Kept
+# as a list so the load-time check below can say which hooks it accepted and
+# why, instead of silently allowing everything it does not recognise.
+_INERT_SPECULATIVE_HOOKS = {
+    # final norm + the replicated lm_head (models/glm5_next/language.py:3604);
+    # lm_head is replicated in the shard plan, so this reduces nothing.
+    "speculative_logits_from_hidden": "replicated norm + lm_head, no collective",
+    "speculative_argmax_from_hidden": "argmax over the replicated head",
+    # identity for glm5_next; a pure elementwise reshape elsewhere.
+    "speculative_draft_hidden": "reshapes the drafter's hidden, no collective",
+}
+
+# The hooks the mirror announces.  Named so the load-time refusal can tell a
+# hook it mirrors from one it has never heard of.
+_MIRRORED_SPECULATIVE_HOOKS = ("speculative_verify_hidden",
+                               "speculative_verify_logits")
+
+
+class _ReadOnlyStack:
+    """``mirror.model``: read the inner stack, do not run it.
+
+    Reads are what the drafter and the MTP helpers need (embed_tokens, layers,
+    norm, layer_type).  A CALL is a full unannounced forward, which is the shape
+    of the 2026-09-08 hang, so it raises with the reason instead.
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+    def __call__(self, *args, **kwargs):
+        raise TPDesync(
+            "TP mode refuses a direct call to language_model.model(...): it runs "
+            "the sharded stack on rank 0 with no OP_FORWARD announced, so rank 1 "
+            "never runs the matching reduces and the two ranks are out of phase "
+            "from the next collective on (2026-09-08: rank 1 refused with "
+            "TPDesync and rank 0 spun at 200% CPU for 40 minutes). Call the "
+            "language model itself -- the mirror announces that path -- or add a "
+            "verb for this one.")
+
+
+def _force_same_graph_hidden(out) -> None:
+    """The ``_force_same_graph`` of the verify path.
+
+    Same argument, different output shape: the verify hooks return a tuple whose
+    first element is the pre-final-norm hidden, and with ``skip_logits=True``
+    there are no logits to evaluate at all.  Evaluating the hidden forces every
+    reduce in the stack (it is the last decoder layer's output), which is what
+    makes rank 0's executed graph equal to rank 1's -- rank 1 evaluates its
+    logits unconditionally (tp/worker.py, OP_FORWARD).
+    """
+    import mlx.core as mx
+
+    first = out[0] if isinstance(out, tuple) and out else out
+    if isinstance(first, mx.array):
+        mx.eval(first)
+
+
 class MirroredLanguageModel:
     """Rank-0 wrapper: announce each forward, then run it locally.
 
@@ -277,6 +398,7 @@ class MirroredLanguageModel:
         # Cost is bounded: one extra cache stays alive between generations, and
         # during steady decode it is the same object we are already using.
         self._last_cache_obj = None
+        self._model_proxy = None
         self._lock = threading.RLock()
         self._closed = False
         self.shard_report = shard_report
@@ -302,7 +424,101 @@ class MirroredLanguageModel:
         atexit.register(_atexit_shutdown)
 
     def __getattr__(self, name):
+        """Fall through to the wrapped model -- except for the forwards.
+
+        This method is where the 2026-09-08 MTP hang came from.  Attribute
+        fall-through is what makes the wrapper transparent, and it is also what
+        makes it *leaky*: ``speculative/mtp.py`` asks the language model for
+        ``speculative_verify_hidden`` (mtp.py:92) and gets a bound method of the
+        RAW model, which then runs the whole sharded stack -- 101 all_sums --
+        with no OP_FORWARD announced.  Rank 1, sitting in its control wait,
+        paired its next control reduce with one of those, read a control vector
+        that was never one, and refused with ``TPDesync`` naming the last shape
+        it had agreed on (batch 1, seqlen 15: the 15-token prompt of that run).
+        DFlash2 survives the same wiring only because it verifies through
+        ``lm(...)`` (speculative/dflash.py:1206) and therefore through
+        ``__call__`` below.
+
+        So the hooks that run a forward are implemented on this class (they
+        announce, then delegate), and any *other* attribute that is known to run
+        one is refused BY NAME here rather than handed out.  The rule matches the
+        one ``_RANK0_ONLY_KWARGS`` already applies to keyword arguments: an
+        unmirrored forward is not a wrong answer, it is a hang a long way from
+        its cause, so it has to be impossible to reach by accident.
+        """
+        if name in _UNMIRRORABLE_FORWARD_HOOKS:
+            raise TPDesync(
+                f"TP mode will not hand out {name!r}: it runs a sharded forward "
+                f"on rank 0 alone, and rank 1 is only told about forwards that go "
+                f"through the mirror. Implement it on MirroredLanguageModel (see "
+                f"speculative_verify_hidden) so it announces OP_FORWARD first, or "
+                f"serve this drafter single-box.")
         return getattr(self._lm, name)
+
+    @property
+    def model(self):
+        """The inner stack, readable but not callable.
+
+        ``speculative/mtp.py`` falls back to ``lm.model(...)`` when a model has
+        no verify hook (mtp.py:119,129), and ``mtp.py:62`` reads
+        ``lm.model.layers`` on every round.  The reads are harmless -- layers,
+        embed_tokens, norm -- and the drafter's ``reset()`` needs them
+        (speculative/drafters/glm5_next_mtp: ``target_model.language_model.model
+        .embed_tokens``).  The CALL is the unannounced forward.  So the proxy
+        passes reads through and refuses ``__call__`` by name.
+        """
+        if self._lm is None:
+            raise TPUnavailable("TP mirror has been shut down")
+        inner = self._lm.model
+        proxy = self._model_proxy
+        if proxy is None or proxy._inner is not inner:
+            proxy = self._model_proxy = _ReadOnlyStack(inner)
+        return proxy
+
+    # ------------------------------------------------- speculative verify
+    def speculative_verify_hidden(self, inputs, cache):
+        """Announce the verify block, then run it.  MTP's hot path.
+
+        Rank 1 answers OP_FORWARD by running ``self.lm(ids, cache, capture_
+        layer_ids=[])`` (tp/worker.py handle/OP_FORWARD).  Rank 0 runs
+        ``Glm5NextExactSpeculativeVerifier`` -- ``language_model.model(inputs,
+        cache=cache, gdn_sink=[], hidden_sink=[])`` plus, on the logits variant,
+        the replicated lm_head.  Those two run the SAME 101 reduces in the same
+        order: the sinks are appended to and never read back into the residual
+        (the argument ``_RANK0_ONLY_KWARGS`` already makes for
+        ``capture_layer_ids`` and ``return_hidden``), and ``skip_logits`` only
+        skips a replicated head.  FLAG_CAPTURE is always set, because a verify
+        can be rejected and OP_ROLLBACK on rank 1 refuses without a captured
+        round.
+        """
+        return self._mirrored_verify(
+            "speculative_verify_hidden", inputs, cache,
+            lambda: self._lm.speculative_verify_hidden(inputs, cache))
+
+    def speculative_verify_logits(self, inputs, cache, sampler):
+        return self._mirrored_verify(
+            "speculative_verify_logits", inputs, cache,
+            lambda: self._lm.speculative_verify_logits(inputs, cache, sampler))
+
+    def _mirrored_verify(self, what: str, inputs, cache, run):
+        if self._closed:
+            raise TPUnavailable("TP mirror already released its peer")
+        if inputs is None:
+            raise TPUnavailable("TP mode needs token ids to mirror a forward")
+        with self._lock:
+            self._ensure_epoch(cache)
+            shape = getattr(inputs, "shape", ("?", "?"))
+            self._announce(OP_FORWARD, inputs, flags=FLAG_CAPTURE,
+                           label=f"announce {what} b={shape[0]} s={shape[1]}")
+            with self._guard(f"{what} b={shape[0]} s={shape[1]}"):
+                n0 = _collectives()
+                _reset_forward_counter()
+                out = run()
+                _force_same_graph_hidden(out)
+                if _trace_collectives():
+                    logger.info("rank0 %s b=%s s=%s collectives=%d",
+                                what, shape[0], shape[1], _collectives() - n0)
+            return out
 
     def supports_per_row_speculative_rollback(self, caches) -> bool:
         """No: rank 1 cannot represent a per-row length, so nobody may use one.
@@ -588,6 +804,15 @@ class MirroredLanguageModel:
             if self._watchdog is not None:
                 self._watchdog.stop()
                 self._watchdog = None
+            # Announce EXITING on the side-channel too, and take our beacon
+            # down.  The datagram cannot block, and it is what stops rank 1
+            # waiting out its own dead_s bound after an orderly shutdown.
+            try:
+                from ..tp import heartbeat as _hb
+
+                _hb.shutdown_beacon(announce_exit=True)
+            except Exception:
+                logger.debug("tp: heartbeat shutdown failed", exc_info=True)
             if self._wire is not None:
                 try:
                     self._wire.__exit__(None, None, None)
@@ -724,6 +949,18 @@ def maybe_load_tp(model_path: str):
         worker = launch_worker(model_path, hosts)
         info = preflight(hosts, 0)
         logger.info("tp: group up %s", info)
+        # RANK 0's HALF OF THE SIDE-CHANNEL.  Until now ``init_beacon`` was
+        # called in exactly one place, ``tp/worker.py`` (rank 1), so the
+        # heartbeat was one-directional: rank 1 could tell that rank 0 had
+        # stopped driving, and rank 0 could tell nothing at all.  That is why the
+        # 2026-09-08 hang was unrecoverable -- rank 1 announced EXITING as it
+        # released its shard (worker_loop's finally) and the announcement had no
+        # listener.  Starting one here costs two daemon threads and 44 bytes at
+        # 4 Hz, and it is what makes ``peer_gone()`` (and therefore TPPeerGone)
+        # able to answer.  Best effort: a side-channel that cannot start must
+        # never stop the serve, exactly as it does not on rank 1.
+        clear_peer_gone()
+        _start_rank0_beacon(hosts)
         model, report = load_sharded(model_path, _r(), tp_size())
         peak = materialize(model)
         logger.info("tp: sharded %s peak %.1f GiB", report, peak)
@@ -735,6 +972,7 @@ def maybe_load_tp(model_path: str):
         wire.__enter__()
         watchdog = _Watchdog(_step_timeout()).start()
         inner = model.language_model if hasattr(model, "language_model") else model
+        _refuse_unmirrored_speculative_hooks(inner)
         mirrored = MirroredLanguageModel(
             inner, wire=wire, shard_report=report, watchdog=watchdog)
         if hasattr(model, "language_model"):
@@ -747,6 +985,59 @@ def maybe_load_tp(model_path: str):
         logger.error("tp: unavailable (%s); serving single-box", e, exc_info=True)
         _reap_worker(worker, hosts)
         return None
+
+
+def _start_rank0_beacon(hosts) -> bool:
+    """Rank 0's half of the side-channel.  Best effort; returns whether it is up.
+
+    Never raises: a heartbeat that cannot start must not stop a serve, which is
+    the same rule ``tp/worker.py`` applies on rank 1.  What is lost when it does
+    not start is only detection speed -- the step timeout still bounds an armed
+    step -- so the failure is logged and serving continues.
+    """
+    try:
+        from ..tp import heartbeat as _hb
+
+        b = _hb.init_beacon(0, len(hosts or []) or 2)
+        if b is None:
+            return False
+        b.note(_hb.STATE_IDLE)
+        return True
+    except Exception:
+        logger.warning("tp: rank-0 heartbeat beacon could not start; a peer that "
+                       "exits will only be noticed by the step timeout",
+                       exc_info=True)
+        return False
+
+
+def _refuse_unmirrored_speculative_hooks(inner) -> None:
+    """Refuse AT LOAD any speculative hook the mirror does not know about.
+
+    The MTP hang had no error to read because the bypass was silent: a hook the
+    mirror had never heard of was handed out by ``__getattr__`` and ran a
+    sharded forward on rank 0 alone.  The hooks that exist today are each either
+    mirrored or provably collective-free, and both lists are spelled out above.
+    A hook that is on neither list is, by construction, one nobody has checked --
+    so it is a named refusal here (seconds, before a four-minute load) rather
+    than a hang forty minutes in.
+    """
+    unknown = sorted(
+        n for n in dir(type(inner))
+        if n.startswith("speculative_")
+        and n not in _INERT_SPECULATIVE_HOOKS
+        and n not in _MIRRORED_SPECULATIVE_HOOKS
+        and callable(getattr(inner, n, None))
+    )
+    if unknown:
+        raise TPUnavailable(
+            f"{type(inner).__name__} exposes speculative hooks TP mode does not "
+            f"know how to mirror: {unknown}. A hook that runs the sharded stack "
+            f"outside MirroredLanguageModel issues collectives rank 1 is never "
+            f"told about, which is a hang rather than a wrong answer "
+            f"(2026-09-08, MTP under TP=2). Either implement it on the mirror "
+            f"(see speculative_verify_hidden), or add it to "
+            f"_INERT_SPECULATIVE_HOOKS with the reason it issues no collective, "
+            f"or serve this model single-box.")
 
 
 def _require_live_gpus(hosts) -> None:
