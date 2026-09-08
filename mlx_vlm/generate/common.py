@@ -179,6 +179,29 @@ def prefill_logits_keep_kwargs(language_model, width: int) -> dict:
     return {"num_logits_to_keep": 1}
 
 
+def prefill_keep_cache_enabled() -> bool:
+    """R-cc (V5, 2026-09-08).  ``MLX_VLM_GLM5_PREFILL_KEEP_CACHE``, default OFF.
+
+    Both chunk loops call ``mx.clear_cache()`` after every chunk (generate/ar.py,
+    server/generation.py).  That returns the allocator's free pool to the OS, so
+    the ~17 GB of per-layer transients the NEXT chunk allocates are fresh pages:
+    the forward pays the re-allocation and the first-touch faults INSIDE the timed
+    region.  With the flag on the loop keeps the pool and reuses it.
+
+    Bit-identical by construction: this is an allocator hint and touches no array,
+    no shape and no kernel.  The cost it trades against is peak RSS -- the pool is
+    not returned between chunks -- which is exactly what the epsilon arm measures.
+
+    Default OFF, and OFF means "clear as today": unset restores byte-for-byte the
+    95bbe594 loop.  Read per call (L40 EnvSpec mode ``per_call``); it is read once
+    per chunk, next to a call that used to unmap gigabytes.
+    """
+    raw = os.environ.get("MLX_VLM_GLM5_PREFILL_KEEP_CACHE")
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def prefill_tail_merge_enabled() -> bool:
     """(b), default ON since I1437.  ``...TAIL_MERGE=0`` restores a6634a75."""
     return _env_default_on("MLX_VLM_GLM5_PREFILL_TAIL_MERGE")
