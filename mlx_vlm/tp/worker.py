@@ -112,6 +112,73 @@ class TPDesync(RuntimeError):
     """
 
 
+class TPPeerGone(RuntimeError):
+    """The peer rank is not there any more, and we noticed BEFORE the reduce.
+
+    This is the exception the 2026-09-08 MTP incident could not raise.  Rank 1
+    died with :class:`TPDesync`, released its shard and announced EXITING on the
+    side-channel; rank 0 walked into the next ``all_sum`` anyway and spun at
+    ~200% CPU forever, because the wait for a peer contribution is inside
+    jaccl/Metal and nothing on the host can preempt it (see
+    ``transport.Deadman``'s docstring -- that is not a bug in this file, it is a
+    property of the collective).
+
+    So the recovery has to happen one step EARLIER: refuse to enter a collective
+    whose other half is known to be missing.  Raised from ``_ctrl_send`` it
+    propagates out of the generation thread like any other error -- the request
+    fails with a named reason, the server's unload path runs, the model is
+    released -- with no signal and no ``os._exit``.  Once a thread is already
+    inside the spin, only the watchdog's exit is left.
+    """
+
+
+# ---------------------------------------------------------- peer liveness
+# Set by whoever learns the peer is gone (rank 0's watchdog, a failed verb, the
+# heartbeat).  Read before every control send.  A plain module global rather
+# than mirror state because ``_ctrl_send`` is a module function and the
+# knowledge is process-wide: there is exactly one peer.
+_PEER_GONE: Optional[str] = None
+
+
+def mark_peer_gone(reason: str) -> None:
+    global _PEER_GONE
+    if _PEER_GONE is None:
+        _PEER_GONE = str(reason)
+        logger.error("tp: peer marked gone: %s. The next control verb will "
+                     "raise TPPeerGone instead of entering a collective that "
+                     "cannot complete.", _PEER_GONE)
+
+
+def clear_peer_gone() -> None:
+    """Forget the verdict (a fresh group formation gets a fresh peer)."""
+    global _PEER_GONE
+    _PEER_GONE = None
+
+
+def peer_gone() -> Optional[str]:
+    """Why the peer is gone, or None.
+
+    Two sources: an explicit :func:`mark_peer_gone`, and the heartbeat beacon's
+    own verdict.  Reading the beacon here (rather than only from a monitor
+    thread) means the gate works even if the monitor never runs: ``poll()`` is
+    documented as a pure function of already-received state and does no I/O.
+    """
+    if _PEER_GONE is not None:
+        return _PEER_GONE
+    try:
+        from ..tp import heartbeat as _hb
+
+        b = _hb.beacon()
+        if b is None:
+            return None
+        verdict, why = b.poll()
+        if verdict in (_hb.PEER_EXITING, _hb.PEER_DEAD):
+            return f"{verdict}: {why}"
+    except Exception:  # pragma: no cover - the gate must never itself fail
+        logger.debug("tp: peer_gone probe failed", exc_info=True)
+    return None
+
+
 # ------------------------------------------------------------------ preflight
 def preflight(hosts: List[str], rank: int, timeout_s: float = 60.0) -> dict:
     """Seconds-long transport check before anything expensive.
@@ -287,6 +354,24 @@ def _ctrl_send(op: int, epoch: int, ids, *, flags: int = 0, arg0: int = 0,
     import mlx.core as mx
 
     shape, flat = _flatten(ids)
+    # THE GATE.  Everything below this line is unpreemptible once entered: a
+    # collective whose peer is gone does not fail, it spins (2026-09-08, 40
+    # minutes at ~200% CPU, three SIGTERMs ignored).  The only place the peer's
+    # absence can still be acted on is HERE, before the reduce is built.
+    # OP_EXIT is NOT exempt.  A farewell is still a collective, and a collective
+    # to a peer that has already left is the same infinite spin as any other --
+    # so the teardown path must skip it too.  Both callers of the EXIT verb
+    # (``MirroredLanguageModel._release_peer`` and ``.shutdown``) already catch
+    # and fall back to reaping the peer over ssh, which is the only thing that
+    # can still be done for a peer that is not answering.
+    gone = peer_gone()
+    if gone is not None:
+        raise TPPeerGone(
+            f"refusing to announce op{op} (epoch {epoch}): the peer rank is "
+            f"gone -- {gone}. Entering the collective would block inside jaccl "
+            f"forever with no way back; raising here lets the request fail, the "
+            f"generation thread unwind and the model be released by the "
+            f"ordinary unload path.")
     # Publish the epoch to the side-channel BEFORE the collective that carries
     # the verb.  If this all_sum is the one that wedges, the beat already names
     # the epoch rank 0 was trying to announce.
