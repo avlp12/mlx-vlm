@@ -5857,6 +5857,27 @@ class BatchGenerator:
         generation_responses = []
         prompt_responses = []
 
+        # Keep a just-finished cache through the response/capture window, then
+        # release its peer epoch on the next scheduler step before replacement.
+        pending_filter = getattr(
+            self._generation_batch, "_pending_filter_keep", None)
+        finished_plain_batch = pending_filter == []
+        if len(self._generation_batch) == 0 or finished_plain_batch:
+            cache = getattr(self._generation_batch, "prompt_cache", None)
+            lm = getattr(self._generation_batch, "_language_model", None)
+            release = getattr(lm, "release_cache", None)
+            if cache and callable(release):
+                release(cache)
+            if finished_plain_batch:
+                self._generation_batch = GenerationBatch.empty(
+                    self.model, self.sampler, self.tokenizer.stopping_criteria,
+                    compute_logprobs=self.compute_logprobs,
+                    top_logprobs_k=self.top_logprobs_k,
+                    greedy_sampling=self.greedy_sampling,
+                )
+            elif cache:
+                self._generation_batch.prompt_cache = []
+
         # Decode-first: always emit a generation step before touching prefill.
         yield_after_decode = any(
             getattr(processor, "requires_immediate_decode_yield", False)

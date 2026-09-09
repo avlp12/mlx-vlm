@@ -55,7 +55,8 @@ from ..tp.worker import (  # noqa: F401  re-exported for the rank-0 side
     ENV_HOSTS, ENV_MAX_TOK, ENV_RANK, ENV_WORKER_PY, ENV_WORKER_SRC,
     ENV_WORKER_MODEL, FLAG_CAPTURE, FLAG_HAS_NAME, FLAG_LEFT_ZERO_PAD, HEADER,
     NAME_WORDS, PROTO_VERSION,
-    OP_EXIT, OP_FORWARD, OP_MAKE_CACHE, OP_ROLLBACK, OP_VAULT_RESTORE,
+    MAX_LIVE_EPOCHS, OP_EXIT, OP_FORWARD, OP_MAKE_CACHE, OP_RELEASE_CACHE,
+    OP_ROLLBACK, OP_VAULT_RESTORE,
     OP_VAULT_STORE, Ctrl, TPDesync, TPUnavailable,
     _ack_recv, _ctrl_recv, _ctrl_send, _max_tok, decode, encode,
     name_to_words, preflight, text_embeddings, tp_enabled, tp_hosts, tp_rank,
@@ -302,6 +303,7 @@ class MirroredLanguageModel:
     def __init__(self, lm, *, wire=None, shard_report=None, watchdog=None):
         self._lm = lm
         self._epoch = 0
+        self._next_epoch = 0
         self._last_cache_id = None
         # A strong reference to the cache we last announced.  id() alone is not
         # a safe identity key: once a cache is freed its address can be reused
@@ -313,6 +315,7 @@ class MirroredLanguageModel:
         # during steady decode it is the same object we are already using.
         self._last_cache_obj = None
         self._last_batch_signature = None
+        self._cache_epochs = {}
         self._lock = threading.RLock()
         self._closed = False
         self.shard_report = shard_report
@@ -479,16 +482,47 @@ class MirroredLanguageModel:
         cid = id(cache)
         padding = _cache_left_padding(cache)
         signature = None if padding is None else tuple(padding)
+        known = self._cache_epochs.get(cid)
+        if known is not None and known[0] is cache:
+            _, epoch, old_signature = known
+            if signature != old_signature:
+                raise TPDesync("TP batch cache row composition changed without a control verb")
+            self._epoch = epoch
+            self._last_cache_id = cid
+            self._last_cache_obj = cache
+            self._last_batch_signature = signature
+            return
         if cid == self._last_cache_id and cache is self._last_cache_obj:
             if signature != self._last_batch_signature:
                 raise TPDesync("TP batch cache row composition changed without a control verb")
             return
         self._require_reconstructible(cache)
-        self._epoch += 1
+        if len(self._cache_epochs) >= MAX_LIVE_EPOCHS:
+            raise TPUnavailable("TP live cache epoch limit reached")
+        self._next_epoch += 1
+        self._epoch = self._next_epoch
         self._last_cache_id = cid
         self._last_cache_obj = cache
         self._last_batch_signature = signature
+        self._cache_epochs[cid] = (cache, self._epoch, signature)
         self._announce(OP_MAKE_CACHE, padding, label="make_cache")
+
+    def release_cache(self, cache) -> None:
+        """Release one known epoch on both ranks; unknown/double release refuses."""
+        with self._lock:
+            record = self._cache_epochs.get(id(cache))
+            if record is None or record[0] is not cache:
+                raise TPDesync("TP release of unknown cache")
+            epoch = record[1]
+            selected_epoch = self._epoch
+            self._epoch = epoch
+            self._announce(OP_RELEASE_CACHE, None, label=f"release cache epoch={epoch}")
+            del self._cache_epochs[id(cache)]
+            if self._last_cache_obj is cache:
+                self._last_cache_id = None
+                self._last_cache_obj = None
+                self._last_batch_signature = None
+            self._epoch = selected_epoch if selected_epoch != epoch else 0
 
     def refuse_batch_row_change(self, operation: str) -> None:
         raise TPDesync(
@@ -512,6 +546,7 @@ class MirroredLanguageModel:
         self._closed = True
         try:
             _ctrl_send(OP_EXIT, self._epoch, None)
+            self._cache_epochs.clear()
             logger.warning("tp: released peer with EXIT after %s", why)
         except Exception:
             logger.warning("tp: could not release peer after %s; reaping instead",
@@ -520,6 +555,11 @@ class MirroredLanguageModel:
                 _reap_peer_workers(tp_hosts())
             except Exception:
                 logger.warning("tp: peer reap also failed", exc_info=True)
+        finally:
+            self._cache_epochs.clear()
+            self._last_cache_obj = None
+            self._last_cache_id = None
+            self._last_batch_signature = None
 
     def _announce(self, op, ids, *, flags=0, arg0=0, name="", label="") -> None:
         if self._watchdog is not None:
@@ -586,7 +626,10 @@ class MirroredLanguageModel:
         rank 1 would sum halves of different states into fluent nonsense.
         """
         with self._lock:
-            self._epoch += 1
+            if len(self._cache_epochs) >= MAX_LIVE_EPOCHS:
+                raise TPUnavailable("TP live cache epoch limit reached")
+            self._next_epoch += 1
+            self._epoch = self._next_epoch
             self._last_cache_id = id(cache)
             self._last_cache_obj = cache
             self._announce(OP_VAULT_RESTORE, None, arg0=int(prefix_len),
@@ -604,6 +647,11 @@ class MirroredLanguageModel:
                 self._last_cache_id = None
                 self._last_cache_obj = None
                 logger.info("tp: peer vault miss for %s; cold prefill", name[:12])
+            else:
+                signature = _cache_left_padding(cache)
+                signature = None if signature is None else tuple(signature)
+                self._last_batch_signature = signature
+                self._cache_epochs[id(cache)] = (cache, self._epoch, signature)
             return ok
 
     # --------------------------------------------------------------- teardown
@@ -645,8 +693,10 @@ class MirroredLanguageModel:
                 except Exception:
                     logger.warning("tp: releasing wired limit failed", exc_info=True)
                 self._wire = None
+            self._cache_epochs.clear()
             self._last_cache_obj = None
             self._last_cache_id = None
+            self._last_batch_signature = None
             self._lm = None
             if self._atexit_hook is not None:
                 try:

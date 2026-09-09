@@ -34,6 +34,7 @@ rung?" — the answer is a second collective with the roles swapped, not a socke
     3    ROLLBACK        epoch, accepted[], block      each rank rolls back its own half
     4    VAULT_STORE     epoch, name, prefix_len       each rank checkpoints its own half
     5    VAULT_RESTORE   epoch, name, prefix_len       each rank restores its own half, + ack
+    6    RELEASE_CACHE   epoch                         rank 1 drops the named live cache
 
 `PROTO_VERSION`, the header width and the payload width are agreed in preflight
 over a vector whose width is frozen forever. A revision skew between the boxes
@@ -53,7 +54,7 @@ divergence:
   splices, is refused. The equality check runs per call and is never cached.
   `MAKE_CACHE` also carries the exact per-row left-padding vector, and rank 1
   converts the same cache leaves to batch-aware caches before prefill. Protocol
-  version 6 makes an older peer fail the fixed-width handshake before serving.
+  version 7 makes an older peer fail the fixed-width handshake before serving.
 * a **mutation of the cache outside a forward** (speculative rollback, vault
   restore) → announced. Filtering, reordering, or extending a live batch cache
   changes its padding signature and is refused because no control verb mirrors

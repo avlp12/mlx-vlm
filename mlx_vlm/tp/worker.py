@@ -45,12 +45,13 @@ ENV_WORKER_MODEL = "MLX_VLM_GLM5_TP_WORKER_MODEL"
 # old rank 1 contributes zeros, which reproduces rank 0's view instead of
 # cancelling it, so the very first verb with a nonzero epoch reads as a
 # disagreement and every TP serve dies on op2.
-PROTO_VERSION = 6
+PROTO_VERSION = 7
 
 OP_EXIT, OP_MAKE_CACHE, OP_FORWARD = 0, 1, 2
 OP_ROLLBACK = 3         # speculative round rejected: roll my own shard back
 OP_VAULT_STORE = 4      # checkpoint my own shard's cache under this name
 OP_VAULT_RESTORE = 5    # rebuild my own shard's cache from this name (+ ack)
+OP_RELEASE_CACHE = 6    # drop one named epoch after rank 0 gives up ownership
 
 # Fixed-width header, then ``n`` payload words.
 #   0 op | 1 epoch | 2 batch | 3 seqlen | 4 flags | 5 arg0 | 6..13 name
@@ -526,8 +527,9 @@ def _ack_recv() -> int:
 # ------------------------------------------------------------------- worker
 _OP_NAMES = {OP_EXIT: "EXIT", OP_MAKE_CACHE: "MAKE_CACHE", OP_FORWARD: "FORWARD",
              OP_ROLLBACK: "ROLLBACK", OP_VAULT_STORE: "VAULT_STORE",
-             OP_VAULT_RESTORE: "VAULT_RESTORE"}
+             OP_VAULT_RESTORE: "VAULT_RESTORE", OP_RELEASE_CACHE: "RELEASE_CACHE"}
 ENV_TRACE = "MLX_VLM_GLM5_TP_TRACE"
+MAX_LIVE_EPOCHS = 32
 
 
 def _trace() -> bool:
@@ -554,18 +556,21 @@ class _WorkerState:
         self.epoch: int = -1
         # gdn_states from the last capturing forward: what a ROLLBACK replays.
         self.last_gdn = None
+        self.gdn_by_epoch = {}
         self.tokens_seen: int = 0
 
     # -- helpers ----------------------------------------------------------
     def cache_for(self, epoch: int):
         c = self.caches.get(epoch)
         if c is None:
-            c = self.caches[epoch] = self.lm.make_cache()
+            raise TPDesync(f"tp worker: unknown cache epoch {epoch}")
         return c
 
     def new_cache(self, epoch: int, left_padding=None):
-        # One live cache in mode-level TP: rank 0 drives one conversation at a
-        # time, and holding the old one would only pin its KV.
+        if epoch in self.caches:
+            raise TPDesync(f"tp worker: duplicate MAKE_CACHE epoch {epoch}")
+        if len(self.caches) >= MAX_LIVE_EPOCHS:
+            raise TPUnavailable("tp worker: live cache epoch limit reached")
         c = self.lm.make_cache()
         if left_padding is not None:
             from ..models import cache as cache_mod
@@ -582,7 +587,7 @@ class _WorkerState:
                 raise TPUnavailable(
                     f"tp worker cannot batch cache type {type(entry).__name__}")
             c = [to_batch(entry) for entry in c]
-        self.caches = {epoch: c}
+        self.caches[epoch] = c
         self.epoch = epoch
         self.last_gdn = None
         return c
@@ -596,6 +601,9 @@ class _WorkerState:
                         msg.seqlen, msg.capture, msg.arg0, msg.name[:12])
         if msg.op == OP_EXIT:
             logger.info("tp worker: EXIT")
+            self.caches.clear()
+            self.last_gdn = None
+            self.gdn_by_epoch.clear()
             return False
 
         if msg.op == OP_MAKE_CACHE:
@@ -606,6 +614,7 @@ class _WorkerState:
             import mlx.core as mx
 
             c = self.cache_for(msg.epoch)
+            self.epoch = msg.epoch
             ids = mx.array(msg.ids, dtype=mx.int32).reshape(msg.batch, msg.seqlen)
             # A capturing forward must be capturing on BOTH ranks.  The capture
             # itself is numerically inert -- the sinks are appended to, never
@@ -627,18 +636,34 @@ class _WorkerState:
                 logger.info("rank1 forward b=%s s=%s collectives=%d",
                             msg.batch, msg.seqlen, collective_count() - n0)
             self.last_gdn = getattr(out, "gdn_states", None) if msg.capture else None
+            if msg.capture:
+                self.gdn_by_epoch[msg.epoch] = self.last_gdn
+            else:
+                self.gdn_by_epoch.pop(msg.epoch, None)
             self.tokens_seen += msg.batch * msg.seqlen
+            return True
+
+        if msg.op == OP_RELEASE_CACHE:
+            if msg.epoch not in self.caches:
+                raise TPDesync(f"tp worker: RELEASE unknown epoch {msg.epoch}")
+            del self.caches[msg.epoch]
+            self.gdn_by_epoch.pop(msg.epoch, None)
+            if self.epoch == msg.epoch:
+                self.epoch = -1
+                self.last_gdn = None
             return True
 
         if msg.op == OP_ROLLBACK:
             c = self.caches.get(msg.epoch)
-            if c is None or self.last_gdn is None:
+            gdn = self.gdn_by_epoch.get(msg.epoch)
+            if c is None or gdn is None:
                 raise TPDesync(
                     "tp worker: ROLLBACK with no captured round to roll back "
                     f"(epoch={msg.epoch}, cache={'yes' if c else 'no'})")
             accepted = list(msg.ids or [])
             self.lm.rollback_speculative_cache(
-                c, self.last_gdn, accepted, int(msg.arg0))
+                c, gdn, accepted, int(msg.arg0))
+            self.gdn_by_epoch.pop(msg.epoch, None)
             self.last_gdn = None
             return True
 
@@ -688,6 +713,11 @@ class _WorkerState:
         """
         ok = False
         if self.vault is not None and msg.name:
+            if msg.epoch in self.caches:
+                raise TPDesync(
+                    f"tp worker: duplicate VAULT_RESTORE epoch {msg.epoch}")
+            if len(self.caches) >= MAX_LIVE_EPOCHS:
+                raise TPUnavailable("tp worker: live cache epoch limit reached")
             c = self.lm.make_cache()
             try:
                 ok = bool(self.vault.restore(msg.name, int(msg.arg0), c))
@@ -695,7 +725,7 @@ class _WorkerState:
                 logger.warning("tp worker: vault restore failed", exc_info=True)
                 ok = False
             if ok:
-                self.caches = {msg.epoch: c}
+                self.caches[msg.epoch] = c
                 self.epoch = msg.epoch
                 self.last_gdn = None
         if not ok:
@@ -753,6 +783,7 @@ def worker_loop(model_path: str, hosts: List[str], rank: int) -> None:
                            exc_info=True)
         state.caches.clear()
         state.last_gdn = None
+        state.gdn_by_epoch.clear()
         state.vault = None
         lm = None
         model = None

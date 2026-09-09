@@ -114,15 +114,14 @@ def test_worker_rebuilds_left_zero_padded_text_embeddings():
     assert mx.all(got[1] == mx.array([[5] * 4, [6] * 4, [7] * 4])).item()
 
 
-def test_worker_replaces_the_cache_on_a_new_epoch():
-    """One live cache: rank 0 drives one conversation at a time, and holding the
-    previous one would pin its KV for nothing."""
+def test_worker_retains_the_cache_on_a_new_epoch_until_release():
+    """A donor prefill must not discard the incumbent cache it may rejoin."""
     lm = _TwinLM()
     st = W._WorkerState(lm)
     st.handle(_msg(W.OP_MAKE_CACHE, 1))
     st.handle(_msg(W.OP_FORWARD, 1, ids=[1]))
     st.handle(_msg(W.OP_MAKE_CACHE, 2))
-    assert list(st.caches) == [2]
+    assert list(st.caches) == [1, 2]
 
 
 def test_worker_exits_on_exit():
@@ -163,6 +162,15 @@ def test_rollback_without_a_captured_round_is_refused():
     st = W._WorkerState(lm)
     st.handle(_msg(W.OP_MAKE_CACHE, 1))
     st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2]))          # no capture flag
+    with pytest.raises(W.TPDesync, match="no captured round"):
+        st.handle(_msg(W.OP_ROLLBACK, 1, ids=[0], arg0=2))
+
+
+def test_ordinary_forward_clears_that_epochs_stale_capture():
+    lm = _TwinLM(); st = W._WorkerState(lm)
+    st.handle(_msg(W.OP_MAKE_CACHE, 1))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[1, 2], flags=W.FLAG_CAPTURE))
+    st.handle(_msg(W.OP_FORWARD, 1, ids=[3]))
     with pytest.raises(W.TPDesync, match="no captured round"):
         st.handle(_msg(W.OP_ROLLBACK, 1, ids=[0], arg0=2))
 

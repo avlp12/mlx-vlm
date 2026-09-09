@@ -206,11 +206,14 @@ def test_mirror_survives_id_reuse(monkeypatch):
     """Regression: a freed cache can hand its address to the next one.  Matching
     on id() alone would skip MAKE_CACHE and leave rank 1 on the old cache."""
     m, sent = _mirror(monkeypatch)
-    m(_Ids(1, 2), cache=[])              # first cache becomes garbage
+    first = []
+    m(_Ids(1, 2), cache=first)
+    m.release_cache(first)                # ownership ends before address reuse
     sent.clear()
     for _ in range(50):                  # force address reuse
         c = []
         m(_Ids(1, 2), cache=c)
+        m.release_cache(c)
     assert [s.op for s in sent].count(T.OP_MAKE_CACHE) == 50
 
 
